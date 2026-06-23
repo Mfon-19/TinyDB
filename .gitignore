@@ -1,1 +1,17 @@
 /docs
+
+# Build outputs
+/build/
+/cmake-build-*/
+
+# Local CMake/editor state
+/CMakeUserPresets.json
+/compile_commands.json
+/.cache/
+
+# Test and coverage artifacts
+/Testing/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
