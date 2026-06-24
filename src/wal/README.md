@@ -27,8 +27,8 @@ page's log sequence number before flushing that dirty page.
 - A **commit record** marks an operation as durable.
 
 ## Planned files
-- `wal.h` / `wal.cpp` — `Wal`: `append(record) -> Lsn`, `flush_to(lsn)`
-  (`fdatasync`/`fsync`), `iterate()` for recovery.
+- `wal.h` / `wal.cpp` — `Wal`: `Append(record) -> Lsn`, `FlushTo(lsn)`
+  (`fdatasync`/`fsync`), `Iterate()` for recovery.
 - `log_record.h` / `log_record.cpp` — record types + (de)serialization + checksum.
 - `lsn.h` — the log sequence number type.
 

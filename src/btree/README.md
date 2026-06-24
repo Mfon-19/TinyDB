@@ -3,15 +3,15 @@
 The ordered index and the core data structure of the engine. A disk-resident
 **B+-tree** mapping **byte-string keys → byte-string values**, built on top of the
 buffer pool (it fetches/pins pages, never touches the file directly). This is what
-gives the engine `get`, ordered `scan`, and efficient `put`/`delete`.
+gives the engine `Get`, ordered `Scan`, and efficient `Put`/`Delete`.
 
 ## Responsibilities
 - Lay out interior and leaf nodes inside 4 KB pages (slotted-page format).
 - Search by key (binary search within a node, descend the tree).
-- `insert` / `update` / `delete` entries.
+- `Insert` / `Update` / `Delete` entries.
 - **Split** full nodes and propagate splits toward the root.
 - Link leaf nodes left-to-right so **range scans** are sequential.
-- Provide a **cursor** for `seek` / `next` and range iteration.
+- Provide a **cursor** for `Seek` / `Next` and range iteration.
 - Emit WAL records for every structural change (see `src/wal`) so changes are
   recoverable.
 
@@ -25,10 +25,10 @@ gives the engine `get`, ordered `scan`, and efficient `put`/`delete`.
 ## Planned files
 - `node.h` / `node.cpp` — slotted-page node format: header, cell-pointer array,
   cell access, in-page free space.
-- `btree.h` / `btree.cpp` — `BTree`: `get`, `put`, `erase`, `scan`; split logic
+- `btree.h` / `btree.cpp` — `BTree`: `Get`, `Put`, `Erase`, `Scan`; split logic
   and root tracking.
-- `cursor.h` / `cursor.cpp` — `Cursor`: `seek(key)`, `next()`, `key()`,
-  `value()` — drives range scans.
+- `cursor.h` / `cursor.cpp` — `Cursor`: `Seek(key)`, `Next()`, `Key()`,
+  `Value()` — drives range scans.
 
 ## Key decisions
 - **B+-tree** (all values in leaves, leaves linked) — built for page-based,

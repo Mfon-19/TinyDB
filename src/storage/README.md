@@ -26,8 +26,8 @@ header/free-list/file-format logic grows large enough to justify it.
 - Full spec lives in `docs/FILE_FORMAT.md`.
 
 ## Planned files
-- `disk_manager.h` / `disk_manager.cpp` — `DiskManager`: `open`, `read_page`,
-  `write_page`, `allocate_page`, `free_page`, `sync`, `size`; owns the Linux fd.
+- `disk_manager.h` / `disk_manager.cpp` — `DiskManager`: `Open`, `ReadPage`,
+  `WritePage`, `AllocatePage`, `FreePage`, `Sync`, `Size`; owns the Linux fd.
 - `page.h` — `Page`: page number + raw 4 KB buffer.
 - `file_header.h` / `file_header.cpp` — read/write/validate page 1.
 - `freelist.h` / `freelist.cpp` — simple linked-list free-page management.

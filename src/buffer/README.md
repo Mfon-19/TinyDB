@@ -15,15 +15,15 @@ most important — and most benchmarked — components of the engine.
 
 ## The fetch path
 ```
-fetch_page(pgno):
+FetchPage(pgno):
   in pool?  → pin, return it (cache hit)
   else      → pick a victim, flush it if dirty (WAL first),
               read pgno from DiskManager, pin, return it (cache miss)
 ```
 
 ## Planned files
-- `buffer_pool.h` / `buffer_pool.cpp` — `BufferPool`: `fetch_page(pgno)`,
-  `unpin_page(pgno, dirty)`, `new_page()`, `flush_page(pgno)`, `flush_all()`.
+- `buffer_pool.h` / `buffer_pool.cpp` — `BufferPool`: `FetchPage(pgno)`,
+  `UnpinPage(pgno, dirty)`, `NewPage()`, `FlushPage(pgno)`, `FlushAllPages()`.
 - `frame.h` — a pool slot: page buffer, page number, pin count, dirty flag.
 - `replacer.h` / `replacer.cpp` — eviction policy (start with **clock**; LRU is
   an easy alternative). Picks an unpinned victim.

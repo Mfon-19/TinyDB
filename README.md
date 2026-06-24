@@ -9,22 +9,22 @@ full RDBMS. No SQL, query planner, joins, or network server; just the hard,
 systems-heavy part: storage, indexing, caching, and durability.
 
 ```cpp
-TinyDB::StorageEngine db("data.db");
+tinydb::StorageEngine db("data.db");
 
-db.put("user:1", "Mfon");
-db.put("user:2", "Alice");
+db.Put("user:1", "Mfon");
+db.Put("user:2", "Alice");
 
-auto v = db.get("user:1");          // -> "Mfon"
-db.remove("user:2");
+auto v = db.Get("user:1");          // -> "Mfon"
+db.Remove("user:2");
 
-for (auto [key, value] : db.scan("user:1", "user:9"))
+for (auto [key, value] : db.Scan("user:1", "user:9"))
     std::cout << key << " = " << value << "\n";
 ```
 
 ## Architecture
 
 ```
-StorageEngine API   (put / get / remove / scan)   src/engine
+StorageEngine API   (Put / Get / Remove / Scan)   src/engine
    │
 B+-tree index                                      src/btree
    │
@@ -47,7 +47,7 @@ disk
 |------|--------------|
 | `src/storage` | DiskManager, page-based file format, freelist, Linux fd I/O |
 | `src/buffer`  | Buffer pool / page cache (pin, dirty, eviction) |
-| `src/btree`   | B+-tree index — ordered get / put / delete / scan |
+| `src/btree`   | B+-tree index — ordered Get / Put / Delete / Scan |
 | `src/codec`   | Encoding primitives: `Slice`, varints, cell format |
 | `src/wal`     | Write-ahead log (redo logging) |
 | `src/recovery`| Crash recovery (redo replay) + checkpointing |

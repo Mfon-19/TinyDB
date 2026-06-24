@@ -1,10 +1,7 @@
 ---
 Language: Cpp
-BasedOnStyle: LLVM
-AccessModifierOffset: -2
-AllowShortFunctionsOnASingleLine: Empty
-ColumnLimit: 100
+BasedOnStyle: Google
+ColumnLimit: 120
 DerivePointerAlignment: false
-IndentWidth: 2
-PointerAlignment: Left
-SortIncludes: CaseSensitive
+PointerAlignment: Right
+IncludeBlocks: Preserve

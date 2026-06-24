@@ -9,10 +9,10 @@ checkpoint, close — and delegates the real work downward.
 ```cpp
 StorageEngine db("data.db");
 
-db.put(key, value);            // insert or overwrite
-auto v = db.get(key);          // -> optional<value>
-db.remove(key);                // delete (tombstone)
-for (auto [k, v] : db.scan(lo, hi))   // ordered range scan
+db.Put(key, value);            // insert or overwrite
+auto v = db.Get(key);          // -> optional<value>
+db.Remove(key);                // delete (tombstone)
+for (auto [k, v] : db.Scan(lo, hi))   // ordered range scan
     ...
 ```
 Keys and values are opaque byte strings (`Slice`). No SQL, no schema, no joins —
@@ -21,7 +21,7 @@ that surface area is deliberately out of scope (see `docs/ROADMAP.md`).
 ## Responsibilities
 - **Open**: initialize `DiskManager`/buffer pool/WAL, then run `src/recovery`
   before accepting any request.
-- Implement `put` / `get` / `remove` / `scan` on top of the B+-tree.
+- Implement `Put` / `Get` / `Remove` / `Scan` on top of the B+-tree.
 - Enforce **per-operation atomicity + durability**: log the change, durably sync
   the log to commit, then it's safe — a crash either fully applies the op or not
   at all.

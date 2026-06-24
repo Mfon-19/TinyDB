@@ -9,7 +9,7 @@ engine, measure it, and report numbers tied back to hardware behavior.
 - **Point read latency** — `get` p50 / p99 (microseconds), warm vs cold cache.
 - **Range scan throughput** — keys/sec for `scan` over large ranges.
 - **Buffer-pool hit rate** — under various pool sizes and access patterns.
-- **Recovery time** — how long `open()` takes to replay the WAL after a crash.
+- **Recovery time** — how long `Open()` takes to replay the WAL after a crash.
 - **Durable sync cost** — sync-per-op vs batched, to make the durability
   trade-off visible.
 

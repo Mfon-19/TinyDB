@@ -10,7 +10,7 @@ an arbitrary point, reopen, and the database must come back correct.
 
 ## Recovery algorithm (redo)
 ```
-on open():
+on Open():
   scan the WAL from the last checkpoint
   verify each record's checksum; stop at the first torn/partial record
   for each committed record:
@@ -29,7 +29,7 @@ recovery is safe to run after a crash *during recovery itself*.
   the WAL doesn't grow without bound.
 
 ## Planned files
-- `recovery.h` / `recovery.cpp` — `recover(Wal&, DiskManager&)`: the redo pass
+- `recovery.h` / `recovery.cpp` — `Recover(Wal&, DiskManager&)`: the redo pass
   run at open.
 - `checkpoint.h` / `checkpoint.cpp` — flush dirty pages, sync the database file,
   and advance the WAL start point.
