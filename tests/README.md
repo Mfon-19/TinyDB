@@ -1,30 +1,40 @@
 # tests — Test suite
 
 Where correctness is enforced. A storage engine is pointer- and byte-layout-heavy
-and persists state across runs, so testing is first-class, not an afterthought.
-Three kinds of tests live here.
+and must survive crashes, so testing is first-class — and for this project the
+testing *is* the impressive part. Four kinds of tests live here.
 
 ## 1. Unit tests (per layer)
-One test file per component, mirroring `src/`:
-- `pager_test.cpp` — page read/write round-trips, cache eviction, freelist reuse.
-- `btree_test.cpp` — insert/search/delete, node splits & merges, overflow pages,
-  large randomized insert/lookup sequences.
-- `record_test.cpp` — value (de)serialization round-trips, comparison rules.
-- `catalog_test.cpp` — create/drop/lookup, schema reload after reopen.
-- `binder_test.cpp` — name resolution, `*` expansion, type-error detection.
-- `exec_test.cpp` — each operator and expression evaluation.
+One file per component, mirroring `src/`:
+- `vfs_test.cpp` / `pager_test.cpp` — page read/write round-trips, freelist reuse.
+- `buffer_pool_test.cpp` — fetch/pin/unpin, eviction, dirty flushing.
+- `codec_test.cpp` — slice, varint, and cell encode/decode round-trips.
+- `btree_test.cpp` — insert/search/delete, node splits, range scans.
+- `wal_test.cpp` — append, flush, iterate, checksum/torn-tail detection.
 
-## 2. Golden SQL tests
-`sql/` — `.sql` input files paired with expected-output files. A runner executes
-the SQL against a fresh database and diffs the printed result. This is the main
-end-to-end safety net for query behavior.
+## 2. Differential (model-based) tests — the correctness backbone
+`differential/` — run the **same random sequence** of `put`/`get`/`remove`/`scan`
+against the engine and against a reference `std::map<string,string>`, asserting
+they always agree. This is how real engines find B+-tree bugs; the randomized,
+long-running version is the highest-value bug finder in the suite.
 
-## 3. Crash-recovery tests
-`recovery/` — open a database, begin a write, simulate a crash (abort before
-sync / kill the process), reopen, and assert the database is consistent and the
-incomplete write left no corruption. Validates the durability layer.
+## 3. Crash / chaos tests — the headline
+`chaos/` — the signal that separates this from a toy:
+```
+loop thousands of times:
+  apply random put/delete operations
+  kill the process at a random point (no clean close)
+  reopen → recovery runs
+  verify contents match the expected committed state
+```
+Validates `src/wal` + `src/recovery`. Implemented with process-level kills and/or
+a VFS fault-injection layer that simulates torn/partial writes and lost syncs.
+
+## 4. Persistence / reopen tests
+`persistence/` — write data, close cleanly, reopen, and assert everything is
+still there and correctly ordered.
 
 ## Tooling
-- Framework: GoogleTest (decided in `docs/DESIGN.md`).
-- Debug builds run under **ASan/UBSan**; the randomized B+-tree tests are the
-  highest-value bug finders.
+- Framework: GoogleTest.
+- Debug builds run under **ASan/UBSan**; differential + chaos tests are the
+  highest-value bug finders. The codec decoders are also a **libFuzzer** target.
