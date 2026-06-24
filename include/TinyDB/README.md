@@ -1,7 +1,7 @@
-# include/synarch — Public API headers
+# include/TinyDB — Public API headers
 
 The stable, public-facing interface to the storage engine. Anything that embeds
-synarch — the CLI, the test suite, the benchmarks, or a future application —
+TinyDB — the CLI, the test suite, the benchmarks, or a future application —
 includes **only** these headers. Internal headers under `src/**` are
 implementation detail and are not installed.
 
@@ -14,8 +14,8 @@ implementation detail and are not installed.
 - `options.h` — open-time configuration (buffer-pool size, sync mode, path).
 
 ## Key decisions
-- One namespace, `synarch`, for all public types.
+- One namespace, `TinyDB`, for all public types.
 - The public surface is a **byte-string key-value store** — small, stable, and
   storage-agnostic, so internals (page format, buffer pool, B+-tree, WAL) can
   change without breaking embedders.
-- Header layout mirrors how the library installs: `#include <synarch/storage_engine.h>`.
+- Header layout mirrors how the library installs: `#include <TinyDB/storage_engine.h>`.

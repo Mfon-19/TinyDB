@@ -10,7 +10,8 @@ engine, measure it, and report numbers tied back to hardware behavior.
 - **Range scan throughput** — keys/sec for `scan` over large ranges.
 - **Buffer-pool hit rate** — under various pool sizes and access patterns.
 - **Recovery time** — how long `open()` takes to replay the WAL after a crash.
-- **fsync cost** — sync-per-op vs batched, to make the durability trade-off visible.
+- **Durable sync cost** — sync-per-op vs batched, to make the durability
+  trade-off visible.
 
 ## Example headline numbers (the kind to publish in the README)
 ```
@@ -32,5 +33,5 @@ crash recovery time:         R ms
 - Report **distributions (p50/p99), not just averages** — tail latency is what
   matters and what shows benchmarking maturity.
 - Tie results to hardware: page size vs branching factor, random vs sequential
-  SSD I/O, cache-friendly record layout, fsync cost.
+  SSD I/O, cache-friendly record layout, durable sync cost.
 - Benchmarks link against the **release** preset (optimized, no sanitizers).

@@ -6,7 +6,8 @@ testing *is* the impressive part. Four kinds of tests live here.
 
 ## 1. Unit tests (per layer)
 One file per component, mirroring `src/`:
-- `vfs_test.cpp` / `pager_test.cpp` — page read/write round-trips, freelist reuse.
+- `disk_manager_test.cpp` — page read/write round-trips, durable sync, freelist
+  reuse.
 - `buffer_pool_test.cpp` — fetch/pin/unpin, eviction, dirty flushing.
 - `codec_test.cpp` — slice, varint, and cell encode/decode round-trips.
 - `btree_test.cpp` — insert/search/delete, node splits, range scans.
@@ -28,7 +29,8 @@ loop thousands of times:
   verify contents match the expected committed state
 ```
 Validates `src/wal` + `src/recovery`. Implemented with process-level kills and/or
-a VFS fault-injection layer that simulates torn/partial writes and lost syncs.
+a test `DiskManager`/fault-injection wrapper that simulates torn writes,
+partial writes, and failed syncs.
 
 ## 4. Persistence / reopen tests
 `persistence/` — write data, close cleanly, reopen, and assert everything is

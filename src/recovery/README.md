@@ -29,10 +29,10 @@ recovery is safe to run after a crash *during recovery itself*.
   the WAL doesn't grow without bound.
 
 ## Planned files
-- `recovery.h` / `recovery.cpp` — `recover(Wal&, Pager&)`: the redo pass run at
-  open.
-- `checkpoint.h` / `checkpoint.cpp` — flush dirty pages, fsync, advance the WAL
-  start point.
+- `recovery.h` / `recovery.cpp` — `recover(Wal&, DiskManager&)`: the redo pass
+  run at open.
+- `checkpoint.h` / `checkpoint.cpp` — flush dirty pages, sync the database file,
+  and advance the WAL start point.
 
 ## Key decisions
 - **Redo-only** recovery (matches the WAL's redo logging) — no undo pass in v1.

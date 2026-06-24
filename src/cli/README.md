@@ -26,6 +26,6 @@ scan <lo> <hi>         print ordered key/value pairs in range
 - `repl.h` / `repl.cpp` — the read-eval-print loop and command dispatch.
 
 ## Key decisions
-- Depends only on the public API in `include/synarch`, not internal headers.
+- Depends only on the public API in `include/TinyDB`, not internal headers.
 - No storage logic here — purely a driver for the engine.
 - The `.stats` command surfaces the metrics that matter for `bench/`.

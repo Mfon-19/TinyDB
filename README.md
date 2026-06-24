@@ -1,4 +1,4 @@
-# synarch
+# TinyDB
 
 A disk-backed, ordered **key-value storage engine** in C++ — a page-based file
 format, a buffer pool, a B+-tree index, write-ahead logging, and crash recovery,
@@ -9,7 +9,7 @@ full RDBMS. No SQL, query planner, joins, or network server; just the hard,
 systems-heavy part: storage, indexing, caching, and durability.
 
 ```cpp
-synarch::StorageEngine db("data.db");
+TinyDB::StorageEngine db("data.db");
 
 db.put("user:1", "Mfon");
 db.put("user:2", "Alice");
@@ -30,11 +30,11 @@ B+-tree index                                      src/btree
    │
 Buffer pool (page cache)                           src/buffer
    │
-Pager + file format                                src/storage
+DiskManager / page file                            src/storage
    │            ▲ write-ahead rule
 WAL ──► Recovery │                                 src/wal, src/recovery
    │
-VFS (OS file I/O, durable fsync)                   src/storage
+Linux fd I/O (pread / pwrite / fdatasync)          src/storage
    │
 disk
 ```
@@ -45,7 +45,7 @@ disk
 
 | Path | What's there |
 |------|--------------|
-| `src/storage` | VFS, pager, page-based file format, freelist |
+| `src/storage` | DiskManager, page-based file format, freelist, Linux fd I/O |
 | `src/buffer`  | Buffer pool / page cache (pin, dirty, eviction) |
 | `src/btree`   | B+-tree index — ordered get / put / delete / scan |
 | `src/codec`   | Encoding primitives: `Slice`, varints, cell format |
@@ -53,7 +53,7 @@ disk
 | `src/recovery`| Crash recovery (redo replay) + checkpointing |
 | `src/engine`  | The storage-engine API and lifecycle |
 | `src/cli`     | Interactive REPL for the KV API |
-| `include/synarch` | Public headers (the embed surface) |
+| `include/TinyDB` | Public headers (the embed surface) |
 | `tests`       | Unit, differential (vs `std::map`), and chaos tests |
 | `bench`       | Throughput / latency / recovery benchmarks |
 | `docs`        | Design, style, tooling, file/WAL format, recovery |

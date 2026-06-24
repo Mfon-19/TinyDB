@@ -4,5 +4,5 @@ Checks: >
   clang-analyzer-*,
   performance-*,
   -performance-enum-size
-HeaderFilterRegex: '^(.*include/synarch/.*|.*src/.*|.*tests/.*)$'
+HeaderFilterRegex: '^(.*include/TinyDB/.*|.*src/.*|.*tests/.*)$'
 FormatStyle: file

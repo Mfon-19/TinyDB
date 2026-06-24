@@ -13,7 +13,7 @@
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "SYNARCH_WARNINGS_AS_ERRORS": "ON"
+        "TINYDB_WARNINGS_AS_ERRORS": "ON"
       }
     },
     {
@@ -23,7 +23,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "SANITIZE": "ON",
-        "SYNARCH_ENABLE_CLANG_TIDY": "OFF"
+        "TINYDB_ENABLE_CLANG_TIDY": "OFF"
       }
     },
     {
@@ -31,7 +31,7 @@
       "displayName": "Debug + clang-tidy",
       "inherits": "debug",
       "cacheVariables": {
-        "SYNARCH_ENABLE_CLANG_TIDY": "ON"
+        "TINYDB_ENABLE_CLANG_TIDY": "ON"
       }
     },
     {
@@ -41,7 +41,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "SANITIZE": "OFF",
-        "SYNARCH_ENABLE_CLANG_TIDY": "OFF"
+        "TINYDB_ENABLE_CLANG_TIDY": "OFF"
       }
     },
     {

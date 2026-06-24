@@ -19,16 +19,17 @@ Keys and values are opaque byte strings (`Slice`). No SQL, no schema, no joins �
 that surface area is deliberately out of scope (see `docs/ROADMAP.md`).
 
 ## Responsibilities
-- **Open**: initialize the VFS/pager/buffer pool/WAL, then run `src/recovery`
+- **Open**: initialize `DiskManager`/buffer pool/WAL, then run `src/recovery`
   before accepting any request.
 - Implement `put` / `get` / `remove` / `scan` on top of the B+-tree.
-- Enforce **per-operation atomicity + durability**: log the change, fsync to
-  commit, then it's safe — a crash either fully applies the op or not at all.
-- Drive **checkpointing** and clean **close** (flush + fsync + mark clean).
+- Enforce **per-operation atomicity + durability**: log the change, durably sync
+  the log to commit, then it's safe — a crash either fully applies the op or not
+  at all.
+- Drive **checkpointing** and clean **close** (flush + durable sync + mark clean).
 
 ## Planned files
 - `storage_engine.h` / `storage_engine.cpp` — `StorageEngine`: owns
-  `Vfs`/`Pager`/`BufferPool`/`Wal`/`BTree`; implements the KV API and lifecycle.
+  `DiskManager`/`BufferPool`/`Wal`/`BTree`; implements the KV API and lifecycle.
 - `options.h` — open options (path, buffer-pool size, sync mode).
 
 ## Key decisions
@@ -36,5 +37,5 @@ that surface area is deliberately out of scope (see `docs/ROADMAP.md`).
   SQLite/LMDB/RocksDB shape).
 - Atomicity is **per operation** for v1; multi-op transactions
   (`begin`/`commit`/`rollback`) are a documented later extension.
-- The public types are mirrored in `include/synarch` — this folder is the impl;
+- The public types are mirrored in `include/TinyDB` — this folder is the impl;
   embedders include only the public headers.

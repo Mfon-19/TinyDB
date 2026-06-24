@@ -17,8 +17,8 @@ page's log sequence number before flushing that dirty page.
   committed records forward.
 - Single-writer model means there is no uncommitted-then-rolled-back state to
   undo — this is the deliberate simplification that keeps recovery tractable.
-- Each operation (`put`/`delete`) is logged, then committed by an `fsync` of the
-  log. A committed op is durable even if the data pages aren't flushed yet.
+- Each operation (`put`/`delete`) is logged, then committed by a durable sync of
+  the log. A committed op is durable even if the data pages aren't flushed yet.
 
 ## Log format
 - Append-only file (or log pages). Each record: type, **log sequence number
@@ -27,8 +27,8 @@ page's log sequence number before flushing that dirty page.
 - A **commit record** marks an operation as durable.
 
 ## Planned files
-- `wal.h` / `wal.cpp` — `Wal`: `append(record) -> Lsn`, `flush_to(lsn)` (fsync),
-  `iterate()` for recovery.
+- `wal.h` / `wal.cpp` — `Wal`: `append(record) -> Lsn`, `flush_to(lsn)`
+  (`fdatasync`/`fsync`), `iterate()` for recovery.
 - `log_record.h` / `log_record.cpp` — record types + (de)serialization + checksum.
 - `lsn.h` — the log sequence number type.
 
