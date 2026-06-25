@@ -53,7 +53,7 @@ disk
 | `src/recovery`| Crash recovery (redo replay) + checkpointing |
 | `src/engine`  | The storage-engine API and lifecycle |
 | `src/cli`     | Interactive REPL for the KV API |
-| `include/TinyDB` | Public headers (the embed surface) |
+| `include/tinydb` | Public headers (the embed surface) |
 | `tests`       | Unit, differential (vs `std::map`), and chaos tests |
 | `bench`       | Throughput / latency / recovery benchmarks |
 | `docs`        | Design, style, tooling, file/WAL format, recovery |

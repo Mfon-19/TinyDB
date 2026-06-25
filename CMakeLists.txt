@@ -60,7 +60,7 @@ function(TinyDB_apply_local_tooling target_name)
   endif()
 endfunction()
 
-add_library(TinyDB src/database.cpp)
+add_library(TinyDB src/engine/storage_engine.cpp include/tinydb/storage_engine.h)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
 target_compile_features(TinyDB PUBLIC cxx_std_20)
 target_include_directories(
@@ -69,12 +69,14 @@ target_include_directories(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 TinyDB_apply_local_tooling(TinyDB)
 
-add_executable(TinyDB_cli src/cli/main.cpp)
-set_target_properties(TinyDB_cli PROPERTIES OUTPUT_NAME TinyDB)
-target_link_libraries(TinyDB_cli PRIVATE TinyDB::TinyDB)
-TinyDB_apply_local_tooling(TinyDB_cli)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/cli/main.cpp")
+  add_executable(TinyDB_cli src/cli/main.cpp)
+  set_target_properties(TinyDB_cli PROPERTIES OUTPUT_NAME TinyDB)
+  target_link_libraries(TinyDB_cli PRIVATE TinyDB::TinyDB)
+  TinyDB_apply_local_tooling(TinyDB_cli)
+endif()
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_test.cpp")
   FetchContent_Declare(
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git

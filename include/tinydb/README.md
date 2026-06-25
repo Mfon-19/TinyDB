@@ -1,7 +1,7 @@
-# include/TinyDB — Public API headers
+# include/tinydb — Public API headers
 
 The stable, public-facing interface to the storage engine. Anything that embeds
-TinyDB — the CLI, the test suite, the benchmarks, or a future application —
+tinydb — the CLI, the test suite, the benchmarks, or a future application —
 includes **only** these headers. Internal headers under `src/**` are
 implementation detail and are not installed.
 
@@ -18,4 +18,4 @@ implementation detail and are not installed.
 - The public surface is a **byte-string key-value store** — small, stable, and
   storage-agnostic, so internals (page format, buffer pool, B+-tree, WAL) can
   change without breaking embedders.
-- Header layout mirrors how the library installs: `#include <TinyDB/storage_engine.h>`.
+- Header layout mirrors how the library installs: `#include <tinydb/storage_engine.h>`.
