@@ -4,17 +4,21 @@
 
 namespace tinydb {
 
-StorageEngine::StorageEngine(std::filesystem::path path) : path_(std::move(path)) {}
+StorageEngine::StorageEngine(std::filesystem::path path)
+    : path_(std::move(path)) {}
 
 StorageEngine::StorageEngine(StorageEngine &&other) noexcept
-    : path_(std::move(other.path_)), closed_(other.closed_), data_(std::move(other.data_)) {
+    : path_(std::move(other.path_)),
+      closed_(other.closed_),
+      data_(std::move(other.data_)) {
   // Mark the moved from StorageEngine as closed
   other.closed_ = true;
 }
 
 StorageEngine::~StorageEngine() { Close(); }
 
-auto StorageEngine::operator=(StorageEngine &&other) noexcept -> StorageEngine & {
+auto StorageEngine::operator=(StorageEngine &&other) noexcept
+    -> StorageEngine & {
   if (this != &other) {
     // Close the current engine before moving resources
     Close();
@@ -39,7 +43,8 @@ auto StorageEngine::Put(std::string_view key, std::string_view value) -> void {
   data_[std::string(key)] = std::string(value);
 }
 
-auto StorageEngine::Get(std::string_view key) const -> std::optional<std::string> {
+auto StorageEngine::Get(std::string_view key) const
+    -> std::optional<std::string> {
   if (closed_) {
     return std::nullopt;
   }

@@ -60,7 +60,14 @@ function(TinyDB_apply_local_tooling target_name)
   endif()
 endfunction()
 
-add_library(TinyDB src/engine/storage_engine.cpp include/tinydb/storage_engine.h)
+add_library(
+  TinyDB
+  include/tinydb/disk_manager.h
+  include/tinydb/file_header.h
+  include/tinydb/page.h
+  include/tinydb/storage_engine.h
+  src/engine/storage_engine.cpp
+  src/storage/disk_manager.cpp)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
 target_compile_features(TinyDB PUBLIC cxx_std_20)
 target_include_directories(
@@ -93,4 +100,9 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_test.cpp")
   target_link_libraries(TinyDB_smoke_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
   TinyDB_apply_local_tooling(TinyDB_smoke_test)
   gtest_discover_tests(TinyDB_smoke_test)
+
+  add_executable(TinyDB_disk_manager_test tests/disk_manager_test.cpp)
+  target_link_libraries(TinyDB_disk_manager_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+  TinyDB_apply_local_tooling(TinyDB_disk_manager_test)
+  gtest_discover_tests(TinyDB_disk_manager_test)
 endif()
