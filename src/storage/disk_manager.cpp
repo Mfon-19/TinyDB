@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cassert>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -17,9 +18,14 @@ static constexpr std::uint32_t FILE_MAGIC = 0x54444231U;
 
 DiskManager::DiskManager(const std::filesystem::path &path) {
   fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (fd_ < 0) {
+    throw std::system_error(errno, std::generic_category(), "open");
+  }
 
   struct stat stat_buffer {};
-  ::fstat(fd_, &stat_buffer);
+  if (::fstat(fd_, &stat_buffer) < 0) {
+    throw std::system_error(errno, std::generic_category(), "fstat");
+  }
 
   if (stat_buffer.st_size == 0) {
     header_ = FileHeader{
@@ -32,11 +38,15 @@ DiskManager::DiskManager(const std::filesystem::path &path) {
     auto header_page = std::array<char, PAGE_SIZE>{};
     std::memcpy(header_page.data(), &header_, sizeof(header_));
 
-    ::pwrite(fd_, header_page.data(), header_page.size(), 0);
+    if (::pwrite(fd_, header_page.data(), header_page.size(), 0) < 0) {
+      throw std::system_error(errno, std::generic_category(), "pwrite");
+    }
     return;
   }
 
-  ::pread(fd_, &header_, sizeof(header_), 0);
+  if (::pread(fd_, &header_, sizeof(header_), 0) < 0) {
+    throw std::system_error(errno, std::generic_category(), "pread");
+  }
 }
 
 DiskManager::DiskManager(DiskManager &&other) noexcept
@@ -63,29 +73,41 @@ DiskManager::~DiskManager() {
 
 // Increment next_page_id, then write to the database file
 auto DiskManager::AllocatePage() -> page_id_t {
+  assert(fd_ >= 0 && "allocating from a closed disk manager");
+
   const auto page_id = header_.next_page_id;
   ++header_.next_page_id;
-  ::pwrite(fd_, &header_, sizeof(header_), 0);
+  if (::pwrite(fd_, &header_, sizeof(header_), 0) < 0) {
+    throw std::system_error(errno, std::generic_category(), "pwrite");
+  }
 
   return page_id;
 }
 
 auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> void {
+  assert(fd_ >= 0 && "reading from a closed disk manager");
+
   if (page_id >= header_.next_page_id) {
     throw std::out_of_range("page has not been allocated");
   }
 
   const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  ::pread(fd_, data, PAGE_SIZE, offset);
+  if (::pread(fd_, data, PAGE_SIZE, offset) < 0) {
+    throw std::system_error(errno, std::generic_category(), "pread");
+  }
 }
 
 auto DiskManager::WritePage(page_id_t page_id, const char *data) const -> void {
+  assert(fd_ >= 0 && "writing to a closed disk manager");
+
   if (page_id >= header_.next_page_id) {
     throw std::out_of_range("page has not been allocated");
   }
 
   const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  ::pwrite(fd_, data, PAGE_SIZE, offset);
+  if (::pwrite(fd_, data, PAGE_SIZE, offset) < 0) {
+    throw std::system_error(errno, std::generic_category(), "pwrite");
+  }
 }
 
 }  // namespace tinydb

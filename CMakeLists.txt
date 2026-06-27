@@ -62,10 +62,12 @@ endfunction()
 
 add_library(
   TinyDB
+  include/tinydb/buffer_pool.h
   include/tinydb/disk_manager.h
   include/tinydb/file_header.h
   include/tinydb/page.h
   include/tinydb/storage_engine.h
+  src/buffer/buffer_pool.cpp
   src/engine/storage_engine.cpp
   src/storage/disk_manager.cpp)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
@@ -83,7 +85,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/cli/main.cpp")
   TinyDB_apply_local_tooling(TinyDB_cli)
 endif()
 
-if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_test.cpp")
+if(BUILD_TESTING)
   FetchContent_Declare(
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
@@ -96,13 +98,24 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_test.cpp")
 
   include(GoogleTest)
 
-  add_executable(TinyDB_smoke_test tests/smoke_test.cpp)
-  target_link_libraries(TinyDB_smoke_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-  TinyDB_apply_local_tooling(TinyDB_smoke_test)
-  gtest_discover_tests(TinyDB_smoke_test)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_test.cpp")
+    add_executable(TinyDB_smoke_test tests/smoke_test.cpp)
+    target_link_libraries(TinyDB_smoke_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    TinyDB_apply_local_tooling(TinyDB_smoke_test)
+    gtest_discover_tests(TinyDB_smoke_test)
+  endif()
 
-  add_executable(TinyDB_disk_manager_test tests/disk_manager_test.cpp)
-  target_link_libraries(TinyDB_disk_manager_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-  TinyDB_apply_local_tooling(TinyDB_disk_manager_test)
-  gtest_discover_tests(TinyDB_disk_manager_test)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/disk_manager_test.cpp")
+    add_executable(TinyDB_disk_manager_test tests/disk_manager_test.cpp)
+    target_link_libraries(TinyDB_disk_manager_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    TinyDB_apply_local_tooling(TinyDB_disk_manager_test)
+    gtest_discover_tests(TinyDB_disk_manager_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/buffer_pool_test.cpp")
+    add_executable(TinyDB_buffer_pool_test tests/buffer_pool_test.cpp)
+    target_link_libraries(TinyDB_buffer_pool_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    TinyDB_apply_local_tooling(TinyDB_buffer_pool_test)
+    gtest_discover_tests(TinyDB_buffer_pool_test)
+  endif()
 endif()
