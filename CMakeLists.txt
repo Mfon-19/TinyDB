@@ -62,11 +62,13 @@ endfunction()
 
 add_library(
   TinyDB
+  include/tinydb/btree.h
   include/tinydb/buffer_pool.h
   include/tinydb/disk_manager.h
   include/tinydb/file_header.h
   include/tinydb/page.h
   include/tinydb/storage_engine.h
+  src/btree/btree.cpp
   src/buffer/buffer_pool.cpp
   src/engine/storage_engine.cpp
   src/storage/disk_manager.cpp)
@@ -98,13 +100,6 @@ if(BUILD_TESTING)
 
   include(GoogleTest)
 
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_test.cpp")
-    add_executable(TinyDB_smoke_test tests/smoke_test.cpp)
-    target_link_libraries(TinyDB_smoke_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    TinyDB_apply_local_tooling(TinyDB_smoke_test)
-    gtest_discover_tests(TinyDB_smoke_test)
-  endif()
-
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/disk_manager_test.cpp")
     add_executable(TinyDB_disk_manager_test tests/disk_manager_test.cpp)
     target_link_libraries(TinyDB_disk_manager_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
@@ -117,5 +112,12 @@ if(BUILD_TESTING)
     target_link_libraries(TinyDB_buffer_pool_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
     TinyDB_apply_local_tooling(TinyDB_buffer_pool_test)
     gtest_discover_tests(TinyDB_buffer_pool_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/btree_test.cpp")
+    add_executable(TinyDB_btree_test tests/btree_test.cpp)
+    target_link_libraries(TinyDB_btree_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    TinyDB_apply_local_tooling(TinyDB_btree_test)
+    gtest_discover_tests(TinyDB_btree_test)
   endif()
 endif()
