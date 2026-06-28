@@ -62,13 +62,13 @@ endfunction()
 
 add_library(
   TinyDB
-  include/tinydb/btree.h
+  include/tinydb/b_plus_tree.h
   include/tinydb/buffer_pool.h
   include/tinydb/disk_manager.h
   include/tinydb/file_header.h
   include/tinydb/page.h
   include/tinydb/storage_engine.h
-  src/btree/btree.cpp
+  src/btree/b_plus_tree.cpp
   src/buffer/buffer_pool.cpp
   src/engine/storage_engine.cpp
   src/storage/disk_manager.cpp)
@@ -114,10 +114,10 @@ if(BUILD_TESTING)
     gtest_discover_tests(TinyDB_buffer_pool_test)
   endif()
 
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/btree_test.cpp")
-    add_executable(TinyDB_btree_test tests/btree_test.cpp)
-    target_link_libraries(TinyDB_btree_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    TinyDB_apply_local_tooling(TinyDB_btree_test)
-    gtest_discover_tests(TinyDB_btree_test)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/b_plus_tree_test.cpp")
+    add_executable(TinyDB_b_plus_tree_test tests/b_plus_tree_test.cpp)
+    target_link_libraries(TinyDB_b_plus_tree_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    TinyDB_apply_local_tooling(TinyDB_b_plus_tree_test)
+    gtest_discover_tests(TinyDB_b_plus_tree_test)
   endif()
 endif()

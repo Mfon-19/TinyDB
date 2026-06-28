@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
-#include <tinydb/btree.h>
+#include <tinydb/b_plus_tree.h>
 
 #include <unistd.h>
 
 #include <filesystem>
+#include <iomanip>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,24 +22,25 @@ static auto NewRootLeaf(tinydb::BufferPool *buffer_pool) -> tinydb::page_id_t {
   auto *header = reinterpret_cast<tinydb::LeafHeader *>(page);
 
   *header = tinydb::LeafHeader{
-      .type = 1,
+      .type = tinydb::NodeType::Leaf,
       .cell_count = 0,
       .free_start = sizeof(tinydb::LeafHeader),
-      .free_end = tinydb::PAGE_SIZE,
+      .free_end = static_cast<std::uint16_t>(tinydb::PAGE_SIZE),
+      .next_leaf = tinydb::HEADER_PAGE_ID,
   };
 
   buffer_pool->UnpinPage(root_page_id, true);
   return root_page_id;
 }
 
-TEST(BTreeTest, PutGetAndOverwrite) {
+TEST(BPlusTreeTest, PutGetAndOverwrite) {
   const auto path = TestPath("put_get");
   std::filesystem::remove(path);
 
   {
     tinydb::DiskManager disk(path);
     tinydb::BufferPool buffer_pool(&disk, 3);
-    tinydb::BTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
+    tinydb::BPlusTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
 
     EXPECT_EQ(tree.Get("missing"), std::nullopt);
 
@@ -59,14 +62,14 @@ TEST(BTreeTest, PutGetAndOverwrite) {
   std::filesystem::remove(path);
 }
 
-TEST(BTreeTest, RemoveHidesValueAndAllowsReinsert) {
+TEST(BPlusTreeTest, RemoveHidesValueAndAllowsReinsert) {
   const auto path = TestPath("remove");
   std::filesystem::remove(path);
 
   {
     tinydb::DiskManager disk(path);
     tinydb::BufferPool buffer_pool(&disk, 3);
-    tinydb::BTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
+    tinydb::BPlusTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
 
     tree.Put("cat", "meow");
     auto cat = tree.Get("cat");
@@ -83,14 +86,14 @@ TEST(BTreeTest, RemoveHidesValueAndAllowsReinsert) {
   std::filesystem::remove(path);
 }
 
-TEST(BTreeTest, ScanReturnsSortedRangeAndSkipsTombstones) {
+TEST(BPlusTreeTest, ScanReturnsSortedRangeAndSkipsTombstones) {
   const auto path = TestPath("scan");
   std::filesystem::remove(path);
 
   {
     tinydb::DiskManager disk(path);
     tinydb::BufferPool buffer_pool(&disk, 3);
-    tinydb::BTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
+    tinydb::BPlusTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
 
     tree.Put("mango", "orange");
     tree.Put("apple", "red");
@@ -106,6 +109,40 @@ TEST(BTreeTest, ScanReturnsSortedRangeAndSkipsTombstones) {
     };
 
     EXPECT_EQ(rows, expected);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, RootLeafSplitCreatesSearchableLeaves) {
+  const auto path = TestPath("root_split");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 8);
+    tinydb::BPlusTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
+
+    for (int i = 0; i < 50; ++i) {
+      auto key_stream = std::ostringstream{};
+      key_stream << "key_" << std::setw(3) << std::setfill('0') << i;
+      const auto key = key_stream.str();
+      const auto value = std::string(80, static_cast<char>('a' + (i % 26)));
+      tree.Put(key, value);
+    }
+
+    for (int i = 0; i < 50; ++i) {
+      auto key_stream = std::ostringstream{};
+      key_stream << "key_" << std::setw(3) << std::setfill('0') << i;
+      const auto key = key_stream.str();
+      const auto value = std::string(80, static_cast<char>('a' + (i % 26)));
+      EXPECT_EQ(tree.Get(key), std::optional<std::string>{value});
+    }
+
+    const auto rows = tree.Scan("key_010", "key_020");
+    ASSERT_FALSE(rows.empty());
+    EXPECT_EQ(rows.front().first, "key_010");
+    EXPECT_EQ(rows.back().first, "key_019");
   }
 
   std::filesystem::remove(path);
