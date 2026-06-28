@@ -35,12 +35,7 @@ DiskManager::DiskManager(const std::filesystem::path &path) {
         .next_page_id = FIRST_DATA_PAGE_ID,
     };
 
-    auto header_page = std::array<char, PAGE_SIZE>{};
-    std::memcpy(header_page.data(), &header_, sizeof(header_));
-
-    if (::pwrite(fd_, header_page.data(), header_page.size(), 0) < 0) {
-      throw std::system_error(errno, std::generic_category(), "pwrite");
-    }
+    WriteHeader();
     return;
   }
 
@@ -73,15 +68,28 @@ DiskManager::~DiskManager() {
 
 // Increment next_page_id, then write to the database file
 auto DiskManager::AllocatePage() -> page_id_t {
-  assert(fd_ >= 0 && "allocating from a closed disk manager");
-
   const auto page_id = header_.next_page_id;
-  ++header_.next_page_id;
-  if (::pwrite(fd_, &header_, sizeof(header_), 0) < 0) {
-    throw std::system_error(errno, std::generic_category(), "pwrite");
+  const auto new_size = static_cast<off_t>((page_id + 1) * PAGE_SIZE);
+
+  if (::ftruncate(fd_, new_size) < 0) {
+    throw std::system_error(errno, std::generic_category(), "ftruncate");
   }
 
+  ++header_.next_page_id;
+  WriteHeader();
+
   return page_id;
+}
+
+void DiskManager::WriteHeader() const {
+  assert(fd_ >= 0 && "writing header to a closed disk manager");
+
+  auto header_page = std::array<char, PAGE_SIZE>{};
+  std::memcpy(header_page.data(), &header_, sizeof(header_));
+
+  if (::pwrite(fd_, header_page.data(), header_page.size(), 0) < 0) {
+    throw std::system_error(errno, std::generic_category(), "pwrite");
+  }
 }
 
 auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> void {

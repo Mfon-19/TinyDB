@@ -29,6 +29,9 @@ class DiskManager {
   void WritePage(page_id_t page_id, const char *data) const;
 
  private:
+  // Writes the in-memory file header to page 0.
+  void WriteHeader() const;
+
   // fd_ == -1 means this object does not own an open file descriptor.
   int fd_{-1};
   FileHeader header_;
