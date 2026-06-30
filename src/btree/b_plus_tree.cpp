@@ -23,6 +23,7 @@ struct InternalRecord {
 };
 
 static constexpr auto LEAF_MIN_BYTES = PAGE_SIZE / 2;
+static constexpr auto INTERNAL_MIN_BYTES = PAGE_SIZE / 2;
 
 // The slot array starts immediately after the fixed-size leaf header.
 static auto LeafSlots(char *page) -> std::uint16_t * {
@@ -329,8 +330,7 @@ static auto ChooseLeafSplit(const std::vector<LeafRecord> &records)
 
 // Choose a redistribution point for two adjacent leaves after a delete. Unlike
 // split selection, this enforces the minimum-fill rule for both resulting
-// leaves. If no candidate satisfies that, merge is the next policy, but merge
-// is intentionally not implemented yet.
+// leaves. If no candidate satisfies that, merge is the next policy.
 static auto ChooseLeafRedistributionSplit(
     const std::vector<LeafRecord> &records) -> std::optional<std::size_t> {
   auto split_index = std::size_t{0};
@@ -345,6 +345,42 @@ static auto ChooseLeafRedistributionSplit(
     }
 
     if (*left_used < LEAF_MIN_BYTES || *right_used < LEAF_MIN_BYTES) {
+      continue;
+    }
+
+    const auto imbalance = *left_used > *right_used ? *left_used - *right_used
+                                                    : *right_used - *left_used;
+    if (!found_split || imbalance < best_imbalance) {
+      found_split = true;
+      best_imbalance = imbalance;
+      split_index = candidate;
+    }
+  }
+
+  if (!found_split) {
+    return std::nullopt;
+  }
+  return split_index;
+}
+
+// Choose the separator to move up to the parent when redistributing two
+// adjacent internal pages. The promoted separator is not stored in either
+// child, so both child ranges must be checked on either side of the candidate.
+static auto ChooseInternalRedistributionSplit(
+    const std::vector<InternalRecord> &records) -> std::optional<std::size_t> {
+  auto split_index = std::size_t{0};
+  auto found_split = false;
+  auto best_imbalance = std::size_t{PAGE_SIZE * 2};
+
+  for (std::size_t candidate = 0; candidate < records.size(); ++candidate) {
+    const auto left_used = PackedInternalBytes(records, 0, candidate);
+    const auto right_used =
+        PackedInternalBytes(records, candidate + 1, records.size());
+    if (!left_used.has_value() || !right_used.has_value()) {
+      continue;
+    }
+
+    if (*left_used < INTERNAL_MIN_BYTES || *right_used < INTERNAL_MIN_BYTES) {
       continue;
     }
 
@@ -479,8 +515,8 @@ static void PackInternalPage(char *page, page_id_t first_child,
 
 // Rewriting an internal separator may change its byte size, so update the
 // parent by rebuilding the whole internal page. If the replacement separator
-// would not fit, leave the parent untouched and let a later merge policy handle
-// the underfull leaf.
+// would not fit, leave the parent untouched so the caller can try another
+// repair path.
 static auto TryUpdateInternalSeparator(char *page, std::size_t separator_index,
                                        std::string_view key) -> bool {
   auto *header = reinterpret_cast<InternalHeader *>(page);
@@ -498,6 +534,278 @@ static auto TryUpdateInternalSeparator(char *page, std::size_t separator_index,
 
   PackInternalPage(page, first_child, records, 0, records.size());
   return true;
+}
+
+// Remove child[child_index] from an internal page. Removing child 0 also
+// removes separator 0 and promotes the old child 1 pointer into first_child.
+// Removing any other child removes the separator immediately to its left.
+static void RemoveInternalChild(char *page, std::size_t child_index) {
+  auto *header = reinterpret_cast<InternalHeader *>(page);
+  auto first_child = header->first_child;
+  auto records = ReadInternalRecords(page);
+
+  if (records.empty() || child_index > records.size()) {
+    throw std::runtime_error("internal child delete out of range");
+  }
+
+  if (child_index == 0) {
+    first_child = records.front().right_child;
+    records.erase(records.begin());
+  } else {
+    records.erase(records.begin() +
+                  static_cast<std::vector<InternalRecord>::difference_type>(
+                      child_index - 1));
+  }
+
+  PackInternalPage(page, first_child, records, 0, records.size());
+}
+
+static auto InternalUsedBytes(char *page) -> std::size_t {
+  const auto records = ReadInternalRecords(page);
+  const auto used = PackedInternalBytes(records, 0, records.size());
+  if (!used.has_value()) {
+    throw std::runtime_error("internal page cannot pack records");
+  }
+  return *used;
+}
+
+static void DeleteChildFromInternal(BufferPool *buffer_pool,
+                                    page_id_t root_page_id, page_id_t page_id,
+                                    std::size_t child_index,
+                                    std::vector<page_id_t> parent_path);
+
+// Repair an internal page after one of its children was merged away. This is
+// the upward half of delete: remove the child pointer, then either stop, steal
+// from a sibling, merge with a sibling, or shrink the root.
+static void DeleteChildFromInternal(BufferPool *buffer_pool,
+                                    page_id_t root_page_id, page_id_t page_id,
+                                    std::size_t child_index,
+                                    std::vector<page_id_t> parent_path) {
+  char *page = buffer_pool->FetchPage(page_id);
+  RemoveInternalChild(page, child_index);
+
+  auto *header = reinterpret_cast<InternalHeader *>(page);
+
+  // TinyDB keeps root_page_id stable. If the root has one remaining child,
+  // copy that child page over the root page instead of changing root_page_id_.
+  if (page_id == root_page_id) {
+    if (header->cell_count == 0) {
+      const auto only_child_page_id = header->first_child;
+      char *only_child_page = buffer_pool->FetchPage(only_child_page_id);
+      std::memcpy(page, only_child_page, PAGE_SIZE);
+      buffer_pool->UnpinPage(only_child_page_id, false);
+    }
+
+    buffer_pool->UnpinPage(page_id, true);
+    return;
+  }
+
+  if (InternalUsedBytes(page) >= INTERNAL_MIN_BYTES) {
+    buffer_pool->UnpinPage(page_id, true);
+    return;
+  }
+
+  const auto target_first_child = header->first_child;
+  const auto target_records = ReadInternalRecords(page);
+  const auto parent_page_id = parent_path.back();
+  parent_path.pop_back();
+
+  char *parent_page = buffer_pool->FetchPage(parent_page_id);
+  auto *parent_header = reinterpret_cast<InternalHeader *>(parent_page);
+  const auto target_index = FindInternalChildIndex(parent_page, page_id);
+  const auto parent_records = ReadInternalRecords(parent_page);
+
+  // Try stealing from the left internal sibling. The parent separator between
+  // left and target moves down into the combined sequence, and a new middle
+  // separator moves back up into the parent.
+  if (target_index > 0) {
+    const auto left_page_id = InternalChildAt(parent_page, target_index - 1);
+    char *left_page = buffer_pool->FetchPage(left_page_id);
+    auto *left_node_header = reinterpret_cast<NodeHeader *>(left_page);
+
+    if (left_node_header->type != NodeType::Internal) {
+      buffer_pool->UnpinPage(left_page_id, false);
+      buffer_pool->UnpinPage(parent_page_id, false);
+      buffer_pool->UnpinPage(page_id, true);
+      throw std::runtime_error("internal sibling is not internal");
+    }
+
+    auto *left_header = reinterpret_cast<InternalHeader *>(left_page);
+    const auto left_first_child = left_header->first_child;
+    auto combined_records = ReadInternalRecords(left_page);
+    combined_records.push_back(InternalRecord{
+        .key = parent_records[target_index - 1].key,
+        .right_child = target_first_child,
+    });
+    combined_records.insert(combined_records.end(), target_records.begin(),
+                            target_records.end());
+
+    const auto split_index =
+        ChooseInternalRedistributionSplit(combined_records);
+    if (split_index.has_value() &&
+        TryUpdateInternalSeparator(parent_page, target_index - 1,
+                                   combined_records[*split_index].key)) {
+      PackInternalPage(left_page, left_first_child, combined_records, 0,
+                       *split_index);
+      PackInternalPage(page, combined_records[*split_index].right_child,
+                       combined_records, *split_index + 1,
+                       combined_records.size());
+
+      buffer_pool->UnpinPage(left_page_id, true);
+      buffer_pool->UnpinPage(parent_page_id, true);
+      buffer_pool->UnpinPage(page_id, true);
+      return;
+    }
+
+    buffer_pool->UnpinPage(left_page_id, false);
+  }
+
+  // Try stealing from the right internal sibling. This is symmetrical to the
+  // left case: target keeps the low range, right keeps the high range, and the
+  // selected middle separator replaces the parent separator.
+  if (target_index < parent_header->cell_count) {
+    const auto right_page_id = InternalChildAt(parent_page, target_index + 1);
+    char *right_page = buffer_pool->FetchPage(right_page_id);
+    auto *right_node_header = reinterpret_cast<NodeHeader *>(right_page);
+
+    if (right_node_header->type != NodeType::Internal) {
+      buffer_pool->UnpinPage(right_page_id, false);
+      buffer_pool->UnpinPage(parent_page_id, false);
+      buffer_pool->UnpinPage(page_id, true);
+      throw std::runtime_error("internal sibling is not internal");
+    }
+
+    auto *right_header = reinterpret_cast<InternalHeader *>(right_page);
+    const auto right_first_child = right_header->first_child;
+    auto combined_records = target_records;
+    combined_records.push_back(InternalRecord{
+        .key = parent_records[target_index].key,
+        .right_child = right_first_child,
+    });
+    const auto right_records = ReadInternalRecords(right_page);
+    combined_records.insert(combined_records.end(), right_records.begin(),
+                            right_records.end());
+
+    const auto split_index =
+        ChooseInternalRedistributionSplit(combined_records);
+    if (split_index.has_value() &&
+        TryUpdateInternalSeparator(parent_page, target_index,
+                                   combined_records[*split_index].key)) {
+      PackInternalPage(page, target_first_child, combined_records, 0,
+                       *split_index);
+      PackInternalPage(right_page, combined_records[*split_index].right_child,
+                       combined_records, *split_index + 1,
+                       combined_records.size());
+
+      buffer_pool->UnpinPage(right_page_id, true);
+      buffer_pool->UnpinPage(parent_page_id, true);
+      buffer_pool->UnpinPage(page_id, true);
+      return;
+    }
+
+    buffer_pool->UnpinPage(right_page_id, false);
+  }
+
+  // Neither sibling can donate. Merge with the left sibling when possible,
+  // because that leaves the existing left child pointer in the parent.
+  if (target_index > 0) {
+    const auto left_page_id = InternalChildAt(parent_page, target_index - 1);
+    char *left_page = buffer_pool->FetchPage(left_page_id);
+    auto *left_header = reinterpret_cast<InternalHeader *>(left_page);
+    const auto left_first_child = left_header->first_child;
+    auto combined_records = ReadInternalRecords(left_page);
+    combined_records.push_back(InternalRecord{
+        .key = parent_records[target_index - 1].key,
+        .right_child = target_first_child,
+    });
+    combined_records.insert(combined_records.end(), target_records.begin(),
+                            target_records.end());
+
+    if (!PackedInternalBytes(combined_records, 0, combined_records.size())
+             .has_value()) {
+      const auto split_index = ChooseInternalSplit(combined_records);
+      if (split_index.has_value() &&
+          TryUpdateInternalSeparator(parent_page, target_index - 1,
+                                     combined_records[*split_index].key)) {
+        PackInternalPage(left_page, left_first_child, combined_records, 0,
+                         *split_index);
+        PackInternalPage(page, combined_records[*split_index].right_child,
+                         combined_records, *split_index + 1,
+                         combined_records.size());
+
+        buffer_pool->UnpinPage(left_page_id, true);
+        buffer_pool->UnpinPage(parent_page_id, true);
+        buffer_pool->UnpinPage(page_id, true);
+        return;
+      }
+
+      buffer_pool->UnpinPage(left_page_id, false);
+      buffer_pool->UnpinPage(parent_page_id, false);
+      buffer_pool->UnpinPage(page_id, true);
+      return;
+    }
+
+    PackInternalPage(left_page, left_first_child, combined_records, 0,
+                     combined_records.size());
+    buffer_pool->UnpinPage(left_page_id, true);
+    buffer_pool->UnpinPage(parent_page_id, false);
+    buffer_pool->UnpinPage(page_id, true);
+    DeleteChildFromInternal(buffer_pool, root_page_id, parent_page_id,
+                            target_index, parent_path);
+    return;
+  }
+
+  if (target_index < parent_header->cell_count) {
+    const auto right_page_id = InternalChildAt(parent_page, target_index + 1);
+    char *right_page = buffer_pool->FetchPage(right_page_id);
+    auto *right_header = reinterpret_cast<InternalHeader *>(right_page);
+    const auto right_first_child = right_header->first_child;
+    auto combined_records = target_records;
+    combined_records.push_back(InternalRecord{
+        .key = parent_records[target_index].key,
+        .right_child = right_first_child,
+    });
+    const auto right_records = ReadInternalRecords(right_page);
+    combined_records.insert(combined_records.end(), right_records.begin(),
+                            right_records.end());
+
+    if (!PackedInternalBytes(combined_records, 0, combined_records.size())
+             .has_value()) {
+      const auto split_index = ChooseInternalSplit(combined_records);
+      if (split_index.has_value() &&
+          TryUpdateInternalSeparator(parent_page, target_index,
+                                     combined_records[*split_index].key)) {
+        PackInternalPage(page, target_first_child, combined_records, 0,
+                         *split_index);
+        PackInternalPage(right_page, combined_records[*split_index].right_child,
+                         combined_records, *split_index + 1,
+                         combined_records.size());
+
+        buffer_pool->UnpinPage(right_page_id, true);
+        buffer_pool->UnpinPage(parent_page_id, true);
+        buffer_pool->UnpinPage(page_id, true);
+        return;
+      }
+
+      buffer_pool->UnpinPage(right_page_id, false);
+      buffer_pool->UnpinPage(parent_page_id, false);
+      buffer_pool->UnpinPage(page_id, true);
+      return;
+    }
+
+    PackInternalPage(page, target_first_child, combined_records, 0,
+                     combined_records.size());
+    buffer_pool->UnpinPage(right_page_id, false);
+    buffer_pool->UnpinPage(parent_page_id, false);
+    buffer_pool->UnpinPage(page_id, true);
+    DeleteChildFromInternal(buffer_pool, root_page_id, parent_page_id,
+                            target_index + 1, parent_path);
+    return;
+  }
+
+  buffer_pool->UnpinPage(parent_page_id, false);
+  buffer_pool->UnpinPage(page_id, true);
+  throw std::runtime_error("internal page has no sibling");
 }
 
 BPlusTree::BPlusTree(BufferPool *buffer_pool, page_id_t root_page_id)
@@ -817,9 +1125,9 @@ void BPlusTree::Put(std::string_view key, std::string_view value) {
 }
 
 void BPlusTree::Remove(std::string_view key) {
-  // We need the immediate parent if the leaf underflows, so keep the page ids
-  // seen on the descent. Ancestors are left alone for now because this step
-  // only redistributes leaf records; merge/internal repair comes later.
+  // We need the parent path if the leaf underflows. Leaf stealing/merge may
+  // remove a child pointer from the parent, and that deletion can propagate up
+  // through internal pages.
   auto parent_path = std::vector<page_id_t>{};
   page_id_t page_id = root_page_id_;
 
@@ -952,11 +1260,96 @@ void BPlusTree::Remove(std::string_view key) {
       buffer_pool_->UnpinPage(right_page_id, false);
     }
 
-    // No sibling can donate while preserving the minimum-fill rule. Leave the
-    // leaf underfull for the future merge implementation.
+    // Neither sibling can donate while preserving the minimum-fill rule. Merge
+    // with an adjacent leaf, then delete the removed child pointer from the
+    // parent. The orphaned page is left allocated until free-page reuse exists.
+    auto ancestor_path = parent_path;
+    ancestor_path.pop_back();
+
+    if (child_index > 0) {
+      const auto left_page_id = InternalChildAt(parent_page, child_index - 1);
+      char *left_page = buffer_pool_->FetchPage(left_page_id);
+      auto combined_records = ReadLeafRecords(left_page);
+      combined_records.insert(combined_records.end(), records.begin(),
+                              records.end());
+
+      if (!PackedLeafBytes(combined_records, 0, combined_records.size())
+               .has_value()) {
+        const auto split_index = ChooseLeafSplit(combined_records);
+        if (split_index.has_value() &&
+            TryUpdateInternalSeparator(parent_page, child_index - 1,
+                                       combined_records[*split_index].key)) {
+          PackLeafPage(left_page, combined_records, 0, *split_index, page_id);
+          PackLeafPage(page, combined_records, *split_index,
+                       combined_records.size(), target_next_leaf);
+
+          buffer_pool_->UnpinPage(left_page_id, true);
+          buffer_pool_->UnpinPage(parent_page_id, true);
+          buffer_pool_->UnpinPage(page_id, true);
+          return;
+        }
+
+        buffer_pool_->UnpinPage(left_page_id, false);
+        buffer_pool_->UnpinPage(parent_page_id, false);
+        buffer_pool_->UnpinPage(page_id, true);
+        return;
+      }
+
+      PackLeafPage(left_page, combined_records, 0, combined_records.size(),
+                   target_next_leaf);
+      buffer_pool_->UnpinPage(left_page_id, true);
+      buffer_pool_->UnpinPage(parent_page_id, false);
+      buffer_pool_->UnpinPage(page_id, true);
+      DeleteChildFromInternal(buffer_pool_, root_page_id_, parent_page_id,
+                              child_index, ancestor_path);
+      return;
+    }
+
+    if (child_index < parent_header->cell_count) {
+      const auto right_page_id = InternalChildAt(parent_page, child_index + 1);
+      char *right_page = buffer_pool_->FetchPage(right_page_id);
+      auto *right_header = reinterpret_cast<LeafHeader *>(right_page);
+      const auto right_next_leaf = right_header->next_leaf;
+      auto combined_records = records;
+      const auto right_records = ReadLeafRecords(right_page);
+      combined_records.insert(combined_records.end(), right_records.begin(),
+                              right_records.end());
+
+      if (!PackedLeafBytes(combined_records, 0, combined_records.size())
+               .has_value()) {
+        const auto split_index = ChooseLeafSplit(combined_records);
+        if (split_index.has_value() &&
+            TryUpdateInternalSeparator(parent_page, child_index,
+                                       combined_records[*split_index].key)) {
+          PackLeafPage(page, combined_records, 0, *split_index, right_page_id);
+          PackLeafPage(right_page, combined_records, *split_index,
+                       combined_records.size(), right_next_leaf);
+
+          buffer_pool_->UnpinPage(right_page_id, true);
+          buffer_pool_->UnpinPage(parent_page_id, true);
+          buffer_pool_->UnpinPage(page_id, true);
+          return;
+        }
+
+        buffer_pool_->UnpinPage(right_page_id, false);
+        buffer_pool_->UnpinPage(parent_page_id, false);
+        buffer_pool_->UnpinPage(page_id, true);
+        return;
+      }
+
+      PackLeafPage(page, combined_records, 0, combined_records.size(),
+                   right_next_leaf);
+      buffer_pool_->UnpinPage(right_page_id, false);
+      buffer_pool_->UnpinPage(parent_page_id, false);
+      buffer_pool_->UnpinPage(page_id, true);
+      DeleteChildFromInternal(buffer_pool_, root_page_id_, parent_page_id,
+                              child_index + 1, ancestor_path);
+      return;
+    }
+
     buffer_pool_->UnpinPage(parent_page_id, false);
     buffer_pool_->UnpinPage(page_id, true);
-    return;
+    throw std::runtime_error("leaf page has no sibling");
   }
 }
 

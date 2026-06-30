@@ -49,6 +49,23 @@ static auto TestValue(int seed, std::size_t size) -> std::string {
   return value;
 }
 
+static auto TestRows(int begin, int end, std::size_t value_size)
+    -> std::vector<std::pair<std::string, std::string>> {
+  auto rows = std::vector<std::pair<std::string, std::string>>{};
+  for (int i = begin; i < end; ++i) {
+    rows.emplace_back(TestKey(i), TestValue(i, value_size));
+  }
+  return rows;
+}
+
+static void AddExpected(
+    std::map<std::string, std::string> *expected_rows,
+    const std::vector<std::pair<std::string, std::string>> &rows) {
+  for (const auto &[key, value] : rows) {
+    (*expected_rows)[key] = value;
+  }
+}
+
 static auto NewLeaf(
     tinydb::BufferPool *buffer_pool,
     const std::vector<std::pair<std::string, std::string>> &rows,
@@ -321,6 +338,133 @@ TEST(BPlusTreeTest, LeafStealRight) {
     }
 
     CheckTree(&tree, expected);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, LeafMergeRoot) {
+  const auto path = TestPath("leaf_merge_root");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 16);
+    auto expected = std::map<std::string, std::string>{};
+
+    const auto left_rows = TestRows(0, 10, 80);
+    const auto right_rows = TestRows(1000, 1010, 80);
+    AddExpected(&expected, left_rows);
+    AddExpected(&expected, right_rows);
+
+    const auto right_page_id =
+        NewLeaf(&buffer_pool, right_rows, tinydb::HEADER_PAGE_ID);
+    const auto left_page_id = NewLeaf(&buffer_pool, left_rows, right_page_id);
+    const auto root_page_id = NewRootInternal(&buffer_pool, left_page_id,
+                                              {{TestKey(1000), right_page_id}});
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    tree.Remove(TestKey(1000));
+    expected.erase(TestKey(1000));
+
+    CheckTree(&tree, expected);
+
+    char *root_page = buffer_pool.FetchPage(root_page_id);
+    auto *node_header = reinterpret_cast<tinydb::NodeHeader *>(root_page);
+    EXPECT_EQ(node_header->type, tinydb::NodeType::Leaf);
+    buffer_pool.UnpinPage(root_page_id, false);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, LeafMergeParent) {
+  const auto path = TestPath("leaf_merge_parent");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 16);
+    auto expected = std::map<std::string, std::string>{};
+
+    const auto left_rows = TestRows(0, 10, 80);
+    const auto middle_rows = TestRows(1000, 1010, 80);
+    const auto right_rows = TestRows(2000, 2010, 80);
+    AddExpected(&expected, left_rows);
+    AddExpected(&expected, middle_rows);
+    AddExpected(&expected, right_rows);
+
+    const auto right_page_id =
+        NewLeaf(&buffer_pool, right_rows, tinydb::HEADER_PAGE_ID);
+    const auto middle_page_id =
+        NewLeaf(&buffer_pool, middle_rows, right_page_id);
+    const auto left_page_id = NewLeaf(&buffer_pool, left_rows, middle_page_id);
+    const auto root_page_id = NewRootInternal(
+        &buffer_pool, left_page_id,
+        {{TestKey(1000), middle_page_id}, {TestKey(2000), right_page_id}});
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    tree.Remove(TestKey(1000));
+    expected.erase(TestKey(1000));
+
+    CheckTree(&tree, expected);
+
+    char *root_page = buffer_pool.FetchPage(root_page_id);
+    auto *node_header = reinterpret_cast<tinydb::NodeHeader *>(root_page);
+    EXPECT_EQ(node_header->type, tinydb::NodeType::Internal);
+    buffer_pool.UnpinPage(root_page_id, false);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, InternalMergeRoot) {
+  const auto path = TestPath("internal_merge_root");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 32);
+    auto expected = std::map<std::string, std::string>{};
+
+    const auto first_rows = TestRows(0, 5, 80);
+    const auto second_rows = TestRows(1000, 1005, 80);
+    const auto third_rows = TestRows(2000, 2005, 80);
+    const auto fourth_rows = TestRows(3000, 3005, 80);
+    AddExpected(&expected, first_rows);
+    AddExpected(&expected, second_rows);
+    AddExpected(&expected, third_rows);
+    AddExpected(&expected, fourth_rows);
+
+    const auto fourth_page_id =
+        NewLeaf(&buffer_pool, fourth_rows, tinydb::HEADER_PAGE_ID);
+    const auto third_page_id =
+        NewLeaf(&buffer_pool, third_rows, fourth_page_id);
+    const auto second_page_id =
+        NewLeaf(&buffer_pool, second_rows, third_page_id);
+    const auto first_page_id =
+        NewLeaf(&buffer_pool, first_rows, second_page_id);
+
+    const auto left_internal_page_id = NewRootInternal(
+        &buffer_pool, first_page_id, {{TestKey(1000), second_page_id}});
+    const auto right_internal_page_id = NewRootInternal(
+        &buffer_pool, third_page_id, {{TestKey(3000), fourth_page_id}});
+    const auto root_page_id =
+        NewRootInternal(&buffer_pool, left_internal_page_id,
+                        {{TestKey(2000), right_internal_page_id}});
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    tree.Remove(TestKey(1000));
+    expected.erase(TestKey(1000));
+
+    CheckTree(&tree, expected);
+
+    char *root_page = buffer_pool.FetchPage(root_page_id);
+    auto *node_header = reinterpret_cast<tinydb::NodeHeader *>(root_page);
+    EXPECT_EQ(node_header->type, tinydb::NodeType::Internal);
+    auto *root_header = reinterpret_cast<tinydb::InternalHeader *>(root_page);
+    EXPECT_EQ(root_header->cell_count, 2);
+    buffer_pool.UnpinPage(root_page_id, false);
   }
 
   std::filesystem::remove(path);
@@ -721,6 +865,45 @@ TEST(BPlusTreeTest, RandomOps) {
 
       EXPECT_EQ(tree.Scan(start_key, end_key), expected_scan);
     }
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, RandomMutate) {
+  const auto path = TestPath("random_mutate");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 64);
+    tinydb::BPlusTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
+    auto expected = std::map<std::string, std::string>{};
+    auto rng = std::mt19937{0xBADC0DEU};
+    auto key_dist = std::uniform_int_distribution<int>{0, 219};
+    auto value_size_dist = std::uniform_int_distribution<int>{1, 300};
+    auto op_dist = std::uniform_int_distribution<int>{0, 99};
+
+    for (int op = 0; op < 1000; ++op) {
+      const auto key_id = key_dist(rng);
+      const auto key = TestKey(key_id);
+
+      if (op_dist(rng) < 65) {
+        const auto value_size = static_cast<std::size_t>(value_size_dist(rng));
+        const auto value = TestValue(op + key_id, value_size);
+        tree.Put(key, value);
+        expected[key] = value;
+      } else {
+        tree.Remove(key);
+        expected.erase(key);
+      }
+
+      if (op % 50 == 0) {
+        CheckTree(&tree, expected);
+      }
+    }
+
+    CheckTree(&tree, expected);
   }
 
   std::filesystem::remove(path);
