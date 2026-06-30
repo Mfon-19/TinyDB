@@ -49,6 +49,101 @@ static auto TestValue(int seed, std::size_t size) -> std::string {
   return value;
 }
 
+static auto NewLeaf(
+    tinydb::BufferPool *buffer_pool,
+    const std::vector<std::pair<std::string, std::string>> &rows,
+    tinydb::page_id_t next_leaf) -> tinydb::page_id_t {
+  tinydb::page_id_t page_id = 0;
+  char *page = buffer_pool->NewPage(&page_id);
+  auto *header = reinterpret_cast<tinydb::LeafHeader *>(page);
+  *header = tinydb::LeafHeader{
+      .type = tinydb::NodeType::Leaf,
+      .cell_count = 0,
+      .free_start = sizeof(tinydb::LeafHeader),
+      .free_end = static_cast<std::uint16_t>(tinydb::PAGE_SIZE),
+      .next_leaf = next_leaf,
+  };
+  auto *slots =
+      reinterpret_cast<std::uint16_t *>(page + sizeof(tinydb::LeafHeader));
+
+  for (const auto &[key, value] : rows) {
+    const auto cell_size =
+        sizeof(tinydb::LeafCellHeader) + key.size() + value.size();
+    const auto cell_offset = static_cast<std::uint16_t>(
+        (header->free_end - cell_size) &
+        ~std::size_t{alignof(tinydb::LeafCellHeader) - 1});
+    if (header->free_start + sizeof(std::uint16_t) > cell_offset) {
+      throw std::runtime_error("test leaf does not fit");
+    }
+
+    char *cell = page + cell_offset;
+    auto cell_header = tinydb::LeafCellHeader{
+        .key_size = static_cast<std::uint16_t>(key.size()),
+        .value_size = static_cast<std::uint16_t>(value.size()),
+        .flags = 0,
+    };
+    std::memcpy(cell, &cell_header, sizeof(cell_header));
+    std::copy(key.begin(), key.end(), cell + sizeof(tinydb::LeafCellHeader));
+    std::copy(value.begin(), value.end(),
+              cell + sizeof(tinydb::LeafCellHeader) + key.size());
+
+    slots[header->cell_count] = cell_offset;
+    ++header->cell_count;
+    header->free_start =
+        static_cast<std::uint16_t>(header->free_start + sizeof(std::uint16_t));
+    header->free_end = cell_offset;
+  }
+
+  buffer_pool->UnpinPage(page_id, true);
+  return page_id;
+}
+
+static auto NewRootInternal(
+    tinydb::BufferPool *buffer_pool, tinydb::page_id_t first_child,
+    const std::vector<std::pair<std::string, tinydb::page_id_t>> &separators)
+    -> tinydb::page_id_t {
+  tinydb::page_id_t page_id = 0;
+  char *page = buffer_pool->NewPage(&page_id);
+  auto *header = reinterpret_cast<tinydb::InternalHeader *>(page);
+  *header = tinydb::InternalHeader{
+      .type = tinydb::NodeType::Internal,
+      .cell_count = 0,
+      .free_start = sizeof(tinydb::InternalHeader),
+      .free_end = static_cast<std::uint16_t>(tinydb::PAGE_SIZE),
+      .first_child = first_child,
+  };
+  auto *slots =
+      reinterpret_cast<std::uint16_t *>(page + sizeof(tinydb::InternalHeader));
+
+  for (const auto &[key, right_child] : separators) {
+    const auto cell_size = sizeof(tinydb::InternalCellHeader) + key.size();
+    const auto cell_offset = static_cast<std::uint16_t>(
+        (header->free_end - cell_size) &
+        ~std::size_t{alignof(tinydb::InternalCellHeader) - 1});
+    if (header->free_start + sizeof(std::uint16_t) > cell_offset) {
+      throw std::runtime_error("test internal page does not fit");
+    }
+
+    char *cell = page + cell_offset;
+    auto cell_header = tinydb::InternalCellHeader{
+        .right_child = right_child,
+        .key_size = static_cast<std::uint16_t>(key.size()),
+    };
+    std::memcpy(cell, &cell_header, sizeof(cell_header));
+    std::copy(key.begin(), key.end(),
+              cell + sizeof(tinydb::InternalCellHeader));
+
+    slots[header->cell_count] = cell_offset;
+    ++header->cell_count;
+    header->free_start =
+        static_cast<std::uint16_t>(header->free_start + sizeof(std::uint16_t));
+    header->free_end = cell_offset;
+  }
+
+  buffer_pool->UnpinPage(page_id, true);
+  return page_id;
+}
+
 static void CheckTree(tinydb::BPlusTree *tree,
                       const std::map<std::string, std::string> &expected_rows) {
   for (const auto &[key, value] : expected_rows) {
@@ -150,6 +245,82 @@ TEST(BPlusTreeTest, CompactInsert) {
     auto *node_header = reinterpret_cast<tinydb::NodeHeader *>(root_page);
     EXPECT_EQ(node_header->type, tinydb::NodeType::Leaf);
     buffer_pool.UnpinPage(root_page_id, false);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, LeafStealLeft) {
+  const auto path = TestPath("leaf_steal_left");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 16);
+    auto expected = std::map<std::string, std::string>{};
+    auto left_rows = std::vector<std::pair<std::string, std::string>>{};
+    auto right_rows = std::vector<std::pair<std::string, std::string>>{};
+
+    for (int i = 0; i < 30; ++i) {
+      left_rows.emplace_back(TestKey(i), TestValue(i, 80));
+      expected[TestKey(i)] = TestValue(i, 80);
+    }
+    for (int i = 1000; i < 1030; ++i) {
+      right_rows.emplace_back(TestKey(i), TestValue(i, 80));
+      expected[TestKey(i)] = TestValue(i, 80);
+    }
+
+    const auto right_page_id =
+        NewLeaf(&buffer_pool, right_rows, tinydb::HEADER_PAGE_ID);
+    const auto left_page_id = NewLeaf(&buffer_pool, left_rows, right_page_id);
+    const auto root_page_id = NewRootInternal(&buffer_pool, left_page_id,
+                                              {{TestKey(1000), right_page_id}});
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    for (int i = 1000; i < 1014; ++i) {
+      tree.Remove(TestKey(i));
+      expected.erase(TestKey(i));
+    }
+
+    CheckTree(&tree, expected);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, LeafStealRight) {
+  const auto path = TestPath("leaf_steal_right");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 16);
+    auto expected = std::map<std::string, std::string>{};
+    auto left_rows = std::vector<std::pair<std::string, std::string>>{};
+    auto right_rows = std::vector<std::pair<std::string, std::string>>{};
+
+    for (int i = 0; i < 30; ++i) {
+      left_rows.emplace_back(TestKey(i), TestValue(i, 80));
+      expected[TestKey(i)] = TestValue(i, 80);
+    }
+    for (int i = 1000; i < 1030; ++i) {
+      right_rows.emplace_back(TestKey(i), TestValue(i, 80));
+      expected[TestKey(i)] = TestValue(i, 80);
+    }
+
+    const auto right_page_id =
+        NewLeaf(&buffer_pool, right_rows, tinydb::HEADER_PAGE_ID);
+    const auto left_page_id = NewLeaf(&buffer_pool, left_rows, right_page_id);
+    const auto root_page_id = NewRootInternal(&buffer_pool, left_page_id,
+                                              {{TestKey(1000), right_page_id}});
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    for (int i = 0; i < 14; ++i) {
+      tree.Remove(TestKey(i));
+      expected.erase(TestKey(i));
+    }
+
+    CheckTree(&tree, expected);
   }
 
   std::filesystem::remove(path);

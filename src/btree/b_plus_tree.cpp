@@ -22,6 +22,8 @@ struct InternalRecord {
   page_id_t right_child;
 };
 
+static constexpr auto LEAF_MIN_BYTES = PAGE_SIZE / 2;
+
 // The slot array starts immediately after the fixed-size leaf header.
 static auto LeafSlots(char *page) -> std::uint16_t * {
   return reinterpret_cast<std::uint16_t *>(page + sizeof(LeafHeader));
@@ -167,6 +169,87 @@ static void WriteInternalCell(char *page, std::uint16_t offset,
   std::copy(key.begin(), key.end(), cell + sizeof(InternalCellHeader));
 }
 
+// Read live leaf cells into ordinary C++ records. Tombstoned cells stay on the
+// page until some later rewrite, but they do not participate in searches,
+// compaction, splitting, or stealing.
+static auto ReadLeafRecords(char *page) -> std::vector<LeafRecord> {
+  auto *header = reinterpret_cast<LeafHeader *>(page);
+  auto *slots = LeafSlots(page);
+  auto records = std::vector<LeafRecord>{};
+  records.reserve(header->cell_count);
+
+  for (std::uint16_t i = 0; i < header->cell_count; ++i) {
+    char *cell = page + slots[i];
+    auto *cell_header = reinterpret_cast<LeafCellHeader *>(cell);
+    if (cell_header->flags == 1) {
+      continue;
+    }
+
+    char *cell_key = cell + sizeof(LeafCellHeader);
+    char *cell_value = cell_key + cell_header->key_size;
+    records.push_back(LeafRecord{
+        .key = std::string(cell_key, cell_header->key_size),
+        .value = std::string(cell_value, cell_header->value_size),
+    });
+  }
+
+  return records;
+}
+
+// Read internal separator cells into ordinary records while keeping the
+// separate first_child pointer in the page header.
+static auto ReadInternalRecords(char *page) -> std::vector<InternalRecord> {
+  auto *header = reinterpret_cast<InternalHeader *>(page);
+  auto *slots = InternalSlots(page);
+  auto records = std::vector<InternalRecord>{};
+  records.reserve(header->cell_count);
+
+  for (std::uint16_t i = 0; i < header->cell_count; ++i) {
+    char *cell = page + slots[i];
+    auto *cell_header = reinterpret_cast<InternalCellHeader *>(cell);
+    records.push_back(InternalRecord{
+        .key = std::string(InternalCellKey(cell)),
+        .right_child = cell_header->right_child,
+    });
+  }
+
+  return records;
+}
+
+// Return child[index] from an internal node. child[0] is first_child; every
+// later child is stored as the right_child of the previous separator cell.
+static auto InternalChildAt(char *page, std::size_t index) -> page_id_t {
+  auto *header = reinterpret_cast<InternalHeader *>(page);
+  auto *slots = InternalSlots(page);
+
+  if (index > header->cell_count) {
+    throw std::runtime_error("internal child index out of range");
+  }
+
+  if (index == 0) {
+    return header->first_child;
+  }
+
+  char *cell = page + slots[index - 1];
+  auto *cell_header = reinterpret_cast<InternalCellHeader *>(cell);
+  return cell_header->right_child;
+}
+
+// Find the position of a child pointer inside its parent. This is used by leaf
+// stealing to locate adjacent siblings and the separator that must change.
+static auto FindInternalChildIndex(char *page,
+                                   page_id_t child_page_id) -> std::size_t {
+  auto *header = reinterpret_cast<InternalHeader *>(page);
+
+  for (std::size_t index = 0; index <= header->cell_count; ++index) {
+    if (InternalChildAt(page, index) == child_page_id) {
+      return index;
+    }
+  }
+
+  throw std::runtime_error("child page not found in parent");
+}
+
 // Simulate packing a range of leaf records. Returning nullopt means the range
 // cannot fit in one leaf page using the real page layout.
 static auto PackedLeafBytes(const std::vector<LeafRecord> &records,
@@ -226,6 +309,42 @@ static auto ChooseLeafSplit(const std::vector<LeafRecord> &records)
     const auto left_used = PackedLeafBytes(records, 0, candidate);
     const auto right_used = PackedLeafBytes(records, candidate, records.size());
     if (!left_used.has_value() || !right_used.has_value()) {
+      continue;
+    }
+
+    const auto imbalance = *left_used > *right_used ? *left_used - *right_used
+                                                    : *right_used - *left_used;
+    if (!found_split || imbalance < best_imbalance) {
+      found_split = true;
+      best_imbalance = imbalance;
+      split_index = candidate;
+    }
+  }
+
+  if (!found_split) {
+    return std::nullopt;
+  }
+  return split_index;
+}
+
+// Choose a redistribution point for two adjacent leaves after a delete. Unlike
+// split selection, this enforces the minimum-fill rule for both resulting
+// leaves. If no candidate satisfies that, merge is the next policy, but merge
+// is intentionally not implemented yet.
+static auto ChooseLeafRedistributionSplit(
+    const std::vector<LeafRecord> &records) -> std::optional<std::size_t> {
+  auto split_index = std::size_t{0};
+  auto found_split = false;
+  auto best_imbalance = std::size_t{PAGE_SIZE * 2};
+
+  for (std::size_t candidate = 1; candidate < records.size(); ++candidate) {
+    const auto left_used = PackedLeafBytes(records, 0, candidate);
+    const auto right_used = PackedLeafBytes(records, candidate, records.size());
+    if (!left_used.has_value() || !right_used.has_value()) {
+      continue;
+    }
+
+    if (*left_used < LEAF_MIN_BYTES || *right_used < LEAF_MIN_BYTES) {
       continue;
     }
 
@@ -356,6 +475,29 @@ static void PackInternalPage(char *page, page_id_t first_child,
         static_cast<std::uint16_t>(header->free_start + sizeof(std::uint16_t));
     header->free_end = cell_offset;
   }
+}
+
+// Rewriting an internal separator may change its byte size, so update the
+// parent by rebuilding the whole internal page. If the replacement separator
+// would not fit, leave the parent untouched and let a later merge policy handle
+// the underfull leaf.
+static auto TryUpdateInternalSeparator(char *page, std::size_t separator_index,
+                                       std::string_view key) -> bool {
+  auto *header = reinterpret_cast<InternalHeader *>(page);
+  const auto first_child = header->first_child;
+  auto records = ReadInternalRecords(page);
+
+  if (separator_index >= records.size()) {
+    throw std::runtime_error("internal separator index out of range");
+  }
+
+  records[separator_index].key = std::string(key);
+  if (!PackedInternalBytes(records, 0, records.size()).has_value()) {
+    return false;
+  }
+
+  PackInternalPage(page, first_child, records, 0, records.size());
+  return true;
 }
 
 BPlusTree::BPlusTree(BufferPool *buffer_pool, page_id_t root_page_id)
@@ -675,6 +817,10 @@ void BPlusTree::Put(std::string_view key, std::string_view value) {
 }
 
 void BPlusTree::Remove(std::string_view key) {
+  // We need the immediate parent if the leaf underflows, so keep the page ids
+  // seen on the descent. Ancestors are left alone for now because this step
+  // only redistributes leaf records; merge/internal repair comes later.
+  auto parent_path = std::vector<page_id_t>{};
   page_id_t page_id = root_page_id_;
 
   while (true) {
@@ -684,29 +830,132 @@ void BPlusTree::Remove(std::string_view key) {
     // Route through internal pages using the same separator-key search as Get.
     if (node_header->type == NodeType::Internal) {
       const auto child_page_id = FindInternalChild(page, key);
+      parent_path.push_back(page_id);
       buffer_pool_->UnpinPage(page_id, false);
       page_id = child_page_id;
       continue;
     }
 
     // Deletion is logical for now: find the key in the leaf and mark its cell
-    // as tombstoned. The slot stays in place until compaction exists.
+    // as tombstoned. If the leaf falls below the minimum byte occupancy, try to
+    // steal records from an adjacent leaf with the same parent.
     auto *header = reinterpret_cast<LeafHeader *>(page);
     auto *slots = LeafSlots(page);
-    bool dirty = false;
     const auto index = FindLeafSlot(page, key);
 
-    if (index < header->cell_count) {
-      char *cell = page + slots[index];
-      auto *cell_header = reinterpret_cast<LeafCellHeader *>(cell);
-
-      if (LeafCellKey(cell) == key) {
-        cell_header->flags = 1;
-        dirty = true;
-      }
+    if (index >= header->cell_count) {
+      buffer_pool_->UnpinPage(page_id, false);
+      return;
     }
 
-    buffer_pool_->UnpinPage(page_id, dirty);
+    char *cell = page + slots[index];
+    auto *cell_header = reinterpret_cast<LeafCellHeader *>(cell);
+    if (LeafCellKey(cell) != key || cell_header->flags == 1) {
+      buffer_pool_->UnpinPage(page_id, false);
+      return;
+    }
+
+    cell_header->flags = 1;
+
+    auto records = ReadLeafRecords(page);
+    const auto used_bytes = PackedLeafBytes(records, 0, records.size());
+    if (!used_bytes.has_value()) {
+      buffer_pool_->UnpinPage(page_id, true);
+      throw std::runtime_error("leaf page cannot pack live records");
+    }
+
+    // Root leaves are allowed to be small. Non-root leaves that remain at least
+    // half full also need no structural repair, so the tombstone can stay until
+    // an insert needs the space.
+    if (parent_path.empty() || *used_bytes >= LEAF_MIN_BYTES) {
+      buffer_pool_->UnpinPage(page_id, true);
+      return;
+    }
+
+    const auto target_next_leaf = header->next_leaf;
+    const auto parent_page_id = parent_path.back();
+    char *parent_page = buffer_pool_->FetchPage(parent_page_id);
+    auto *parent_header = reinterpret_cast<InternalHeader *>(parent_page);
+    const auto child_index = FindInternalChildIndex(parent_page, page_id);
+
+    // Prefer the left sibling. It keeps the target's right-link unchanged and
+    // moves the largest left records into the front of the underfull target.
+    if (child_index > 0) {
+      const auto left_page_id = InternalChildAt(parent_page, child_index - 1);
+      char *left_page = buffer_pool_->FetchPage(left_page_id);
+      auto *left_node_header = reinterpret_cast<NodeHeader *>(left_page);
+
+      if (left_node_header->type != NodeType::Leaf) {
+        buffer_pool_->UnpinPage(left_page_id, false);
+        buffer_pool_->UnpinPage(parent_page_id, false);
+        buffer_pool_->UnpinPage(page_id, true);
+        throw std::runtime_error("leaf sibling is not a leaf");
+      }
+
+      auto combined_records = ReadLeafRecords(left_page);
+      combined_records.insert(combined_records.end(), records.begin(),
+                              records.end());
+
+      const auto split_index = ChooseLeafRedistributionSplit(combined_records);
+      if (split_index.has_value() &&
+          TryUpdateInternalSeparator(parent_page, child_index - 1,
+                                     combined_records[*split_index].key)) {
+        PackLeafPage(left_page, combined_records, 0, *split_index, page_id);
+        PackLeafPage(page, combined_records, *split_index,
+                     combined_records.size(), target_next_leaf);
+
+        buffer_pool_->UnpinPage(left_page_id, true);
+        buffer_pool_->UnpinPage(parent_page_id, true);
+        buffer_pool_->UnpinPage(page_id, true);
+        return;
+      }
+
+      buffer_pool_->UnpinPage(left_page_id, false);
+    }
+
+    // If the left sibling cannot donate, try the right sibling. The target
+    // keeps the low side of the combined key range, and the parent's separator
+    // for the right child becomes the right leaf's new first key.
+    if (child_index < parent_header->cell_count) {
+      const auto right_page_id = InternalChildAt(parent_page, child_index + 1);
+      char *right_page = buffer_pool_->FetchPage(right_page_id);
+      auto *right_node_header = reinterpret_cast<NodeHeader *>(right_page);
+
+      if (right_node_header->type != NodeType::Leaf) {
+        buffer_pool_->UnpinPage(right_page_id, false);
+        buffer_pool_->UnpinPage(parent_page_id, false);
+        buffer_pool_->UnpinPage(page_id, true);
+        throw std::runtime_error("leaf sibling is not a leaf");
+      }
+
+      auto *right_header = reinterpret_cast<LeafHeader *>(right_page);
+      const auto right_next_leaf = right_header->next_leaf;
+      auto combined_records = records;
+      const auto right_records = ReadLeafRecords(right_page);
+      combined_records.insert(combined_records.end(), right_records.begin(),
+                              right_records.end());
+
+      const auto split_index = ChooseLeafRedistributionSplit(combined_records);
+      if (split_index.has_value() &&
+          TryUpdateInternalSeparator(parent_page, child_index,
+                                     combined_records[*split_index].key)) {
+        PackLeafPage(page, combined_records, 0, *split_index, right_page_id);
+        PackLeafPage(right_page, combined_records, *split_index,
+                     combined_records.size(), right_next_leaf);
+
+        buffer_pool_->UnpinPage(right_page_id, true);
+        buffer_pool_->UnpinPage(parent_page_id, true);
+        buffer_pool_->UnpinPage(page_id, true);
+        return;
+      }
+
+      buffer_pool_->UnpinPage(right_page_id, false);
+    }
+
+    // No sibling can donate while preserving the minimum-fill rule. Leave the
+    // leaf underfull for the future merge implementation.
+    buffer_pool_->UnpinPage(parent_page_id, false);
+    buffer_pool_->UnpinPage(page_id, true);
     return;
   }
 }
