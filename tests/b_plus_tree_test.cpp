@@ -122,6 +122,39 @@ TEST(BPlusTreeTest, RemoveReinsert) {
   std::filesystem::remove(path);
 }
 
+TEST(BPlusTreeTest, CompactInsert) {
+  const auto path = TestPath("compact_insert");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 16);
+    const auto root_page_id = NewRootLeaf(&buffer_pool);
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    for (int i = 0; i < 38; ++i) {
+      tree.Put(TestKey(i), TestValue(i, 80));
+    }
+
+    for (int i = 0; i < 30; ++i) {
+      tree.Remove(TestKey(i));
+    }
+
+    const auto large_value = std::string(1000, 'z');
+    tree.Put(TestKey(9999), large_value);
+
+    EXPECT_EQ(tree.Get(TestKey(0)), std::nullopt);
+    EXPECT_EQ(tree.Get(TestKey(9999)), std::optional<std::string>{large_value});
+
+    char *root_page = buffer_pool.FetchPage(root_page_id);
+    auto *node_header = reinterpret_cast<tinydb::NodeHeader *>(root_page);
+    EXPECT_EQ(node_header->type, tinydb::NodeType::Leaf);
+    buffer_pool.UnpinPage(root_page_id, false);
+  }
+
+  std::filesystem::remove(path);
+}
+
 TEST(BPlusTreeTest, ScanRange) {
   const auto path = TestPath("scan");
   std::filesystem::remove(path);

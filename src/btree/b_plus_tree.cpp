@@ -463,8 +463,8 @@ void BPlusTree::Put(std::string_view key, std::string_view value) {
     }
 
     // The leaf has no physical space for the new cell. Rebuild the live cells
-    // as ordinary records, apply this Put, sort them, then split that record
-    // list into two leaves. Tombstoned cells are ignored during the rebuild.
+    // as ordinary records and apply this Put in memory. Tombstoned cells are
+    // ignored, which is the opportunistic compaction step.
     auto records = std::vector<LeafRecord>{};
     bool replaced = false;
     for (std::uint16_t i = 0; i < header->cell_count; ++i) {
@@ -497,6 +497,16 @@ void BPlusTree::Put(std::string_view key, std::string_view value) {
                 return left.key < right.key;
               });
 
+    // Compact before splitting. If the live records plus this Put fit in the
+    // same leaf, rewrite that leaf without tombstones and avoid touching the
+    // parent.
+    const auto old_next_leaf = header->next_leaf;
+    if (PackedLeafBytes(records, 0, records.size()).has_value()) {
+      PackLeafPage(page, records, 0, records.size(), old_next_leaf);
+      buffer_pool_->UnpinPage(page_id, true);
+      return;
+    }
+
     if (records.size() < 2) {
       buffer_pool_->UnpinPage(page_id, false);
       throw std::runtime_error("leaf page full");
@@ -518,7 +528,6 @@ void BPlusTree::Put(std::string_view key, std::string_view value) {
       // Splitting the root leaf is special because root_page_id_ should keep
       // pointing at the root. Allocate two leaf children and rewrite the old
       // root page as an internal node that points at those children.
-      const auto old_next_leaf = header->next_leaf;
       page_id_t left_page_id = 0;
       char *left_page = buffer_pool_->NewPage(&left_page_id);
       page_id_t right_page_id = 0;
@@ -543,7 +552,6 @@ void BPlusTree::Put(std::string_view key, std::string_view value) {
     // Non-root leaf split: keep the old leaf page as the left sibling so the
     // parent still points at a valid left child. The new page becomes the right
     // sibling, and its first key is inserted into the parent.
-    const auto old_next_leaf = header->next_leaf;
     page_id_t right_page_id = 0;
     char *right_page = buffer_pool_->NewPage(&right_page_id);
     PackLeafPage(page, records, 0, *split_index, right_page_id);
