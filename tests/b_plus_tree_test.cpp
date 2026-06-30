@@ -470,6 +470,71 @@ TEST(BPlusTreeTest, InternalMergeRoot) {
   std::filesystem::remove(path);
 }
 
+TEST(BPlusTreeTest, SingleLeafParent) {
+  const auto path = TestPath("single_leaf_parent");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 32);
+    auto expected = std::map<std::string, std::string>{};
+
+    const auto leaf_rows = TestRows(0, 5, 80);
+    const auto other_rows = TestRows(5000, 5005, 80);
+    AddExpected(&expected, leaf_rows);
+    AddExpected(&expected, other_rows);
+
+    const auto other_leaf_page_id =
+        NewLeaf(&buffer_pool, other_rows, tinydb::HEADER_PAGE_ID);
+    const auto leaf_page_id =
+        NewLeaf(&buffer_pool, leaf_rows, other_leaf_page_id);
+    const auto parent_page_id = NewRootInternal(&buffer_pool, leaf_page_id, {});
+    const auto other_parent_page_id =
+        NewRootInternal(&buffer_pool, other_leaf_page_id, {});
+    const auto root_page_id = NewRootInternal(
+        &buffer_pool, parent_page_id, {{TestKey(5000), other_parent_page_id}});
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    EXPECT_NO_THROW(tree.Remove(TestKey(0)));
+    expected.erase(TestKey(0));
+
+    CheckTree(&tree, expected);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, SingleInternalParent) {
+  const auto path = TestPath("single_internal_parent");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 32);
+    auto expected = std::map<std::string, std::string>{};
+
+    const auto left_rows = TestRows(0, 5, 80);
+    const auto right_rows = TestRows(1000, 1005, 80);
+    AddExpected(&expected, left_rows);
+    AddExpected(&expected, right_rows);
+
+    const auto right_page_id =
+        NewLeaf(&buffer_pool, right_rows, tinydb::HEADER_PAGE_ID);
+    const auto left_page_id = NewLeaf(&buffer_pool, left_rows, right_page_id);
+    const auto parent_page_id = NewRootInternal(
+        &buffer_pool, left_page_id, {{TestKey(1000), right_page_id}});
+    const auto root_page_id = NewRootInternal(&buffer_pool, parent_page_id, {});
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    EXPECT_NO_THROW(tree.Remove(TestKey(1000)));
+    expected.erase(TestKey(1000));
+
+    CheckTree(&tree, expected);
+  }
+
+  std::filesystem::remove(path);
+}
+
 TEST(BPlusTreeTest, ScanRange) {
   const auto path = TestPath("scan");
   std::filesystem::remove(path);
