@@ -7,7 +7,9 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <map>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -34,6 +36,37 @@ static auto NewRootLeaf(tinydb::BufferPool *buffer_pool) -> tinydb::page_id_t {
 
   buffer_pool->UnpinPage(root_page_id, true);
   return root_page_id;
+}
+
+static auto TestKey(int value) -> std::string {
+  auto key_stream = std::ostringstream{};
+  key_stream << "key_" << std::setw(4) << std::setfill('0') << value;
+  return key_stream.str();
+}
+
+static auto TestValue(int seed, std::size_t size) -> std::string {
+  auto value = std::string(size, static_cast<char>('a' + (seed % 26)));
+  return value;
+}
+
+static void CheckTree(tinydb::BPlusTree *tree,
+                      const std::map<std::string, std::string> &expected_rows) {
+  for (const auto &[key, value] : expected_rows) {
+    EXPECT_EQ(tree->Get(key), std::optional<std::string>{value});
+  }
+
+  auto expected_scan = std::vector<std::pair<std::string, std::string>>{};
+  for (const auto &[key, value] : expected_rows) {
+    expected_scan.emplace_back(key, value);
+  }
+
+  auto end_key = std::string(1, '\x7f');
+  if (!expected_rows.empty()) {
+    end_key = expected_rows.rbegin()->first;
+    end_key.push_back('\x7f');
+  }
+
+  EXPECT_EQ(tree->Scan("", end_key), expected_scan);
 }
 
 TEST(BPlusTreeTest, PutGet) {
@@ -430,6 +463,103 @@ TEST(BPlusTreeTest, InternalSplit) {
     ASSERT_EQ(rows.size(), 30);
     EXPECT_EQ(rows.front().first, make_key(100));
     EXPECT_EQ(rows.back().first, make_key(129));
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, RandomOps) {
+  const auto path = TestPath("random_ops");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 64);
+    tinydb::BPlusTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
+    auto expected = std::map<std::string, std::string>{};
+    auto rng = std::mt19937{0xC0FFEEU};
+    auto key_dist = std::uniform_int_distribution<int>{0, 319};
+    auto value_size_dist = std::uniform_int_distribution<int>{1, 320};
+
+    for (int op = 0; op < 700; ++op) {
+      const auto key_id = key_dist(rng);
+      const auto value_size = static_cast<std::size_t>(value_size_dist(rng));
+      const auto key = TestKey(key_id);
+      const auto value = TestValue(op + key_id, value_size);
+
+      tree.Put(key, value);
+      expected[key] = value;
+
+      if (op % 50 == 0) {
+        CheckTree(&tree, expected);
+      }
+    }
+
+    CheckTree(&tree, expected);
+
+    auto range_dist = std::uniform_int_distribution<int>{0, 330};
+    for (int i = 0; i < 80; ++i) {
+      auto start_id = range_dist(rng);
+      auto end_id = range_dist(rng);
+      if (end_id < start_id) {
+        std::swap(start_id, end_id);
+      }
+      ++end_id;
+
+      const auto start_key = TestKey(start_id);
+      const auto end_key = TestKey(end_id);
+      auto expected_scan = std::vector<std::pair<std::string, std::string>>{};
+
+      for (auto it = expected.lower_bound(start_key);
+           it != expected.end() && it->first < end_key; ++it) {
+        expected_scan.emplace_back(it->first, it->second);
+      }
+
+      EXPECT_EQ(tree.Scan(start_key, end_key), expected_scan);
+    }
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, Reopen) {
+  const auto path = TestPath("reopen_btree");
+  std::filesystem::remove(path);
+
+  auto expected = std::map<std::string, std::string>{};
+  tinydb::page_id_t root_page_id = tinydb::HEADER_PAGE_ID;
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 32);
+    root_page_id = NewRootLeaf(&buffer_pool);
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    for (int i = 0; i < 180; ++i) {
+      const auto key = TestKey(i);
+      const auto value = TestValue(i, 40U + static_cast<std::size_t>(i % 180));
+      tree.Put(key, value);
+      expected[key] = value;
+    }
+
+    CheckTree(&tree, expected);
+    buffer_pool.FlushAllPages();
+  }
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 32);
+    tinydb::BPlusTree tree(&buffer_pool, root_page_id);
+
+    CheckTree(&tree, expected);
+
+    const auto rows = tree.Scan(TestKey(40), TestKey(55));
+    auto expected_scan = std::vector<std::pair<std::string, std::string>>{};
+    for (auto it = expected.lower_bound(TestKey(40));
+         it != expected.end() && it->first < TestKey(55); ++it) {
+      expected_scan.emplace_back(it->first, it->second);
+    }
+    EXPECT_EQ(rows, expected_scan);
   }
 
   std::filesystem::remove(path);
