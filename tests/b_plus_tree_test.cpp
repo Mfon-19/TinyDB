@@ -147,3 +147,103 @@ TEST(BPlusTreeTest, RootLeafSplitCreatesSearchableLeaves) {
 
   std::filesystem::remove(path);
 }
+
+TEST(BPlusTreeTest, NonRootLeafSplitsUpdateParent) {
+  const auto path = TestPath("non_root_leaf_split");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 16);
+    tinydb::BPlusTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
+
+    for (int i = 0; i < 120; ++i) {
+      auto key_stream = std::ostringstream{};
+      key_stream << "key_" << std::setw(3) << std::setfill('0') << i;
+      const auto key = key_stream.str();
+      const auto value = std::string(80, static_cast<char>('a' + (i % 26)));
+      tree.Put(key, value);
+    }
+
+    for (int i = 0; i < 120; ++i) {
+      auto key_stream = std::ostringstream{};
+      key_stream << "key_" << std::setw(3) << std::setfill('0') << i;
+      const auto key = key_stream.str();
+      const auto value = std::string(80, static_cast<char>('a' + (i % 26)));
+      EXPECT_EQ(tree.Get(key), std::optional<std::string>{value});
+    }
+
+    const auto rows = tree.Scan("key_000", "key_999");
+    ASSERT_EQ(rows.size(), 120);
+    EXPECT_EQ(rows.front().first, "key_000");
+    EXPECT_EQ(rows.back().first, "key_119");
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, LeafSplitsCanInsertSeparatorBeforeExistingParentKeys) {
+  const auto path = TestPath("left_leaf_split");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 16);
+    tinydb::BPlusTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
+
+    for (int i = 119; i >= 0; --i) {
+      auto key_stream = std::ostringstream{};
+      key_stream << "key_" << std::setw(3) << std::setfill('0') << i;
+      const auto key = key_stream.str();
+      const auto value = std::string(80, static_cast<char>('a' + (i % 26)));
+      tree.Put(key, value);
+    }
+
+    const auto rows = tree.Scan("key_000", "key_999");
+    ASSERT_EQ(rows.size(), 120);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      auto key_stream = std::ostringstream{};
+      key_stream << "key_" << std::setw(3) << std::setfill('0') << i;
+      EXPECT_EQ(rows[i].first, key_stream.str());
+    }
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BPlusTreeTest, InternalSplitsCreateDeeperTree) {
+  const auto path = TestPath("internal_split");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool buffer_pool(&disk, 32);
+    tinydb::BPlusTree tree(&buffer_pool, NewRootLeaf(&buffer_pool));
+
+    auto make_key = [](int value) {
+      auto key_stream = std::ostringstream{};
+      key_stream << "key_" << std::setw(4) << std::setfill('0') << value << "_"
+                 << std::string(56, 'x');
+      return key_stream.str();
+    };
+
+    for (int i = 0; i < 360; ++i) {
+      const auto key = make_key(i);
+      const auto value = std::string(384, static_cast<char>('a' + (i % 26)));
+      tree.Put(key, value);
+    }
+
+    for (int i = 0; i < 360; ++i) {
+      const auto key = make_key(i);
+      const auto value = std::string(384, static_cast<char>('a' + (i % 26)));
+      EXPECT_EQ(tree.Get(key), std::optional<std::string>{value});
+    }
+
+    const auto rows = tree.Scan(make_key(100), make_key(130));
+    ASSERT_EQ(rows.size(), 30);
+    EXPECT_EQ(rows.front().first, make_key(100));
+    EXPECT_EQ(rows.back().first, make_key(129));
+  }
+
+  std::filesystem::remove(path);
+}

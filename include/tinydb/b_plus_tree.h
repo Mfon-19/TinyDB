@@ -128,10 +128,11 @@ struct InternalCellHeader {
   forming a sort of linked list.
 
   When we first create the B+ tree, we have just one page with id=root_page_id.
-  At this point, it is both the root page, and the single leaf page. When we
-  Put, we add to the page until it gets full. Once its full, we split this leaf
-  page, creating a new root page which will be the first internal page. The root
-  now points to two leaf pages.
+  At this point, it is both the root page and the single leaf page. Inserts add
+  to that leaf until it fills. A full leaf splits into two leaves and copies the
+  first key of the right leaf into the parent as a separator. If the parent is
+  full, the internal split promotes its middle separator upward. This continues
+  until some parent has room or the root itself splits.
 
 */
 class BPlusTree {
