@@ -273,39 +273,113 @@ void BPlusTree::Put(std::string_view key, std::string_view value) {
     }
 
     for (const auto &record : records) {
-      const auto required_leaf_bytes =
-          sizeof(LeafHeader) + sizeof(std::uint16_t) + sizeof(LeafCellHeader) +
-          record.key.size() + record.value.size() + alignof(LeafCellHeader) - 1;
-      if (required_leaf_bytes > PAGE_SIZE) {
+      const auto record_cell_size =
+          sizeof(LeafCellHeader) + record.key.size() + record.value.size();
+      auto cell_offset = std::uint16_t{0};
+      auto record_fits = false;
+      if (record_cell_size <= PAGE_SIZE) {
+        cell_offset = static_cast<std::uint16_t>(
+            (PAGE_SIZE - record_cell_size) &
+            ~std::size_t{alignof(LeafCellHeader) - 1});
+        record_fits = sizeof(LeafHeader) + sizeof(std::uint16_t) <= cell_offset;
+      }
+
+      if (!record_fits) {
         buffer_pool_->UnpinPage(page_id, false);
         throw std::runtime_error("leaf record too large");
       }
     }
 
-    // Records are variable-sized, so splitting by count can leave one page too
-    // large if a few values are much bigger than the others. Choose the split
-    // point by approximate bytes instead: slot bytes plus cell bytes, with a
-    // small alignment allowance for each packed cell.
-    auto total_leaf_bytes = std::size_t{0};
-    for (const auto &record : records) {
-      total_leaf_bytes += sizeof(std::uint16_t) + sizeof(LeafCellHeader) +
-                          record.key.size() + record.value.size() +
-                          alignof(LeafCellHeader) - 1;
-    }
+    // Records are variable-sized, so split selection must prove both resulting
+    // leaf pages can actually pack their cells. For every possible split, run
+    // the same free_start/free_end math the writer uses below and keep the
+    // valid split with the closest byte balance.
+    auto split_index = std::size_t{0};
+    auto found_leaf_split = false;
+    auto best_leaf_imbalance = std::size_t{PAGE_SIZE * 2};
+    for (std::size_t candidate = 1; candidate < records.size(); ++candidate) {
+      auto left_free_start = std::size_t{sizeof(LeafHeader)};
+      auto left_free_end = std::size_t{PAGE_SIZE};
+      auto left_fits = true;
+      for (std::size_t i = 0; i < candidate; ++i) {
+        const auto left_candidate_cell_size = sizeof(LeafCellHeader) +
+                                              records[i].key.size() +
+                                              records[i].value.size();
+        if (left_candidate_cell_size > left_free_end) {
+          left_fits = false;
+          break;
+        }
 
-    auto left_leaf_bytes = std::size_t{0};
-    auto split_index = std::size_t{1};
-    for (std::size_t i = 0; i + 1 < records.size(); ++i) {
-      left_leaf_bytes += sizeof(std::uint16_t) + sizeof(LeafCellHeader) +
-                         records[i].key.size() + records[i].value.size() +
-                         alignof(LeafCellHeader) - 1;
-      split_index = i + 1;
-      if (left_leaf_bytes >= total_leaf_bytes / 2) {
-        break;
+        const auto cell_offset = (left_free_end - left_candidate_cell_size) &
+                                 ~std::size_t{alignof(LeafCellHeader) - 1};
+        left_free_start += sizeof(std::uint16_t);
+        if (left_free_start > cell_offset) {
+          left_fits = false;
+          break;
+        }
+        left_free_end = cell_offset;
+      }
+
+      auto right_free_start = std::size_t{sizeof(LeafHeader)};
+      auto right_free_end = std::size_t{PAGE_SIZE};
+      auto right_fits = true;
+      for (std::size_t i = candidate; i < records.size(); ++i) {
+        const auto right_candidate_cell_size = sizeof(LeafCellHeader) +
+                                               records[i].key.size() +
+                                               records[i].value.size();
+        if (right_candidate_cell_size > right_free_end) {
+          right_fits = false;
+          break;
+        }
+
+        const auto cell_offset = (right_free_end - right_candidate_cell_size) &
+                                 ~std::size_t{alignof(LeafCellHeader) - 1};
+        right_free_start += sizeof(std::uint16_t);
+        if (right_free_start > cell_offset) {
+          right_fits = false;
+          break;
+        }
+        right_free_end = cell_offset;
+      }
+
+      if (!left_fits || !right_fits) {
+        continue;
+      }
+
+      const auto left_used = left_free_start + PAGE_SIZE - left_free_end;
+      const auto right_used = right_free_start + PAGE_SIZE - right_free_end;
+      const auto imbalance = left_used > right_used ? left_used - right_used
+                                                    : right_used - left_used;
+      if (!found_leaf_split || imbalance < best_leaf_imbalance) {
+        found_leaf_split = true;
+        best_leaf_imbalance = imbalance;
+        split_index = candidate;
       }
     }
 
+    if (!found_leaf_split) {
+      buffer_pool_->UnpinPage(page_id, false);
+      throw std::runtime_error("leaf split cannot fit records");
+    }
+
     const auto leaf_separator_key = records[split_index].key;
+    const auto separator_cell_size =
+        sizeof(InternalCellHeader) + leaf_separator_key.size();
+    auto separator_cell_offset = std::uint16_t{0};
+    auto separator_fits_internal = false;
+    if (separator_cell_size <= PAGE_SIZE) {
+      separator_cell_offset = static_cast<std::uint16_t>(
+          (PAGE_SIZE - separator_cell_size) &
+          ~std::size_t{alignof(InternalCellHeader) - 1});
+      separator_fits_internal =
+          sizeof(InternalHeader) + sizeof(std::uint16_t) <=
+          separator_cell_offset;
+    }
+
+    if (!separator_fits_internal) {
+      buffer_pool_->UnpinPage(page_id, false);
+      throw std::runtime_error("leaf separator too large");
+    }
 
     if (parent_path.empty()) {
       // Splitting the root leaf is special because root_page_id_ should keep
@@ -608,7 +682,91 @@ void BPlusTree::Put(std::string_view key, std::string_view value) {
                 return left.key < right.key;
               });
 
-    const auto internal_split_index = internal_records.size() / 2;
+    // Internal separators are also variable-sized. A count-middle split can
+    // overfill one child when a large separator lands near the middle, so try
+    // every promotable separator and only accept candidates whose left and
+    // right partitions both pack into one internal page.
+    auto internal_split_index = std::size_t{0};
+    auto found_internal_split = false;
+    auto best_internal_imbalance = std::size_t{PAGE_SIZE * 2};
+    for (std::size_t candidate = 0; candidate < internal_records.size();
+         ++candidate) {
+      const auto promoted_cell_size =
+          sizeof(InternalCellHeader) + internal_records[candidate].key.size();
+      auto promoted_fits_parent = false;
+      if (promoted_cell_size <= PAGE_SIZE) {
+        const auto promoted_cell_offset =
+            (PAGE_SIZE - promoted_cell_size) &
+            ~std::size_t{alignof(InternalCellHeader) - 1};
+        promoted_fits_parent = sizeof(InternalHeader) + sizeof(std::uint16_t) <=
+                               promoted_cell_offset;
+      }
+      if (!promoted_fits_parent) {
+        continue;
+      }
+
+      auto left_free_start = std::size_t{sizeof(InternalHeader)};
+      auto left_free_end = std::size_t{PAGE_SIZE};
+      auto left_fits = true;
+      for (std::size_t i = 0; i < candidate; ++i) {
+        const auto cell_size =
+            sizeof(InternalCellHeader) + internal_records[i].key.size();
+        if (cell_size > left_free_end) {
+          left_fits = false;
+          break;
+        }
+
+        const auto cell_offset = (left_free_end - cell_size) &
+                                 ~std::size_t{alignof(InternalCellHeader) - 1};
+        left_free_start += sizeof(std::uint16_t);
+        if (left_free_start > cell_offset) {
+          left_fits = false;
+          break;
+        }
+        left_free_end = cell_offset;
+      }
+
+      auto right_free_start = std::size_t{sizeof(InternalHeader)};
+      auto right_free_end = std::size_t{PAGE_SIZE};
+      auto right_fits = true;
+      for (std::size_t i = candidate + 1; i < internal_records.size(); ++i) {
+        const auto cell_size =
+            sizeof(InternalCellHeader) + internal_records[i].key.size();
+        if (cell_size > right_free_end) {
+          right_fits = false;
+          break;
+        }
+
+        const auto cell_offset = (right_free_end - cell_size) &
+                                 ~std::size_t{alignof(InternalCellHeader) - 1};
+        right_free_start += sizeof(std::uint16_t);
+        if (right_free_start > cell_offset) {
+          right_fits = false;
+          break;
+        }
+        right_free_end = cell_offset;
+      }
+
+      if (!left_fits || !right_fits) {
+        continue;
+      }
+
+      const auto left_used = left_free_start + PAGE_SIZE - left_free_end;
+      const auto right_used = right_free_start + PAGE_SIZE - right_free_end;
+      const auto imbalance = left_used > right_used ? left_used - right_used
+                                                    : right_used - left_used;
+      if (!found_internal_split || imbalance < best_internal_imbalance) {
+        found_internal_split = true;
+        best_internal_imbalance = imbalance;
+        internal_split_index = candidate;
+      }
+    }
+
+    if (!found_internal_split) {
+      buffer_pool_->UnpinPage(parent_page_id, false);
+      throw std::runtime_error("internal split cannot fit records");
+    }
+
     const auto promoted_key = internal_records[internal_split_index].key;
     const auto right_first_child =
         internal_records[internal_split_index].right_child;

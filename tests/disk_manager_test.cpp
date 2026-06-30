@@ -13,7 +13,7 @@ static auto TestPath(const std::string &name) -> std::filesystem::path {
          ("tinydb_" + name + "_" + std::to_string(::getpid()) + ".db");
 }
 
-TEST(DiskManagerTest, WriteReadAndReopenPage) {
+TEST(DiskManagerTest, ReopenPage) {
   const auto path = TestPath("write_read_reopen");
   std::filesystem::remove(path);
 
@@ -42,7 +42,7 @@ TEST(DiskManagerTest, WriteReadAndReopenPage) {
   std::filesystem::remove(path);
 }
 
-TEST(DiskManagerTest, ReadUnallocatedPageThrows) {
+TEST(DiskManagerTest, UnallocatedRead) {
   const auto path = TestPath("unallocated_read");
   std::filesystem::remove(path);
 

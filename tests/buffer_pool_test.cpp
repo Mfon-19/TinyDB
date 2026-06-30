@@ -13,7 +13,7 @@ static auto TestPath(const std::string &name) -> std::filesystem::path {
          ("tinydb_buffer_" + name + "_" + std::to_string(::getpid()) + ".db");
 }
 
-TEST(BufferPoolTest, NewPageFlushesToDisk) {
+TEST(BufferPoolTest, FlushNewPage) {
   const auto path = TestPath("flush");
   std::filesystem::remove(path);
 
@@ -39,7 +39,7 @@ TEST(BufferPoolTest, NewPageFlushesToDisk) {
   std::filesystem::remove(path);
 }
 
-TEST(BufferPoolTest, EvictsDirtyUnpinnedPage) {
+TEST(BufferPoolTest, EvictDirtyPage) {
   const auto path = TestPath("evict");
   std::filesystem::remove(path);
 
@@ -65,7 +65,7 @@ TEST(BufferPoolTest, EvictsDirtyUnpinnedPage) {
   std::filesystem::remove(path);
 }
 
-TEST(BufferPoolTest, DoesNotEvictPinnedPage) {
+TEST(BufferPoolTest, KeepPinnedPage) {
   const auto path = TestPath("pinned");
   std::filesystem::remove(path);
 
