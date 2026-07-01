@@ -1,3 +1,5 @@
+#pragma once
+
 #include <tinydb/buffer_pool.h>
 #include <cstdint>
 #include <optional>
@@ -7,6 +9,12 @@
 #include <vector>
 
 namespace tinydb {
+
+// Largest key + value the tree accepts; Put aborts on anything bigger, so
+// callers (the storage engine API) must reject oversized entries first. The
+// cap guarantees any overflowing node has a valid split point (see the
+// static_asserts in src/btree/node.h).
+constexpr std::size_t MAX_ENTRY_BYTES = PAGE_SIZE / 4 - 32;
 
 enum class NodeType : std::uint16_t {
   Leaf = 1,

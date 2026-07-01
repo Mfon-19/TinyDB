@@ -64,11 +64,14 @@ add_library(
   TinyDB
   include/tinydb/b_plus_tree.h
   include/tinydb/buffer_pool.h
+  include/tinydb/check.h
   include/tinydb/disk_manager.h
   include/tinydb/file_header.h
   include/tinydb/page.h
+  include/tinydb/page_ref.h
   include/tinydb/storage_engine.h
   src/btree/b_plus_tree.cpp
+  src/btree/node.h
   src/buffer/buffer_pool.cpp
   src/engine/storage_engine.cpp
   src/storage/disk_manager.cpp)

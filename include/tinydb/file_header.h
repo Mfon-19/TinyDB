@@ -1,3 +1,5 @@
+#pragma once
+
 #include <tinydb/page.h>
 #include <cstdint>
 

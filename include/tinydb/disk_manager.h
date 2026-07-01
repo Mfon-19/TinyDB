@@ -1,3 +1,5 @@
+#pragma once
+
 #include <tinydb/file_header.h>
 #include <filesystem>
 
