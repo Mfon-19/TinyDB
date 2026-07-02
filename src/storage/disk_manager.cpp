@@ -42,6 +42,10 @@ DiskManager::DiskManager(const std::filesystem::path &path) {
   if (::pread(fd_, &header_, sizeof(header_), 0) < 0) {
     throw std::system_error(errno, std::generic_category(), "pread");
   }
+
+  if (header_.magic != FILE_MAGIC || header_.page_size != PAGE_SIZE) {
+    throw std::runtime_error("not a TinyDB database file: " + path.string());
+  }
 }
 
 DiskManager::DiskManager(DiskManager &&other) noexcept
@@ -79,6 +83,15 @@ auto DiskManager::AllocatePage() -> page_id_t {
   WriteHeader();
 
   return page_id;
+}
+
+auto DiskManager::GetRootPageId() const -> page_id_t {
+  return header_.root_page_id;
+}
+
+void DiskManager::SetRootPageId(page_id_t root_page_id) {
+  header_.root_page_id = root_page_id;
+  WriteHeader();
 }
 
 void DiskManager::WriteHeader() const {

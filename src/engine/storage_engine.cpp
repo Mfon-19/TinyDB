@@ -1,16 +1,40 @@
 #include <tinydb/storage_engine.h>
+
 #include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace tinydb {
 
+namespace {
+constexpr std::size_t POOL_FRAME_COUNT = 64;
+}  // namespace
+
 StorageEngine::StorageEngine(std::filesystem::path path)
-    : path_(std::move(path)) {}
+    : path_(std::move(path)),
+      disk_(std::make_unique<DiskManager>(path_)),
+      pool_(std::make_unique<BufferPool>(disk_.get(), POOL_FRAME_COUNT)) {
+  // A fresh database has no root yet: allocate one zeroed page, persist its
+  // id in the file header, and let the tree bootstrap it as an empty leaf.
+  auto root_page_id = disk_->GetRootPageId();
+  if (root_page_id == HEADER_PAGE_ID) {
+    pool_->NewPage(&root_page_id);
+    pool_->UnpinPage(root_page_id, true);
+    disk_->SetRootPageId(root_page_id);
+  }
+  tree_ = std::make_unique<BPlusTree>(pool_.get(), root_page_id);
+}
 
 StorageEngine::StorageEngine(StorageEngine &&other) noexcept
     : path_(std::move(other.path_)),
       closed_(other.closed_),
-      data_(std::move(other.data_)) {
+      disk_(std::move(other.disk_)),
+      pool_(std::move(other.pool_)),
+      tree_(std::move(other.tree_)) {
   // Mark the moved from StorageEngine as closed
   other.closed_ = true;
 }
@@ -24,48 +48,60 @@ auto StorageEngine::operator=(StorageEngine &&other) noexcept
     Close();
     path_ = std::move(other.path_);
     closed_ = other.closed_;
-    data_ = std::move(other.data_);
+    disk_ = std::move(other.disk_);
+    pool_ = std::move(other.pool_);
+    tree_ = std::move(other.tree_);
     other.closed_ = true;
   }
 
   return *this;
 }
 
-auto StorageEngine::Open(std::filesystem::path &path) -> StorageEngine {
-  // Initialize a StorageEngine and return to the user
+auto StorageEngine::Open(const std::filesystem::path &path) -> StorageEngine {
   return StorageEngine(path);
 }
 
-auto StorageEngine::Put(std::string_view key, std::string_view value) -> void {
+auto StorageEngine::Put(std::string_view key, std::string_view value)
+    -> PutStatus {
   if (closed_) {
-    return;
+    return PutStatus::Closed;
   }
-  data_[std::string(key)] = std::string(value);
+  if (key.size() + value.size() > MAX_ENTRY_BYTES) {
+    return PutStatus::EntryTooLarge;
+  }
+  tree_->Put(key, value);
+  return PutStatus::Ok;
 }
 
-auto StorageEngine::Get(std::string_view key) const
-    -> std::optional<std::string> {
+auto StorageEngine::Get(std::string_view key) -> std::optional<std::string> {
   if (closed_) {
     return std::nullopt;
   }
-  auto it = data_.find(std::string(key));
-  if (it != data_.end()) {
-    return it->second;
-  }
-  return std::nullopt;
+  return tree_->Get(key);
 }
 
 auto StorageEngine::Remove(std::string_view key) -> void {
   if (closed_) {
     return;
   }
-  data_.erase(std::string(key));
+  tree_->Remove(key);
+}
+
+auto StorageEngine::Scan(std::string_view start, std::string_view end)
+    -> std::vector<std::pair<std::string, std::string>> {
+  if (closed_) {
+    return {};
+  }
+  return tree_->Scan(start, end);
 }
 
 auto StorageEngine::Close() -> void {
-  if (!closed_) {
-    closed_ = true;
-    data_.clear();  // Release backing store memory
+  if (closed_) {
+    return;
   }
+  closed_ = true;
+  tree_.reset();
+  pool_.reset();  // the pool flushes its dirty pages on destruction
+  disk_.reset();
 }
 }  // namespace tinydb
