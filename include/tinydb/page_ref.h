@@ -9,8 +9,7 @@ namespace tinydb {
 // records the page as dirty.
 class PageRef {
  public:
-  PageRef(BufferPool *pool, page_id_t page_id)
-      : pool_(pool), page_id_(page_id), data_(pool->FetchPage(page_id)) {}
+  PageRef(BufferPool *pool, page_id_t page_id) : pool_(pool), page_id_(page_id), data_(pool->FetchPage(page_id)) {}
 
   // Allocates a fresh (zeroed) page and returns it pinned.
   static auto New(BufferPool *pool) -> PageRef {
@@ -22,10 +21,7 @@ class PageRef {
   PageRef(const PageRef &) = delete;
   auto operator=(const PageRef &) -> PageRef & = delete;
   PageRef(PageRef &&other) noexcept
-      : pool_(other.pool_),
-        page_id_(other.page_id_),
-        data_(other.data_),
-        dirty_(other.dirty_) {
+      : pool_(other.pool_), page_id_(other.page_id_), data_(other.data_), dirty_(other.dirty_) {
     other.pool_ = nullptr;
   }
   auto operator=(PageRef &&) -> PageRef & = delete;
@@ -41,8 +37,7 @@ class PageRef {
   void MarkDirty() { dirty_ = true; }
 
  private:
-  PageRef(BufferPool *pool, page_id_t page_id, char *data)
-      : pool_(pool), page_id_(page_id), data_(data) {}
+  PageRef(BufferPool *pool, page_id_t page_id, char *data) : pool_(pool), page_id_(page_id), data_(data) {}
 
   BufferPool *pool_;
   page_id_t page_id_;

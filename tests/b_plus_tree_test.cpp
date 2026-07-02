@@ -14,6 +14,10 @@
 #include <utility>
 #include <vector>
 
+// The suite asserts on tree structure by inspecting raw page headers, so it
+// reaches into the library's private on-disk format header.
+#include "btree/page_format.h"
+
 namespace {
 
 auto RowKey(int row) -> std::string {
@@ -42,8 +46,7 @@ class BPlusTreeTest : public ::testing::Test {
   void SetUp() override {
     const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
     db_path_ = std::filesystem::temp_directory_path() /
-               ("tinydb_bpt_" + std::string(info->name()) + "_" +
-                std::to_string(::getpid()) + ".db");
+               ("tinydb_bpt_" + std::string(info->name()) + "_" + std::to_string(::getpid()) + ".db");
     std::filesystem::remove(db_path_);
 
     disk_.emplace(db_path_);
@@ -122,8 +125,7 @@ class BPlusTreeTest : public ::testing::Test {
     for (;;) {
       char *page = pool_->FetchPage(page_id);
       const auto type = reinterpret_cast<tinydb::NodeHeader *>(page)->type;
-      const auto first_child =
-          reinterpret_cast<tinydb::InternalHeader *>(page)->first_child;
+      const auto first_child = reinterpret_cast<tinydb::InternalHeader *>(page)->first_child;
       pool_->UnpinPage(page_id, false);
       if (type == tinydb::NodeType::Leaf) {
         return depth;
@@ -139,8 +141,7 @@ class BPlusTreeTest : public ::testing::Test {
     for (;;) {
       char *page = pool_->FetchPage(page_id);
       const auto type = reinterpret_cast<tinydb::NodeHeader *>(page)->type;
-      const auto first_child =
-          reinterpret_cast<tinydb::InternalHeader *>(page)->first_child;
+      const auto first_child = reinterpret_cast<tinydb::InternalHeader *>(page)->first_child;
       pool_->UnpinPage(page_id, false);
       if (type == tinydb::NodeType::Leaf) {
         break;
@@ -151,8 +152,7 @@ class BPlusTreeTest : public ::testing::Test {
     int length = 0;
     while (page_id != tinydb::HEADER_PAGE_ID) {
       char *page = pool_->FetchPage(page_id);
-      const auto next_leaf =
-          reinterpret_cast<tinydb::LeafHeader *>(page)->next_leaf;
+      const auto next_leaf = reinterpret_cast<tinydb::LeafHeader *>(page)->next_leaf;
       pool_->UnpinPage(page_id, false);
       page_id = next_leaf;
       ++length;
@@ -407,8 +407,7 @@ TEST_F(BPlusTreeTest, FuzzAgainstModel) {
     const auto end = RowKey(hi);
 
     auto want = std::vector<std::pair<std::string, std::string>>{};
-    for (auto it = model_.lower_bound(start);
-         it != model_.end() && it->first < end; ++it) {
+    for (auto it = model_.lower_bound(start); it != model_.end() && it->first < end; ++it) {
       want.emplace_back(it->first, it->second);
     }
     EXPECT_EQ(tree_->Scan(start, end), want);
@@ -451,30 +450,23 @@ TEST_F(BPlusTreeTest, TombstoneCellsStayDead) {
       .free_end = static_cast<std::uint16_t>(tinydb::PAGE_SIZE),
       .next_leaf = tinydb::HEADER_PAGE_ID,
   };
-  auto *slots =
-      reinterpret_cast<std::uint16_t *>(page + sizeof(tinydb::LeafHeader));
+  auto *slots = reinterpret_cast<std::uint16_t *>(page + sizeof(tinydb::LeafHeader));
 
-  const auto append_cell = [&](const std::string &key,
-                               const std::string &value, std::uint8_t flags) {
-    const auto cell_size =
-        sizeof(tinydb::LeafCellHeader) + key.size() + value.size();
-    const auto offset = static_cast<std::uint16_t>(
-        (header->free_end - cell_size) &
-        ~std::size_t{alignof(tinydb::LeafCellHeader) - 1});
+  const auto append_cell = [&](const std::string &key, const std::string &value, std::uint8_t flags) {
+    const auto cell_size = sizeof(tinydb::LeafCellHeader) + key.size() + value.size();
+    const auto offset =
+        static_cast<std::uint16_t>((header->free_end - cell_size) & ~std::size_t{alignof(tinydb::LeafCellHeader) - 1});
     const auto cell_header = tinydb::LeafCellHeader{
         .key_size = static_cast<std::uint16_t>(key.size()),
         .value_size = static_cast<std::uint16_t>(value.size()),
         .flags = flags,
     };
     std::memcpy(page + offset, &cell_header, sizeof(cell_header));
-    std::copy_n(key.data(), key.size(),
-                page + offset + sizeof(cell_header));
-    std::copy_n(value.data(), value.size(),
-                page + offset + sizeof(cell_header) + key.size());
+    std::copy_n(key.data(), key.size(), page + offset + sizeof(cell_header));
+    std::copy_n(value.data(), value.size(), page + offset + sizeof(cell_header) + key.size());
     slots[header->cell_count] = offset;
     ++header->cell_count;
-    header->free_start =
-        static_cast<std::uint16_t>(header->free_start + sizeof(std::uint16_t));
+    header->free_start = static_cast<std::uint16_t>(header->free_start + sizeof(std::uint16_t));
     header->free_end = offset;
   };
 

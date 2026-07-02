@@ -9,8 +9,7 @@
 #include <string>
 
 static auto TestPath(const std::string &name) -> std::filesystem::path {
-  return std::filesystem::temp_directory_path() /
-         ("tinydb_" + name + "_" + std::to_string(::getpid()) + ".db");
+  return std::filesystem::temp_directory_path() / ("tinydb_" + name + "_" + std::to_string(::getpid()) + ".db");
 }
 
 TEST(DiskManagerTest, ReopenPage) {
@@ -49,8 +48,7 @@ TEST(DiskManagerTest, UnallocatedRead) {
   tinydb::DiskManager disk(path);
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
 
-  EXPECT_THROW(disk.ReadPage(tinydb::FIRST_DATA_PAGE_ID, page.data()),
-               std::out_of_range);
+  EXPECT_THROW(disk.ReadPage(tinydb::FIRST_DATA_PAGE_ID, page.data()), std::out_of_range);
 
   std::filesystem::remove(path);
 }

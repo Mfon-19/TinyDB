@@ -41,8 +41,7 @@ StorageEngine::StorageEngine(StorageEngine &&other) noexcept
 
 StorageEngine::~StorageEngine() { Close(); }
 
-auto StorageEngine::operator=(StorageEngine &&other) noexcept
-    -> StorageEngine & {
+auto StorageEngine::operator=(StorageEngine &&other) noexcept -> StorageEngine & {
   if (this != &other) {
     // Close the current engine before moving resources
     Close();
@@ -57,12 +56,9 @@ auto StorageEngine::operator=(StorageEngine &&other) noexcept
   return *this;
 }
 
-auto StorageEngine::Open(const std::filesystem::path &path) -> StorageEngine {
-  return StorageEngine(path);
-}
+auto StorageEngine::Open(const std::filesystem::path &path) -> StorageEngine { return StorageEngine(path); }
 
-auto StorageEngine::Put(std::string_view key, std::string_view value)
-    -> PutStatus {
+auto StorageEngine::Put(std::string_view key, std::string_view value) -> PutStatus {
   if (closed_) {
     return PutStatus::Closed;
   }
@@ -87,8 +83,8 @@ auto StorageEngine::Remove(std::string_view key) -> void {
   tree_->Remove(key);
 }
 
-auto StorageEngine::Scan(std::string_view start, std::string_view end)
-    -> std::vector<std::pair<std::string, std::string>> {
+auto StorageEngine::Scan(std::string_view start,
+                         std::string_view end) -> std::vector<std::pair<std::string, std::string>> {
   if (closed_) {
     return {};
   }

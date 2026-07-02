@@ -9,8 +9,7 @@
 #include <string>
 
 static auto TestPath(const std::string &name) -> std::filesystem::path {
-  return std::filesystem::temp_directory_path() /
-         ("tinydb_buffer_" + name + "_" + std::to_string(::getpid()) + ".db");
+  return std::filesystem::temp_directory_path() / ("tinydb_buffer_" + name + "_" + std::to_string(::getpid()) + ".db");
 }
 
 TEST(BufferPoolTest, FlushNewPage) {

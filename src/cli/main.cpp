@@ -48,8 +48,7 @@ auto RunCommand(tinydb::StorageEngine &engine, std::string_view program,
       case tinydb::PutStatus::Ok:
         return 0;
       case tinydb::PutStatus::EntryTooLarge:
-        std::cerr << "error: key + value exceeds "
-                  << tinydb::MAX_ENTRY_BYTES << " bytes\n";
+        std::cerr << "error: key + value exceeds " << tinydb::MAX_ENTRY_BYTES << " bytes\n";
         return 1;
       case tinydb::PutStatus::Closed:
         std::cerr << "error: database handle is closed\n";
@@ -74,9 +73,7 @@ auto RunCommand(tinydb::StorageEngine &engine, std::string_view program,
   }
 
   if (command == "scan" && (args.size() == 2 || args.size() == 4)) {
-    const auto rows = args.size() == 4
-                          ? engine.Scan(args[2], args[3])
-                          : engine.Scan("", ScanEverythingEnd());
+    const auto rows = args.size() == 4 ? engine.Scan(args[2], args[3]) : engine.Scan("", ScanEverythingEnd());
     for (const auto &[key, value] : rows) {
       std::cout << key << '\t' << value << '\n';
     }

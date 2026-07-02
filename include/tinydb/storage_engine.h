@@ -52,8 +52,7 @@ class StorageEngine {
   auto Remove(std::string_view key) -> void;
 
   // Returns rows with start <= key < end, in key order.
-  auto Scan(std::string_view start, std::string_view end)
-      -> std::vector<std::pair<std::string, std::string>>;
+  auto Scan(std::string_view start, std::string_view end) -> std::vector<std::pair<std::string, std::string>>;
 
   // Flushes everything to disk and releases resources owned by this handle.
   // Safe to call more than once.

@@ -35,8 +35,7 @@ class StorageEngineTest : public ::testing::Test {
  protected:
   void SetUp() override {
     const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
-    const auto stem = "tinydb_engine_" + std::string(info->name()) + "_" +
-                      std::to_string(::getpid());
+    const auto stem = "tinydb_engine_" + std::string(info->name()) + "_" + std::to_string(::getpid());
     db_path_ = std::filesystem::temp_directory_path() / (stem + ".db");
     second_db_path_ = std::filesystem::temp_directory_path() / (stem + "_b.db");
     std::filesystem::remove(db_path_);
@@ -165,14 +164,12 @@ TEST_F(StorageEngineTest, ReopenedDatabaseAcceptsMutations) {
   {
     auto engine = tinydb::StorageEngine::Open(db_path_);
     engine.Remove(RowKey(5));
-    ASSERT_EQ(engine.Put(RowKey(100), RowValue(100, 30)),
-              tinydb::PutStatus::Ok);
+    ASSERT_EQ(engine.Put(RowKey(100), RowValue(100, 30)), tinydb::PutStatus::Ok);
   }
 
   auto engine = tinydb::StorageEngine::Open(db_path_);
   EXPECT_EQ(engine.Get(RowKey(5)), std::nullopt);
-  EXPECT_EQ(engine.Get(RowKey(100)),
-            std::optional<std::string>{RowValue(100, 30)});
+  EXPECT_EQ(engine.Get(RowKey(100)), std::optional<std::string>{RowValue(100, 30)});
   EXPECT_EQ(engine.Scan("", SCAN_END).size(), 20);  // 20 - 1 + 1
 }
 
@@ -244,8 +241,7 @@ TEST_F(StorageEngineTest, OpenRejectsForeignFiles) {
     file << "this is not a tinydb database, just some text\n";
   }
 
-  EXPECT_THROW(static_cast<void>(tinydb::StorageEngine::Open(db_path_)),
-               std::runtime_error);
+  EXPECT_THROW(static_cast<void>(tinydb::StorageEngine::Open(db_path_)), std::runtime_error);
 }
 
 }  // namespace

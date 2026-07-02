@@ -71,7 +71,11 @@ add_library(
   include/tinydb/page_ref.h
   include/tinydb/storage_engine.h
   src/btree/b_plus_tree.cpp
-  src/btree/node.h
+  src/btree/internal_node.cpp
+  src/btree/internal_node.h
+  src/btree/leaf_node.cpp
+  src/btree/leaf_node.h
+  src/btree/page_format.h
   src/buffer/buffer_pool.cpp
   src/engine/storage_engine.cpp
   src/storage/disk_manager.cpp)
@@ -120,6 +124,10 @@ if(BUILD_TESTING)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/b_plus_tree_test.cpp")
     add_executable(TinyDB_b_plus_tree_test tests/b_plus_tree_test.cpp)
     target_link_libraries(TinyDB_b_plus_tree_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    # White-box tests: the suite inspects on-disk page headers, which live in
+    # the library's private page_format.h.
+    target_include_directories(TinyDB_b_plus_tree_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_b_plus_tree_test)
     gtest_discover_tests(TinyDB_b_plus_tree_test)
   endif()

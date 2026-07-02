@@ -48,8 +48,7 @@ DiskManager::DiskManager(const std::filesystem::path &path) {
   }
 }
 
-DiskManager::DiskManager(DiskManager &&other) noexcept
-    : fd_(std::exchange(other.fd_, -1)), header_(other.header_) {}
+DiskManager::DiskManager(DiskManager &&other) noexcept : fd_(std::exchange(other.fd_, -1)), header_(other.header_) {}
 
 auto DiskManager::operator=(DiskManager &&other) noexcept -> DiskManager & {
   if (this != &other) {
@@ -85,9 +84,7 @@ auto DiskManager::AllocatePage() -> page_id_t {
   return page_id;
 }
 
-auto DiskManager::GetRootPageId() const -> page_id_t {
-  return header_.root_page_id;
-}
+auto DiskManager::GetRootPageId() const -> page_id_t { return header_.root_page_id; }
 
 void DiskManager::SetRootPageId(page_id_t root_page_id) {
   header_.root_page_id = root_page_id;

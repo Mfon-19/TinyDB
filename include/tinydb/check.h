@@ -5,10 +5,8 @@
 
 namespace tinydb {
 
-[[noreturn]] inline void PanicAt(const char *file, int line,
-                                 const char *message) {
-  std::fprintf(stderr, "tinydb: invariant violated at %s:%d: %s\n", file, line,
-               message);
+[[noreturn]] inline void PanicAt(const char *file, int line, const char *message) {
+  std::fprintf(stderr, "tinydb: invariant violated at %s:%d: %s\n", file, line, message);
   std::abort();
 }
 
