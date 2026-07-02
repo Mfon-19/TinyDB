@@ -8,6 +8,7 @@ project(
 option(SANITIZE "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(TINYDB_ENABLE_CLANG_TIDY "Run clang-tidy while compiling local targets" OFF)
 option(TINYDB_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(TINYDB_BUILD_BENCHMARKS "Build the workload benchmarks in bench/" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -138,4 +139,29 @@ if(BUILD_TESTING)
     TinyDB_apply_local_tooling(TinyDB_storage_engine_test)
     gtest_discover_tests(TinyDB_storage_engine_test)
   endif()
+endif()
+
+if(TINYDB_BUILD_BENCHMARKS)
+  # SYSTEM keeps the library's headers out of our warning set; the benchmarks
+  # themselves still build with the project's -Werror flags.
+  FetchContent_Declare(
+    googlebenchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG v1.9.1
+    GIT_SHALLOW TRUE
+    SYSTEM)
+  set(BENCHMARK_ENABLE_TESTING
+      OFF
+      CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_GTEST_TESTS
+      OFF
+      CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_WERROR
+      OFF
+      CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(googlebenchmark)
+
+  add_executable(TinyDB_workloads_bench bench/workloads_bench.cpp)
+  target_link_libraries(TinyDB_workloads_bench PRIVATE TinyDB::TinyDB benchmark::benchmark_main)
+  TinyDB_apply_local_tooling(TinyDB_workloads_bench)
 endif()
