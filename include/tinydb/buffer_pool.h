@@ -33,6 +33,11 @@ class BufferPool {
   auto NewPage(page_id_t *page_id) -> char *;
   auto FetchPage(page_id_t page_id) -> char *;
   void UnpinPage(page_id_t page_id, bool dirty);
+
+  // Drops page_id from the pool (it must be unpinned; its cached bytes are
+  // dead, so they are discarded rather than flushed) and puts it on the disk
+  // manager's free list for reuse.
+  void FreePage(page_id_t page_id);
   void FlushPage(page_id_t page_id);
   void FlushAllPages();
 

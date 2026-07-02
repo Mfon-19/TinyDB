@@ -87,6 +87,8 @@
 
 namespace tinydb {
 
+// Value 3 is taken: FREE_PAGE_TYPE in file_header.h marks a page on the
+// free list, which is never a tree node.
 enum class NodeType : std::uint16_t {
   Leaf = 1,
   Internal = 2,

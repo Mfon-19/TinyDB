@@ -42,6 +42,67 @@ TEST(DiskManagerTest, ReopenPage) {
   std::filesystem::remove(path);
 }
 
+TEST(DiskManagerTest, FreedPagesAreReusedNewestFirst) {
+  const auto path = TestPath("free_reuse");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    const auto first = disk.AllocatePage();
+    static_cast<void>(disk.AllocatePage());
+    const auto third = disk.AllocatePage();
+    const auto size_before = std::filesystem::file_size(path);
+
+    disk.FreePage(first);
+    disk.FreePage(third);
+
+    // LIFO: the most recently freed page comes back first, without growth.
+    EXPECT_EQ(disk.AllocatePage(), third);
+    EXPECT_EQ(disk.AllocatePage(), first);
+    EXPECT_EQ(std::filesystem::file_size(path), size_before);
+
+    // With the free list drained, the file grows again.
+    EXPECT_EQ(disk.AllocatePage(), third + 1);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(DiskManagerTest, FreeListSurvivesReopen) {
+  const auto path = TestPath("free_reopen");
+  std::filesystem::remove(path);
+
+  tinydb::page_id_t freed = 0;
+  {
+    tinydb::DiskManager disk(path);
+    freed = disk.AllocatePage();
+    static_cast<void>(disk.AllocatePage());
+    disk.FreePage(freed);
+  }
+
+  {
+    tinydb::DiskManager disk(path);
+    EXPECT_EQ(disk.AllocatePage(), freed);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(DiskManagerDeathTest, DoubleFreeDies) {
+  const auto path = TestPath("double_free");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    const auto page_id = disk.AllocatePage();
+    disk.FreePage(page_id);
+
+    EXPECT_DEATH(disk.FreePage(page_id), "double free");
+  }
+
+  std::filesystem::remove(path);
+}
+
 TEST(DiskManagerTest, RejectsTruncatedFile) {
   const auto path = TestPath("truncated");
   std::filesystem::remove(path);

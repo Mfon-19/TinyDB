@@ -202,6 +202,28 @@ TEST_F(StorageEngineTest, LargeWorkloadSurvivesReopen) {
   }
 }
 
+TEST_F(StorageEngineTest, ChurnDoesNotGrowTheFile) {
+  const auto churn = [this] {
+    auto engine = tinydb::StorageEngine::Open(db_path_);
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_EQ(engine.Put(RowKey(i), RowValue(i, 120)), tinydb::PutStatus::Ok);
+    }
+    for (int i = 0; i < 200; ++i) {
+      engine.Remove(RowKey(i));
+    }
+    engine.Close();
+  };
+
+  // The first cycle sizes the file; merges and root collapses free the
+  // emptied pages, so every later identical cycle runs on reused pages.
+  churn();
+  const auto stable_size = std::filesystem::file_size(db_path_);
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    churn();
+    EXPECT_EQ(std::filesystem::file_size(db_path_), stable_size);
+  }
+}
+
 TEST_F(StorageEngineTest, MoveTransfersOwnership) {
   auto first = tinydb::StorageEngine::Open(db_path_);
   ASSERT_EQ(first.Put("moved", "data"), tinydb::PutStatus::Ok);

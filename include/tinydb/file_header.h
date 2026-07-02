@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tinydb/page.h>
+
 #include <cstdint>
 
 namespace tinydb {
@@ -18,5 +19,20 @@ struct FileHeader {
 
   // The next page id to allocate. New database files start at page 1.
   page_id_t next_page_id;
+
+  // Head of the free-page list, threaded through the free pages themselves
+  // (each stores a FreePageHeader). HEADER_PAGE_ID means the list is empty.
+  page_id_t free_list_head;
+};
+
+// Marks a page on the free list. The value is distinct from the B+ tree node
+// types (see src/btree/page_format.h), so any dangling reference into a
+// freed page aborts loudly the moment a node codec tries to load it.
+constexpr std::uint16_t FREE_PAGE_TYPE = 3;
+
+// The first bytes of a page on the free list; the rest of the page is dead.
+struct FreePageHeader {
+  std::uint16_t type;   // always FREE_PAGE_TYPE
+  page_id_t next_free;  // HEADER_PAGE_ID terminates the list
 };
 }  // namespace tinydb

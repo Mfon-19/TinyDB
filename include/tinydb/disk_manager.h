@@ -1,7 +1,9 @@
 #pragma once
 
 #include <tinydb/file_header.h>
+
 #include <filesystem>
+#include <unordered_set>
 
 namespace tinydb {
 
@@ -21,8 +23,15 @@ class DiskManager {
   auto operator=(DiskManager &&) noexcept -> DiskManager &;
   ~DiskManager();
 
-  // Returns a fresh data page id. Freed-page reuse is deferred.
+  // Returns a data page id: the most recently freed page if any, otherwise
+  // a fresh page grown at the end of the file. The page's on-disk bytes are
+  // unspecified; the caller writes it before reading it.
   auto AllocatePage() -> page_id_t;
+
+  // Puts page_id on the free list for AllocatePage to reuse. The caller
+  // must own the page and drop every reference to it first. Freeing a page
+  // twice is a bug and aborts.
+  void FreePage(page_id_t page_id);
 
   // The B+ tree root page id persisted in the file header. HEADER_PAGE_ID
   // means the database has no root yet (freshly created file).
@@ -48,5 +57,9 @@ class DiskManager {
   // fd_ == -1 means this object does not own an open file descriptor.
   int fd_{-1};
   FileHeader header_;
+
+  // In-memory mirror of the on-disk free list, rebuilt on open. Exists to
+  // catch double frees immediately and corrupt (cyclic) lists at open.
+  std::unordered_set<page_id_t> free_pages_;
 };
 }  // namespace tinydb

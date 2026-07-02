@@ -86,6 +86,21 @@ void BufferPool::UnpinPage(page_id_t page_id, bool dirty) {
   frame.dirty = frame.dirty || dirty;
 }
 
+void BufferPool::FreePage(page_id_t page_id) {
+  const auto page_it = page_table_.find(page_id);
+  if (page_it != page_table_.end()) {
+    auto &frame = frames_[page_it->second];
+    TINYDB_CHECK(frame.pin_count == 0, "freeing a pinned page");
+
+    frame.page_id = HEADER_PAGE_ID;
+    frame.dirty = false;
+    free_list_.push_back(page_it->second);
+    page_table_.erase(page_it);
+  }
+
+  disk_manager_->FreePage(page_id);
+}
+
 void BufferPool::FlushPage(page_id_t page_id) {
   const auto page_it = page_table_.find(page_id);
   if (page_it == page_table_.end()) {

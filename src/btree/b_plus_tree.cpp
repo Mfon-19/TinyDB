@@ -40,8 +40,10 @@
     pages and rewrites the root as an internal node; a root collapse copies
     the last child over the root page.
 
-  - Orphaned pages (after merges and collapses) leak until free-page reuse
-    exists in the disk manager. Scan's end bound is exclusive.
+  - Pages orphaned by merges and root collapses are handed back to the
+    buffer pool (BufferPool::FreePage), which drops any cached copy and puts
+    them on the disk manager's free list for reuse. Scan's end bound is
+    exclusive.
 */
 
 namespace tinydb {
@@ -142,39 +144,42 @@ auto RepairLeafChild(BufferPool *pool, page_id_t parent_id, const PathStep &chil
   const page_id_t left_id = parent.ChildAt(sep_index);
   const page_id_t right_id = parent.ChildAt(sep_index + 1);
 
-  PageRef left_page(pool, left_id);
-  PageRef right_page(pool, right_id);
-  auto combined = LeafNode::Load(left_page.Data());
-  combined.Absorb(LeafNode::Load(right_page.Data()));
+  {
+    PageRef left_page(pool, left_id);
+    PageRef right_page(pool, right_id);
+    auto combined = LeafNode::Load(left_page.Data());
+    combined.Absorb(LeafNode::Load(right_page.Data()));
 
-  if (combined.Fits()) {
-    // Merge into the left page; the right page is orphaned until free-page
-    // reuse exists.
+    if (!combined.Fits()) {
+      // Rebalance: redistribute evenly (this is exactly a split of the
+      // combined node) and promote the new separator into the parent.
+      auto split = combined.Split(right_id, /*tail_heavy=*/false);
+      parent.SetSeparatorKey(sep_index, std::move(split.separator));
+      if (!parent.Fits()) {
+        // The fatter separator does not fit in the parent. Skip the repair
+        // before touching anything: the child stays underfull but the tree
+        // stays correct.
+        return false;
+      }
+      combined.Store(left_page.Data());
+      left_page.MarkDirty();
+      split.right.Store(right_page.Data());
+      right_page.MarkDirty();
+      parent.Store(parent_page.Data());
+      parent_page.MarkDirty();
+      return false;
+    }
+
+    // Merge into the left page.
     combined.Store(left_page.Data());
     left_page.MarkDirty();
     parent.EraseSeparator(sep_index);
     parent.Store(parent_page.Data());
     parent_page.MarkDirty();
-    return true;
   }
 
-  // Rebalance: redistribute evenly (this is exactly a split of the combined
-  // node) and promote the new separator into the parent.
-  auto split = combined.Split(right_id, /*tail_heavy=*/false);
-  parent.SetSeparatorKey(sep_index, std::move(split.separator));
-  if (!parent.Fits()) {
-    // The fatter separator does not fit in the parent. Skip the repair
-    // before touching anything: the child stays underfull but the tree
-    // stays correct.
-    return false;
-  }
-  combined.Store(left_page.Data());
-  left_page.MarkDirty();
-  split.right.Store(right_page.Data());
-  right_page.MarkDirty();
-  parent.Store(parent_page.Data());
-  parent_page.MarkDirty();
-  return false;
+  pool->FreePage(right_id);  // the merged-away sibling, unpinned above
+  return true;
 }
 
 // The internal-node version of the repair above. The one difference: the
@@ -190,49 +195,58 @@ auto RepairInternalChild(BufferPool *pool, page_id_t parent_id, const PathStep &
   const page_id_t left_id = parent.ChildAt(sep_index);
   const page_id_t right_id = parent.ChildAt(sep_index + 1);
 
-  PageRef left_page(pool, left_id);
-  PageRef right_page(pool, right_id);
-  auto combined = InternalNode::Load(left_page.Data());
-  combined.Absorb(parent.SeparatorKeyAt(sep_index), InternalNode::Load(right_page.Data()));
+  {
+    PageRef left_page(pool, left_id);
+    PageRef right_page(pool, right_id);
+    auto combined = InternalNode::Load(left_page.Data());
+    combined.Absorb(parent.SeparatorKeyAt(sep_index), InternalNode::Load(right_page.Data()));
 
-  if (combined.Fits()) {
+    if (!combined.Fits()) {
+      auto split = combined.Split();
+      parent.SetSeparatorKey(sep_index, std::move(split.separator));
+      if (!parent.Fits()) {
+        return false;
+      }
+      combined.Store(left_page.Data());
+      left_page.MarkDirty();
+      split.right.Store(right_page.Data());
+      right_page.MarkDirty();
+      parent.Store(parent_page.Data());
+      parent_page.MarkDirty();
+      return false;
+    }
+
     combined.Store(left_page.Data());
     left_page.MarkDirty();
     parent.EraseSeparator(sep_index);
     parent.Store(parent_page.Data());
     parent_page.MarkDirty();
-    return true;
   }
 
-  auto split = combined.Split();
-  parent.SetSeparatorKey(sep_index, std::move(split.separator));
-  if (!parent.Fits()) {
-    return false;
-  }
-  combined.Store(left_page.Data());
-  left_page.MarkDirty();
-  split.right.Store(right_page.Data());
-  right_page.MarkDirty();
-  parent.Store(parent_page.Data());
-  parent_page.MarkDirty();
-  return false;
+  pool->FreePage(right_id);  // the merged-away sibling, unpinned above
+  return true;
 }
 
 // While the root is an internal node with no separators, its single child is
 // the whole tree: copy the child over the root page (stable root page id).
 void CollapseRoot(BufferPool *pool, page_id_t root_page_id) {
   for (;;) {
-    PageRef root_page(pool, root_page_id);
-    if (ReadAs<NodeHeader>(root_page.Data()).type != NodeType::Internal) {
-      return;
+    page_id_t child_id = HEADER_PAGE_ID;
+    {
+      PageRef root_page(pool, root_page_id);
+      if (ReadAs<NodeHeader>(root_page.Data()).type != NodeType::Internal) {
+        return;
+      }
+      const auto root = InternalNode::Load(root_page.Data());
+      if (root.SeparatorCount() > 0) {
+        return;
+      }
+      child_id = root.FirstChild();
+      PageRef child_page(pool, child_id);
+      std::memcpy(root_page.Data(), child_page.Data(), PAGE_SIZE);
+      root_page.MarkDirty();
     }
-    const auto root = InternalNode::Load(root_page.Data());
-    if (root.SeparatorCount() > 0) {
-      return;
-    }
-    PageRef child_page(pool, root.FirstChild());
-    std::memcpy(root_page.Data(), child_page.Data(), PAGE_SIZE);
-    root_page.MarkDirty();
+    pool->FreePage(child_id);  // the swallowed child's page, unpinned above
   }
 }
 

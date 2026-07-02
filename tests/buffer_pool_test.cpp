@@ -64,6 +64,49 @@ TEST(BufferPoolTest, EvictDirtyPage) {
   std::filesystem::remove(path);
 }
 
+TEST(BufferPoolTest, FreedPageIsForgottenAndReused) {
+  const auto path = TestPath("free");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool pool(&disk, 2);
+
+    tinydb::page_id_t page_id = 0;
+    char *data = pool.NewPage(&page_id);
+    data[0] = 'x';
+    pool.UnpinPage(page_id, true);
+    pool.FreePage(page_id);  // must discard the dirty bytes with the page
+
+    tinydb::page_id_t reused_id = 0;
+    char *reused = pool.NewPage(&reused_id);
+    EXPECT_EQ(reused_id, page_id);  // the freed page comes back
+    EXPECT_EQ(reused[0], '\0');     // zeroed, not the stale 'x'
+    pool.UnpinPage(reused_id, false);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BufferPoolDeathTest, FreeOfPinnedPageDies) {
+  const auto path = TestPath("free_pinned");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool pool(&disk, 1);
+
+    tinydb::page_id_t page_id = 0;
+    pool.NewPage(&page_id);  // stays pinned
+
+    EXPECT_DEATH(pool.FreePage(page_id), "freeing a pinned page");
+
+    pool.UnpinPage(page_id, false);
+  }
+
+  std::filesystem::remove(path);
+}
+
 TEST(BufferPoolDeathTest, UnpinOfNonResidentPageDies) {
   const auto path = TestPath("unpin_missing");
   std::filesystem::remove(path);
