@@ -54,8 +54,10 @@ class StorageEngine {
   // Returns rows with start <= key < end, in key order.
   auto Scan(std::string_view start, std::string_view end) -> std::vector<std::pair<std::string, std::string>>;
 
-  // Flushes everything to disk and releases resources owned by this handle.
-  // Safe to call more than once.
+  // Flushes everything to the storage device (fsync) and releases resources
+  // owned by this handle. Safe to call more than once. Throws on I/O
+  // failure; the destructor calls this too but can only report errors to
+  // stderr, so call Close() directly when flush errors must be handled.
   auto Close() -> void;
 
  private:

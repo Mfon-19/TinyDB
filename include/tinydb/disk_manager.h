@@ -31,6 +31,10 @@ class DiskManager {
   // Records a new root page id in the file header and writes it out.
   void SetRootPageId(page_id_t root_page_id);
 
+  // Blocks until every write so far has reached the storage device, not just
+  // the OS page cache. This is the durability point for a clean close.
+  void Sync() const;
+
   // Reads exactly one page into data. Reading an unallocated page is an error.
   void ReadPage(page_id_t page_id, char *data) const;
 

@@ -64,6 +64,38 @@ TEST(BufferPoolTest, EvictDirtyPage) {
   std::filesystem::remove(path);
 }
 
+TEST(BufferPoolDeathTest, UnpinOfNonResidentPageDies) {
+  const auto path = TestPath("unpin_missing");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool pool(&disk, 1);
+
+    EXPECT_DEATH(pool.UnpinPage(tinydb::FIRST_DATA_PAGE_ID, false), "not in the pool");
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BufferPoolDeathTest, DoubleUnpinDies) {
+  const auto path = TestPath("double_unpin");
+  std::filesystem::remove(path);
+
+  {
+    tinydb::DiskManager disk(path);
+    tinydb::BufferPool pool(&disk, 1);
+
+    tinydb::page_id_t page_id = 0;
+    pool.NewPage(&page_id);
+    pool.UnpinPage(page_id, true);
+
+    EXPECT_DEATH(pool.UnpinPage(page_id, false), "unpinning an unpinned page");
+  }
+
+  std::filesystem::remove(path);
+}
+
 TEST(BufferPoolTest, KeepPinnedPage) {
   const auto path = TestPath("pinned");
   std::filesystem::remove(path);

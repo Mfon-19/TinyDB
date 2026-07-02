@@ -1,5 +1,7 @@
 #include <tinydb/storage_engine.h>
 
+#include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -39,7 +41,15 @@ StorageEngine::StorageEngine(StorageEngine &&other) noexcept
   other.closed_ = true;
 }
 
-StorageEngine::~StorageEngine() { Close(); }
+StorageEngine::~StorageEngine() {
+  try {
+    Close();
+  } catch (const std::exception &error) {
+    // A destructor must not throw. Callers who need to handle flush errors
+    // (disk full, I/O failure) should call Close() themselves.
+    std::fprintf(stderr, "tinydb: failed to close %s: %s\n", path_.c_str(), error.what());
+  }
+}
 
 auto StorageEngine::operator=(StorageEngine &&other) noexcept -> StorageEngine & {
   if (this != &other) {
@@ -97,7 +107,9 @@ auto StorageEngine::Close() -> void {
   }
   closed_ = true;
   tree_.reset();
-  pool_.reset();  // the pool flushes its dirty pages on destruction
+  pool_->FlushAllPages();
+  disk_->Sync();  // the durability point: writes reach the device, not just the page cache
+  pool_.reset();
   disk_.reset();
 }
 }  // namespace tinydb

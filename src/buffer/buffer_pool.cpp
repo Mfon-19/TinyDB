@@ -1,6 +1,6 @@
 #include <tinydb/buffer_pool.h>
+#include <tinydb/check.h>
 
-#include <cassert>
 #include <stdexcept>
 #include <utility>
 
@@ -76,8 +76,11 @@ auto BufferPool::FetchPage(page_id_t page_id) -> char * {
 }
 
 void BufferPool::UnpinPage(page_id_t page_id, bool dirty) {
-  auto &frame = frames_[page_table_.at(page_id)];
-  assert(frame.pin_count > 0 && "unpinning an unpinned page");
+  const auto page_it = page_table_.find(page_id);
+  TINYDB_CHECK(page_it != page_table_.end(), "unpinning a page that is not in the pool");
+
+  auto &frame = frames_[page_it->second];
+  TINYDB_CHECK(frame.pin_count > 0, "unpinning an unpinned page");
 
   --frame.pin_count;
   frame.dirty = frame.dirty || dirty;
