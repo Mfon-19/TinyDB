@@ -1,23 +1,20 @@
-// Tier 1 workload benchmarks. Every benchmark drives the public
-// StorageEngine API, so a measured "op" is a whole Put/Get/Remove/Scan: tree
-// descent, buffer-pool lookups, node encode/decode, and page I/O on pool
-// misses. TINYDB_CHECK stays enabled in release builds, so its cost is part
-// of every number here.
-//
 // Build and run:
 //   cmake -S . -B cmake-build-release -DCMAKE_BUILD_TYPE=Release -DTINYDB_BUILD_BENCHMARKS=ON
 //   cmake --build cmake-build-release --target TinyDB_workloads_bench
 //   ./cmake-build-release/TinyDB_workloads_bench
 //
-// Caveat on "cold": the databases here fit in RAM, so a buffer-pool miss is
-// served by the OS page cache (a pread plus a memcpy), not a disk seek.
-// These numbers isolate the engine's own costs; real cold-storage latency
-// needs dropped caches or a database much larger than memory.
+// The two "cold" levels: PointReadCold misses the buffer pool but the OS
+// page cache still absorbs the pread, so it isolates the engine's pool-miss
+// path. PointReadColdDisk additionally evicts the file from the page cache
+// (posix_fadvise) between read batches, so misses pay for real device I/O.
+// The database file must live on a disk-backed filesystem for that to mean
+// anything — on a tmpfs /tmp the "device" is RAM and eviction is a no-op.
 
 #include <benchmark/benchmark.h>
 #include <tinydb/check.h>
 #include <tinydb/storage_engine.h>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -40,6 +37,9 @@ constexpr const char *SCAN_END = "\x7f";
 // Fixed payload size. With 12-byte keys an entry costs ~120 bytes on a page,
 // so a fully packed leaf holds around 33 rows.
 constexpr std::size_t VALUE_BYTES = 100;
+
+// PointReadColdDisk evicts the OS page cache after this many reads.
+constexpr std::int64_t READS_PER_EVICTION = 100;
 
 auto BenchPath(const std::string &name) -> std::filesystem::path {
   return std::filesystem::temp_directory_path() / ("tinydb_bench_" + name + "_" + std::to_string(::getpid()) + ".db");
@@ -136,6 +136,32 @@ auto PrebuiltDb(std::int64_t rows) -> const std::filesystem::path & {
   return databases.try_emplace(rows, rows).first->second.Path();
 }
 
+// Evicts a file's pages from the OS page cache so the next reads hit the
+// storage device. The page cache is per-inode, not per-descriptor, so
+// advising through this separate read-only descriptor also evicts what the
+// engine's own descriptor would otherwise find cached. Only clean pages are
+// dropped, which is fine here: the prebuilt databases are closed and synced.
+class PageCacheEvictor {
+ public:
+  explicit PageCacheEvictor(const std::filesystem::path &path) : fd_(::open(path.c_str(), O_RDONLY)) {
+    TINYDB_CHECK(fd_ >= 0, "opening the database for cache eviction failed");
+  }
+
+  PageCacheEvictor(const PageCacheEvictor &) = delete;
+  auto operator=(const PageCacheEvictor &) -> PageCacheEvictor & = delete;
+  PageCacheEvictor(PageCacheEvictor &&) = delete;
+  auto operator=(PageCacheEvictor &&) -> PageCacheEvictor & = delete;
+
+  ~PageCacheEvictor() { ::close(fd_); }
+
+  auto Evict() const -> void {
+    TINYDB_CHECK(::posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED) == 0, "posix_fadvise failed");
+  }
+
+ private:
+  int fd_;
+};
+
 // Shared body of the two insert benchmarks: each iteration bulk-loads a
 // fresh database, timing only the Puts. Open and the closing flush + fsync
 // stay outside the clock; per-operation durability is the WAL's job later.
@@ -214,6 +240,32 @@ void PointReadCold(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(PointReadCold)->Arg(100'000);
+
+void PointReadColdDisk(benchmark::State &state) {
+  // Like PointReadCold, but the OS page cache is evicted between read
+  // batches, so a buffer-pool miss costs a real device read. The batch is
+  // small relative to the ~3,000 leaves (a read within a batch revisits an
+  // already-warmed leaf ~2% of the time), and eviction runs off the clock.
+  const auto keys = ShuffledKeys(state.range(0));
+  const auto &path = PrebuiltDb(state.range(0));
+  auto engine = tinydb::StorageEngine::Open(path);
+  const auto evictor = PageCacheEvictor{path};
+
+  std::size_t next = 0;
+  while (state.KeepRunningBatch(READS_PER_EVICTION)) {
+    state.PauseTiming();
+    evictor.Evict();
+    state.ResumeTiming();
+
+    for (std::int64_t i = 0; i < READS_PER_EVICTION; ++i) {
+      auto value = engine.Get(keys[next]);
+      benchmark::DoNotOptimize(value);
+      next = (next + 1) % keys.size();
+    }
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(PointReadColdDisk)->Arg(100'000)->Unit(benchmark::kMicrosecond);
 
 void RangeScan(benchmark::State &state) {
   // Full-table scan following the leaf sibling chain. Bytes/sec counts the
