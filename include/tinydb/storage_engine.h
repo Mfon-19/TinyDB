@@ -32,8 +32,8 @@ class StorageEngine {
   StorageEngine(const StorageEngine &) = delete;
   auto operator=(const StorageEngine &) -> StorageEngine & = delete;
 
-  StorageEngine(StorageEngine &&) noexcept;
-  auto operator=(StorageEngine &&) noexcept -> StorageEngine &;
+  StorageEngine(StorageEngine &&other) noexcept;
+  auto operator=(StorageEngine &&other) noexcept -> StorageEngine &;
   ~StorageEngine();
 
   // Opens or creates the database at path. Throws on I/O failure or if the

@@ -18,6 +18,13 @@ struct Frame {
   bool dirty{false};
 };
 
+// What NewPage hands back: the id of the freshly allocated page and its
+// zeroed in-pool bytes, already pinned.
+struct NewPageResult {
+  page_id_t page_id;
+  char *data;
+};
+
 // BufferPool caches a fixed number of database pages in memory.
 class BufferPool {
  public:
@@ -30,7 +37,7 @@ class BufferPool {
   auto operator=(BufferPool &&other) noexcept -> BufferPool &;
   ~BufferPool();
 
-  auto NewPage(page_id_t *page_id) -> char *;
+  auto NewPage() -> NewPageResult;
   auto FetchPage(page_id_t page_id) -> char *;
   void UnpinPage(page_id_t page_id, bool dirty);
 

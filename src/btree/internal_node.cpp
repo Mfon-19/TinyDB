@@ -46,6 +46,7 @@ auto InternalNode::Load(const char *page) -> InternalNode {
   node.first_child_ = header.first_child;
   node.records_.reserve(header.cell_count);
   const std::size_t slots_end = sizeof(InternalHeader) + header.cell_count * SLOT_SIZE;
+  TINYDB_CHECK(slots_end <= PAGE_SIZE, "slot array overruns page");
 
   for (std::size_t i = 0; i < header.cell_count; ++i) {
     const auto offset = static_cast<std::size_t>(ReadAs<slot_t>(page + sizeof(InternalHeader) + i * SLOT_SIZE));

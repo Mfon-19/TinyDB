@@ -50,7 +50,7 @@ void BufferPool::FlushBestEffort() noexcept {
   }
 }
 
-auto BufferPool::NewPage(page_id_t *page_id) -> char * {
+auto BufferPool::NewPage() -> NewPageResult {
   const auto frame_id = PickFrame();
   const auto new_page_id = disk_manager_->AllocatePage();
   auto &frame = frames_[frame_id];
@@ -60,9 +60,8 @@ auto BufferPool::NewPage(page_id_t *page_id) -> char * {
   frame.pin_count = 1;
   frame.dirty = true;
   page_table_[new_page_id] = frame_id;
-  *page_id = new_page_id;
 
-  return frame.data.data();
+  return {.page_id = new_page_id, .data = frame.data.data()};
 }
 
 auto BufferPool::FetchPage(page_id_t page_id) -> char * {

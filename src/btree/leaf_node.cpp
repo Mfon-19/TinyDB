@@ -42,6 +42,7 @@ auto LeafNode::Load(const char *page) -> LeafNode {
   node.next_leaf_ = header.next_leaf;
   node.records_.reserve(header.cell_count);
   const std::size_t slots_end = sizeof(LeafHeader) + header.cell_count * SLOT_SIZE;
+  TINYDB_CHECK(slots_end <= PAGE_SIZE, "slot array overruns page");
 
   for (std::size_t i = 0; i < header.cell_count; ++i) {
     const auto offset = static_cast<std::size_t>(ReadAs<slot_t>(page + sizeof(LeafHeader) + i * SLOT_SIZE));

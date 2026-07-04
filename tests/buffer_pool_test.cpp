@@ -20,8 +20,7 @@ TEST(BufferPoolTest, FlushNewPage) {
     tinydb::DiskManager disk(path);
     tinydb::BufferPool pool(&disk, 1);
 
-    tinydb::page_id_t page_id = 0;
-    char *data = pool.NewPage(&page_id);
+    const auto [page_id, data] = pool.NewPage();
     data[0] = 'b';
     data[tinydb::PAGE_SIZE - 1] = 'p';
 
@@ -46,13 +45,11 @@ TEST(BufferPoolTest, EvictDirtyPage) {
     tinydb::DiskManager disk(path);
     tinydb::BufferPool pool(&disk, 1);
 
-    tinydb::page_id_t first_page_id = 0;
-    char *first_page = pool.NewPage(&first_page_id);
+    const auto [first_page_id, first_page] = pool.NewPage();
     first_page[0] = 'a';
     pool.UnpinPage(first_page_id, true);
 
-    tinydb::page_id_t second_page_id = 0;
-    char *second_page = pool.NewPage(&second_page_id);
+    const auto [second_page_id, second_page] = pool.NewPage();
     second_page[0] = 'z';
     pool.UnpinPage(second_page_id, true);
 
@@ -72,14 +69,12 @@ TEST(BufferPoolTest, FreedPageIsForgottenAndReused) {
     tinydb::DiskManager disk(path);
     tinydb::BufferPool pool(&disk, 2);
 
-    tinydb::page_id_t page_id = 0;
-    char *data = pool.NewPage(&page_id);
+    const auto [page_id, data] = pool.NewPage();
     data[0] = 'x';
     pool.UnpinPage(page_id, true);
     pool.FreePage(page_id);  // must discard the dirty bytes with the page
 
-    tinydb::page_id_t reused_id = 0;
-    char *reused = pool.NewPage(&reused_id);
+    const auto [reused_id, reused] = pool.NewPage();
     EXPECT_EQ(reused_id, page_id);  // the freed page comes back
     EXPECT_EQ(reused[0], '\0');     // zeroed, not the stale 'x'
     pool.UnpinPage(reused_id, false);
@@ -96,8 +91,7 @@ TEST(BufferPoolDeathTest, FreeOfPinnedPageDies) {
     tinydb::DiskManager disk(path);
     tinydb::BufferPool pool(&disk, 1);
 
-    tinydb::page_id_t page_id = 0;
-    pool.NewPage(&page_id);  // stays pinned
+    const auto page_id = pool.NewPage().page_id;  // stays pinned
 
     EXPECT_DEATH(pool.FreePage(page_id), "freeing a pinned page");
 
@@ -129,8 +123,7 @@ TEST(BufferPoolDeathTest, DoubleUnpinDies) {
     tinydb::DiskManager disk(path);
     tinydb::BufferPool pool(&disk, 1);
 
-    tinydb::page_id_t page_id = 0;
-    pool.NewPage(&page_id);
+    const auto page_id = pool.NewPage().page_id;
     pool.UnpinPage(page_id, true);
 
     EXPECT_DEATH(pool.UnpinPage(page_id, false), "unpinning an unpinned page");
@@ -147,11 +140,9 @@ TEST(BufferPoolTest, KeepPinnedPage) {
     tinydb::DiskManager disk(path);
     tinydb::BufferPool pool(&disk, 1);
 
-    tinydb::page_id_t page_id = 0;
-    pool.NewPage(&page_id);
+    const auto page_id = pool.NewPage().page_id;
 
-    tinydb::page_id_t blocked_page_id = 0;
-    EXPECT_THROW(pool.NewPage(&blocked_page_id), std::runtime_error);
+    EXPECT_THROW(pool.NewPage(), std::runtime_error);
 
     pool.UnpinPage(page_id, false);
   }

@@ -24,7 +24,7 @@ StorageEngine::StorageEngine(std::filesystem::path path)
   // id in the file header, and let the tree bootstrap it as an empty leaf.
   auto root_page_id = disk_->GetRootPageId();
   if (root_page_id == HEADER_PAGE_ID) {
-    pool_->NewPage(&root_page_id);
+    root_page_id = pool_->NewPage().page_id;
     pool_->UnpinPage(root_page_id, true);
     disk_->SetRootPageId(root_page_id);
   }

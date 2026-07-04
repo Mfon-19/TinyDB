@@ -35,4 +35,9 @@ struct FreePageHeader {
   std::uint16_t type;   // always FREE_PAGE_TYPE
   page_id_t next_free;  // HEADER_PAGE_ID terminates the list
 };
+
+// These structs are on-disk formats: a size change (new member, reordered
+// members, different padding) is a file-format change and must be deliberate.
+static_assert(sizeof(FileHeader) == 32);
+static_assert(sizeof(FreePageHeader) == 16);
 }  // namespace tinydb

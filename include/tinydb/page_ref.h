@@ -13,9 +13,8 @@ class PageRef {
 
   // Allocates a fresh (zeroed) page and returns it pinned.
   static auto New(BufferPool *pool) -> PageRef {
-    page_id_t page_id = HEADER_PAGE_ID;
-    char *data = pool->NewPage(&page_id);
-    return {pool, page_id, data};
+    const auto page = pool->NewPage();
+    return {pool, page.page_id, page.data};
   }
 
   PageRef(const PageRef &) = delete;

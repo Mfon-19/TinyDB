@@ -127,6 +127,13 @@ struct InternalCellHeader {
   std::uint16_t key_size;
 };
 
+// These structs are on-disk formats: a size change (new member, reordered
+// members, different padding) is a file-format change and must be deliberate.
+static_assert(sizeof(LeafHeader) == 16);
+static_assert(sizeof(InternalHeader) == 16);
+static_assert(sizeof(LeafCellHeader) == 6);
+static_assert(sizeof(InternalCellHeader) == 16);
+
 // Type-safe memcpy in and out of page bytes: page data is never accessed
 // through pointer casts, so alignment never matters.
 template <typename T>

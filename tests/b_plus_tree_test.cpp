@@ -51,7 +51,7 @@ class BPlusTreeTest : public ::testing::Test {
 
     disk_.emplace(db_path_);
     pool_.emplace(&*disk_, FRAME_COUNT);
-    pool_->NewPage(&root_page_id_);  // left zeroed; the tree bootstraps it
+    root_page_id_ = pool_->NewPage().page_id;  // left zeroed; the tree bootstraps it
     pool_->UnpinPage(root_page_id_, true);
     tree_.emplace(&*pool_, root_page_id_);
   }
@@ -439,8 +439,7 @@ TEST_F(BPlusTreeTest, SurvivesReopen) {
 // dropped on the next rewrite. Built by hand since the tree never writes
 // them itself.
 TEST_F(BPlusTreeTest, TombstoneCellsStayDead) {
-  tinydb::page_id_t page_id = 0;
-  char *page = pool_->NewPage(&page_id);
+  const auto [page_id, page] = pool_->NewPage();
 
   auto *header = reinterpret_cast<tinydb::LeafHeader *>(page);
   *header = tinydb::LeafHeader{
