@@ -12,7 +12,6 @@
 #include <filesystem>
 #include <stdexcept>
 #include <system_error>
-#include <utility>
 
 namespace tinydb {
 static constexpr std::uint32_t FILE_MAGIC = 0x54444231U;
@@ -31,95 +30,67 @@ static auto ReadFreePageHeader(int fd, page_id_t page_id) -> FreePageHeader {
   return header;
 }
 
-DiskManager::DiskManager(const std::filesystem::path &path) {
-  fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-  if (fd_ < 0) {
+// If anything after the open throws (unreadable file, bad magic, corrupt
+// free list), ~UniqueFd closes the descriptor: members are destroyed even
+// though the half-built DiskManager's own destructor never runs.
+DiskManager::DiskManager(const std::filesystem::path &path)
+    : fd_(::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644)) {
+  if (!fd_.Valid()) {
     throw std::system_error(errno, std::generic_category(), "open");
   }
 
-  // The destructor never runs for a partially constructed object, so if
-  // anything below throws (unreadable file, bad magic, corrupt free list)
-  // the descriptor must be closed by hand or it leaks.
-  try {
-    struct stat stat_buffer {};
-    if (::fstat(fd_, &stat_buffer) < 0) {
-      throw std::system_error(errno, std::generic_category(), "fstat");
-    }
-
-    if (stat_buffer.st_size == 0) {
-      header_ = FileHeader{
-          .magic = FILE_MAGIC,
-          .page_size = PAGE_SIZE,
-          .root_page_id = HEADER_PAGE_ID,
-          .next_page_id = FIRST_DATA_PAGE_ID,
-          .free_list_head = HEADER_PAGE_ID,
-      };
-
-      WriteHeader();
-      return;
-    }
-
-    const auto bytes_read = ::pread(fd_, &header_, sizeof(header_), 0);
-    if (bytes_read < 0) {
-      throw std::system_error(errno, std::generic_category(), "pread");
-    }
-
-    // A file too short to hold a header cannot be a database either.
-    if (static_cast<std::size_t>(bytes_read) != sizeof(header_) || header_.magic != FILE_MAGIC ||
-        header_.page_size != PAGE_SIZE) {
-      throw std::runtime_error("not a TinyDB database file: " + path.string());
-    }
-
-    // Rebuild the in-memory free-page set. Walking the list here also proves
-    // it is acyclic and points only at allocated pages marked free.
-    auto free_page_id = header_.free_list_head;
-    while (free_page_id != HEADER_PAGE_ID) {
-      if (free_page_id >= header_.next_page_id || free_pages_.contains(free_page_id)) {
-        throw std::runtime_error("corrupt free list in " + path.string());
-      }
-      const auto free_header = ReadFreePageHeader(fd_, free_page_id);
-      if (free_header.type != FREE_PAGE_TYPE) {
-        throw std::runtime_error("corrupt free list in " + path.string());
-      }
-      free_pages_.insert(free_page_id);
-      free_page_id = free_header.next_free;
-    }
-  } catch (...) {
-    static_cast<void>(::close(fd_));
-    throw;
-  }
-}
-
-DiskManager::DiskManager(DiskManager &&other) noexcept
-    : fd_(std::exchange(other.fd_, -1)), header_(other.header_), free_pages_(std::move(other.free_pages_)) {}
-
-auto DiskManager::operator=(DiskManager &&other) noexcept -> DiskManager & {
-  if (this != &other) {
-    if (fd_ >= 0) {
-      static_cast<void>(::close(fd_));
-    }
-
-    fd_ = std::exchange(other.fd_, -1);
-    header_ = other.header_;
-    free_pages_ = std::move(other.free_pages_);
+  struct stat stat_buffer {};
+  if (::fstat(fd_.Get(), &stat_buffer) < 0) {
+    throw std::system_error(errno, std::generic_category(), "fstat");
   }
 
-  return *this;
-}
+  if (stat_buffer.st_size == 0) {
+    header_ = FileHeader{
+        .magic = FILE_MAGIC,
+        .page_size = PAGE_SIZE,
+        .root_page_id = HEADER_PAGE_ID,
+        .next_page_id = FIRST_DATA_PAGE_ID,
+        .free_list_head = HEADER_PAGE_ID,
+    };
 
-DiskManager::~DiskManager() {
-  if (fd_ >= 0) {
-    static_cast<void>(::close(fd_));
+    WriteHeader();
+    return;
+  }
+
+  const auto bytes_read = ::pread(fd_.Get(), &header_, sizeof(header_), 0);
+  if (bytes_read < 0) {
+    throw std::system_error(errno, std::generic_category(), "pread");
+  }
+
+  // A file too short to hold a header cannot be a database either.
+  if (static_cast<std::size_t>(bytes_read) != sizeof(header_) || header_.magic != FILE_MAGIC ||
+      header_.page_size != PAGE_SIZE) {
+    throw std::runtime_error("not a TinyDB database file: " + path.string());
+  }
+
+  // Rebuild the in-memory free-page set. Walking the list here also proves
+  // it is acyclic and points only at allocated pages marked free.
+  auto free_page_id = header_.free_list_head;
+  while (free_page_id != HEADER_PAGE_ID) {
+    if (free_page_id >= header_.next_page_id || free_pages_.contains(free_page_id)) {
+      throw std::runtime_error("corrupt free list in " + path.string());
+    }
+    const auto free_header = ReadFreePageHeader(fd_.Get(), free_page_id);
+    if (free_header.type != FREE_PAGE_TYPE) {
+      throw std::runtime_error("corrupt free list in " + path.string());
+    }
+    free_pages_.insert(free_page_id);
+    free_page_id = free_header.next_free;
   }
 }
 
 auto DiskManager::AllocatePage() -> page_id_t {
-  TINYDB_CHECK(fd_ >= 0, "allocating a page on a closed disk manager");
+  TINYDB_CHECK(fd_.Valid(), "allocating a page on a closed disk manager");
 
   // Pop the most recently freed page when one is available.
   if (header_.free_list_head != HEADER_PAGE_ID) {
     const auto page_id = header_.free_list_head;
-    const auto free_header = ReadFreePageHeader(fd_, page_id);
+    const auto free_header = ReadFreePageHeader(fd_.Get(), page_id);
     TINYDB_CHECK(free_header.type == FREE_PAGE_TYPE, "free list head is not a free page");
 
     header_.free_list_head = free_header.next_free;
@@ -132,7 +103,7 @@ auto DiskManager::AllocatePage() -> page_id_t {
   const auto page_id = header_.next_page_id;
   const auto new_size = static_cast<off_t>((page_id + 1) * PAGE_SIZE);
 
-  if (::ftruncate(fd_, new_size) < 0) {
+  if (::ftruncate(fd_.Get(), new_size) < 0) {
     throw std::system_error(errno, std::generic_category(), "ftruncate");
   }
 
@@ -143,7 +114,7 @@ auto DiskManager::AllocatePage() -> page_id_t {
 }
 
 void DiskManager::FreePage(page_id_t page_id) {
-  TINYDB_CHECK(fd_ >= 0, "freeing a page on a closed disk manager");
+  TINYDB_CHECK(fd_.Valid(), "freeing a page on a closed disk manager");
   const bool allocated = page_id != HEADER_PAGE_ID && page_id < header_.next_page_id;
   TINYDB_CHECK(allocated, "freeing a page that was never allocated");
   TINYDB_CHECK(!free_pages_.contains(page_id), "double free of a page");
@@ -153,7 +124,7 @@ void DiskManager::FreePage(page_id_t page_id) {
       .next_free = header_.free_list_head,
   };
   const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  const auto bytes_written = ::pwrite(fd_, &free_header, sizeof(free_header), offset);
+  const auto bytes_written = ::pwrite(fd_.Get(), &free_header, sizeof(free_header), offset);
   if (bytes_written < 0) {
     throw std::system_error(errno, std::generic_category(), "pwrite");
   }
@@ -174,20 +145,20 @@ void DiskManager::SetRootPageId(page_id_t root_page_id) {
 }
 
 void DiskManager::Sync() const {
-  TINYDB_CHECK(fd_ >= 0, "syncing a closed disk manager");
+  TINYDB_CHECK(fd_.Valid(), "syncing a closed disk manager");
 
-  if (::fsync(fd_) < 0) {
+  if (::fsync(fd_.Get()) < 0) {
     throw std::system_error(errno, std::generic_category(), "fsync");
   }
 }
 
 void DiskManager::WriteHeader() const {
-  TINYDB_CHECK(fd_ >= 0, "writing header to a closed disk manager");
+  TINYDB_CHECK(fd_.Valid(), "writing header to a closed disk manager");
 
   auto header_page = std::array<char, PAGE_SIZE>{};
   std::memcpy(header_page.data(), &header_, sizeof(header_));
 
-  const auto bytes_written = ::pwrite(fd_, header_page.data(), header_page.size(), 0);
+  const auto bytes_written = ::pwrite(fd_.Get(), header_page.data(), header_page.size(), 0);
   if (bytes_written < 0) {
     throw std::system_error(errno, std::generic_category(), "pwrite");
   }
@@ -197,7 +168,7 @@ void DiskManager::WriteHeader() const {
 }
 
 auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> void {
-  TINYDB_CHECK(fd_ >= 0, "reading from a closed disk manager");
+  TINYDB_CHECK(fd_.Valid(), "reading from a closed disk manager");
   TINYDB_CHECK(!free_pages_.contains(page_id), "reading a freed page");
 
   if (page_id >= header_.next_page_id) {
@@ -205,7 +176,7 @@ auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> void {
   }
 
   const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  const auto bytes_read = ::pread(fd_, data, PAGE_SIZE, offset);
+  const auto bytes_read = ::pread(fd_.Get(), data, PAGE_SIZE, offset);
   if (bytes_read < 0) {
     throw std::system_error(errno, std::generic_category(), "pread");
   }
@@ -215,7 +186,7 @@ auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> void {
 }
 
 auto DiskManager::WritePage(page_id_t page_id, const char *data) const -> void {
-  TINYDB_CHECK(fd_ >= 0, "writing to a closed disk manager");
+  TINYDB_CHECK(fd_.Valid(), "writing to a closed disk manager");
   TINYDB_CHECK(!free_pages_.contains(page_id), "writing to a freed page");
 
   if (page_id >= header_.next_page_id) {
@@ -223,7 +194,7 @@ auto DiskManager::WritePage(page_id_t page_id, const char *data) const -> void {
   }
 
   const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  const auto bytes_written = ::pwrite(fd_, data, PAGE_SIZE, offset);
+  const auto bytes_written = ::pwrite(fd_.Get(), data, PAGE_SIZE, offset);
   if (bytes_written < 0) {
     throw std::system_error(errno, std::generic_category(), "pwrite");
   }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tinydb/file_header.h>
+#include <tinydb/unique_fd.h>
 
 #include <filesystem>
 #include <unordered_set>
@@ -19,9 +20,11 @@ class DiskManager {
   DiskManager(const DiskManager &) = delete;
   auto operator=(const DiskManager &) -> DiskManager & = delete;
 
-  DiskManager(DiskManager &&) noexcept;
-  auto operator=(DiskManager &&) noexcept -> DiskManager &;
-  ~DiskManager();
+  // UniqueFd carries the descriptor across moves and closes it on
+  // destruction, so the compiler-generated special members are correct.
+  DiskManager(DiskManager &&) noexcept = default;
+  auto operator=(DiskManager &&) noexcept -> DiskManager & = default;
+  ~DiskManager() = default;
 
   // Returns a data page id: the most recently freed page if any, otherwise
   // a fresh page grown at the end of the file. The page's on-disk bytes are
@@ -54,8 +57,8 @@ class DiskManager {
   // Writes the in-memory file header to page 0.
   void WriteHeader() const;
 
-  // fd_ == -1 means this object does not own an open file descriptor.
-  int fd_{-1};
+  // An invalid fd means this object was moved from.
+  UniqueFd fd_;
   FileHeader header_;
 
   // In-memory mirror of the on-disk free list, rebuilt on open. Exists to

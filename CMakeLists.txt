@@ -71,6 +71,7 @@ add_library(
   include/tinydb/page.h
   include/tinydb/page_ref.h
   include/tinydb/storage_engine.h
+  include/tinydb/unique_fd.h
   src/btree/b_plus_tree.cpp
   src/btree/internal_node.cpp
   src/btree/internal_node.h
