@@ -18,6 +18,53 @@ for (const auto &[key, value] : db.Scan("user:", "user;").value())  // [start, e
   std::cout << key << " = " << value << "\n";
 ```
 
+## Architecture
+
+Four layers — here drawn as the structures they are. One key's journey,
+top to bottom:
+
+```text
+                   Put · Get · Remove · Scan
+                               │
+                     ╔═════════▼═════════╗
+                     ║   StorageEngine   ║      src/engine — the one door
+                     ╚═════════╤═════════╝      in; every failure walks
+                               │                back out of it as a
+                               │                Status / Result<T>
+                          [ B+ tree ]           src/btree
+                            ┌─────┐
+                            │ k37 │             internal nodes route
+                            └┬───┬┘             the key down
+                       ┌─────┘   └─────┐
+                   ┌───▼───┐       ┌───▼───┐
+              ┄┄──▶│ k1 k9 │──────▶│k37 k80│──▶┄┄
+                   └───────┘       └───────┘    leaves hold the rows,
+                               │                chained for Scan
+                               │  every node is one 4 KiB page,
+                               ▼  fetched and pinned via PageRef
+                        [ Buffer pool ]         src/buffer
+                ┌────┬────┬────┬────┬────┬────┬────┐
+                │ p3*│p17 │ p9*│ …  │p41 │p88*│ p5 │  64 fixed frames
+                └────┴────┴────┴────┴────┴────┴────┘  * = dirty
+                 pins hold pages in; a clock hand
+                 sweeps for the eviction victim
+                               │
+                        [ DiskManager ]         src/storage
+                               │
+                               │  pread · pwrite · fsync
+                               ▼
+             ┌────────┬────────┬────────┬────────┬┄┄
+             │ header │ btree  │  free  │ btree  │┄┄  data.db
+             └───┬────┴────────┴───▲────┴────────┴┄┄
+                 └─ free-list head ┘
+                 freed pages are reused before the file grows
+```
+
+Each layer only talks to the one directly below it: the tree never sees the
+file, the pool never parses a node. The write-ahead log (next up) will slot
+in beside the buffer pool, getting its records to disk before the pages
+they describe.
+
 ## What's inside
 
 - **4 KiB slotted pages** over plain `pread`/`pwrite`, with an intrusive
