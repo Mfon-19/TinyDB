@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <tinydb/status.h>
 #include <tinydb/storage_engine.h>
 
 #include <unistd.h>
@@ -7,7 +8,6 @@
 #include <fstream>
 #include <map>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,147 +52,151 @@ class StorageEngineTest : public ::testing::Test {
 };
 
 TEST_F(StorageEngineTest, OpenCreatesEmptyDatabase) {
-  auto engine = tinydb::StorageEngine::Open(db_path_);
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
 
   EXPECT_TRUE(std::filesystem::exists(db_path_));
-  EXPECT_EQ(engine.Get("anything"), std::nullopt);
-  EXPECT_TRUE(engine.Scan("", SCAN_END).empty());
-  engine.Remove("anything");  // removing from an empty database is a no-op
+  EXPECT_EQ(engine.Get("anything").value(), std::nullopt);
+  EXPECT_TRUE(engine.Scan("", SCAN_END).value().empty());
+  EXPECT_TRUE(engine.Remove("anything").Ok());  // removing from an empty database is a no-op
 }
 
 TEST_F(StorageEngineTest, PutGetRemoveRoundTrip) {
-  auto engine = tinydb::StorageEngine::Open(db_path_);
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
 
-  EXPECT_EQ(engine.Put("apple", "red"), tinydb::PutStatus::Ok);
-  EXPECT_EQ(engine.Put("banana", "yellow"), tinydb::PutStatus::Ok);
+  EXPECT_TRUE(engine.Put("apple", "red").Ok());
+  EXPECT_TRUE(engine.Put("banana", "yellow").Ok());
 
-  EXPECT_EQ(engine.Get("apple"), std::optional<std::string>{"red"});
-  EXPECT_EQ(engine.Get("banana"), std::optional<std::string>{"yellow"});
+  EXPECT_EQ(engine.Get("apple").value(), std::optional<std::string>{"red"});
+  EXPECT_EQ(engine.Get("banana").value(), std::optional<std::string>{"yellow"});
 
-  engine.Remove("apple");
-  EXPECT_EQ(engine.Get("apple"), std::nullopt);
-  EXPECT_EQ(engine.Get("banana"), std::optional<std::string>{"yellow"});
+  EXPECT_TRUE(engine.Remove("apple").Ok());
+  EXPECT_EQ(engine.Get("apple").value(), std::nullopt);
+  EXPECT_EQ(engine.Get("banana").value(), std::optional<std::string>{"yellow"});
 }
 
 TEST_F(StorageEngineTest, PutReplacesExistingValue) {
-  auto engine = tinydb::StorageEngine::Open(db_path_);
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
 
-  EXPECT_EQ(engine.Put("key", "first"), tinydb::PutStatus::Ok);
-  EXPECT_EQ(engine.Put("key", "second"), tinydb::PutStatus::Ok);
+  EXPECT_TRUE(engine.Put("key", "first").Ok());
+  EXPECT_TRUE(engine.Put("key", "second").Ok());
 
-  EXPECT_EQ(engine.Get("key"), std::optional<std::string>{"second"});
-  EXPECT_EQ(engine.Scan("", SCAN_END).size(), 1);
+  EXPECT_EQ(engine.Get("key").value(), std::optional<std::string>{"second"});
+  EXPECT_EQ(engine.Scan("", SCAN_END).value().size(), 1);
 }
 
 TEST_F(StorageEngineTest, EntrySizeCapIsEnforced) {
-  auto engine = tinydb::StorageEngine::Open(db_path_);
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
 
   // Exactly at the cap is accepted.
   const auto key = std::string{"key"};
   const auto max_value = RowValue(0, tinydb::MAX_ENTRY_BYTES - key.size());
-  EXPECT_EQ(engine.Put(key, max_value), tinydb::PutStatus::Ok);
+  EXPECT_TRUE(engine.Put(key, max_value).Ok());
 
   // One byte over is rejected and must not disturb existing data.
   const auto oversized = max_value + "x";
-  EXPECT_EQ(engine.Put("other", oversized), tinydb::PutStatus::EntryTooLarge);
-  EXPECT_EQ(engine.Put(key, oversized), tinydb::PutStatus::EntryTooLarge);
+  EXPECT_EQ(engine.Put("other", oversized).Code(), tinydb::StatusCode::InvalidArgument);
+  EXPECT_EQ(engine.Put(key, oversized).Code(), tinydb::StatusCode::InvalidArgument);
 
-  EXPECT_EQ(engine.Get("other"), std::nullopt);
-  EXPECT_EQ(engine.Get(key), std::optional<std::string>{max_value});
+  EXPECT_EQ(engine.Get("other").value(), std::nullopt);
+  EXPECT_EQ(engine.Get(key).value(), std::optional<std::string>{max_value});
 }
 
 TEST_F(StorageEngineTest, ScanBoundsAreHalfOpen) {
-  auto engine = tinydb::StorageEngine::Open(db_path_);
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
   for (int i = 0; i < 10; ++i) {
-    ASSERT_EQ(engine.Put(RowKey(i), RowValue(i, 20)), tinydb::PutStatus::Ok);
+    ASSERT_TRUE(engine.Put(RowKey(i), RowValue(i, 20)).Ok());
   }
 
-  const auto rows = engine.Scan(RowKey(3), RowKey(6));
+  const auto rows = engine.Scan(RowKey(3), RowKey(6)).value();
   ASSERT_EQ(rows.size(), 3);
   EXPECT_EQ(rows.front().first, RowKey(3));
   EXPECT_EQ(rows.back().first, RowKey(5));
 
-  EXPECT_TRUE(engine.Scan(RowKey(4), RowKey(4)).empty());
+  EXPECT_TRUE(engine.Scan(RowKey(4), RowKey(4)).value().empty());
 }
 
 TEST_F(StorageEngineTest, ClosedHandleRefusesWork) {
-  auto engine = tinydb::StorageEngine::Open(db_path_);
-  ASSERT_EQ(engine.Put("key", "value"), tinydb::PutStatus::Ok);
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(engine.Put("key", "value").Ok());
 
-  engine.Close();
+  ASSERT_TRUE(engine.Close().Ok());
 
-  EXPECT_EQ(engine.Put("key", "other"), tinydb::PutStatus::Closed);
-  EXPECT_EQ(engine.Get("key"), std::nullopt);
-  EXPECT_TRUE(engine.Scan("", SCAN_END).empty());
-  engine.Remove("key");  // ignored, must not crash
-  engine.Close();        // closing twice is safe
+  EXPECT_EQ(engine.Put("key", "other").Code(), tinydb::StatusCode::Closed);
+  EXPECT_EQ(engine.Remove("key").Code(), tinydb::StatusCode::Closed);
+  const auto got = engine.Get("key");
+  ASSERT_FALSE(got.has_value());
+  EXPECT_EQ(got.error().Code(), tinydb::StatusCode::Closed);
+  const auto rows = engine.Scan("", SCAN_END);
+  ASSERT_FALSE(rows.has_value());
+  EXPECT_EQ(rows.error().Code(), tinydb::StatusCode::Closed);
+  EXPECT_TRUE(engine.Close().Ok());  // closing twice is safe
 
   // The pre-close write reached the file.
-  auto reopened = tinydb::StorageEngine::Open(db_path_);
-  EXPECT_EQ(reopened.Get("key"), std::optional<std::string>{"value"});
+  auto reopened = tinydb::StorageEngine::Open(db_path_).value();
+  EXPECT_EQ(reopened.Get("key").value(), std::optional<std::string>{"value"});
 }
 
 TEST_F(StorageEngineTest, DataSurvivesExplicitClose) {
   {
-    auto engine = tinydb::StorageEngine::Open(db_path_);
-    ASSERT_EQ(engine.Put("persist", "me"), tinydb::PutStatus::Ok);
-    engine.Close();
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
+    ASSERT_TRUE(engine.Put("persist", "me").Ok());
+    ASSERT_TRUE(engine.Close().Ok());
   }
 
-  auto engine = tinydb::StorageEngine::Open(db_path_);
-  EXPECT_EQ(engine.Get("persist"), std::optional<std::string>{"me"});
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  EXPECT_EQ(engine.Get("persist").value(), std::optional<std::string>{"me"});
 }
 
 TEST_F(StorageEngineTest, DataSurvivesDestructor) {
   {
-    auto engine = tinydb::StorageEngine::Open(db_path_);
-    ASSERT_EQ(engine.Put("persist", "me too"), tinydb::PutStatus::Ok);
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
+    ASSERT_TRUE(engine.Put("persist", "me too").Ok());
     // No Close(): the destructor must flush.
   }
 
-  auto engine = tinydb::StorageEngine::Open(db_path_);
-  EXPECT_EQ(engine.Get("persist"), std::optional<std::string>{"me too"});
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  EXPECT_EQ(engine.Get("persist").value(), std::optional<std::string>{"me too"});
 }
 
 TEST_F(StorageEngineTest, ReopenedDatabaseAcceptsMutations) {
   {
-    auto engine = tinydb::StorageEngine::Open(db_path_);
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
     for (int i = 0; i < 20; ++i) {
-      ASSERT_EQ(engine.Put(RowKey(i), RowValue(i, 30)), tinydb::PutStatus::Ok);
+      ASSERT_TRUE(engine.Put(RowKey(i), RowValue(i, 30)).Ok());
     }
   }
   {
-    auto engine = tinydb::StorageEngine::Open(db_path_);
-    engine.Remove(RowKey(5));
-    ASSERT_EQ(engine.Put(RowKey(100), RowValue(100, 30)), tinydb::PutStatus::Ok);
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
+    ASSERT_TRUE(engine.Remove(RowKey(5)).Ok());
+    ASSERT_TRUE(engine.Put(RowKey(100), RowValue(100, 30)).Ok());
   }
 
-  auto engine = tinydb::StorageEngine::Open(db_path_);
-  EXPECT_EQ(engine.Get(RowKey(5)), std::nullopt);
-  EXPECT_EQ(engine.Get(RowKey(100)), std::optional<std::string>{RowValue(100, 30)});
-  EXPECT_EQ(engine.Scan("", SCAN_END).size(), 20);  // 20 - 1 + 1
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  EXPECT_EQ(engine.Get(RowKey(5)).value(), std::nullopt);
+  EXPECT_EQ(engine.Get(RowKey(100)).value(), std::optional<std::string>{RowValue(100, 30)});
+  EXPECT_EQ(engine.Scan("", SCAN_END).value().size(), 20);  // 20 - 1 + 1
 }
 
 TEST_F(StorageEngineTest, LargeWorkloadSurvivesReopen) {
   auto model = std::map<std::string, std::string>{};
 
   {
-    auto engine = tinydb::StorageEngine::Open(db_path_);
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
     // Enough data for many leaf splits and at least one root split.
     for (int i = 0; i < 400; ++i) {
       const auto key = RowKey(i);
       const auto value = RowValue(i, 50 + (static_cast<std::size_t>(i) * 13) % 400);
-      ASSERT_EQ(engine.Put(key, value), tinydb::PutStatus::Ok);
+      ASSERT_TRUE(engine.Put(key, value).Ok());
       model[key] = value;
     }
     for (int i = 0; i < 400; i += 3) {
-      engine.Remove(RowKey(i));
+      ASSERT_TRUE(engine.Remove(RowKey(i)).Ok());
       model.erase(RowKey(i));
     }
   }
 
-  auto engine = tinydb::StorageEngine::Open(db_path_);
-  const auto rows = engine.Scan("", SCAN_END);
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  const auto rows = engine.Scan("", SCAN_END).value();
   ASSERT_EQ(rows.size(), model.size());
   auto it = model.begin();
   for (const auto &[key, value] : rows) {
@@ -204,14 +208,14 @@ TEST_F(StorageEngineTest, LargeWorkloadSurvivesReopen) {
 
 TEST_F(StorageEngineTest, ChurnDoesNotGrowTheFile) {
   const auto churn = [this] {
-    auto engine = tinydb::StorageEngine::Open(db_path_);
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
     for (int i = 0; i < 200; ++i) {
-      ASSERT_EQ(engine.Put(RowKey(i), RowValue(i, 120)), tinydb::PutStatus::Ok);
+      ASSERT_TRUE(engine.Put(RowKey(i), RowValue(i, 120)).Ok());
     }
     for (int i = 0; i < 200; ++i) {
-      engine.Remove(RowKey(i));
+      ASSERT_TRUE(engine.Remove(RowKey(i)).Ok());
     }
-    engine.Close();
+    ASSERT_TRUE(engine.Close().Ok());
   };
 
   // The first cycle sizes the file; merges and root collapses free the
@@ -225,36 +229,36 @@ TEST_F(StorageEngineTest, ChurnDoesNotGrowTheFile) {
 }
 
 TEST_F(StorageEngineTest, MoveTransfersOwnership) {
-  auto first = tinydb::StorageEngine::Open(db_path_);
-  ASSERT_EQ(first.Put("moved", "data"), tinydb::PutStatus::Ok);
+  auto first = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(first.Put("moved", "data").Ok());
 
   auto second = std::move(first);
 
   // The moved-from handle acts closed.
   // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
-  EXPECT_EQ(first.Put("x", "y"), tinydb::PutStatus::Closed);
+  EXPECT_EQ(first.Put("x", "y").Code(), tinydb::StatusCode::Closed);
 
   // The destination owns the database.
-  EXPECT_EQ(second.Get("moved"), std::optional<std::string>{"data"});
-  EXPECT_EQ(second.Put("more", "rows"), tinydb::PutStatus::Ok);
+  EXPECT_EQ(second.Get("moved").value(), std::optional<std::string>{"data"});
+  EXPECT_TRUE(second.Put("more", "rows").Ok());
 }
 
 TEST_F(StorageEngineTest, MoveAssignClosesTheOldDatabase) {
-  auto target = tinydb::StorageEngine::Open(db_path_);
-  ASSERT_EQ(target.Put("old", "database"), tinydb::PutStatus::Ok);
+  auto target = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(target.Put("old", "database").Ok());
 
-  auto source = tinydb::StorageEngine::Open(second_db_path_);
-  ASSERT_EQ(source.Put("new", "database"), tinydb::PutStatus::Ok);
+  auto source = tinydb::StorageEngine::Open(second_db_path_).value();
+  ASSERT_TRUE(source.Put("new", "database").Ok());
 
   target = std::move(source);
 
   // target now serves the second database...
-  EXPECT_EQ(target.Get("new"), std::optional<std::string>{"database"});
-  EXPECT_EQ(target.Get("old"), std::nullopt);
+  EXPECT_EQ(target.Get("new").value(), std::optional<std::string>{"database"});
+  EXPECT_EQ(target.Get("old").value(), std::nullopt);
 
   // ...and the first database was flushed when target closed it.
-  auto reopened = tinydb::StorageEngine::Open(db_path_);
-  EXPECT_EQ(reopened.Get("old"), std::optional<std::string>{"database"});
+  auto reopened = tinydb::StorageEngine::Open(db_path_).value();
+  EXPECT_EQ(reopened.Get("old").value(), std::optional<std::string>{"database"});
 }
 
 TEST_F(StorageEngineTest, OpenRejectsForeignFiles) {
@@ -263,7 +267,9 @@ TEST_F(StorageEngineTest, OpenRejectsForeignFiles) {
     file << "this is not a tinydb database, just some text\n";
   }
 
-  EXPECT_THROW(static_cast<void>(tinydb::StorageEngine::Open(db_path_)), std::runtime_error);
+  const auto result = tinydb::StorageEngine::Open(db_path_);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::InvalidArgument);
 }
 
 }  // namespace

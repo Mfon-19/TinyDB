@@ -1,6 +1,6 @@
 # TinyDB
 
-A disk-backed, ordered **key-value storage engine** in C++20. A page-based
+A disk-backed, ordered **key-value storage engine** in C++23. A page-based
 file format, a buffer pool, and a B+-tree index behind a small embedded API.
 
 It is the persistence core that sits *underneath* a database, not a full
@@ -8,13 +8,13 @@ RDBMS: no SQL, planner, or server, just storage, indexing, caching, and
 durability.
 
 ```cpp
-auto db = tinydb::StorageEngine::Open("data.db");
+auto db = tinydb::StorageEngine::Open("data.db").value();
 
-db.Put("user:1", "Mfon");
-db.Get("user:1");             // -> std::optional{"Mfon"}
+db.Put("user:1", "Mfon");     // -> tinydb::Status
+db.Get("user:1");             // -> Result<std::optional<std::string>>
 db.Remove("user:1");
 
-for (const auto &[key, value] : db.Scan("user:", "user;"))  // [start, end)
+for (const auto &[key, value] : db.Scan("user:", "user;").value())  // [start, end)
   std::cout << key << " = " << value << "\n";
 ```
 
@@ -27,6 +27,8 @@ for (const auto &[key, value] : db.Scan("user:", "user;"))  // [start, end)
 - **B+ tree** — variable-length keys and values, splits (tail-heavy for
   ascending inserts), merges, and leaf-chained range scans.
 - **Durability at close** — `Close()` flushes and fsyncs.
+- **Status-based errors** — I/O failures travel as `Status` / `Result<T>`
+  (`std::expected`) values, LevelDB-style; nothing throws.
 - Invariant checks (`TINYDB_CHECK`) stay on in release builds: corruption
   aborts loudly rather than propagating.
 

@@ -1,12 +1,12 @@
 #include <gtest/gtest.h>
 #include <tinydb/disk_manager.h>
+#include <tinydb/status.h>
 
 #include <unistd.h>
 
 #include <array>
 #include <filesystem>
 #include <fstream>
-#include <stdexcept>
 #include <string>
 
 static auto TestPath(const std::string &name) -> std::filesystem::path {
@@ -18,21 +18,21 @@ TEST(DiskManagerTest, ReopenPage) {
   std::filesystem::remove(path);
 
   {
-    tinydb::DiskManager disk(path);
-    const auto page_id = disk.AllocatePage();
+    auto disk = tinydb::DiskManager::Open(path).value();
+    const auto page_id = disk.AllocatePage().value();
     EXPECT_EQ(page_id, tinydb::FIRST_DATA_PAGE_ID);
 
     auto page = std::array<char, tinydb::PAGE_SIZE>{};
     page[0] = 'a';
     page[tinydb::PAGE_SIZE - 1] = 'z';
-    disk.WritePage(page_id, page.data());
+    ASSERT_TRUE(disk.WritePage(page_id, page.data()).Ok());
   }
 
   {
-    tinydb::DiskManager disk(path);
+    auto disk = tinydb::DiskManager::Open(path).value();
 
     auto page = std::array<char, tinydb::PAGE_SIZE>{};
-    disk.ReadPage(tinydb::FIRST_DATA_PAGE_ID, page.data());
+    ASSERT_TRUE(disk.ReadPage(tinydb::FIRST_DATA_PAGE_ID, page.data()).Ok());
 
     EXPECT_EQ(page[0], 'a');
     EXPECT_EQ(page[tinydb::PAGE_SIZE - 1], 'z');
@@ -47,14 +47,14 @@ TEST(DiskManagerTest, FreedPagesAreReusedNewestFirst) {
   std::filesystem::remove(path);
 
   {
-    tinydb::DiskManager disk(path);
-    const auto first = disk.AllocatePage();
-    static_cast<void>(disk.AllocatePage());
-    const auto third = disk.AllocatePage();
+    auto disk = tinydb::DiskManager::Open(path).value();
+    const auto first = disk.AllocatePage().value();
+    ASSERT_TRUE(disk.AllocatePage().has_value());
+    const auto third = disk.AllocatePage().value();
     const auto size_before = std::filesystem::file_size(path);
 
-    disk.FreePage(first);
-    disk.FreePage(third);
+    ASSERT_TRUE(disk.FreePage(first).Ok());
+    ASSERT_TRUE(disk.FreePage(third).Ok());
 
     // LIFO: the most recently freed page comes back first, without growth.
     EXPECT_EQ(disk.AllocatePage(), third);
@@ -74,14 +74,14 @@ TEST(DiskManagerTest, FreeListSurvivesReopen) {
 
   tinydb::page_id_t freed = 0;
   {
-    tinydb::DiskManager disk(path);
-    freed = disk.AllocatePage();
-    static_cast<void>(disk.AllocatePage());
-    disk.FreePage(freed);
+    auto disk = tinydb::DiskManager::Open(path).value();
+    freed = disk.AllocatePage().value();
+    ASSERT_TRUE(disk.AllocatePage().has_value());
+    ASSERT_TRUE(disk.FreePage(freed).Ok());
   }
 
   {
-    tinydb::DiskManager disk(path);
+    auto disk = tinydb::DiskManager::Open(path).value();
     EXPECT_EQ(disk.AllocatePage(), freed);
   }
 
@@ -93,11 +93,11 @@ TEST(DiskManagerDeathTest, DoubleFreeDies) {
   std::filesystem::remove(path);
 
   {
-    tinydb::DiskManager disk(path);
-    const auto page_id = disk.AllocatePage();
-    disk.FreePage(page_id);
+    auto disk = tinydb::DiskManager::Open(path).value();
+    const auto page_id = disk.AllocatePage().value();
+    ASSERT_TRUE(disk.FreePage(page_id).Ok());
 
-    EXPECT_DEATH(disk.FreePage(page_id), "double free");
+    EXPECT_DEATH(static_cast<void>(disk.FreePage(page_id)), "double free");
   }
 
   std::filesystem::remove(path);
@@ -112,7 +112,9 @@ TEST(DiskManagerTest, RejectsTruncatedFile) {
     file << "abc";  // non-empty, but shorter than a file header
   }
 
-  EXPECT_THROW(tinydb::DiskManager{path}, std::runtime_error);
+  const auto result = tinydb::DiskManager::Open(path);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::InvalidArgument);
 
   std::filesystem::remove(path);
 }
@@ -122,13 +124,13 @@ TEST(DiskManagerTest, SyncAfterWrites) {
   std::filesystem::remove(path);
 
   {
-    tinydb::DiskManager disk(path);
-    const auto page_id = disk.AllocatePage();
+    auto disk = tinydb::DiskManager::Open(path).value();
+    const auto page_id = disk.AllocatePage().value();
 
     auto page = std::array<char, tinydb::PAGE_SIZE>{};
     page[0] = 's';
-    disk.WritePage(page_id, page.data());
-    disk.Sync();  // must not throw on a healthy descriptor
+    ASSERT_TRUE(disk.WritePage(page_id, page.data()).Ok());
+    EXPECT_TRUE(disk.Sync().Ok());  // must succeed on a healthy descriptor
   }
 
   std::filesystem::remove(path);
@@ -138,10 +140,11 @@ TEST(DiskManagerTest, UnallocatedRead) {
   const auto path = TestPath("unallocated_read");
   std::filesystem::remove(path);
 
-  tinydb::DiskManager disk(path);
+  auto disk = tinydb::DiskManager::Open(path).value();
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
 
-  EXPECT_THROW(disk.ReadPage(tinydb::FIRST_DATA_PAGE_ID, page.data()), std::out_of_range);
+  const auto status = disk.ReadPage(tinydb::FIRST_DATA_PAGE_ID, page.data());
+  EXPECT_EQ(status.Code(), tinydb::StatusCode::InvalidArgument);
 
   std::filesystem::remove(path);
 }

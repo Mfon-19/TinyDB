@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tinydb/buffer_pool.h>
+#include <tinydb/status.h>
 
 #include <cstddef>
 #include <optional>
@@ -37,14 +38,20 @@ constexpr std::size_t MAX_ENTRY_BYTES = PAGE_SIZE / 4 - 32;
 */
 class BPlusTree {
  public:
-  BPlusTree(BufferPool *buffer_pool, page_id_t root_page_id);
+  // Attaches to the tree rooted at root_page_id, bootstrapping a zeroed
+  // page into an empty leaf. Fails if the root page cannot be read or does
+  // not hold a tree node.
+  static auto Open(BufferPool *buffer_pool, page_id_t root_page_id) -> Result<BPlusTree>;
 
-  void Put(std::string_view key, std::string_view value);
-  auto Get(std::string_view key) -> std::optional<std::string>;
-  void Remove(std::string_view key);
-  auto Scan(std::string_view start, std::string_view end) -> std::vector<std::pair<std::string, std::string>>;
+  auto Put(std::string_view key, std::string_view value) -> Status;
+  auto Get(std::string_view key) -> Result<std::optional<std::string>>;
+  auto Remove(std::string_view key) -> Status;
+  auto Scan(std::string_view start, std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>>;
 
  private:
+  BPlusTree(BufferPool *buffer_pool, page_id_t root_page_id)
+      : buffer_pool_(buffer_pool), root_page_id_(root_page_id) {}
+
   BufferPool *buffer_pool_;
   page_id_t root_page_id_;
 };

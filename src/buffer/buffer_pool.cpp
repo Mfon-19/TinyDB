@@ -2,8 +2,7 @@
 #include <tinydb/check.h>
 
 #include <cstdio>
-#include <exception>
-#include <stdexcept>
+#include <expected>
 #include <utility>
 
 namespace tinydb {
@@ -43,28 +42,32 @@ auto BufferPool::operator=(BufferPool &&other) noexcept -> BufferPool & {
 BufferPool::~BufferPool() { FlushBestEffort(); }
 
 void BufferPool::FlushBestEffort() noexcept {
-  try {
-    FlushAllPages();
-  } catch (const std::exception &error) {
-    std::fprintf(stderr, "tinydb: buffer pool flush failed: %s\n", error.what());
+  if (const auto status = FlushAllPages(); !status.Ok()) {
+    std::fprintf(stderr, "tinydb: buffer pool flush failed: %s\n", status.ToString().c_str());
   }
 }
 
-auto BufferPool::NewPage() -> NewPageResult {
+auto BufferPool::NewPage() -> Result<NewPageResult> {
   const auto frame_id = PickFrame();
+  if (!frame_id) {
+    return std::unexpected(frame_id.error());
+  }
   const auto new_page_id = disk_manager_->AllocatePage();
-  auto &frame = frames_[frame_id];
+  if (!new_page_id) {
+    return std::unexpected(new_page_id.error());
+  }
+  auto &frame = frames_[*frame_id];
 
-  frame.page_id = new_page_id;
+  frame.page_id = *new_page_id;
   frame.data.fill(0);
   frame.pin_count = 1;
   frame.dirty = true;
-  page_table_[new_page_id] = frame_id;
+  page_table_[*new_page_id] = *frame_id;
 
-  return {.page_id = new_page_id, .data = frame.data.data()};
+  return NewPageResult{.page_id = *new_page_id, .data = frame.data.data()};
 }
 
-auto BufferPool::FetchPage(page_id_t page_id) -> char * {
+auto BufferPool::FetchPage(page_id_t page_id) -> Result<char *> {
   const auto page_it = page_table_.find(page_id);
   if (page_it != page_table_.end()) {
     auto &frame = frames_[page_it->second];
@@ -73,13 +76,20 @@ auto BufferPool::FetchPage(page_id_t page_id) -> char * {
   }
 
   const auto frame_id = PickFrame();
-  auto &frame = frames_[frame_id];
+  if (!frame_id) {
+    return std::unexpected(frame_id.error());
+  }
+  auto &frame = frames_[*frame_id];
 
-  disk_manager_->ReadPage(page_id, frame.data.data());
+  if (auto status = disk_manager_->ReadPage(page_id, frame.data.data()); !status.Ok()) {
+    // The picked frame is left clean, unpinned, and out of the page table;
+    // the next eviction scan can reuse it.
+    return std::unexpected(std::move(status));
+  }
   frame.page_id = page_id;
   frame.pin_count = 1;
   frame.dirty = false;
-  page_table_[page_id] = frame_id;
+  page_table_[page_id] = *frame_id;
 
   return frame.data.data();
 }
@@ -95,7 +105,7 @@ void BufferPool::UnpinPage(page_id_t page_id, bool dirty) {
   frame.dirty = frame.dirty || dirty;
 }
 
-void BufferPool::FreePage(page_id_t page_id) {
+auto BufferPool::FreePage(page_id_t page_id) -> Status {
   const auto page_it = page_table_.find(page_id);
   if (page_it != page_table_.end()) {
     auto &frame = frames_[page_it->second];
@@ -107,36 +117,44 @@ void BufferPool::FreePage(page_id_t page_id) {
     page_table_.erase(page_it);
   }
 
-  disk_manager_->FreePage(page_id);
+  return disk_manager_->FreePage(page_id);
 }
 
-void BufferPool::FlushPage(page_id_t page_id) {
+auto BufferPool::FlushPage(page_id_t page_id) -> Status {
   const auto page_it = page_table_.find(page_id);
   if (page_it == page_table_.end()) {
-    return;
+    return {};
   }
 
   auto &frame = frames_[page_it->second];
   if (frame.dirty) {
-    disk_manager_->WritePage(frame.page_id, frame.data.data());
+    if (auto status = disk_manager_->WritePage(frame.page_id, frame.data.data()); !status.Ok()) {
+      return status;
+    }
     frame.dirty = false;
   }
+  return {};
 }
 
-void BufferPool::FlushAllPages() {
+auto BufferPool::FlushAllPages() -> Status {
   if (disk_manager_ == nullptr) {
-    return;
+    return {};
   }
 
+  // Frames are marked clean as they are written, so a failed flush can be
+  // retried and only rewrites the remainder.
   for (auto &frame : frames_) {
     if (frame.dirty) {
-      disk_manager_->WritePage(frame.page_id, frame.data.data());
+      if (auto status = disk_manager_->WritePage(frame.page_id, frame.data.data()); !status.Ok()) {
+        return status;
+      }
       frame.dirty = false;
     }
   }
+  return {};
 }
 
-auto BufferPool::PickFrame() -> frame_id_t {
+auto BufferPool::PickFrame() -> Result<frame_id_t> {
   if (!free_list_.empty()) {
     const auto frame_id = free_list_.back();
     free_list_.pop_back();
@@ -150,7 +168,9 @@ auto BufferPool::PickFrame() -> frame_id_t {
 
     if (frame.pin_count == 0) {
       if (frame.dirty) {
-        disk_manager_->WritePage(frame.page_id, frame.data.data());
+        if (auto status = disk_manager_->WritePage(frame.page_id, frame.data.data()); !status.Ok()) {
+          return std::unexpected(std::move(status));
+        }
       }
       page_table_.erase(frame.page_id);
       frame.dirty = false;
@@ -158,7 +178,7 @@ auto BufferPool::PickFrame() -> frame_id_t {
     }
   }
 
-  throw std::runtime_error("no evictable frame");
+  return std::unexpected(Status::ResourceExhausted("no evictable frame"));
 }
 
 }  // namespace tinydb

@@ -1,6 +1,10 @@
 #pragma once
 
 #include <tinydb/buffer_pool.h>
+#include <tinydb/status.h>
+
+#include <expected>
+#include <utility>
 
 namespace tinydb {
 
@@ -9,12 +13,22 @@ namespace tinydb {
 // records the page as dirty.
 class PageRef {
  public:
-  PageRef(BufferPool *pool, page_id_t page_id) : pool_(pool), page_id_(page_id), data_(pool->FetchPage(page_id)) {}
+  // Pins page_id, fetching it from disk if it is not already cached.
+  static auto Fetch(BufferPool *pool, page_id_t page_id) -> Result<PageRef> {
+    auto data = pool->FetchPage(page_id);
+    if (!data) {
+      return std::unexpected(std::move(data).error());
+    }
+    return PageRef{pool, page_id, *data};
+  }
 
   // Allocates a fresh (zeroed) page and returns it pinned.
-  static auto New(BufferPool *pool) -> PageRef {
-    const auto page = pool->NewPage();
-    return {pool, page.page_id, page.data};
+  static auto New(BufferPool *pool) -> Result<PageRef> {
+    auto page = pool->NewPage();
+    if (!page) {
+      return std::unexpected(std::move(page).error());
+    }
+    return PageRef{pool, page->page_id, page->data};
   }
 
   PageRef(const PageRef &) = delete;

@@ -9,6 +9,7 @@ Checks: >
   -bugprone-easily-swappable-parameters,
   -bugprone-narrowing-conversions,
   -modernize-avoid-c-arrays,
+  -modernize-use-std-print,
   -modernize-use-nodiscard,
   -performance-enum-size,
   -readability-function-cognitive-complexity,

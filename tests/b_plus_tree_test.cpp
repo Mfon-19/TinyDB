@@ -49,11 +49,11 @@ class BPlusTreeTest : public ::testing::Test {
                ("tinydb_bpt_" + std::string(info->name()) + "_" + std::to_string(::getpid()) + ".db");
     std::filesystem::remove(db_path_);
 
-    disk_.emplace(db_path_);
+    disk_.emplace(tinydb::DiskManager::Open(db_path_).value());
     pool_.emplace(&*disk_, FRAME_COUNT);
-    root_page_id_ = pool_->NewPage().page_id;  // left zeroed; the tree bootstraps it
+    root_page_id_ = pool_->NewPage().value().page_id;  // left zeroed; the tree bootstraps it
     pool_->UnpinPage(root_page_id_, true);
-    tree_.emplace(&*pool_, root_page_id_);
+    tree_.emplace(tinydb::BPlusTree::Open(&*pool_, root_page_id_).value());
   }
 
   void TearDown() override {
@@ -66,19 +66,19 @@ class BPlusTreeTest : public ::testing::Test {
   void PutRow(int row, std::size_t length) {
     const auto key = RowKey(row);
     const auto value = RowValue(row, length);
-    tree_->Put(key, value);
+    ASSERT_TRUE(tree_->Put(key, value).Ok());
     model_[key] = value;
   }
 
   void RemoveRow(int row) {
     const auto key = RowKey(row);
-    tree_->Remove(key);
+    ASSERT_TRUE(tree_->Remove(key).Ok());
     model_.erase(key);
   }
 
   // The tree and the model must agree exactly: same rows, same order.
   void ExpectMatchesModel() {
-    const auto rows = tree_->Scan("", SCAN_END);
+    const auto rows = tree_->Scan("", SCAN_END).value();
     ASSERT_EQ(rows.size(), model_.size());
     auto it = model_.begin();
     for (const auto &[key, value] : rows) {
@@ -90,7 +90,7 @@ class BPlusTreeTest : public ::testing::Test {
 
   void ExpectGetMatchesModel(int row) {
     const auto key = RowKey(row);
-    const auto got = tree_->Get(key);
+    const auto got = tree_->Get(key).value();
     const auto want = model_.find(key);
     if (want == model_.end()) {
       EXPECT_EQ(got, std::nullopt) << key;
@@ -102,17 +102,17 @@ class BPlusTreeTest : public ::testing::Test {
   // Flushes everything, tears the stack down, and rebuilds it from the file.
   void ReopenDatabase() {
     tree_.reset();
-    pool_->FlushAllPages();
+    ASSERT_TRUE(pool_->FlushAllPages().Ok());
     pool_.reset();
     disk_.reset();
 
-    disk_.emplace(db_path_);
+    disk_.emplace(tinydb::DiskManager::Open(db_path_).value());
     pool_.emplace(&*disk_, FRAME_COUNT);
-    tree_.emplace(&*pool_, root_page_id_);
+    tree_.emplace(tinydb::BPlusTree::Open(&*pool_, root_page_id_).value());
   }
 
   auto RootType() -> tinydb::NodeType {
-    char *page = pool_->FetchPage(root_page_id_);
+    char *page = pool_->FetchPage(root_page_id_).value();
     const auto type = reinterpret_cast<tinydb::NodeHeader *>(page)->type;
     pool_->UnpinPage(root_page_id_, false);
     return type;
@@ -123,7 +123,7 @@ class BPlusTreeTest : public ::testing::Test {
     int depth = 1;
     auto page_id = root_page_id_;
     for (;;) {
-      char *page = pool_->FetchPage(page_id);
+      char *page = pool_->FetchPage(page_id).value();
       const auto type = reinterpret_cast<tinydb::NodeHeader *>(page)->type;
       const auto first_child = reinterpret_cast<tinydb::InternalHeader *>(page)->first_child;
       pool_->UnpinPage(page_id, false);
@@ -139,7 +139,7 @@ class BPlusTreeTest : public ::testing::Test {
   auto LeafChainLength() -> int {
     auto page_id = root_page_id_;
     for (;;) {
-      char *page = pool_->FetchPage(page_id);
+      char *page = pool_->FetchPage(page_id).value();
       const auto type = reinterpret_cast<tinydb::NodeHeader *>(page)->type;
       const auto first_child = reinterpret_cast<tinydb::InternalHeader *>(page)->first_child;
       pool_->UnpinPage(page_id, false);
@@ -151,7 +151,7 @@ class BPlusTreeTest : public ::testing::Test {
 
     int length = 0;
     while (page_id != tinydb::HEADER_PAGE_ID) {
-      char *page = pool_->FetchPage(page_id);
+      char *page = pool_->FetchPage(page_id).value();
       const auto next_leaf = reinterpret_cast<tinydb::LeafHeader *>(page)->next_leaf;
       pool_->UnpinPage(page_id, false);
       page_id = next_leaf;
@@ -173,9 +173,9 @@ using BPlusTreeDeathTest = BPlusTreeTest;
 TEST_F(BPlusTreeTest, StartsEmpty) {
   EXPECT_EQ(RootType(), tinydb::NodeType::Leaf);
   EXPECT_EQ(TreeDepth(), 1);
-  EXPECT_EQ(tree_->Get(RowKey(1)), std::nullopt);
-  EXPECT_TRUE(tree_->Scan("", SCAN_END).empty());
-  tree_->Remove(RowKey(1));  // deleting from an empty tree is a no-op
+  EXPECT_EQ(tree_->Get(RowKey(1)).value(), std::nullopt);
+  EXPECT_TRUE(tree_->Scan("", SCAN_END).value().empty());
+  EXPECT_TRUE(tree_->Remove(RowKey(1)).Ok());  // deleting from an empty tree is a no-op
   ExpectMatchesModel();
 }
 
@@ -188,8 +188,8 @@ TEST_F(BPlusTreeTest, InsertAndLookup) {
   ExpectGetMatchesModel(1);
   ExpectGetMatchesModel(2);
   ExpectGetMatchesModel(3);
-  EXPECT_EQ(tree_->Get(RowKey(4)), std::nullopt);
-  EXPECT_EQ(tree_->Get("row-"), std::nullopt);  // prefix of real keys
+  EXPECT_EQ(tree_->Get(RowKey(4)).value(), std::nullopt);
+  EXPECT_EQ(tree_->Get("row-").value(), std::nullopt);  // prefix of real keys
 }
 
 TEST_F(BPlusTreeTest, OverwriteKeepsOneRowPerKey) {
@@ -202,7 +202,7 @@ TEST_F(BPlusTreeTest, OverwriteKeepsOneRowPerKey) {
   PutRow(15, 0);    // empty value
 
   ExpectMatchesModel();
-  EXPECT_EQ(tree_->Get(RowKey(15)), std::optional<std::string>{""});
+  EXPECT_EQ(tree_->Get(RowKey(15)).value(), std::optional<std::string>{""});
 }
 
 TEST_F(BPlusTreeTest, DeleteIsIdempotent) {
@@ -210,8 +210,8 @@ TEST_F(BPlusTreeTest, DeleteIsIdempotent) {
   RemoveRow(7);
   ExpectMatchesModel();
 
-  tree_->Remove(RowKey(7));  // second delete of the same key
-  tree_->Remove(RowKey(8));  // delete of a key that never existed
+  EXPECT_TRUE(tree_->Remove(RowKey(7)).Ok());  // second delete of the same key
+  EXPECT_TRUE(tree_->Remove(RowKey(8)).Ok());  // delete of a key that never existed
   ExpectMatchesModel();
 
   PutRow(7, 40);
@@ -219,14 +219,14 @@ TEST_F(BPlusTreeTest, DeleteIsIdempotent) {
 }
 
 TEST_F(BPlusTreeTest, MinimalKeysAndValues) {
-  tree_->Put("", "value under empty key");
+  ASSERT_TRUE(tree_->Put("", "value under empty key").Ok());
   model_[""] = "value under empty key";
-  tree_->Put("k", "");
+  ASSERT_TRUE(tree_->Put("k", "").Ok());
   model_["k"] = "";
 
   ExpectMatchesModel();
-  EXPECT_EQ(tree_->Get(""), std::optional<std::string>{"value under empty key"});
-  EXPECT_EQ(tree_->Get("k"), std::optional<std::string>{""});
+  EXPECT_EQ(tree_->Get("").value(), std::optional<std::string>{"value under empty key"});
+  EXPECT_EQ(tree_->Get("k").value(), std::optional<std::string>{""});
 }
 
 TEST_F(BPlusTreeTest, ScanBoundsAreHalfOpen) {
@@ -235,20 +235,20 @@ TEST_F(BPlusTreeTest, ScanBoundsAreHalfOpen) {
   }
 
   // [start, end): the end key itself is excluded.
-  const auto rows = tree_->Scan(RowKey(12), RowKey(15));
+  const auto rows = tree_->Scan(RowKey(12), RowKey(15)).value();
   ASSERT_EQ(rows.size(), 3);
   EXPECT_EQ(rows.front().first, RowKey(12));
   EXPECT_EQ(rows.back().first, RowKey(14));
 
   // Bounds that fall between keys behave like lower bounds.
-  const auto between = tree_->Scan("row-000011x", "row-000013x");
+  const auto between = tree_->Scan("row-000011x", "row-000013x").value();
   ASSERT_EQ(between.size(), 2);
   EXPECT_EQ(between.front().first, RowKey(12));
   EXPECT_EQ(between.back().first, RowKey(13));
 
-  EXPECT_TRUE(tree_->Scan(RowKey(15), RowKey(15)).empty());  // empty range
-  EXPECT_TRUE(tree_->Scan(RowKey(19), RowKey(11)).empty());  // inverted
-  EXPECT_TRUE(tree_->Scan(RowKey(50), SCAN_END).empty());    // past the data
+  EXPECT_TRUE(tree_->Scan(RowKey(15), RowKey(15)).value().empty());  // empty range
+  EXPECT_TRUE(tree_->Scan(RowKey(19), RowKey(11)).value().empty());  // inverted
+  EXPECT_TRUE(tree_->Scan(RowKey(50), SCAN_END).value().empty());    // past the data
 }
 
 TEST_F(BPlusTreeTest, RootSplitKeepsRootPageId) {
@@ -271,14 +271,14 @@ TEST_F(BPlusTreeTest, GrowsThreeLevels) {
   for (int i = 0; i < 400; ++i) {
     const auto key = RowKey(i) + padding;
     const auto value = RowValue(i, 300);
-    tree_->Put(key, value);
+    ASSERT_TRUE(tree_->Put(key, value).Ok());
     model_[key] = value;
   }
 
   EXPECT_GE(TreeDepth(), 3);
   ExpectMatchesModel();
 
-  const auto rows = tree_->Scan(RowKey(150), RowKey(160));
+  const auto rows = tree_->Scan(RowKey(150), RowKey(160)).value();
   ASSERT_EQ(rows.size(), 10);
   EXPECT_EQ(rows.front().first, RowKey(150) + padding);
   EXPECT_EQ(rows.back().first, RowKey(159) + padding);
@@ -311,7 +311,7 @@ TEST_F(BPlusTreeTest, MaxSizedEntries) {
   for (int i = 0; i < 12; ++i) {
     const auto key = RowKey(i);
     const auto value = RowValue(i, tinydb::MAX_ENTRY_BYTES - key.size());
-    tree_->Put(key, value);
+    ASSERT_TRUE(tree_->Put(key, value).Ok());
     model_[key] = value;
   }
 
@@ -321,7 +321,7 @@ TEST_F(BPlusTreeTest, MaxSizedEntries) {
 TEST_F(BPlusTreeDeathTest, OversizedEntryAborts) {
   const auto key = RowKey(1);
   const auto value = RowValue(1, tinydb::MAX_ENTRY_BYTES - key.size() + 1);
-  EXPECT_DEATH(tree_->Put(key, value), "MAX_ENTRY_BYTES");
+  EXPECT_DEATH(static_cast<void>(tree_->Put(key, value)), "MAX_ENTRY_BYTES");
 }
 
 TEST_F(BPlusTreeTest, DrainToEmptyCollapsesRoot) {
@@ -410,7 +410,7 @@ TEST_F(BPlusTreeTest, FuzzAgainstModel) {
     for (auto it = model_.lower_bound(start); it != model_.end() && it->first < end; ++it) {
       want.emplace_back(it->first, it->second);
     }
-    EXPECT_EQ(tree_->Scan(start, end), want);
+    EXPECT_EQ(tree_->Scan(start, end).value(), want);
   }
 }
 
@@ -439,7 +439,7 @@ TEST_F(BPlusTreeTest, SurvivesReopen) {
 // dropped on the next rewrite. Built by hand since the tree never writes
 // them itself.
 TEST_F(BPlusTreeTest, TombstoneCellsStayDead) {
-  const auto [page_id, page] = pool_->NewPage();
+  const auto [page_id, page] = pool_->NewPage().value();
 
   auto *header = reinterpret_cast<tinydb::LeafHeader *>(page);
   *header = tinydb::LeafHeader{
@@ -473,13 +473,13 @@ TEST_F(BPlusTreeTest, TombstoneCellsStayDead) {
   append_cell("zombie", "gone", 1);
   pool_->UnpinPage(page_id, true);
 
-  tinydb::BPlusTree tree(&*pool_, page_id);
-  EXPECT_EQ(tree.Get("live"), std::optional<std::string>{"here"});
-  EXPECT_EQ(tree.Get("zombie"), std::nullopt);
+  auto tree = tinydb::BPlusTree::Open(&*pool_, page_id).value();
+  EXPECT_EQ(tree.Get("live").value(), std::optional<std::string>{"here"});
+  EXPECT_EQ(tree.Get("zombie").value(), std::nullopt);
 
   // Any mutation rewrites the page; the tombstone must not resurrect.
-  tree.Put("new", "row");
-  const auto rows = tree.Scan("", SCAN_END);
+  ASSERT_TRUE(tree.Put("new", "row").Ok());
+  const auto rows = tree.Scan("", SCAN_END).value();
   const auto want = std::vector<std::pair<std::string, std::string>>{
       {"live", "here"},
       {"new", "row"},

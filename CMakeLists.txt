@@ -10,7 +10,7 @@ option(TINYDB_ENABLE_CLANG_TIDY "Run clang-tidy while compiling local targets" O
 option(TINYDB_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(TINYDB_BUILD_BENCHMARKS "Build the workload benchmarks in bench/" OFF)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -47,7 +47,12 @@ set(TINYDB_CLANG_TIDY_COMMAND "")
 if(TINYDB_ENABLE_CLANG_TIDY)
   find_program(CLANG_TIDY_EXE NAMES clang-tidy clang-tidy-18 clang-tidy-17 clang-tidy-16)
   if(CLANG_TIDY_EXE)
-    set(TINYDB_CLANG_TIDY_COMMAND "${CLANG_TIDY_EXE};--quiet")
+    # LLVM 18 reports __cpp_concepts=201907 while GCC 13's <expected>
+    # requires 202002 before exposing std::expected. The real compiler remains
+    # GCC; this only lets clang-tidy parse the libstdc++ C++23 header.
+    set(TINYDB_CLANG_TIDY_COMMAND
+        "${CLANG_TIDY_EXE};--quiet;--extra-arg=-Wno-builtin-macro-redefined;--extra-arg=-D__cpp_concepts=202002L"
+    )
   else()
     message(WARNING "TINYDB_ENABLE_CLANG_TIDY=ON but clang-tidy was not found")
   endif()
@@ -70,6 +75,7 @@ add_library(
   include/tinydb/file_header.h
   include/tinydb/page.h
   include/tinydb/page_ref.h
+  include/tinydb/status.h
   include/tinydb/storage_engine.h
   include/tinydb/unique_fd.h
   src/btree/b_plus_tree.cpp
@@ -82,7 +88,7 @@ add_library(
   src/engine/storage_engine.cpp
   src/storage/disk_manager.cpp)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
-target_compile_features(TinyDB PUBLIC cxx_std_20)
+target_compile_features(TinyDB PUBLIC cxx_std_23)
 target_include_directories(
   TinyDB
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tinydb/disk_manager.h>
+#include <tinydb/status.h>
 
 #include <array>
 #include <cstddef>
@@ -37,23 +38,25 @@ class BufferPool {
   auto operator=(BufferPool &&other) noexcept -> BufferPool &;
   ~BufferPool();
 
-  auto NewPage() -> NewPageResult;
-  auto FetchPage(page_id_t page_id) -> char *;
+  auto NewPage() -> Result<NewPageResult>;
+  auto FetchPage(page_id_t page_id) -> Result<char *>;
   void UnpinPage(page_id_t page_id, bool dirty);
 
   // Drops page_id from the pool (it must be unpinned; its cached bytes are
   // dead, so they are discarded rather than flushed) and puts it on the disk
   // manager's free list for reuse.
-  void FreePage(page_id_t page_id);
-  void FlushPage(page_id_t page_id);
-  void FlushAllPages();
+  auto FreePage(page_id_t page_id) -> Status;
+  auto FlushPage(page_id_t page_id) -> Status;
+  auto FlushAllPages() -> Status;
 
  private:
-  auto PickFrame() -> frame_id_t;
+  // Hands out a free frame, evicting an unpinned page if none are free.
+  // Fails with ResourceExhausted when every frame is pinned.
+  auto PickFrame() -> Result<frame_id_t>;
 
-  // FlushAllPages for contexts that must not throw (destructor, move
-  // assignment): failures are reported to stderr and swallowed. Callers who
-  // need to handle flush errors flush through the owning handle first.
+  // FlushAllPages for the destructor and move assignment, which cannot
+  // surface a status: failures are reported to stderr and dropped. Callers
+  // who need to handle flush errors flush through the owning handle first.
   void FlushBestEffort() noexcept;
 
   DiskManager *disk_manager_{nullptr};

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,12 +29,13 @@
     flags != 0 are treated as tombstones: skipped on load and dropped on the
     next rewrite.)
 
-  - Nothing fails silently: impossible states abort via TINYDB_CHECK, and no
-    structural change is written until everything it depends on is known to
-    fit. Entries are capped at MAX_ENTRY_BYTES, which guarantees every
-    overflowing node has a valid split point (see page_format.h). The one
-    deliberate soft spot: if a rebalance would promote a separator too fat
-    for the parent, the repair is skipped and the child stays underfull —
+  - Nothing fails silently: I/O failures propagate out as statuses before
+    any dependent page is written, impossible states abort via TINYDB_CHECK,
+    and no structural change is written until everything it depends on is
+    known to fit. Entries are capped at MAX_ENTRY_BYTES, which guarantees
+    every overflowing node has a valid split point (see page_format.h). The
+    one deliberate soft spot: if a rebalance would promote a separator too
+    fat for the parent, the repair is skipped and the child stays underfull —
     the tree remains correct, only occupancy suffers.
 
   - The root page id never changes. A root split moves both halves to new
@@ -54,17 +56,20 @@ struct PathStep {
   std::size_t child_index;  // this node's position under its parent
 };
 
-auto DescendToLeaf(BufferPool *pool, page_id_t root_page_id, std::string_view key) -> std::vector<PathStep> {
+auto DescendToLeaf(BufferPool *pool, page_id_t root_page_id, std::string_view key) -> Result<std::vector<PathStep>> {
   auto path = std::vector<PathStep>{{root_page_id, 0}};
   for (;;) {
     TINYDB_CHECK(path.size() <= 64, "tree too deep; page cycle likely");
-    PageRef page(pool, path.back().page_id);
-    const auto type = ReadAs<NodeHeader>(page.Data()).type;
+    auto page = PageRef::Fetch(pool, path.back().page_id);
+    if (!page) {
+      return std::unexpected(std::move(page).error());
+    }
+    const auto type = ReadAs<NodeHeader>(page->Data()).type;
     if (type == NodeType::Leaf) {
       return path;
     }
     TINYDB_CHECK(type == NodeType::Internal, "descended into a non-tree page");
-    const auto node = InternalNode::Load(page.Data());
+    const auto node = InternalNode::Load(page->Data());
     const auto child_index = node.FindChildIndex(key);
     path.push_back({node.ChildAt(child_index), child_index});
   }
@@ -81,51 +86,63 @@ struct PendingSeparator {
 // pages and the root page is rewritten as an internal node above them, so
 // the root page id never changes.
 auto SplitAndWrite(BufferPool *pool, PageRef &page, LeafNode &node, bool is_root,
-                   bool tail_heavy) -> std::optional<PendingSeparator> {
-  PageRef right_page = PageRef::New(pool);
-  auto split = node.Split(right_page.Id(), tail_heavy);
-  split.right.Store(right_page.Data());
-  right_page.MarkDirty();
+                   bool tail_heavy) -> Result<std::optional<PendingSeparator>> {
+  auto right_page = PageRef::New(pool);
+  if (!right_page) {
+    return std::unexpected(std::move(right_page).error());
+  }
+  auto split = node.Split(right_page->Id(), tail_heavy);
+  split.right.Store(right_page->Data());
+  right_page->MarkDirty();
 
   if (!is_root) {
     node.Store(page.Data());
     page.MarkDirty();
-    return PendingSeparator{std::move(split.separator), right_page.Id()};
+    return std::optional{PendingSeparator{std::move(split.separator), right_page->Id()}};
   }
 
-  PageRef left_page = PageRef::New(pool);
-  node.Store(left_page.Data());
-  left_page.MarkDirty();
+  auto left_page = PageRef::New(pool);
+  if (!left_page) {
+    return std::unexpected(std::move(left_page).error());
+  }
+  node.Store(left_page->Data());
+  left_page->MarkDirty();
 
-  const InternalNode new_root(left_page.Id(), std::move(split.separator), right_page.Id());
+  const InternalNode new_root(left_page->Id(), std::move(split.separator), right_page->Id());
   new_root.Store(page.Data());
   page.MarkDirty();
-  return std::nullopt;
+  return std::optional<PendingSeparator>{};
 }
 
 // Same as above for an overflowing internal node; no leaf chain or
 // tail-heavy concerns here.
 auto SplitAndWrite(BufferPool *pool, PageRef &page, InternalNode &node,
-                   bool is_root) -> std::optional<PendingSeparator> {
-  PageRef right_page = PageRef::New(pool);
+                   bool is_root) -> Result<std::optional<PendingSeparator>> {
+  auto right_page = PageRef::New(pool);
+  if (!right_page) {
+    return std::unexpected(std::move(right_page).error());
+  }
   auto split = node.Split();
-  split.right.Store(right_page.Data());
-  right_page.MarkDirty();
+  split.right.Store(right_page->Data());
+  right_page->MarkDirty();
 
   if (!is_root) {
     node.Store(page.Data());
     page.MarkDirty();
-    return PendingSeparator{std::move(split.separator), right_page.Id()};
+    return std::optional{PendingSeparator{std::move(split.separator), right_page->Id()}};
   }
 
-  PageRef left_page = PageRef::New(pool);
-  node.Store(left_page.Data());
-  left_page.MarkDirty();
+  auto left_page = PageRef::New(pool);
+  if (!left_page) {
+    return std::unexpected(std::move(left_page).error());
+  }
+  node.Store(left_page->Data());
+  left_page->MarkDirty();
 
-  const InternalNode new_root(left_page.Id(), std::move(split.separator), right_page.Id());
+  const InternalNode new_root(left_page->Id(), std::move(split.separator), right_page->Id());
   new_root.Store(page.Data());
   page.MarkDirty();
-  return std::nullopt;
+  return std::optional<PendingSeparator>{};
 }
 
 // Repairs an underfull leaf by combining it with a sibling (prefer the one
@@ -133,9 +150,12 @@ auto SplitAndWrite(BufferPool *pool, PageRef &page, InternalNode &node,
 // merges into the left page; otherwise the records are redistributed evenly
 // and the parent separator is updated. Returns true iff the pair merged
 // (i.e. the parent lost a separator and may itself be underfull now).
-auto RepairLeafChild(BufferPool *pool, page_id_t parent_id, const PathStep &child) -> bool {
-  PageRef parent_page(pool, parent_id);
-  auto parent = InternalNode::Load(parent_page.Data());
+auto RepairLeafChild(BufferPool *pool, page_id_t parent_id, const PathStep &child) -> Result<bool> {
+  auto parent_page = PageRef::Fetch(pool, parent_id);
+  if (!parent_page) {
+    return std::unexpected(std::move(parent_page).error());
+  }
+  auto parent = InternalNode::Load(parent_page->Data());
   if (parent.SeparatorCount() == 0) {
     return false;  // an only child has no sibling to repair against
   }
@@ -145,10 +165,16 @@ auto RepairLeafChild(BufferPool *pool, page_id_t parent_id, const PathStep &chil
   const page_id_t right_id = parent.ChildAt(sep_index + 1);
 
   {
-    PageRef left_page(pool, left_id);
-    PageRef right_page(pool, right_id);
-    auto combined = LeafNode::Load(left_page.Data());
-    combined.Absorb(LeafNode::Load(right_page.Data()));
+    auto left_page = PageRef::Fetch(pool, left_id);
+    if (!left_page) {
+      return std::unexpected(std::move(left_page).error());
+    }
+    auto right_page = PageRef::Fetch(pool, right_id);
+    if (!right_page) {
+      return std::unexpected(std::move(right_page).error());
+    }
+    auto combined = LeafNode::Load(left_page->Data());
+    combined.Absorb(LeafNode::Load(right_page->Data()));
 
     if (!combined.Fits()) {
       // Rebalance: redistribute evenly (this is exactly a split of the
@@ -161,32 +187,38 @@ auto RepairLeafChild(BufferPool *pool, page_id_t parent_id, const PathStep &chil
         // stays correct.
         return false;
       }
-      combined.Store(left_page.Data());
-      left_page.MarkDirty();
-      split.right.Store(right_page.Data());
-      right_page.MarkDirty();
-      parent.Store(parent_page.Data());
-      parent_page.MarkDirty();
+      combined.Store(left_page->Data());
+      left_page->MarkDirty();
+      split.right.Store(right_page->Data());
+      right_page->MarkDirty();
+      parent.Store(parent_page->Data());
+      parent_page->MarkDirty();
       return false;
     }
 
     // Merge into the left page.
-    combined.Store(left_page.Data());
-    left_page.MarkDirty();
+    combined.Store(left_page->Data());
+    left_page->MarkDirty();
     parent.EraseSeparator(sep_index);
-    parent.Store(parent_page.Data());
-    parent_page.MarkDirty();
+    parent.Store(parent_page->Data());
+    parent_page->MarkDirty();
   }
 
-  pool->FreePage(right_id);  // the merged-away sibling, unpinned above
+  // The merged-away sibling, unpinned above.
+  if (auto status = pool->FreePage(right_id); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
   return true;
 }
 
 // The internal-node version of the repair above. The one difference: the
 // parent separator comes down between the two halves when they combine.
-auto RepairInternalChild(BufferPool *pool, page_id_t parent_id, const PathStep &child) -> bool {
-  PageRef parent_page(pool, parent_id);
-  auto parent = InternalNode::Load(parent_page.Data());
+auto RepairInternalChild(BufferPool *pool, page_id_t parent_id, const PathStep &child) -> Result<bool> {
+  auto parent_page = PageRef::Fetch(pool, parent_id);
+  if (!parent_page) {
+    return std::unexpected(std::move(parent_page).error());
+  }
+  auto parent = InternalNode::Load(parent_page->Data());
   if (parent.SeparatorCount() == 0) {
     return false;  // an only child has no sibling to repair against
   }
@@ -196,10 +228,16 @@ auto RepairInternalChild(BufferPool *pool, page_id_t parent_id, const PathStep &
   const page_id_t right_id = parent.ChildAt(sep_index + 1);
 
   {
-    PageRef left_page(pool, left_id);
-    PageRef right_page(pool, right_id);
-    auto combined = InternalNode::Load(left_page.Data());
-    combined.Absorb(parent.SeparatorKeyAt(sep_index), InternalNode::Load(right_page.Data()));
+    auto left_page = PageRef::Fetch(pool, left_id);
+    if (!left_page) {
+      return std::unexpected(std::move(left_page).error());
+    }
+    auto right_page = PageRef::Fetch(pool, right_id);
+    if (!right_page) {
+      return std::unexpected(std::move(right_page).error());
+    }
+    auto combined = InternalNode::Load(left_page->Data());
+    combined.Absorb(parent.SeparatorKeyAt(sep_index), InternalNode::Load(right_page->Data()));
 
     if (!combined.Fits()) {
       auto split = combined.Split();
@@ -207,161 +245,221 @@ auto RepairInternalChild(BufferPool *pool, page_id_t parent_id, const PathStep &
       if (!parent.Fits()) {
         return false;
       }
-      combined.Store(left_page.Data());
-      left_page.MarkDirty();
-      split.right.Store(right_page.Data());
-      right_page.MarkDirty();
-      parent.Store(parent_page.Data());
-      parent_page.MarkDirty();
+      combined.Store(left_page->Data());
+      left_page->MarkDirty();
+      split.right.Store(right_page->Data());
+      right_page->MarkDirty();
+      parent.Store(parent_page->Data());
+      parent_page->MarkDirty();
       return false;
     }
 
-    combined.Store(left_page.Data());
-    left_page.MarkDirty();
+    combined.Store(left_page->Data());
+    left_page->MarkDirty();
     parent.EraseSeparator(sep_index);
-    parent.Store(parent_page.Data());
-    parent_page.MarkDirty();
+    parent.Store(parent_page->Data());
+    parent_page->MarkDirty();
   }
 
-  pool->FreePage(right_id);  // the merged-away sibling, unpinned above
+  // The merged-away sibling, unpinned above.
+  if (auto status = pool->FreePage(right_id); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
   return true;
 }
 
 // While the root is an internal node with no separators, its single child is
 // the whole tree: copy the child over the root page (stable root page id).
-void CollapseRoot(BufferPool *pool, page_id_t root_page_id) {
+auto CollapseRoot(BufferPool *pool, page_id_t root_page_id) -> Status {
   for (;;) {
     page_id_t child_id = HEADER_PAGE_ID;
     {
-      PageRef root_page(pool, root_page_id);
-      if (ReadAs<NodeHeader>(root_page.Data()).type != NodeType::Internal) {
-        return;
+      auto root_page = PageRef::Fetch(pool, root_page_id);
+      if (!root_page) {
+        return std::move(root_page).error();
       }
-      const auto root = InternalNode::Load(root_page.Data());
+      if (ReadAs<NodeHeader>(root_page->Data()).type != NodeType::Internal) {
+        return {};
+      }
+      const auto root = InternalNode::Load(root_page->Data());
       if (root.SeparatorCount() > 0) {
-        return;
+        return {};
       }
       child_id = root.FirstChild();
-      PageRef child_page(pool, child_id);
-      std::memcpy(root_page.Data(), child_page.Data(), PAGE_SIZE);
-      root_page.MarkDirty();
+      auto child_page = PageRef::Fetch(pool, child_id);
+      if (!child_page) {
+        return std::move(child_page).error();
+      }
+      std::memcpy(root_page->Data(), child_page->Data(), PAGE_SIZE);
+      root_page->MarkDirty();
     }
-    pool->FreePage(child_id);  // the swallowed child's page, unpinned above
+    // The swallowed child's page, unpinned above.
+    if (auto status = pool->FreePage(child_id); !status.Ok()) {
+      return status;
+    }
   }
 }
 
 }  // namespace
 
-BPlusTree::BPlusTree(BufferPool *buffer_pool, page_id_t root_page_id)
-    : buffer_pool_(buffer_pool), root_page_id_(root_page_id) {
-  TINYDB_CHECK(buffer_pool_ != nullptr, "buffer pool is null");
-  TINYDB_CHECK(root_page_id_ != HEADER_PAGE_ID, "root page id is the reserved header page");
+auto BPlusTree::Open(BufferPool *buffer_pool, page_id_t root_page_id) -> Result<BPlusTree> {
+  TINYDB_CHECK(buffer_pool != nullptr, "buffer pool is null");
+  TINYDB_CHECK(root_page_id != HEADER_PAGE_ID, "root page id is the reserved header page");
 
   // A freshly allocated page is all zeroes; bootstrap it as an empty leaf.
   // NodeType has no zero enumerator, so inspect the raw bytes.
-  PageRef root_page(buffer_pool_, root_page_id_);
-  const auto raw_type = ReadAs<std::uint16_t>(root_page.Data());
+  auto root_page = PageRef::Fetch(buffer_pool, root_page_id);
+  if (!root_page) {
+    return std::unexpected(std::move(root_page).error());
+  }
+  const auto raw_type = ReadAs<std::uint16_t>(root_page->Data());
   if (raw_type == 0) {
-    LeafNode{}.Store(root_page.Data());
-    root_page.MarkDirty();
-    return;
+    LeafNode{}.Store(root_page->Data());
+    root_page->MarkDirty();
+    return BPlusTree(buffer_pool, root_page_id);
   }
   const bool is_node = raw_type == static_cast<std::uint16_t>(NodeType::Leaf) ||
                        raw_type == static_cast<std::uint16_t>(NodeType::Internal);
-  TINYDB_CHECK(is_node, "root page is not a b+ tree node");
+  if (!is_node) {
+    return std::unexpected(Status::Corruption("root page is not a b+ tree node"));
+  }
+  return BPlusTree(buffer_pool, root_page_id);
 }
 
-void BPlusTree::Put(std::string_view key, std::string_view value) {
+auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   TINYDB_CHECK(key.size() + value.size() <= MAX_ENTRY_BYTES, "entry exceeds MAX_ENTRY_BYTES; enforce sizes before Put");
   const auto path = DescendToLeaf(buffer_pool_, root_page_id_, key);
+  if (!path) {
+    return path.error();
+  }
 
   std::optional<PendingSeparator> pending;
   {
-    PageRef leaf_page(buffer_pool_, path.back().page_id);
-    auto node = LeafNode::Load(leaf_page.Data());
+    auto leaf_page = PageRef::Fetch(buffer_pool_, path->back().page_id);
+    if (!leaf_page) {
+      return std::move(leaf_page).error();
+    }
+    auto node = LeafNode::Load(leaf_page->Data());
     const bool at_tail = node.Upsert(key, value);
 
     if (node.Fits()) {
-      node.Store(leaf_page.Data());
-      leaf_page.MarkDirty();
-      return;
+      node.Store(leaf_page->Data());
+      leaf_page->MarkDirty();
+      return {};
     }
     const bool tail_heavy = at_tail && node.NextLeaf() == HEADER_PAGE_ID;
-    pending = SplitAndWrite(buffer_pool_, leaf_page, node,
-                            /*is_root=*/path.size() == 1, tail_heavy);
+    auto split = SplitAndWrite(buffer_pool_, *leaf_page, node,
+                               /*is_root=*/path->size() == 1, tail_heavy);
+    if (!split) {
+      return std::move(split).error();
+    }
+    pending = std::move(*split);
   }
 
   // Insert the pending separator into the ancestors, splitting as needed.
-  std::size_t level = path.size() - 1;
+  std::size_t level = path->size() - 1;
   while (pending.has_value()) {
     TINYDB_CHECK(level > 0, "pending separator escaped the root");
     --level;
-    PageRef page(buffer_pool_, path[level].page_id);
-    auto node = InternalNode::Load(page.Data());
+    auto page = PageRef::Fetch(buffer_pool_, (*path)[level].page_id);
+    if (!page) {
+      return std::move(page).error();
+    }
+    auto node = InternalNode::Load(page->Data());
     node.InsertSeparator(std::move(pending->key), pending->right_child);
 
     if (node.Fits()) {
-      node.Store(page.Data());
-      page.MarkDirty();
-      return;
+      node.Store(page->Data());
+      page->MarkDirty();
+      return {};
     }
-    pending = SplitAndWrite(buffer_pool_, page, node, /*is_root=*/level == 0);
+    auto split = SplitAndWrite(buffer_pool_, *page, node, /*is_root=*/level == 0);
+    if (!split) {
+      return std::move(split).error();
+    }
+    pending = std::move(*split);
   }
+  return {};
 }
 
-auto BPlusTree::Get(std::string_view key) -> std::optional<std::string> {
+auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> {
   const auto path = DescendToLeaf(buffer_pool_, root_page_id_, key);
-  PageRef leaf_page(buffer_pool_, path.back().page_id);
-  return LeafNode::Load(leaf_page.Data()).Get(key);
+  if (!path) {
+    return std::unexpected(path.error());
+  }
+  auto leaf_page = PageRef::Fetch(buffer_pool_, path->back().page_id);
+  if (!leaf_page) {
+    return std::unexpected(std::move(leaf_page).error());
+  }
+  return LeafNode::Load(leaf_page->Data()).Get(key);
 }
 
-void BPlusTree::Remove(std::string_view key) {
+auto BPlusTree::Remove(std::string_view key) -> Status {
   const auto path = DescendToLeaf(buffer_pool_, root_page_id_, key);
+  if (!path) {
+    return path.error();
+  }
   {
-    PageRef leaf_page(buffer_pool_, path.back().page_id);
-    auto node = LeafNode::Load(leaf_page.Data());
-    if (!node.Erase(key)) {
-      return;
+    auto leaf_page = PageRef::Fetch(buffer_pool_, path->back().page_id);
+    if (!leaf_page) {
+      return std::move(leaf_page).error();
     }
-    node.Store(leaf_page.Data());
-    leaf_page.MarkDirty();
+    auto node = LeafNode::Load(leaf_page->Data());
+    if (!node.Erase(key)) {
+      return {};
+    }
+    node.Store(leaf_page->Data());
+    leaf_page->MarkDirty();
 
-    const bool is_root_leaf = path.size() == 1;
+    const bool is_root_leaf = path->size() == 1;
     if (is_root_leaf || !node.Underfull()) {
-      return;
+      return {};
     }
   }
 
   // Repair underfull nodes bottom-up. A rebalance (or a skipped repair) ends
   // the walk; a merge shrinks the parent, which may need repair itself.
   bool leaf_level = true;
-  for (std::size_t level = path.size() - 1; level > 0; --level) {
-    const bool merged = leaf_level ? RepairLeafChild(buffer_pool_, path[level - 1].page_id, path[level])
-                                   : RepairInternalChild(buffer_pool_, path[level - 1].page_id, path[level]);
+  for (std::size_t level = path->size() - 1; level > 0; --level) {
+    const auto merged = leaf_level ? RepairLeafChild(buffer_pool_, (*path)[level - 1].page_id, (*path)[level])
+                                   : RepairInternalChild(buffer_pool_, (*path)[level - 1].page_id, (*path)[level]);
     if (!merged) {
-      return;
+      return merged.error();
+    }
+    if (!*merged) {
+      return {};
     }
     leaf_level = false;
 
     if (level - 1 == 0) {
       break;  // the parent is the root; handled by CollapseRoot below
     }
-    PageRef parent_page(buffer_pool_, path[level - 1].page_id);
-    if (!InternalNode::Load(parent_page.Data()).Underfull()) {
-      return;
+    auto parent_page = PageRef::Fetch(buffer_pool_, (*path)[level - 1].page_id);
+    if (!parent_page) {
+      return std::move(parent_page).error();
+    }
+    if (!InternalNode::Load(parent_page->Data()).Underfull()) {
+      return {};
     }
   }
-  CollapseRoot(buffer_pool_, root_page_id_);
+  return CollapseRoot(buffer_pool_, root_page_id_);
 }
 
-auto BPlusTree::Scan(std::string_view start, std::string_view end) -> std::vector<std::pair<std::string, std::string>> {
+auto BPlusTree::Scan(std::string_view start,
+                     std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>> {
   auto rows = std::vector<std::pair<std::string, std::string>>{};
   const auto path = DescendToLeaf(buffer_pool_, root_page_id_, start);
+  if (!path) {
+    return std::unexpected(path.error());
+  }
 
-  auto page_id = path.back().page_id;
+  auto page_id = path->back().page_id;
   while (page_id != HEADER_PAGE_ID) {
-    PageRef leaf_page(buffer_pool_, page_id);
-    const auto node = LeafNode::Load(leaf_page.Data());
+    auto leaf_page = PageRef::Fetch(buffer_pool_, page_id);
+    if (!leaf_page) {
+      return std::unexpected(std::move(leaf_page).error());
+    }
+    const auto node = LeafNode::Load(leaf_page->Data());
     const auto &records = node.Records();
     auto it =
         std::lower_bound(records.begin(), records.end(), start,

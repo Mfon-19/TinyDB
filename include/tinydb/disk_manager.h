@@ -1,10 +1,12 @@
 #pragma once
 
 #include <tinydb/file_header.h>
+#include <tinydb/status.h>
 #include <tinydb/unique_fd.h>
 
 #include <filesystem>
 #include <unordered_set>
+#include <utility>
 
 namespace tinydb {
 
@@ -12,10 +14,14 @@ namespace tinydb {
 //
 // This layer treats pages as opaque bytes. It does not know whether a page
 // contains a B+ tree node, free page, overflow page, or any higher-level state.
+//
+// I/O failures are reported as Status / Result values; nothing here throws.
 class DiskManager {
  public:
-  // Opens or creates the database file at path.
-  explicit DiskManager(const std::filesystem::path &path);
+  // Opens or creates the database file at path. Fails with InvalidArgument
+  // if the file exists but is not a TinyDB database, Corruption if its free
+  // list is damaged, and IoError if the environment misbehaves.
+  static auto Open(const std::filesystem::path &path) -> Result<DiskManager>;
 
   DiskManager(const DiskManager &) = delete;
   auto operator=(const DiskManager &) -> DiskManager & = delete;
@@ -29,37 +35,39 @@ class DiskManager {
   // Returns a data page id: the most recently freed page if any, otherwise
   // a fresh page grown at the end of the file. The page's on-disk bytes are
   // unspecified; the caller writes it before reading it.
-  auto AllocatePage() -> page_id_t;
+  auto AllocatePage() -> Result<page_id_t>;
 
   // Puts page_id on the free list for AllocatePage to reuse. The caller
   // must own the page and drop every reference to it first. Freeing a page
   // twice is a bug and aborts.
-  void FreePage(page_id_t page_id);
+  auto FreePage(page_id_t page_id) -> Status;
 
   // The B+ tree root page id persisted in the file header. HEADER_PAGE_ID
   // means the database has no root yet (freshly created file).
   auto GetRootPageId() const -> page_id_t;
 
   // Records a new root page id in the file header and writes it out.
-  void SetRootPageId(page_id_t root_page_id);
+  auto SetRootPageId(page_id_t root_page_id) -> Status;
 
   // Blocks until every write so far has reached the storage device, not just
   // the OS page cache. This is the durability point for a clean close.
-  void Sync() const;
+  auto Sync() const -> Status;
 
   // Reads exactly one page into data. Reading an unallocated page is an error.
-  void ReadPage(page_id_t page_id, char *data) const;
+  auto ReadPage(page_id_t page_id, char *data) const -> Status;
 
   // Writes exactly one page from data.
-  void WritePage(page_id_t page_id, const char *data) const;
+  auto WritePage(page_id_t page_id, const char *data) const -> Status;
 
  private:
+  explicit DiskManager(UniqueFd fd) : fd_(std::move(fd)) {}
+
   // Writes the in-memory file header to page 0.
-  void WriteHeader() const;
+  auto WriteHeader() const -> Status;
 
   // An invalid fd means this object was moved from.
   UniqueFd fd_;
-  FileHeader header_;
+  FileHeader header_{};
 
   // In-memory mirror of the on-disk free list, rebuilt on open. Exists to
   // catch double frees immediately and corrupt (cyclic) lists at open.
