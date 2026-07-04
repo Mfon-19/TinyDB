@@ -1,6 +1,8 @@
 #include <tinydb/buffer_pool.h>
 #include <tinydb/check.h>
 
+#include <cstdio>
+#include <exception>
 #include <stdexcept>
 #include <utility>
 
@@ -24,7 +26,7 @@ BufferPool::BufferPool(BufferPool &&other) noexcept
 
 auto BufferPool::operator=(BufferPool &&other) noexcept -> BufferPool & {
   if (this != &other) {
-    FlushAllPages();
+    FlushBestEffort();
 
     disk_manager_ = other.disk_manager_;
     frames_ = std::move(other.frames_);
@@ -38,7 +40,15 @@ auto BufferPool::operator=(BufferPool &&other) noexcept -> BufferPool & {
   return *this;
 }
 
-BufferPool::~BufferPool() { FlushAllPages(); }
+BufferPool::~BufferPool() { FlushBestEffort(); }
+
+void BufferPool::FlushBestEffort() noexcept {
+  try {
+    FlushAllPages();
+  } catch (const std::exception &error) {
+    std::fprintf(stderr, "tinydb: buffer pool flush failed: %s\n", error.what());
+  }
+}
 
 auto BufferPool::NewPage(page_id_t *page_id) -> char * {
   const auto frame_id = PickFrame();

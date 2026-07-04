@@ -41,20 +41,30 @@ StorageEngine::StorageEngine(StorageEngine &&other) noexcept
   other.closed_ = true;
 }
 
-StorageEngine::~StorageEngine() {
+StorageEngine::~StorageEngine() { CloseBestEffort(); }
+
+void StorageEngine::CloseBestEffort() noexcept {
   try {
     Close();
   } catch (const std::exception &error) {
-    // A destructor must not throw. Callers who need to handle flush errors
-    // (disk full, I/O failure) should call Close() themselves.
+    // A destructor and a noexcept move must not throw. Callers who need to
+    // handle flush errors (disk full, I/O failure) should call Close()
+    // themselves.
     std::fprintf(stderr, "tinydb: failed to close %s: %s\n", path_.c_str(), error.what());
   }
 }
 
 auto StorageEngine::operator=(StorageEngine &&other) noexcept -> StorageEngine & {
   if (this != &other) {
-    // Close the current engine before moving resources
-    Close();
+    CloseBestEffort();
+    // If the close failed, the members are still live: release them in
+    // dependency order (the pool's destructor retries its flush while the
+    // disk manager is still alive) rather than letting the member-wise
+    // assignments below destroy the disk manager out from under the pool.
+    tree_.reset();
+    pool_.reset();
+    disk_.reset();
+
     path_ = std::move(other.path_);
     closed_ = other.closed_;
     disk_ = std::move(other.disk_);
@@ -102,13 +112,17 @@ auto StorageEngine::Scan(std::string_view start,
 }
 
 auto StorageEngine::Close() -> void {
-  if (closed_) {
+  if (!disk_) {  // fully closed already, or moved from
     return;
   }
+  // Reject reads and writes from here on, but release resources only after
+  // the flush and sync succeed: if either throws, everything stays live and
+  // a second Close() retries (FlushAllPages marks frames clean as they are
+  // written, so only the remainder is rewritten).
   closed_ = true;
-  tree_.reset();
   pool_->FlushAllPages();
   disk_->Sync();  // the durability point: writes reach the device, not just the page cache
+  tree_.reset();
   pool_.reset();
   disk_.reset();
 }

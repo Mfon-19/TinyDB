@@ -152,14 +152,29 @@ constexpr auto AlignDown(std::size_t value, std::size_t alignment) -> std::size_
 using slot_t = std::uint16_t;
 constexpr std::size_t SLOT_SIZE = sizeof(slot_t);
 
-// The quarter-page footprint invariant behind split-always-succeeds: with
-// every record footprint at most a quarter of a node's usable bytes, the
-// split with the smallest byte imbalance is off-balance by at most one
-// footprint, so the bigger half stays within (total + usable/4) / 2 <= usable
-// for every overflow the tree can build (an insert overflows one page by at
-// most one record; underflow repair combines at most half a page, a full
-// page, and one separator). A separator key is a leaf key, so
-// MAX_ENTRY_BYTES bounds it.
+// Why splitting a node can never fail.
+//
+// These asserts pin the invariant that a record's footprint in a page (its
+// slot plus its aligned cell, worst case shown below) never exceeds a
+// quarter of a node's usable bytes (PAGE_SIZE minus the node header). That
+// quarter bound is what guarantees ChooseSplitIndex always finds a split
+// point where both halves fit in a page, so its "no valid split point"
+// check is unreachable.
+//
+// The argument, with U = usable bytes and F = max footprint <= U/4:
+//   1. Records shift between halves one at a time, so some split point is
+//      off-balance by at most one record: bigger half <= (total + F) / 2.
+//   2. The most bytes a split is ever asked to divide is an underflow
+//      rebalance, which pools an underfull node (below U/2), a full
+//      sibling (up to U), and one separator: total <= 1.5*U + F.
+//      (An insert overflow is milder: U plus one new record.)
+//   Combined: bigger half <= (1.5*U + 2*(U/4)) / 2 = U. It fits, exactly.
+//
+// MAX_ENTRY_BYTES caps key + value, so it bounds a leaf cell; a separator
+// is a copy of a leaf key, so it bounds an internal cell too. If the
+// balance ever shifts — larger MAX_ENTRY_BYTES, smaller PAGE_SIZE, fatter
+// headers — these fire at compile time instead of ChooseSplitIndex
+// aborting at runtime.
 static_assert(SLOT_SIZE + AlignUp(sizeof(LeafCellHeader) + MAX_ENTRY_BYTES, alignof(LeafCellHeader)) <=
               (PAGE_SIZE - sizeof(LeafHeader)) / 4);
 static_assert(SLOT_SIZE + AlignUp(sizeof(InternalCellHeader) + MAX_ENTRY_BYTES, alignof(InternalCellHeader)) <=

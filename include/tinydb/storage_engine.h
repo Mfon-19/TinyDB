@@ -56,14 +56,20 @@ class StorageEngine {
 
   // Flushes everything to the storage device (fsync) and releases resources
   // owned by this handle. Safe to call more than once. Throws on I/O
-  // failure; the destructor calls this too but can only report errors to
-  // stderr, so call Close() directly when flush errors must be handled.
+  // failure; the handle then rejects reads and writes but keeps its
+  // resources, so Close() can be called again to retry the flush. The
+  // destructor calls this too but can only report errors to stderr, so call
+  // Close() directly when flush errors must be handled.
   auto Close() -> void;
 
  private:
   // Construction goes through Open() so initialization and recovery can run
   // before callers receive a usable handle.
   explicit StorageEngine(std::filesystem::path path);
+
+  // Close() for contexts that must not throw (destructor, move assignment):
+  // failures are reported to stderr and swallowed.
+  void CloseBestEffort() noexcept;
 
   std::filesystem::path path_;
   bool closed_{false};

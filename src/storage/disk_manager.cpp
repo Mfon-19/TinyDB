@@ -37,48 +37,56 @@ DiskManager::DiskManager(const std::filesystem::path &path) {
     throw std::system_error(errno, std::generic_category(), "open");
   }
 
-  struct stat stat_buffer {};
-  if (::fstat(fd_, &stat_buffer) < 0) {
-    throw std::system_error(errno, std::generic_category(), "fstat");
-  }
-
-  if (stat_buffer.st_size == 0) {
-    header_ = FileHeader{
-        .magic = FILE_MAGIC,
-        .page_size = PAGE_SIZE,
-        .root_page_id = HEADER_PAGE_ID,
-        .next_page_id = FIRST_DATA_PAGE_ID,
-        .free_list_head = HEADER_PAGE_ID,
-    };
-
-    WriteHeader();
-    return;
-  }
-
-  const auto bytes_read = ::pread(fd_, &header_, sizeof(header_), 0);
-  if (bytes_read < 0) {
-    throw std::system_error(errno, std::generic_category(), "pread");
-  }
-
-  // A file too short to hold a header cannot be a database either.
-  if (static_cast<std::size_t>(bytes_read) != sizeof(header_) || header_.magic != FILE_MAGIC ||
-      header_.page_size != PAGE_SIZE) {
-    throw std::runtime_error("not a TinyDB database file: " + path.string());
-  }
-
-  // Rebuild the in-memory free-page set. Walking the list here also proves
-  // it is acyclic and points only at allocated pages marked free.
-  auto free_page_id = header_.free_list_head;
-  while (free_page_id != HEADER_PAGE_ID) {
-    if (free_page_id >= header_.next_page_id || free_pages_.contains(free_page_id)) {
-      throw std::runtime_error("corrupt free list in " + path.string());
+  // The destructor never runs for a partially constructed object, so if
+  // anything below throws (unreadable file, bad magic, corrupt free list)
+  // the descriptor must be closed by hand or it leaks.
+  try {
+    struct stat stat_buffer {};
+    if (::fstat(fd_, &stat_buffer) < 0) {
+      throw std::system_error(errno, std::generic_category(), "fstat");
     }
-    const auto free_header = ReadFreePageHeader(fd_, free_page_id);
-    if (free_header.type != FREE_PAGE_TYPE) {
-      throw std::runtime_error("corrupt free list in " + path.string());
+
+    if (stat_buffer.st_size == 0) {
+      header_ = FileHeader{
+          .magic = FILE_MAGIC,
+          .page_size = PAGE_SIZE,
+          .root_page_id = HEADER_PAGE_ID,
+          .next_page_id = FIRST_DATA_PAGE_ID,
+          .free_list_head = HEADER_PAGE_ID,
+      };
+
+      WriteHeader();
+      return;
     }
-    free_pages_.insert(free_page_id);
-    free_page_id = free_header.next_free;
+
+    const auto bytes_read = ::pread(fd_, &header_, sizeof(header_), 0);
+    if (bytes_read < 0) {
+      throw std::system_error(errno, std::generic_category(), "pread");
+    }
+
+    // A file too short to hold a header cannot be a database either.
+    if (static_cast<std::size_t>(bytes_read) != sizeof(header_) || header_.magic != FILE_MAGIC ||
+        header_.page_size != PAGE_SIZE) {
+      throw std::runtime_error("not a TinyDB database file: " + path.string());
+    }
+
+    // Rebuild the in-memory free-page set. Walking the list here also proves
+    // it is acyclic and points only at allocated pages marked free.
+    auto free_page_id = header_.free_list_head;
+    while (free_page_id != HEADER_PAGE_ID) {
+      if (free_page_id >= header_.next_page_id || free_pages_.contains(free_page_id)) {
+        throw std::runtime_error("corrupt free list in " + path.string());
+      }
+      const auto free_header = ReadFreePageHeader(fd_, free_page_id);
+      if (free_header.type != FREE_PAGE_TYPE) {
+        throw std::runtime_error("corrupt free list in " + path.string());
+      }
+      free_pages_.insert(free_page_id);
+      free_page_id = free_header.next_free;
+    }
+  } catch (...) {
+    static_cast<void>(::close(fd_));
+    throw;
   }
 }
 

@@ -44,6 +44,11 @@ class BufferPool {
  private:
   auto PickFrame() -> frame_id_t;
 
+  // FlushAllPages for contexts that must not throw (destructor, move
+  // assignment): failures are reported to stderr and swallowed. Callers who
+  // need to handle flush errors flush through the owning handle first.
+  void FlushBestEffort() noexcept;
+
   DiskManager *disk_manager_{nullptr};
   std::vector<Frame> frames_;
   std::unordered_map<page_id_t, frame_id_t> page_table_;
