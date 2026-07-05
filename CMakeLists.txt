@@ -78,6 +78,7 @@ add_library(
   include/tinydb/status.h
   include/tinydb/storage_engine.h
   include/tinydb/unique_fd.h
+  include/tinydb/wal.h
   src/btree/b_plus_tree.cpp
   src/btree/internal_node.cpp
   src/btree/internal_node.h
@@ -86,7 +87,8 @@ add_library(
   src/btree/page_format.h
   src/buffer/buffer_pool.cpp
   src/engine/storage_engine.cpp
-  src/storage/disk_manager.cpp)
+  src/storage/disk_manager.cpp
+  src/wal/wal.cpp)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
 target_compile_features(TinyDB PUBLIC cxx_std_23)
 target_include_directories(
