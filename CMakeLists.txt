@@ -148,6 +148,13 @@ if(BUILD_TESTING)
     TinyDB_apply_local_tooling(TinyDB_storage_engine_test)
     gtest_discover_tests(TinyDB_storage_engine_test)
   endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/wal_test.cpp")
+    add_executable(TinyDB_wal_test tests/wal_test.cpp)
+    target_link_libraries(TinyDB_wal_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    TinyDB_apply_local_tooling(TinyDB_wal_test)
+    gtest_discover_tests(TinyDB_wal_test)
+  endif()
 endif()
 
 if(TINYDB_BUILD_BENCHMARKS)
