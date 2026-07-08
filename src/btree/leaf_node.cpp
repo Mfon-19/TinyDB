@@ -18,6 +18,23 @@
 namespace tinydb {
 namespace {
 
+/*
+  LeafNode is the logical codec for one leaf page:
+
+      records   = [(key, value), ...] sorted by key
+      next_leaf = page id of the next leaf, or HEADER_PAGE_ID
+
+  Leaves contain every value in the tree. Internal pages only route. Range
+  scans rely on the linked list:
+
+      leaf A              leaf B              leaf C
+    [a b c]  --next-->  [k m n]  --next-->  [x y z]
+
+  Load skips tombstoned cells left by older page images; Store rewrites the
+  live records into a fully packed page, so tombstones and fragmentation
+  vanish on the next mutation.
+*/
+
 constexpr std::size_t USABLE_BYTES = PAGE_SIZE - sizeof(LeafHeader);
 
 // A node whose slots + cells drop below half the usable bytes gets repaired.
@@ -92,6 +109,12 @@ void LeafNode::Store(char *page) const {
 }
 
 auto LeafNode::Upsert(std::string_view key, std::string_view value) -> bool {
+  /*
+    Return value is not about "insert vs update"; it answers "did this key
+    land after the previous last key?" The B+ tree combines that with
+    next_leaf == HEADER_PAGE_ID to identify the common ascending-load case
+    and choose a lopsided rightmost split.
+  */
   const auto it = std::lower_bound(records_.begin(), records_.end(), key, KeyIsBefore);
   const bool at_tail = it == records_.end();
   if (!at_tail && it->key == key) {
@@ -165,6 +188,32 @@ auto LeafNode::ChooseSplitIndex() const -> std::size_t {
 }
 
 auto LeafNode::Split(page_id_t right_page_id, bool tail_heavy) -> SplitResult {
+  /*
+    Balanced leaf split:
+
+        before:
+          this page: [a b c k m z] -> old_next
+
+        after:
+          this page: [a b c] -> right_page_id: [k m z] -> old_next
+
+        separator copied up to parent:
+          first key of right half, "k"
+
+    Leaf separators are copies: "k" stays in the right leaf and is also
+    stored in the parent as the boundary key. That differs from internal
+    splits, where the separator moves out of the child.
+
+    Tail-heavy split for ascending inserts:
+
+        before rightmost overflow:
+          [old old old old new]
+
+        after:
+          [old old old old] -> [new]
+
+    That avoids turning sequential inserts into a chain of half-full pages.
+  */
   const bool lopsided = tail_heavy && records_.size() >= 2;
   const std::size_t split = lopsided ? records_.size() - 1 : ChooseSplitIndex();
   const auto split_it = records_.begin() + static_cast<std::ptrdiff_t>(split);
@@ -179,6 +228,20 @@ auto LeafNode::Split(page_id_t right_page_id, bool tail_heavy) -> SplitResult {
 }
 
 void LeafNode::Absorb(LeafNode &&right) {
+  /*
+    Merge adjacent leaves. Since all keys in right must sort after this
+    node's keys, merge is just append plus next-link adoption:
+
+        before:
+          this:  [a b c] -> right
+          right: [k m z] -> old_next
+
+        after:
+          this:  [a b c k m z] -> old_next
+
+    The caller is responsible for removing the parent separator that used
+    to point at right and freeing right's page after it is unpinned.
+  */
   TINYDB_CHECK(records_.empty() || right.records_.empty() || records_.back().key < right.records_.front().key,
                "absorbed leaf does not sort after this one");
   records_.insert(records_.end(), std::make_move_iterator(right.records_.begin()),

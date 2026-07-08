@@ -17,6 +17,25 @@
 namespace tinydb {
 namespace {
 
+/*
+  InternalNode is the logical codec for one internal page. The tree code
+  works with this in-memory shape:
+
+      first_child = C0
+      records     = [K0 -> C1, K1 -> C2, K2 -> C3]
+
+  That represents this routing table:
+
+      key < K0        -> C0
+      K0 <= key < K1  -> C1
+      K1 <= key < K2  -> C2
+      K2 <= key       -> C3
+
+  On disk, first_child lives in the header and each record is a slotted cell
+  containing {right_child, key_size, key bytes}. Load verifies type, cell
+  bounds, and key ordering; Store rewrites a fully packed page from records_.
+*/
+
 constexpr std::size_t USABLE_BYTES = PAGE_SIZE - sizeof(InternalHeader);
 
 // A node whose slots + cells drop below half the usable bytes gets repaired.
@@ -90,6 +109,16 @@ void InternalNode::Store(char *page) const {
 }
 
 auto InternalNode::FindChildIndex(std::string_view key) const -> std::size_t {
+  /*
+    upper_bound implements the "equal goes right" separator rule.
+
+      records: [K0, K1, K2]
+
+        key < K0       -> index 0 -> first_child
+        key == K0      -> index 1 -> K0.right_child
+        K0 < key < K1  -> index 1 -> K0.right_child
+        key >= K2      -> index 3 -> K2.right_child
+  */
   const auto it = std::upper_bound(records_.begin(), records_.end(), key,
                                    [](std::string_view target, const Record &record) { return target < record.key; });
   return static_cast<std::size_t>(it - records_.begin());
@@ -166,6 +195,31 @@ auto InternalNode::ChooseSplitIndex() const -> std::size_t {
 }
 
 auto InternalNode::Split() -> SplitResult {
+  /*
+    Splitting an internal node promotes the middle separator. Unlike a leaf
+    split, the separator does not remain in either child.
+
+      before:
+        first=C0
+        records=[K0->C1, K1->C2, K2->C3, K3->C4]
+
+      split at K2:
+
+        this(left):
+          first=C0
+          records=[K0->C1, K1->C2]
+
+        result.separator:
+          K2
+
+        result.right:
+          first=C3
+          records=[K3->C4]
+
+    The promoted separator's right_child becomes the first_child of the
+    returned right node. That is what preserves the N separators / N+1
+    children invariant after K2 moves up.
+  */
   const std::size_t split = ChooseSplitIndex();
   const auto split_it = records_.begin() + static_cast<std::ptrdiff_t>(split);
 
@@ -178,6 +232,27 @@ auto InternalNode::Split() -> SplitResult {
 }
 
 void InternalNode::Absorb(std::string separator, InternalNode &&right) {
+  /*
+    Merge two adjacent internal nodes by pulling the parent separator down
+    between them.
+
+      parent had:
+                  separator S
+                 /           \
+             this(left)      right
+
+      this before:
+        first=C0, records=[K0->C1]
+
+      right before:
+        first=C2, records=[K2->C3]
+
+      this after Absorb(S, right):
+        first=C0, records=[K0->C1, S->C2, K2->C3]
+
+    The separator points at right.first_child because that child owns keys
+    >= S and below right's first separator.
+  */
   TINYDB_CHECK(records_.empty() || records_.back().key < separator, "separator does not sort after this node's keys");
   records_.push_back(Record{std::move(separator), right.first_child_});
   records_.insert(records_.end(), std::make_move_iterator(right.records_.begin()),
