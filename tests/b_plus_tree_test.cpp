@@ -103,6 +103,7 @@ class BPlusTreeTest : public ::testing::Test {
   void ReopenDatabase() {
     tree_.reset();
     ASSERT_TRUE(pool_->FlushAllPages().Ok());
+    ASSERT_TRUE(disk_->Checkpoint().Ok());  // metadata reaches the file at a checkpoint
     pool_.reset();
     disk_.reset();
 

@@ -72,7 +72,7 @@ TEST(BufferPoolTest, FreedPageIsForgottenAndReused) {
     const auto [page_id, data] = pool.NewPage().value();
     data[0] = 'x';
     pool.UnpinPage(page_id, true);
-    ASSERT_TRUE(pool.FreePage(page_id).Ok());  // must discard the dirty bytes with the page
+    pool.FreePage(page_id);  // must discard the dirty bytes with the page
 
     const auto [reused_id, reused] = pool.NewPage().value();
     EXPECT_EQ(reused_id, page_id);  // the freed page comes back
@@ -93,7 +93,7 @@ TEST(BufferPoolDeathTest, FreeOfPinnedPageDies) {
 
     const auto page_id = pool.NewPage().value().page_id;  // stays pinned
 
-    EXPECT_DEATH(static_cast<void>(pool.FreePage(page_id)), "freeing a pinned page");
+    EXPECT_DEATH(pool.FreePage(page_id), "freeing a pinned page");
 
     pool.UnpinPage(page_id, false);
   }
@@ -148,6 +148,56 @@ TEST(BufferPoolTest, KeepPinnedPage) {
     EXPECT_EQ(blocked.error().Code(), tinydb::StatusCode::ResourceExhausted);
 
     pool.UnpinPage(page_id, false);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(BufferPoolTest, OpDirtyFramesAreNeitherEvictedNorFlushed) {
+  const auto path = TestPath("no_steal");
+  std::filesystem::remove(path);
+
+  {
+    auto disk = tinydb::DiskManager::Open(path).value();
+    tinydb::BufferPool pool(&disk, 1);
+
+    // Two pages on disk, pool of one frame.
+    const auto first = pool.NewPage().value().page_id;
+    pool.UnpinPage(first, true);
+    const auto second = pool.NewPage().value().page_id;  // evicts (writes) first
+    pool.UnpinPage(second, true);
+    ASSERT_TRUE(pool.FlushAllPages().Ok());
+
+    pool.BeginOp();
+    auto *const data = pool.FetchPage(first).value();  // evicts second, clean
+    data[0] = 'u';                                    // uncommitted from here on
+    pool.UnpinPage(first, true);
+
+    // No-steal: the only frame holds uncommitted bytes, so nothing is
+    // evictable even though nothing is pinned.
+    const auto fetch = pool.FetchPage(second);
+    ASSERT_FALSE(fetch.has_value());
+    EXPECT_EQ(fetch.error().Code(), tinydb::StatusCode::ResourceExhausted);
+
+    // And flushing skips it: the on-disk page keeps its committed bytes.
+    ASSERT_TRUE(pool.FlushAllPages().Ok());
+    auto on_disk = std::array<char, tinydb::PAGE_SIZE>{};
+    ASSERT_TRUE(disk.ReadPage(first, on_disk.data()).Ok());
+    EXPECT_EQ(on_disk[0], '\0');
+
+    // The frame is exactly what the operation must log.
+    const auto images = pool.OpDirtyFrames();
+    ASSERT_EQ(images.size(), 1U);
+    EXPECT_EQ(images[0].first, first);
+    EXPECT_EQ(images[0].second[0], 'u');
+
+    // After EndOp the frame is ordinary dirty again: fetching the other
+    // page evicts it, writing the bytes out on the way.
+    pool.EndOp();
+    ASSERT_TRUE(pool.FetchPage(second).has_value());
+    pool.UnpinPage(second, false);
+    ASSERT_TRUE(disk.ReadPage(first, on_disk.data()).Ok());
+    EXPECT_EQ(on_disk[0], 'u');
   }
 
   std::filesystem::remove(path);

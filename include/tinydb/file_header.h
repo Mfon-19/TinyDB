@@ -6,6 +6,8 @@
 
 namespace tinydb {
 
+constexpr std::uint32_t TINYDB_FILE_MAGIC = 0x54444231U;  // "TDB1"
+
 // FileHeader is the logical contents of page 0.
 //
 // The current storage layer writes this struct at the start of page 0. Keep

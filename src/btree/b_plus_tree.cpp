@@ -205,9 +205,7 @@ auto RepairLeafChild(BufferPool *pool, page_id_t parent_id, const PathStep &chil
   }
 
   // The merged-away sibling, unpinned above.
-  if (auto status = pool->FreePage(right_id); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
+  pool->FreePage(right_id);
   return true;
 }
 
@@ -262,9 +260,7 @@ auto RepairInternalChild(BufferPool *pool, page_id_t parent_id, const PathStep &
   }
 
   // The merged-away sibling, unpinned above.
-  if (auto status = pool->FreePage(right_id); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
+  pool->FreePage(right_id);
   return true;
 }
 
@@ -294,9 +290,7 @@ auto CollapseRoot(BufferPool *pool, page_id_t root_page_id) -> Status {
       root_page->MarkDirty();
     }
     // The swallowed child's page, unpinned above.
-    if (auto status = pool->FreePage(child_id); !status.Ok()) {
-      return status;
-    }
+    pool->FreePage(child_id);
   }
 }
 

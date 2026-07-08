@@ -1,4 +1,5 @@
 #include <tinydb/check.h>
+#include <tinydb/file_header.h>
 #include <tinydb/wal.h>
 
 #include <fcntl.h>
@@ -38,6 +39,25 @@ constexpr std::size_t RECORD_FRAME_SIZE = 2 * sizeof(std::uint32_t);  // length 
 // The failing errno as an IoError status, tagged with the operation.
 auto ErrnoStatus(std::string_view operation) -> Status {
   return Status::IoError(std::string(operation) + ": " + std::generic_category().message(errno));
+}
+
+// A new file's data can be durable while its directory entry is not. Commit
+// cannot claim durability for a freshly created WAL until the parent
+// directory is synced too.
+auto SyncParentDirectory(const std::filesystem::path &path) -> Status {
+  auto parent = path.parent_path();
+  if (parent.empty()) {
+    parent = ".";
+  }
+
+  auto dir_fd = UniqueFd(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+  if (!dir_fd.Valid()) {
+    return ErrnoStatus("open directory");
+  }
+  if (::fsync(dir_fd.Get()) < 0) {
+    return ErrnoStatus("fsync directory");
+  }
+  return {};
 }
 
 // CRC-32 (the reflected IEEE polynomial — the same function as zlib's
@@ -115,6 +135,38 @@ auto FullPread(int fd, void *data, std::size_t size, std::uint64_t offset) -> Re
   return total;
 }
 
+// Recovery may rewrite the database header, so DiskManager::Open cannot run
+// first. This preflight still rejects the dangerous case: a non-empty file
+// that is not already a TinyDB database must not be overwritten by a WAL whose
+// name merely happens to match.
+auto ValidateDatabaseFileForRecovery(const std::filesystem::path &db_path) -> Status {
+  auto db_fd = UniqueFd(::open(db_path.c_str(), O_RDONLY | O_CLOEXEC));
+  if (!db_fd.Valid()) {
+    if (errno == ENOENT) {
+      return {};
+    }
+    return ErrnoStatus("open");
+  }
+
+  struct stat stat_buffer {};
+  if (::fstat(db_fd.Get(), &stat_buffer) < 0) {
+    return ErrnoStatus("fstat");
+  }
+  if (stat_buffer.st_size == 0) {
+    return {};
+  }
+
+  FileHeader header{};
+  const auto header_read = FullPread(db_fd.Get(), &header, sizeof(header), 0);
+  if (!header_read) {
+    return header_read.error();
+  }
+  if (*header_read != sizeof(header) || header.magic != TINYDB_FILE_MAGIC || header.page_size != PAGE_SIZE) {
+    return Status::InvalidArgument("not a TinyDB database file: " + db_path.string());
+  }
+  return {};
+}
+
 }  // namespace
 
 auto Wal::PathFor(const std::filesystem::path &db_path) -> std::filesystem::path {
@@ -124,6 +176,51 @@ auto Wal::PathFor(const std::filesystem::path &db_path) -> std::filesystem::path
 }
 
 auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::path &wal_path) -> Status {
+  /*
+    Recovery is redo-only. The WAL is the source of truth for operations that
+    reached their durability point but may not have reached the database file.
+
+      WAL bytes:
+
+        +---------+--------------------+--------------------+------------+
+        | "TDBW"  | op 1               | op 2               | torn tail  |
+        +---------+--------------------+--------------------+------------+
+                  | PAGE* COMMIT       | PAGE* COMMIT       | PAGE* ...  |
+                  +--------- durable --+--------- durable --+-- ignored -+
+
+      One operation:
+
+        PAGE_IMAGE(page 7, post-image)
+        PAGE_IMAGE(page 0, post-image)
+        COMMIT
+
+      Invariants:
+
+        1. A run with no COMMIT did not commit. Drop it.
+        2. A bad frame length or CRC is treated as the start of a torn tail.
+           Stop scanning there; do not trust later bytes.
+        3. A well-formed but semantically impossible record is corruption,
+           not a torn write. Refuse recovery.
+        4. Replaying full-page post-images is idempotent:
+
+              before: page P = old
+              replay: page P = image
+              replay again: page P = image
+
+        5. Never truncate the WAL until the database file, and the containing
+           directory if the DB was recreated, are durable.
+
+      Ordering at the end:
+
+        replay committed images -> fsync(db) -> fsync(db parent if created)
+                                -> truncate WAL -> fsync(WAL)
+
+      If a crash happens before the WAL truncation is durable, recovery simply
+      replays the same committed images again.
+  */
+
+  // Step 1: open the WAL. A missing WAL means the database file is already
+  // the best available state.
   auto wal_fd = UniqueFd(::open(wal_path.c_str(), O_RDWR | O_CLOEXEC));
   if (!wal_fd.Valid()) {
     if (errno == ENOENT) {
@@ -138,6 +235,14 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
   }
   const auto wal_size = static_cast<std::uint64_t>(stat_buffer.st_size);
 
+  // Step 2: prove that replay is allowed to touch the base file. Recovery can
+  // rewrite page 0, so DiskManager::Open cannot validate first; this preflight
+  // rejects the dangerous "foreign.db + valid foreign.db-wal" pairing before
+  // any WAL image can overwrite user data.
+  if (auto status = ValidateDatabaseFileForRecovery(db_path); !status.Ok()) {
+    return status;
+  }
+
   // A crash can beat the header to disk: Open() creates the file and only
   // then writes and fsyncs the magic. Clear the remnant so the next Open()
   // stamps it afresh.
@@ -148,6 +253,8 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
     return {};
   }
 
+  // Step 3: verify the WAL header. From here on, every accepted record still
+  // needs its own CRC check; the magic only proves this is the right file type.
   std::uint32_t magic = 0;
   const auto magic_read = FullPread(wal_fd.Get(), &magic, sizeof(magic), 0);
   if (!magic_read) {
@@ -162,11 +269,21 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
   // scan stops at the first sign of a torn tail: a truncated frame, a length
   // that cannot be real, or a CRC mismatch.
   UniqueFd db_fd;  // opened at the first commit, if any
+  bool created_db_file = false;
   std::vector<std::pair<page_id_t, std::vector<char>>> run;
   bool applied = false;
   auto offset = static_cast<std::uint64_t>(sizeof(WAL_MAGIC));
 
   while (offset < wal_size) {
+    // Step 4: read one framed payload.
+    //
+    //   +----------------+-------------+----------------------+
+    //   | payload_length | payload_crc | payload bytes        |
+    //   +----------------+-------------+----------------------+
+    //
+    // Short frame, impossible length, short payload, or bad CRC means the
+    // writer crashed before this record was durable. The current and later
+    // bytes are ignored by breaking out of the scan.
     std::array<std::uint32_t, 2> frame{};  // {payload_length, crc32}
     const auto frame_read = FullPread(wal_fd.Get(), frame.data(), sizeof(frame), offset);
     if (!frame_read) {
@@ -194,6 +311,8 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
     // guessing which records to trust would be worse than refusing.
     switch (payload.front()) {
       case PAGE_IMAGE_TYPE: {
+        // Step 5a: accumulate this operation's post-images in memory. They
+        // are not applied until a later COMMIT proves the whole run durable.
         if (payload_length != PAGE_IMAGE_PAYLOAD_SIZE) {
           return Status::Corruption("malformed page image record in " + wal_path.string());
         }
@@ -203,11 +322,22 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
         break;
       }
       case COMMIT_TYPE: {
+        // Step 5b: COMMIT closes the current run. Every buffered page image
+        // before it is now durable and must be replayed.
+        //
+        //   run buffer: [page 3 image][page 8 image] + COMMIT
+        //                    |             |
+        //                    v             v
+        //   database:    overwrite p3  overwrite p8
         if (payload_length != COMMIT_PAYLOAD_SIZE) {
           return Status::Corruption("malformed commit record in " + wal_path.string());
         }
         if (!db_fd.Valid()) {
           db_fd = UniqueFd(::open(db_path.c_str(), O_RDWR | O_CLOEXEC));
+          if (!db_fd.Valid() && errno == ENOENT) {
+            db_fd = UniqueFd(::open(db_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
+            created_db_file = db_fd.Valid();
+          }
           if (!db_fd.Valid()) {
             return ErrnoStatus("open");
           }
@@ -232,11 +362,25 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
   // A trailing run with no commit record is an operation that never made it
   // to its durability point; `run` drops it here.
 
-  // Order matters: the database must be durable before the log forgets the
-  // images that could rebuild it.
+  // Step 6: make replay durable. The database must be on stable storage
+  // before the log forgets the images that could rebuild it.
   if (applied && ::fsync(db_fd.Get()) < 0) {
     return ErrnoStatus("fsync");
   }
+  if (applied && created_db_file) {
+    if (auto status = SyncParentDirectory(db_path); !status.Ok()) {
+      return status;
+    }
+  }
+
+  // Step 7: forget only the images that are now safely in the database file.
+  //
+  //   before reset: ["TDBW"][committed run][committed run][ignored tail]
+  //   after reset:  ["TDBW"]
+  //
+  // fsync(WAL) makes the truncation durable. If the crash happens before that
+  // fsync returns, the old committed runs may still be present, which is safe
+  // because replaying full-page images is idempotent.
   if (wal_size > sizeof(WAL_MAGIC)) {
     if (::ftruncate(wal_fd.Get(), static_cast<off_t>(sizeof(WAL_MAGIC))) < 0) {
       return ErrnoStatus("ftruncate");
@@ -271,6 +415,9 @@ auto Wal::Open(const std::filesystem::path &wal_path) -> Result<Wal> {
     if (::fsync(wal.fd_.Get()) < 0) {
       return std::unexpected(ErrnoStatus("fsync"));
     }
+    if (auto status = SyncParentDirectory(wal_path); !status.Ok()) {
+      return std::unexpected(std::move(status));
+    }
     wal.size_bytes_ = sizeof(WAL_MAGIC);
     return wal;
   }
@@ -300,21 +447,75 @@ void Wal::AppendPageImage(page_id_t page_id, const char *data) {
 void Wal::DiscardPending() { pending_.clear(); }
 
 auto Wal::Commit() -> Status {
+  /*
+    Commit is the only durability point for one StorageEngine operation.
+
+      pending_ before Commit():
+
+        +------------------+------------------+
+        | PAGE_IMAGE p0    | PAGE_IMAGE p9    |
+        +------------------+------------------+
+
+      Commit appends one final record in memory:
+
+        +------------------+------------------+----------+
+        | PAGE_IMAGE p0    | PAGE_IMAGE p9    | COMMIT   |
+        +------------------+------------------+----------+
+
+      Then it appends that whole byte run to the existing WAL:
+
+        WAL before:
+          +---------+----------------------+----------------------+
+          | "TDBW"  | old committed run    | old committed run    |
+          +---------+----------------------+----------------------+
+                                                       size_bytes_
+
+        WAL after FullPwrite, before fsync:
+          +---------+----------------------+----------------------+----------------------+
+          | "TDBW"  | old committed run    | old committed run    | new PAGE* COMMIT    |
+          +---------+----------------------+----------------------+----------------------+
+
+      Invariants:
+
+        1. Page images are post-images of every page dirtied by the operation.
+        2. No dirty frame from the operation may be written back by the buffer
+           pool before this Commit succeeds. That is the no-steal half of the
+           redo-only design.
+        3. Until fsync(fd_) returns, recovery may see no new bytes or a torn
+           tail. Both are safe: no complete COMMIT means no replay.
+        4. After fsync(fd_) returns, every PAGE_IMAGE before the COMMIT is
+           durable, so the operation is committed even if the database file
+           still has old page contents.
+        5. size_bytes_ advances only after fsync succeeds. If fsync fails, the
+           caller poisons the engine and recovery will decide what prefix is
+           valid by scanning lengths and CRCs.
+  */
+
   TINYDB_CHECK(fd_.Valid(), "committing on a moved-from log");
   TINYDB_CHECK(!pending_.empty(), "committing an operation that logged no page images");
 
+  // Step 1: close the in-memory run with a COMMIT record. Recovery replays a
+  // run only when this marker is present and its frame passes CRC validation.
   constexpr char commit_payload = COMMIT_TYPE;
   AppendRecord(pending_, &commit_payload, COMMIT_PAYLOAD_SIZE);
 
-  // One write, one fsync: the whole run reaches the file together, and a
-  // crash anywhere before the fsync returns leaves at worst a torn tail for
-  // the recovery scan to discard.
+  // Step 2: append the entire operation as one contiguous byte range.
+  //
+  // A single pwrite is not an atomicity requirement; FullPwrite may loop after
+  // short writes. The framing is what gives recovery a clean prefix: if a crash
+  // interrupts the append, the last frame is short or fails its CRC.
   if (auto status = FullPwrite(fd_.Get(), pending_.data(), pending_.size(), size_bytes_); !status.Ok()) {
     return status;
   }
+
+  // Step 3: fsync is the durability point. Returning Ok before this would let
+  // the caller acknowledge a write that can disappear on power loss.
   if (::fsync(fd_.Get()) < 0) {
     return ErrnoStatus("fsync");
   }
+
+  // Step 4: publish the new logical WAL tail only after the durable append.
+  // The pending buffer is now represented on disk and can be reused.
   size_bytes_ += pending_.size();
   pending_.clear();
   return {};

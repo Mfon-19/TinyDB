@@ -19,7 +19,8 @@ BufferPool::BufferPool(BufferPool &&other) noexcept
       frames_(std::move(other.frames_)),
       page_table_(std::move(other.page_table_)),
       free_list_(std::move(other.free_list_)),
-      next_victim_(other.next_victim_) {
+      next_victim_(other.next_victim_),
+      in_op_(other.in_op_) {
   other.disk_manager_ = nullptr;
 }
 
@@ -32,6 +33,7 @@ auto BufferPool::operator=(BufferPool &&other) noexcept -> BufferPool & {
     page_table_ = std::move(other.page_table_);
     free_list_ = std::move(other.free_list_);
     next_victim_ = other.next_victim_;
+    in_op_ = other.in_op_;
 
     other.disk_manager_ = nullptr;
   }
@@ -62,6 +64,7 @@ auto BufferPool::NewPage() -> Result<NewPageResult> {
   frame.data.fill(0);
   frame.pin_count = 1;
   frame.dirty = true;
+  frame.op_dirty = in_op_;
   page_table_[*new_page_id] = *frame_id;
 
   return NewPageResult{.page_id = *new_page_id, .data = frame.data.data()};
@@ -89,6 +92,7 @@ auto BufferPool::FetchPage(page_id_t page_id) -> Result<char *> {
   frame.page_id = page_id;
   frame.pin_count = 1;
   frame.dirty = false;
+  frame.op_dirty = false;
   page_table_[page_id] = *frame_id;
 
   return frame.data.data();
@@ -103,9 +107,36 @@ void BufferPool::UnpinPage(page_id_t page_id, bool dirty) {
 
   --frame.pin_count;
   frame.dirty = frame.dirty || dirty;
+  frame.op_dirty = frame.op_dirty || (dirty && in_op_);
 }
 
-auto BufferPool::FreePage(page_id_t page_id) -> Status {
+void BufferPool::BeginOp() {
+  TINYDB_CHECK(!in_op_, "beginning an operation before the previous one ended");
+  in_op_ = true;
+}
+
+auto BufferPool::OpDirtyFrames() const -> std::vector<std::pair<page_id_t, const char *>> {
+  TINYDB_CHECK(in_op_, "collecting op-dirty frames outside an operation");
+
+  std::vector<std::pair<page_id_t, const char *>> images;
+  for (const auto &frame : frames_) {
+    if (frame.op_dirty) {
+      images.emplace_back(frame.page_id, frame.data.data());
+    }
+  }
+  return images;
+}
+
+void BufferPool::EndOp() {
+  TINYDB_CHECK(in_op_, "ending an operation that never began");
+
+  for (auto &frame : frames_) {
+    frame.op_dirty = false;
+  }
+  in_op_ = false;
+}
+
+void BufferPool::FreePage(page_id_t page_id) {
   const auto page_it = page_table_.find(page_id);
   if (page_it != page_table_.end()) {
     auto &frame = frames_[page_it->second];
@@ -113,11 +144,12 @@ auto BufferPool::FreePage(page_id_t page_id) -> Status {
 
     frame.page_id = HEADER_PAGE_ID;
     frame.dirty = false;
+    frame.op_dirty = false;
     free_list_.push_back(page_it->second);
     page_table_.erase(page_it);
   }
 
-  return disk_manager_->FreePage(page_id);
+  disk_manager_->FreePage(page_id);
 }
 
 auto BufferPool::FlushPage(page_id_t page_id) -> Status {
@@ -127,7 +159,7 @@ auto BufferPool::FlushPage(page_id_t page_id) -> Status {
   }
 
   auto &frame = frames_[page_it->second];
-  if (frame.dirty) {
+  if (frame.dirty && !frame.op_dirty) {
     if (auto status = disk_manager_->WritePage(frame.page_id, frame.data.data()); !status.Ok()) {
       return status;
     }
@@ -142,9 +174,12 @@ auto BufferPool::FlushAllPages() -> Status {
   }
 
   // Frames are marked clean as they are written, so a failed flush can be
-  // retried and only rewrites the remainder.
+  // retried and only rewrites the remainder. Op-dirty frames are skipped,
+  // not flushed: their bytes are uncommitted, and the one caller that tears
+  // down mid-operation (a poisoned engine) must leave the database file to
+  // the log's committed images alone.
   for (auto &frame : frames_) {
-    if (frame.dirty) {
+    if (frame.dirty && !frame.op_dirty) {
       if (auto status = disk_manager_->WritePage(frame.page_id, frame.data.data()); !status.Ok()) {
         return status;
       }
@@ -166,7 +201,10 @@ auto BufferPool::PickFrame() -> Result<frame_id_t> {
     next_victim_ = (next_victim_ + 1) % frames_.size();
     auto &frame = frames_[frame_id];
 
-    if (frame.pin_count == 0) {
+    // No-steal: a frame dirtied by the in-flight operation holds uncommitted
+    // bytes and cannot be written back. Committed-dirty frames are fair
+    // game — their images are already durable in the log.
+    if (frame.pin_count == 0 && !frame.op_dirty) {
       if (frame.dirty) {
         if (auto status = disk_manager_->WritePage(frame.page_id, frame.data.data()); !status.Ok()) {
           return std::unexpected(std::move(status));

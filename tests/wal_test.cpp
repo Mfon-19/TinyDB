@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <tinydb/file_header.h>
 #include <tinydb/page.h>
 #include <tinydb/status.h>
 #include <tinydb/wal.h>
@@ -6,6 +7,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -24,7 +26,20 @@ static auto TestPath(const std::string &name) -> std::filesystem::path {
 // A database file of `pages` pages, page i filled with the byte '0' + i.
 static void MakeDbFile(const std::filesystem::path &path, int pages) {
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  auto header_page = std::string(tinydb::PAGE_SIZE, '0');
+  const auto header = tinydb::FileHeader{
+      .magic = tinydb::TINYDB_FILE_MAGIC,
+      .page_size = tinydb::PAGE_SIZE,
+      .root_page_id = tinydb::HEADER_PAGE_ID,
+      .next_page_id = static_cast<tinydb::page_id_t>(pages),
+      .free_list_head = tinydb::HEADER_PAGE_ID,
+  };
+  std::memcpy(header_page.data(), &header, sizeof(header));
+  file.write(header_page.data(), static_cast<std::streamsize>(header_page.size()));
   for (int i = 0; i < pages; ++i) {
+    if (i == 0) {
+      continue;
+    }
     const std::string page(tinydb::PAGE_SIZE, static_cast<char>('0' + i));
     file.write(page.data(), static_cast<std::streamsize>(page.size()));
   }
@@ -133,6 +148,7 @@ TEST(WalTest, RecoverAppliesCommittedRuns) {
   const auto wal_path = tinydb::Wal::PathFor(db_path);
   std::filesystem::remove(wal_path);
   MakeDbFile(db_path, 3);
+  const auto db_before = ReadWholeFile(db_path);
 
   {
     auto wal = tinydb::Wal::Open(wal_path).value();
@@ -149,7 +165,7 @@ TEST(WalTest, RecoverAppliesCommittedRuns) {
 
   const auto db = ReadWholeFile(db_path);
   ASSERT_EQ(db.size(), 3 * tinydb::PAGE_SIZE);
-  EXPECT_EQ(db[0], '0');  // header page untouched
+  EXPECT_EQ(db.substr(0, tinydb::PAGE_SIZE), db_before.substr(0, tinydb::PAGE_SIZE));  // header page untouched
   EXPECT_EQ(db[tinydb::PAGE_SIZE], 'b');
   EXPECT_EQ(db[(2 * tinydb::PAGE_SIZE) - 1], 'b');
   EXPECT_EQ(db[2 * tinydb::PAGE_SIZE], 'b');
@@ -160,6 +176,42 @@ TEST(WalTest, RecoverAppliesCommittedRuns) {
   // Idempotent: a second pass has nothing to do and changes nothing.
   EXPECT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
   EXPECT_EQ(ReadWholeFile(db_path), db);
+
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+}
+
+TEST(WalTest, RecoverCanRebuildMissingDatabaseFromCommittedImages) {
+  const auto db_path = TestPath("recover_missing_db");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+
+  auto header_page = std::string(tinydb::PAGE_SIZE, '\0');
+  const auto header = tinydb::FileHeader{
+      .magic = tinydb::TINYDB_FILE_MAGIC,
+      .page_size = tinydb::PAGE_SIZE,
+      .root_page_id = 1,
+      .next_page_id = 2,
+      .free_list_head = tinydb::HEADER_PAGE_ID,
+  };
+  std::memcpy(header_page.data(), &header, sizeof(header));
+  const auto leaf_page = std::string(tinydb::PAGE_SIZE, 'l');
+
+  {
+    auto wal = tinydb::Wal::Open(wal_path).value();
+    wal.AppendPageImage(0, header_page.data());
+    wal.AppendPageImage(1, leaf_page.data());
+    ASSERT_TRUE(wal.Commit().Ok());
+  }
+
+  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+
+  const auto db = ReadWholeFile(db_path);
+  ASSERT_EQ(db.size(), 2 * tinydb::PAGE_SIZE);
+  EXPECT_EQ(db.substr(0, tinydb::PAGE_SIZE), header_page);
+  EXPECT_EQ(db.substr(tinydb::PAGE_SIZE, tinydb::PAGE_SIZE), leaf_page);
+  EXPECT_EQ(std::filesystem::file_size(wal_path), WAL_HEADER_BYTES);
 
   std::filesystem::remove(db_path);
   std::filesystem::remove(wal_path);
@@ -261,6 +313,33 @@ TEST(WalTest, RecoverRejectsAForeignFile) {
   // The file it refused to trust is left exactly as it was.
   EXPECT_EQ(ReadWholeFile(wal_path), "definitely not a wal");
 
+  std::filesystem::remove(wal_path);
+}
+
+TEST(WalTest, RecoverRejectsAForeignDatabaseBeforeReplay) {
+  const auto db_path = TestPath("recover_foreign_db");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  std::filesystem::remove(wal_path);
+  {
+    std::ofstream file(db_path, std::ios::binary | std::ios::trunc);
+    file << "this is not a tinydb database";
+  }
+  const auto db_before = ReadWholeFile(db_path);
+
+  {
+    auto wal = tinydb::Wal::Open(wal_path).value();
+    const std::string image(tinydb::PAGE_SIZE, 'x');
+    wal.AppendPageImage(0, image.data());
+    ASSERT_TRUE(wal.Commit().Ok());
+  }
+  const auto wal_size_before = std::filesystem::file_size(wal_path);
+
+  const auto status = tinydb::Wal::Recover(db_path, wal_path);
+  EXPECT_EQ(status.Code(), tinydb::StatusCode::InvalidArgument);
+  EXPECT_EQ(ReadWholeFile(db_path), db_before);
+  EXPECT_EQ(std::filesystem::file_size(wal_path), wal_size_before);
+
+  std::filesystem::remove(db_path);
   std::filesystem::remove(wal_path);
 }
 

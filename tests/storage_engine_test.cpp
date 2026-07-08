@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 #include <tinydb/status.h>
 #include <tinydb/storage_engine.h>
+#include <tinydb/wal.h>
 
 #include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <string>
@@ -38,13 +40,28 @@ class StorageEngineTest : public ::testing::Test {
     const auto stem = "tinydb_engine_" + std::string(info->name()) + "_" + std::to_string(::getpid());
     db_path_ = std::filesystem::temp_directory_path() / (stem + ".db");
     second_db_path_ = std::filesystem::temp_directory_path() / (stem + "_b.db");
-    std::filesystem::remove(db_path_);
-    std::filesystem::remove(second_db_path_);
+    RemoveDatabase(db_path_);
+    RemoveDatabase(second_db_path_);
   }
 
   void TearDown() override {
-    std::filesystem::remove(db_path_);
-    std::filesystem::remove(second_db_path_);
+    RemoveDatabase(db_path_);
+    RemoveDatabase(second_db_path_);
+  }
+
+  // A database on disk is the file plus its write-ahead log.
+  static void RemoveDatabase(const std::filesystem::path &path) {
+    std::filesystem::remove(path);
+    std::filesystem::remove(tinydb::Wal::PathFor(path));
+  }
+
+  // Copies the database and its log as they sit on disk right now — the
+  // exact state a crash would leave behind (nothing flushed, nothing
+  // closed) — so a second engine can be opened on the copy while the
+  // original stays live.
+  void SnapshotDatabase() const {
+    std::filesystem::copy_file(db_path_, second_db_path_);
+    std::filesystem::copy_file(tinydb::Wal::PathFor(db_path_), tinydb::Wal::PathFor(second_db_path_));
   }
 
   std::filesystem::path db_path_;
@@ -272,4 +289,98 @@ TEST_F(StorageEngineTest, OpenRejectsForeignFiles) {
   EXPECT_EQ(result.error().Code(), tinydb::StatusCode::InvalidArgument);
 }
 
+TEST_F(StorageEngineTest, OpenRejectsForeignFilesBeforeWalReplay) {
+  {
+    auto file = std::ofstream{db_path_, std::ios::binary | std::ios::trunc};
+    file << "this is not a tinydb database, just some text\n";
+  }
+  const auto db_before = [&] {
+    auto file = std::ifstream{db_path_, std::ios::binary};
+    return std::string{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+  }();
+
+  {
+    auto wal = tinydb::Wal::Open(tinydb::Wal::PathFor(db_path_)).value();
+    const auto image = std::string(tinydb::PAGE_SIZE, 'x');
+    wal.AppendPageImage(0, image.data());
+    ASSERT_TRUE(wal.Commit().Ok());
+  }
+  const auto wal_size_before = std::filesystem::file_size(tinydb::Wal::PathFor(db_path_));
+
+  const auto result = tinydb::StorageEngine::Open(db_path_);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::InvalidArgument);
+
+  {
+    auto file = std::ifstream{db_path_, std::ios::binary};
+    const auto db_after = std::string{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    EXPECT_EQ(db_after, db_before);
+  }
+  EXPECT_EQ(std::filesystem::file_size(tinydb::Wal::PathFor(db_path_)), wal_size_before);
+}
+
 }  // namespace
+
+TEST_F(StorageEngineTest, CommittedWritesSurviveACrash) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  for (int row = 0; row < 200; ++row) {
+    ASSERT_TRUE(engine.Put(RowKey(row), RowValue(row, 64)).Ok());
+  }
+  for (int row = 0; row < 100; ++row) {
+    ASSERT_TRUE(engine.Remove(RowKey(row)).Ok());
+  }
+
+  // "Crash": snapshot the files mid-flight, with the engine still open and
+  // nothing checkpointed, and recover a second engine from the copy.
+  SnapshotDatabase();
+  auto recovered = tinydb::StorageEngine::Open(second_db_path_).value();
+
+  const auto rows = recovered.Scan("", SCAN_END).value();
+  ASSERT_EQ(rows.size(), 100U);
+  for (int row = 100; row < 200; ++row) {
+    EXPECT_EQ(recovered.Get(RowKey(row)).value(), RowValue(row, 64));
+  }
+  EXPECT_EQ(recovered.Get(RowKey(0)).value(), std::nullopt);
+
+  // Recovery leaves the copy a normal database: it accepts new work.
+  ASSERT_TRUE(recovered.Put(RowKey(0), "back again").Ok());
+  EXPECT_TRUE(recovered.Close().Ok());
+}
+
+TEST_F(StorageEngineTest, CleanCloseEmptiesTheLog) {
+  {
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
+    ASSERT_TRUE(engine.Put("k", "v").Ok());
+    ASSERT_TRUE(engine.Close().Ok());
+  }
+
+  // Close checkpointed: the log is down to its 4-byte header, and the
+  // database file alone carries the data.
+  const auto wal_path = tinydb::Wal::PathFor(db_path_);
+  EXPECT_EQ(std::filesystem::file_size(wal_path), 4U);
+
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  EXPECT_EQ(engine.Get("k").value(), "v");
+}
+
+TEST_F(StorageEngineTest, LogOutgrowingItsThresholdCheckpoints) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+
+  // Each put logs full images of every page it touches, so this comfortably
+  // pushes the log past its 1 MiB checkpoint threshold at least once.
+  for (int row = 0; row < 400; ++row) {
+    ASSERT_TRUE(engine.Put(RowKey(row), RowValue(row, 128)).Ok());
+  }
+
+  // The workload appended well over 1 MiB of images in total, so a log
+  // still at or under the threshold proves at least one reset happened.
+  const auto wal_path = tinydb::Wal::PathFor(db_path_);
+  EXPECT_LE(std::filesystem::file_size(wal_path), (1U << 20U));
+
+  // And a post-checkpoint crash still recovers cleanly: the database file
+  // plus the shorter log reproduce every row.
+  SnapshotDatabase();
+  auto recovered = tinydb::StorageEngine::Open(second_db_path_).value();
+  EXPECT_EQ(recovered.Scan("", SCAN_END).value().size(), 400U);
+  EXPECT_EQ(recovered.Get(RowKey(399)).value(), RowValue(399, 128));
+}
