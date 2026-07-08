@@ -1,6 +1,8 @@
 #include <tinydb/check.h>
 #include <tinydb/disk_manager.h>
 
+#include "io/syscalls.h"
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -30,7 +32,7 @@ auto ErrnoStatus(std::string_view operation) -> Status {
 auto ReadFreePageHeader(int fd, page_id_t page_id) -> Result<FreePageHeader> {
   FreePageHeader header{};
   const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  const auto bytes_read = ::pread(fd, &header, sizeof(header), offset);
+  const auto bytes_read = io::Pread(fd, &header, sizeof(header), static_cast<std::uint64_t>(offset));
   if (bytes_read < 0) {
     return std::unexpected(ErrnoStatus("pread"));
   }
@@ -43,13 +45,13 @@ auto ReadFreePageHeader(int fd, page_id_t page_id) -> Result<FreePageHeader> {
 }  // namespace
 
 auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager> {
-  auto fd = UniqueFd(::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+  auto fd = UniqueFd(io::Open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
   if (!fd.Valid()) {
     return std::unexpected(ErrnoStatus("open"));
   }
 
   struct stat stat_buffer {};
-  if (::fstat(fd.Get(), &stat_buffer) < 0) {
+  if (io::Fstat(fd.Get(), &stat_buffer) < 0) {
     return std::unexpected(ErrnoStatus("fstat"));
   }
 
@@ -70,7 +72,7 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
     return disk;
   }
 
-  const auto bytes_read = ::pread(disk.fd_.Get(), &disk.header_, sizeof(disk.header_), 0);
+  const auto bytes_read = io::Pread(disk.fd_.Get(), &disk.header_, sizeof(disk.header_), 0);
   if (bytes_read < 0) {
     return std::unexpected(ErrnoStatus("pread"));
   }
@@ -137,7 +139,7 @@ auto DiskManager::AllocatePage() -> Result<page_id_t> {
   const auto page_id = header_.next_page_id;
   const auto new_size = static_cast<off_t>((page_id + 1) * PAGE_SIZE);
 
-  if (::ftruncate(fd_.Get(), new_size) < 0) {
+  if (io::Ftruncate(fd_.Get(), static_cast<std::uint64_t>(new_size)) < 0) {
     return std::unexpected(ErrnoStatus("ftruncate"));
   }
 
@@ -207,7 +209,8 @@ auto DiskManager::Checkpoint() -> Status {
   for (auto link = pending_free_links_.begin(); link != pending_free_links_.end();) {
     const auto free_header = FreePageHeader{.type = FREE_PAGE_TYPE, .next_free = link->second};
     const auto offset = static_cast<off_t>(link->first * PAGE_SIZE);
-    const auto bytes_written = ::pwrite(fd_.Get(), &free_header, sizeof(free_header), offset);
+    const auto bytes_written =
+        io::Pwrite(fd_.Get(), &free_header, sizeof(free_header), static_cast<std::uint64_t>(offset));
     if (bytes_written < 0) {
       return ErrnoStatus("pwrite");
     }
@@ -224,7 +227,7 @@ auto DiskManager::Checkpoint() -> Status {
 auto DiskManager::Sync() const -> Status {
   TINYDB_CHECK(fd_.Valid(), "syncing a closed disk manager");
 
-  if (::fsync(fd_.Get()) < 0) {
+  if (io::Fsync(fd_.Get()) < 0) {
     return ErrnoStatus("fsync");
   }
   return {};
@@ -236,7 +239,7 @@ auto DiskManager::WriteHeader() const -> Status {
   auto header_page = std::array<char, PAGE_SIZE>{};
   std::memcpy(header_page.data(), &header_, sizeof(header_));
 
-  const auto bytes_written = ::pwrite(fd_.Get(), header_page.data(), header_page.size(), 0);
+  const auto bytes_written = io::Pwrite(fd_.Get(), header_page.data(), header_page.size(), 0);
   if (bytes_written < 0) {
     return ErrnoStatus("pwrite");
   }
@@ -255,7 +258,7 @@ auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> Status {
   }
 
   const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  const auto bytes_read = ::pread(fd_.Get(), data, PAGE_SIZE, offset);
+  const auto bytes_read = io::Pread(fd_.Get(), data, PAGE_SIZE, static_cast<std::uint64_t>(offset));
   if (bytes_read < 0) {
     return ErrnoStatus("pread");
   }
@@ -274,7 +277,7 @@ auto DiskManager::WritePage(page_id_t page_id, const char *data) const -> Status
   }
 
   const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  const auto bytes_written = ::pwrite(fd_.Get(), data, PAGE_SIZE, offset);
+  const auto bytes_written = io::Pwrite(fd_.Get(), data, PAGE_SIZE, static_cast<std::uint64_t>(offset));
   if (bytes_written < 0) {
     return ErrnoStatus("pwrite");
   }

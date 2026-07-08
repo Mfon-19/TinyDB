@@ -2,6 +2,8 @@
 #include <tinydb/file_header.h>
 #include <tinydb/wal.h>
 
+#include "io/syscalls.h"
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -50,11 +52,11 @@ auto SyncParentDirectory(const std::filesystem::path &path) -> Status {
     parent = ".";
   }
 
-  auto dir_fd = UniqueFd(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+  auto dir_fd = UniqueFd(io::Open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
   if (!dir_fd.Valid()) {
     return ErrnoStatus("open directory");
   }
-  if (::fsync(dir_fd.Get()) < 0) {
+  if (io::Fsync(dir_fd.Get()) < 0) {
     return ErrnoStatus("fsync directory");
   }
   return {};
@@ -101,7 +103,7 @@ auto FullPwrite(int fd, const void *data, std::size_t size, std::uint64_t offset
   const auto *bytes = static_cast<const char *>(data);
   std::size_t written = 0;
   while (written < size) {
-    const auto result = ::pwrite(fd, bytes + written, size - written, static_cast<off_t>(offset + written));
+    const auto result = io::Pwrite(fd, bytes + written, size - written, offset + written);
     if (result < 0) {
       if (errno == EINTR) {
         continue;
@@ -120,7 +122,7 @@ auto FullPread(int fd, void *data, std::size_t size, std::uint64_t offset) -> Re
   auto *bytes = static_cast<char *>(data);
   std::size_t total = 0;
   while (total < size) {
-    const auto result = ::pread(fd, bytes + total, size - total, static_cast<off_t>(offset + total));
+    const auto result = io::Pread(fd, bytes + total, size - total, offset + total);
     if (result < 0) {
       if (errno == EINTR) {
         continue;
@@ -140,7 +142,7 @@ auto FullPread(int fd, void *data, std::size_t size, std::uint64_t offset) -> Re
 // that is not already a TinyDB database must not be overwritten by a WAL whose
 // name merely happens to match.
 auto ValidateDatabaseFileForRecovery(const std::filesystem::path &db_path) -> Status {
-  auto db_fd = UniqueFd(::open(db_path.c_str(), O_RDONLY | O_CLOEXEC));
+  auto db_fd = UniqueFd(io::Open(db_path, O_RDONLY | O_CLOEXEC));
   if (!db_fd.Valid()) {
     if (errno == ENOENT) {
       return {};
@@ -149,7 +151,7 @@ auto ValidateDatabaseFileForRecovery(const std::filesystem::path &db_path) -> St
   }
 
   struct stat stat_buffer {};
-  if (::fstat(db_fd.Get(), &stat_buffer) < 0) {
+  if (io::Fstat(db_fd.Get(), &stat_buffer) < 0) {
     return ErrnoStatus("fstat");
   }
   if (stat_buffer.st_size == 0) {
@@ -221,7 +223,7 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
 
   // Step 1: open the WAL. A missing WAL means the database file is already
   // the best available state.
-  auto wal_fd = UniqueFd(::open(wal_path.c_str(), O_RDWR | O_CLOEXEC));
+  auto wal_fd = UniqueFd(io::Open(wal_path, O_RDWR | O_CLOEXEC));
   if (!wal_fd.Valid()) {
     if (errno == ENOENT) {
       return {};  // no log, nothing to recover
@@ -230,7 +232,7 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
   }
 
   struct stat stat_buffer {};
-  if (::fstat(wal_fd.Get(), &stat_buffer) < 0) {
+  if (io::Fstat(wal_fd.Get(), &stat_buffer) < 0) {
     return ErrnoStatus("fstat");
   }
   const auto wal_size = static_cast<std::uint64_t>(stat_buffer.st_size);
@@ -247,7 +249,7 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
   // then writes and fsyncs the magic. Clear the remnant so the next Open()
   // stamps it afresh.
   if (wal_size < sizeof(WAL_MAGIC)) {
-    if (wal_size > 0 && ::ftruncate(wal_fd.Get(), 0) < 0) {
+    if (wal_size > 0 && io::Ftruncate(wal_fd.Get(), 0) < 0) {
       return ErrnoStatus("ftruncate");
     }
     return {};
@@ -333,9 +335,9 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
           return Status::Corruption("malformed commit record in " + wal_path.string());
         }
         if (!db_fd.Valid()) {
-          db_fd = UniqueFd(::open(db_path.c_str(), O_RDWR | O_CLOEXEC));
+          db_fd = UniqueFd(io::Open(db_path, O_RDWR | O_CLOEXEC));
           if (!db_fd.Valid() && errno == ENOENT) {
-            db_fd = UniqueFd(::open(db_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
+            db_fd = UniqueFd(io::Open(db_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
             created_db_file = db_fd.Valid();
           }
           if (!db_fd.Valid()) {
@@ -364,7 +366,7 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
 
   // Step 6: make replay durable. The database must be on stable storage
   // before the log forgets the images that could rebuild it.
-  if (applied && ::fsync(db_fd.Get()) < 0) {
+  if (applied && io::Fsync(db_fd.Get()) < 0) {
     return ErrnoStatus("fsync");
   }
   if (applied && created_db_file) {
@@ -382,10 +384,10 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
   // fsync returns, the old committed runs may still be present, which is safe
   // because replaying full-page images is idempotent.
   if (wal_size > sizeof(WAL_MAGIC)) {
-    if (::ftruncate(wal_fd.Get(), static_cast<off_t>(sizeof(WAL_MAGIC))) < 0) {
+    if (io::Ftruncate(wal_fd.Get(), sizeof(WAL_MAGIC)) < 0) {
       return ErrnoStatus("ftruncate");
     }
-    if (::fsync(wal_fd.Get()) < 0) {
+    if (io::Fsync(wal_fd.Get()) < 0) {
       return ErrnoStatus("fsync");
     }
   }
@@ -393,14 +395,14 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
 }
 
 auto Wal::Open(const std::filesystem::path &wal_path) -> Result<Wal> {
-  auto fd = UniqueFd(::open(wal_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+  auto fd = UniqueFd(io::Open(wal_path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
 
   if (!fd.Valid()) {
     return std::unexpected(ErrnoStatus("open"));
   }
 
   struct stat stat_buffer {};
-  if (::fstat(fd.Get(), &stat_buffer) < 0) {
+  if (io::Fstat(fd.Get(), &stat_buffer) < 0) {
     return std::unexpected(ErrnoStatus("fstat"));
   }
 
@@ -412,7 +414,7 @@ auto Wal::Open(const std::filesystem::path &wal_path) -> Result<Wal> {
     if (auto status = FullPwrite(wal.fd_.Get(), &WAL_MAGIC, sizeof(WAL_MAGIC), 0); !status.Ok()) {
       return std::unexpected(std::move(status));
     }
-    if (::fsync(wal.fd_.Get()) < 0) {
+    if (io::Fsync(wal.fd_.Get()) < 0) {
       return std::unexpected(ErrnoStatus("fsync"));
     }
     if (auto status = SyncParentDirectory(wal_path); !status.Ok()) {
@@ -510,7 +512,7 @@ auto Wal::Commit() -> Status {
 
   // Step 3: fsync is the durability point. Returning Ok before this would let
   // the caller acknowledge a write that can disappear on power loss.
-  if (::fsync(fd_.Get()) < 0) {
+  if (io::Fsync(fd_.Get()) < 0) {
     return ErrnoStatus("fsync");
   }
 
@@ -527,7 +529,7 @@ auto Wal::Reset() -> Status {
   TINYDB_CHECK(fd_.Valid(), "resetting a moved-from log");
   TINYDB_CHECK(pending_.empty(), "resetting the log mid-operation");
 
-  if (::ftruncate(fd_.Get(), static_cast<off_t>(sizeof(WAL_MAGIC))) < 0) {
+  if (io::Ftruncate(fd_.Get(), sizeof(WAL_MAGIC)) < 0) {
     return ErrnoStatus("ftruncate");
   }
   // Make the truncation durable before new records land where old ones were.
@@ -535,7 +537,7 @@ auto Wal::Reset() -> Status {
   // the new tail — and a stale record starting exactly where the new tail
   // ends still passes its CRC, so recovery would replay an old page image
   // over newer committed data.
-  if (::fsync(fd_.Get()) < 0) {
+  if (io::Fsync(fd_.Get()) < 0) {
     return ErrnoStatus("fsync");
   }
   size_bytes_ = sizeof(WAL_MAGIC);

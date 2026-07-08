@@ -4,14 +4,21 @@
 #include <tinydb/status.h>
 #include <tinydb/wal.h>
 
+#include "io/syscalls.h"
+
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 // On-disk sizes, mirrored from the format documented in wal.h:
 // header = {u32 magic}, record = {u32 length | u32 crc32 | payload}.
@@ -21,6 +28,29 @@ static constexpr std::uint64_t COMMIT_RECORD_BYTES = 8 + 1;
 
 static auto TestPath(const std::string &name) -> std::filesystem::path {
   return std::filesystem::temp_directory_path() / ("tinydb_" + name + "_" + std::to_string(::getpid()) + ".db");
+}
+
+class ScopedSyscallHook {
+ public:
+  explicit ScopedSyscallHook(tinydb::io::TestHook hook) { tinydb::io::SetTestHook(std::move(hook)); }
+  ScopedSyscallHook(const ScopedSyscallHook &) = delete;
+  auto operator=(const ScopedSyscallHook &) -> ScopedSyscallHook & = delete;
+  ~ScopedSyscallHook() { tinydb::io::ClearTestHook(); }
+};
+
+static auto ParentPath(const std::filesystem::path &path) -> std::filesystem::path {
+  const auto parent = path.parent_path();
+  return parent.empty() ? std::filesystem::path{"."} : parent;
+}
+
+static auto FindCall(const std::vector<tinydb::io::Call> &calls, tinydb::io::Syscall syscall,
+                     const std::filesystem::path &path, std::size_t start = 0) -> std::size_t {
+  for (auto i = start; i < calls.size(); ++i) {
+    if (calls[i].syscall == syscall && calls[i].path == path) {
+      return i;
+    }
+  }
+  return std::numeric_limits<std::size_t>::max();
 }
 
 // A database file of `pages` pages, page i filled with the byte '0' + i.
@@ -75,6 +105,51 @@ TEST(WalTest, OpenStampsAndKeepsTheMagic) {
 
   // Reopen: the magic checks out and nothing is rewritten.
   EXPECT_TRUE(tinydb::Wal::Open(path).has_value());
+
+  std::filesystem::remove(path);
+}
+
+TEST(WalDurabilityTest, OpenFsyncsFreshLogBeforeParentDirectory) {
+  const auto path = TestPath("wal_open_order");
+  std::filesystem::remove(path);
+
+  auto calls = std::vector<tinydb::io::Call>{};
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      calls.push_back(call);
+      return std::nullopt;
+    }};
+    auto wal = tinydb::Wal::Open(path);
+    ASSERT_TRUE(wal.has_value());
+  }
+
+  const auto magic_write = FindCall(calls, tinydb::io::Syscall::Pwrite, path);
+  const auto wal_sync = FindCall(calls, tinydb::io::Syscall::Fsync, path, magic_write + 1);
+  const auto parent_sync = FindCall(calls, tinydb::io::Syscall::Fsync, ParentPath(path), wal_sync + 1);
+
+  ASSERT_NE(magic_write, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(parent_sync, std::numeric_limits<std::size_t>::max());
+  EXPECT_LT(magic_write, wal_sync);
+  EXPECT_LT(wal_sync, parent_sync);
+
+  std::filesystem::remove(path);
+}
+
+TEST(WalDurabilityTest, OpenFailsIfFreshLogDirectoryFsyncFails) {
+  const auto path = TestPath("wal_open_parent_fsync_fails");
+  std::filesystem::remove(path);
+
+  auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+    if (call.syscall == tinydb::io::Syscall::Fsync && call.path == ParentPath(path)) {
+      return tinydb::io::Fault{.error = EIO};
+    }
+    return std::nullopt;
+  }};
+
+  const auto wal = tinydb::Wal::Open(path);
+  ASSERT_FALSE(wal.has_value());
+  EXPECT_EQ(wal.error().Code(), tinydb::StatusCode::IoError);
 
   std::filesystem::remove(path);
 }
@@ -134,6 +209,35 @@ TEST(WalTest, DiscardPendingDropsTheBufferedImages) {
   std::filesystem::remove(path);
 }
 
+TEST(WalDurabilityTest, CommitDoesNotAdvanceTailWhenWalFsyncFails) {
+  const auto path = TestPath("wal_commit_fsync_fails");
+  std::filesystem::remove(path);
+  auto wal = tinydb::Wal::Open(path).value();
+
+  const auto image = std::string(tinydb::PAGE_SIZE, 'x');
+  wal.AppendPageImage(1, image.data());
+
+  auto calls = std::vector<tinydb::io::Call>{};
+  auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+    calls.push_back(call);
+    if (call.syscall == tinydb::io::Syscall::Fsync && call.path == path) {
+      return tinydb::io::Fault{.error = EIO};
+    }
+    return std::nullopt;
+  }};
+
+  const auto status = wal.Commit();
+  EXPECT_EQ(status.Code(), tinydb::StatusCode::IoError);
+  EXPECT_EQ(wal.SizeBytes(), WAL_HEADER_BYTES);
+
+  const auto append = FindCall(calls, tinydb::io::Syscall::Pwrite, path);
+  const auto sync = FindCall(calls, tinydb::io::Syscall::Fsync, path, append + 1);
+  ASSERT_NE(append, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(sync, std::numeric_limits<std::size_t>::max());
+
+  std::filesystem::remove(path);
+}
+
 TEST(WalTest, RecoverIsANoOpWithoutALog) {
   const auto db_path = TestPath("recover_no_log");
   const auto wal_path = tinydb::Wal::PathFor(db_path);
@@ -181,6 +285,74 @@ TEST(WalTest, RecoverAppliesCommittedRuns) {
   std::filesystem::remove(wal_path);
 }
 
+TEST(WalDurabilityTest, RecoverSyncsDatabaseBeforeTruncatingWal) {
+  const auto db_path = TestPath("recover_order");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  std::filesystem::remove(wal_path);
+  MakeDbFile(db_path, 2);
+
+  {
+    auto wal = tinydb::Wal::Open(wal_path).value();
+    const auto image = std::string(tinydb::PAGE_SIZE, 'r');
+    wal.AppendPageImage(1, image.data());
+    ASSERT_TRUE(wal.Commit().Ok());
+  }
+
+  auto calls = std::vector<tinydb::io::Call>{};
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      calls.push_back(call);
+      return std::nullopt;
+    }};
+    ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  }
+
+  const auto db_write = FindCall(calls, tinydb::io::Syscall::Pwrite, db_path);
+  const auto db_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path, db_write + 1);
+  const auto wal_truncate = FindCall(calls, tinydb::io::Syscall::Ftruncate, wal_path, db_sync + 1);
+  const auto wal_sync = FindCall(calls, tinydb::io::Syscall::Fsync, wal_path, wal_truncate + 1);
+
+  ASSERT_NE(db_write, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(db_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_truncate, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_sync, std::numeric_limits<std::size_t>::max());
+  EXPECT_LT(db_write, db_sync);
+  EXPECT_LT(db_sync, wal_truncate);
+  EXPECT_LT(wal_truncate, wal_sync);
+
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+}
+
+TEST(WalDurabilityTest, RecoverLeavesWalIntactWhenDatabaseFsyncFails) {
+  const auto db_path = TestPath("recover_db_fsync_fails");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  std::filesystem::remove(wal_path);
+  MakeDbFile(db_path, 2);
+
+  {
+    auto wal = tinydb::Wal::Open(wal_path).value();
+    const auto image = std::string(tinydb::PAGE_SIZE, 'f');
+    wal.AppendPageImage(1, image.data());
+    ASSERT_TRUE(wal.Commit().Ok());
+  }
+  const auto wal_size_before = std::filesystem::file_size(wal_path);
+
+  auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+    if (call.syscall == tinydb::io::Syscall::Fsync && call.path == db_path) {
+      return tinydb::io::Fault{.error = EIO};
+    }
+    return std::nullopt;
+  }};
+
+  const auto status = tinydb::Wal::Recover(db_path, wal_path);
+  EXPECT_EQ(status.Code(), tinydb::StatusCode::IoError);
+  EXPECT_EQ(std::filesystem::file_size(wal_path), wal_size_before);
+
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+}
+
 TEST(WalTest, RecoverCanRebuildMissingDatabaseFromCommittedImages) {
   const auto db_path = TestPath("recover_missing_db");
   const auto wal_path = tinydb::Wal::PathFor(db_path);
@@ -212,6 +384,57 @@ TEST(WalTest, RecoverCanRebuildMissingDatabaseFromCommittedImages) {
   EXPECT_EQ(db.substr(0, tinydb::PAGE_SIZE), header_page);
   EXPECT_EQ(db.substr(tinydb::PAGE_SIZE, tinydb::PAGE_SIZE), leaf_page);
   EXPECT_EQ(std::filesystem::file_size(wal_path), WAL_HEADER_BYTES);
+
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+}
+
+TEST(WalDurabilityTest, RecoverSyncsCreatedDatabaseDirectoryBeforeTruncatingWal) {
+  const auto db_path = TestPath("recover_created_db_order");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+
+  auto header_page = std::string(tinydb::PAGE_SIZE, '\0');
+  const auto header = tinydb::FileHeader{
+      .magic = tinydb::TINYDB_FILE_MAGIC,
+      .page_size = tinydb::PAGE_SIZE,
+      .root_page_id = 1,
+      .next_page_id = 2,
+      .free_list_head = tinydb::HEADER_PAGE_ID,
+  };
+  std::memcpy(header_page.data(), &header, sizeof(header));
+
+  {
+    auto wal = tinydb::Wal::Open(wal_path).value();
+    wal.AppendPageImage(0, header_page.data());
+    ASSERT_TRUE(wal.Commit().Ok());
+  }
+
+  auto calls = std::vector<tinydb::io::Call>{};
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      calls.push_back(call);
+      return std::nullopt;
+    }};
+    ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  }
+
+  const auto db_write = FindCall(calls, tinydb::io::Syscall::Pwrite, db_path);
+  const auto db_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path, db_write + 1);
+  const auto db_parent_sync = FindCall(calls, tinydb::io::Syscall::Fsync, ParentPath(db_path), db_sync + 1);
+  const auto wal_truncate = FindCall(calls, tinydb::io::Syscall::Ftruncate, wal_path, db_parent_sync + 1);
+  const auto wal_sync = FindCall(calls, tinydb::io::Syscall::Fsync, wal_path, wal_truncate + 1);
+
+  ASSERT_NE(db_write, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(db_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(db_parent_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_truncate, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_sync, std::numeric_limits<std::size_t>::max());
+  EXPECT_LT(db_write, db_sync);
+  EXPECT_LT(db_sync, db_parent_sync);
+  EXPECT_LT(db_parent_sync, wal_truncate);
+  EXPECT_LT(wal_truncate, wal_sync);
 
   std::filesystem::remove(db_path);
   std::filesystem::remove(wal_path);

@@ -3,11 +3,15 @@
 #include <tinydb/storage_engine.h>
 #include <tinydb/wal.h>
 
+#include "io/syscalls.h"
+
 #include <unistd.h>
 
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -31,6 +35,24 @@ auto RowValue(int row, std::size_t length) -> std::string {
     value[i] = static_cast<char>('a' + (static_cast<std::size_t>(row) + i) % 26);
   }
   return value;
+}
+
+class ScopedSyscallHook {
+ public:
+  explicit ScopedSyscallHook(tinydb::io::TestHook hook) { tinydb::io::SetTestHook(std::move(hook)); }
+  ScopedSyscallHook(const ScopedSyscallHook &) = delete;
+  auto operator=(const ScopedSyscallHook &) -> ScopedSyscallHook & = delete;
+  ~ScopedSyscallHook() { tinydb::io::ClearTestHook(); }
+};
+
+auto FindCall(const std::vector<tinydb::io::Call> &calls, tinydb::io::Syscall syscall,
+              const std::filesystem::path &path, std::size_t start = 0) -> std::size_t {
+  for (auto i = start; i < calls.size(); ++i) {
+    if (calls[i].syscall == syscall && calls[i].path == path) {
+      return i;
+    }
+  }
+  return std::numeric_limits<std::size_t>::max();
 }
 
 class StorageEngineTest : public ::testing::Test {
@@ -361,6 +383,52 @@ TEST_F(StorageEngineTest, CleanCloseEmptiesTheLog) {
 
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
   EXPECT_EQ(engine.Get("k").value(), "v");
+}
+
+TEST_F(StorageEngineTest, CleanCloseSyncsDatabaseBeforeResettingWal) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(engine.Put("k", "v").Ok());
+
+  auto calls = std::vector<tinydb::io::Call>{};
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      calls.push_back(call);
+      return std::nullopt;
+    }};
+    ASSERT_TRUE(engine.Close().Ok());
+  }
+
+  const auto db_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path_);
+  const auto wal_truncate =
+      FindCall(calls, tinydb::io::Syscall::Ftruncate, tinydb::Wal::PathFor(db_path_), db_sync + 1);
+  const auto wal_sync = FindCall(calls, tinydb::io::Syscall::Fsync, tinydb::Wal::PathFor(db_path_), wal_truncate + 1);
+
+  ASSERT_NE(db_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_truncate, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_sync, std::numeric_limits<std::size_t>::max());
+  EXPECT_LT(db_sync, wal_truncate);
+  EXPECT_LT(wal_truncate, wal_sync);
+}
+
+TEST_F(StorageEngineTest, CleanCloseLeavesWalIntactWhenDatabaseSyncFails) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(engine.Put("k", "v").Ok());
+  const auto wal_path = tinydb::Wal::PathFor(db_path_);
+  const auto wal_size_before = std::filesystem::file_size(wal_path);
+
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      if (call.syscall == tinydb::io::Syscall::Fsync && call.path == db_path_) {
+        return tinydb::io::Fault{.error = EIO};
+      }
+      return std::nullopt;
+    }};
+    const auto status = engine.Close();
+    EXPECT_EQ(status.Code(), tinydb::StatusCode::IoError);
+    EXPECT_EQ(std::filesystem::file_size(wal_path), wal_size_before);
+  }
+
+  ASSERT_TRUE(engine.Close().Ok());
 }
 
 TEST_F(StorageEngineTest, LogOutgrowingItsThresholdCheckpoints) {
