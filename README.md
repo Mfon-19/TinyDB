@@ -1,5 +1,9 @@
 # TinyDB
 
+<p align="center">
+  <img src="assets/tinydb-mascot.png" alt="TinyDB pixel mascot" width="420">
+</p>
+
 A disk-backed, ordered **key-value storage engine** in C++23. A page-based
 file format, a buffer pool, and a B+-tree index behind a small embedded API.
 
