@@ -1,7 +1,7 @@
 # TinyDB
 
 <p align="center">
-  <img src="assets/tinydb-mascot.png" alt="TinyDB pixel mascot" width="420">
+  <img src="assets/tinydb-mascot-clean.png" alt="TinyDB pixel mascot" width="420">
 </p>
 
 A disk-backed, ordered **key-value storage engine** in C++23. A page-based

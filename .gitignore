@@ -1,5 +1,8 @@
 /docs
 
+# macOS metadata
+.DS_Store
+
 # Build outputs
 /build/
 /cmake-build-*/
