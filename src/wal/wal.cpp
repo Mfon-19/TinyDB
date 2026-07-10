@@ -3,11 +3,13 @@
 #include <tinydb/wal.h>
 
 #include "io/syscalls.h"
+#include "util/checksums.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -62,30 +64,6 @@ auto SyncParentDirectory(const std::filesystem::path &path) -> Status {
   return {};
 }
 
-// CRC-32 (the reflected IEEE polynomial — the same function as zlib's
-// crc32), table-driven, with the table built at compile time.
-constexpr auto MakeCrc32Table() -> std::array<std::uint32_t, 256> {
-  std::array<std::uint32_t, 256> table{};
-  for (std::uint32_t byte = 0; byte < table.size(); ++byte) {
-    std::uint32_t remainder = byte;
-    for (int bit = 0; bit < 8; ++bit) {
-      remainder = (remainder & 1U) != 0 ? 0xEDB88320U ^ (remainder >> 1U) : remainder >> 1U;
-    }
-    table[byte] = remainder;
-  }
-  return table;
-}
-constexpr auto CRC32_TABLE = MakeCrc32Table();
-
-auto Crc32(const char *data, std::size_t size) -> std::uint32_t {
-  std::uint32_t crc = 0xFFFFFFFFU;
-  for (std::size_t i = 0; i < size; ++i) {
-    const auto byte = static_cast<unsigned char>(data[i]);
-    crc = CRC32_TABLE[(crc ^ byte) & 0xFFU] ^ (crc >> 8U);
-  }
-  return crc ^ 0xFFFFFFFFU;
-}
-
 // Appends one crc-framed record — {u32 payload_length | u32 crc32 | payload}
 // — to an operation's pending buffer.
 void AppendRecord(std::vector<char> &out, const char *payload, std::uint32_t payload_length) {
@@ -138,9 +116,18 @@ auto FullPread(int fd, void *data, std::size_t size, std::uint64_t offset) -> Re
 }
 
 // Recovery may rewrite the database header, so DiskManager::Open cannot run
-// first. This preflight still rejects the dangerous case: a non-empty file
-// that is not already a TinyDB database must not be overwritten by a WAL whose
-// name merely happens to match.
+// first. This preflight decides whether replay may touch the base file; the
+// header checksum is what separates damage from foreignness:
+//
+//   missing or empty file       -> yes: replay recreates the database
+//   our magic, checksum intact  -> yes: a healthy database (its geometry
+//                                  must still match this build)
+//   our magic, checksum broken  -> yes: a torn header write — ours, and
+//                                  exactly what a logged header image repairs
+//   nothing but zeroes          -> yes: creation crashed before the header
+//                                  reached the disk
+//   anything else               -> no: a foreign file whose name merely
+//                                  happens to match must not be overwritten
 auto ValidateDatabaseFileForRecovery(const std::filesystem::path &db_path) -> Status {
   auto db_fd = UniqueFd(io::Open(db_path, O_RDONLY | O_CLOEXEC));
   if (!db_fd.Valid()) {
@@ -158,15 +145,27 @@ auto ValidateDatabaseFileForRecovery(const std::filesystem::path &db_path) -> St
     return {};
   }
 
-  FileHeader header{};
-  const auto header_read = FullPread(db_fd.Get(), &header, sizeof(header), 0);
+  // A short read leaves the tail zeroed, so a file smaller than a header
+  // still classifies below.
+  auto bytes = std::array<char, sizeof(FileHeader)>{};
+  const auto header_read = FullPread(db_fd.Get(), bytes.data(), bytes.size(), 0);
   if (!header_read) {
     return header_read.error();
   }
-  if (*header_read != sizeof(header) || header.magic != TINYDB_FILE_MAGIC || header.page_size != PAGE_SIZE) {
-    return Status::InvalidArgument("not a TinyDB database file: " + db_path.string());
+
+  FileHeader header{};
+  std::memcpy(&header, bytes.data(), sizeof(header));
+  if (*header_read == sizeof(header) && header.magic == TINYDB_FILE_MAGIC) {
+    const bool intact = header.checksum == HeaderChecksum(header);
+    if (intact && header.page_size != PAGE_SIZE) {
+      return Status::InvalidArgument("not a TinyDB database file: " + db_path.string());
+    }
+    return {};
   }
-  return {};
+  if (std::ranges::all_of(bytes, [](char byte) { return byte == 0; })) {
+    return {};
+  }
+  return Status::InvalidArgument("not a TinyDB database file: " + db_path.string());
 }
 
 }  // namespace

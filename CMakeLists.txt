@@ -89,6 +89,7 @@ add_library(
   src/engine/storage_engine.cpp
   src/io/syscalls.h
   src/storage/disk_manager.cpp
+  src/util/checksums.h
   src/wal/wal.cpp)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
 target_compile_features(TinyDB PUBLIC cxx_std_23)
@@ -121,6 +122,10 @@ if(BUILD_TESTING)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/disk_manager_test.cpp")
     add_executable(TinyDB_disk_manager_test tests/disk_manager_test.cpp)
     target_link_libraries(TinyDB_disk_manager_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    # White-box tests: the suite uses the private syscall hook and header
+    # checksum helpers under src/.
+    target_include_directories(TinyDB_disk_manager_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_disk_manager_test)
     gtest_discover_tests(TinyDB_disk_manager_test)
   endif()

@@ -3,16 +3,51 @@
 #include <tinydb/file_header.h>
 #include <tinydb/status.h>
 
+#include "io/syscalls.h"
+#include "util/checksums.h"
+
 #include <unistd.h>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 static auto TestPath(const std::string &name) -> std::filesystem::path {
   return std::filesystem::temp_directory_path() / ("tinydb_" + name + "_" + std::to_string(::getpid()) + ".db");
+}
+
+class ScopedSyscallHook {
+ public:
+  explicit ScopedSyscallHook(tinydb::io::TestHook hook) { tinydb::io::SetTestHook(std::move(hook)); }
+  ScopedSyscallHook(const ScopedSyscallHook &) = delete;
+  auto operator=(const ScopedSyscallHook &) -> ScopedSyscallHook & = delete;
+  ~ScopedSyscallHook() { tinydb::io::ClearTestHook(); }
+};
+
+static auto FindCall(const std::vector<tinydb::io::Call> &calls, tinydb::io::Syscall syscall,
+                     const std::filesystem::path &path, std::size_t start = 0) -> std::size_t {
+  for (auto i = start; i < calls.size(); ++i) {
+    if (calls[i].syscall == syscall && calls[i].path == path) {
+      return i;
+    }
+  }
+  return std::numeric_limits<std::size_t>::max();
+}
+
+static void FlipByteAt(const std::filesystem::path &path, std::uint64_t offset) {
+  std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+  file.seekg(static_cast<std::streamoff>(offset));
+  char byte = 0;
+  file.get(byte);
+  file.seekp(static_cast<std::streamoff>(offset));
+  file.put(static_cast<char>(byte ^ 0x1));
 }
 
 TEST(DiskManagerTest, ReopenPage) {
@@ -126,6 +161,70 @@ TEST(DiskManagerTest, RejectsTruncatedFile) {
   std::filesystem::remove(path);
 }
 
+TEST(DiskManagerTest, RejectsACorruptedHeader) {
+  const auto path = TestPath("corrupt_header");
+  std::filesystem::remove(path);
+
+  {
+    auto disk = tinydb::DiskManager::Open(path).value();
+    ASSERT_TRUE(disk.AllocatePage().has_value());
+    ASSERT_TRUE(disk.Checkpoint().Ok());
+  }
+
+  // Damage a checksummed field (root_page_id) without touching the magic.
+  FlipByteAt(path, 8);
+
+  const auto result = tinydb::DiskManager::Open(path);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::Corruption);
+
+  std::filesystem::remove(path);
+}
+
+TEST(DiskManagerTest, RejectsAHeaderThatClaimsPagesBeyondTheFile) {
+  const auto path = TestPath("short_file");
+  std::filesystem::remove(path);
+
+  {
+    auto disk = tinydb::DiskManager::Open(path).value();
+    ASSERT_TRUE(disk.AllocatePage().has_value());
+    ASSERT_TRUE(disk.Checkpoint().Ok());
+  }
+
+  // Chop off the allocated page: the header is intact but now promises a
+  // page the file no longer holds.
+  std::filesystem::resize_file(path, tinydb::PAGE_SIZE);
+
+  const auto result = tinydb::DiskManager::Open(path);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::Corruption);
+
+  std::filesystem::remove(path);
+}
+
+TEST(DiskManagerDurabilityTest, OpenMakesAFreshHeaderDurable) {
+  const auto path = TestPath("fresh_header_durable");
+  std::filesystem::remove(path);
+
+  auto calls = std::vector<tinydb::io::Call>{};
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      calls.push_back(call);
+      return std::nullopt;
+    }};
+    ASSERT_TRUE(tinydb::DiskManager::Open(path).has_value());
+  }
+
+  // The fresh header is written and then fsynced before Open returns, so a
+  // crash after a successful Open cannot leave a header-less file behind.
+  const auto header_write = FindCall(calls, tinydb::io::Syscall::Pwrite, path);
+  const auto header_sync = FindCall(calls, tinydb::io::Syscall::Fsync, path, header_write + 1);
+  ASSERT_NE(header_write, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(header_sync, std::numeric_limits<std::size_t>::max());
+
+  std::filesystem::remove(path);
+}
+
 TEST(DiskManagerTest, SyncAfterWrites) {
   const auto path = TestPath("sync");
   std::filesystem::remove(path);
@@ -192,6 +291,9 @@ TEST(DiskManagerTest, TakeOpImagesCarriesDeferredMetadata) {
   tinydb::FileHeader header{};
   std::memcpy(&header, images[0].data.data(), sizeof(header));
   EXPECT_EQ(header.next_page_id, page_id + 1);
+  // The image is sealed: replaying it must plant a header that passes the
+  // open-time checksum.
+  EXPECT_EQ(header.checksum, tinydb::HeaderChecksum(header));
 
   // A free adds the freed page's link image alongside the header's.
   disk.FreePage(page_id);

@@ -5,6 +5,7 @@
 #include <tinydb/wal.h>
 
 #include "io/syscalls.h"
+#include "util/checksums.h"
 
 #include <unistd.h>
 
@@ -57,13 +58,15 @@ static auto FindCall(const std::vector<tinydb::io::Call> &calls, tinydb::io::Sys
 static void MakeDbFile(const std::filesystem::path &path, int pages) {
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   auto header_page = std::string(tinydb::PAGE_SIZE, '0');
-  const auto header = tinydb::FileHeader{
+  auto header = tinydb::FileHeader{
       .magic = tinydb::TINYDB_FILE_MAGIC,
       .page_size = tinydb::PAGE_SIZE,
       .root_page_id = tinydb::HEADER_PAGE_ID,
       .next_page_id = static_cast<tinydb::page_id_t>(pages),
       .free_list_head = tinydb::HEADER_PAGE_ID,
+      .checksum = 0,
   };
+  header.checksum = tinydb::HeaderChecksum(header);
   std::memcpy(header_page.data(), &header, sizeof(header));
   file.write(header_page.data(), static_cast<std::streamsize>(header_page.size()));
   for (int i = 0; i < pages; ++i) {
@@ -360,13 +363,15 @@ TEST(WalTest, RecoverCanRebuildMissingDatabaseFromCommittedImages) {
   std::filesystem::remove(wal_path);
 
   auto header_page = std::string(tinydb::PAGE_SIZE, '\0');
-  const auto header = tinydb::FileHeader{
+  auto header = tinydb::FileHeader{
       .magic = tinydb::TINYDB_FILE_MAGIC,
       .page_size = tinydb::PAGE_SIZE,
       .root_page_id = 1,
       .next_page_id = 2,
       .free_list_head = tinydb::HEADER_PAGE_ID,
+      .checksum = 0,
   };
+  header.checksum = tinydb::HeaderChecksum(header);
   std::memcpy(header_page.data(), &header, sizeof(header));
   const auto leaf_page = std::string(tinydb::PAGE_SIZE, 'l');
 
@@ -396,13 +401,15 @@ TEST(WalDurabilityTest, RecoverSyncsCreatedDatabaseDirectoryBeforeTruncatingWal)
   std::filesystem::remove(wal_path);
 
   auto header_page = std::string(tinydb::PAGE_SIZE, '\0');
-  const auto header = tinydb::FileHeader{
+  auto header = tinydb::FileHeader{
       .magic = tinydb::TINYDB_FILE_MAGIC,
       .page_size = tinydb::PAGE_SIZE,
       .root_page_id = 1,
       .next_page_id = 2,
       .free_list_head = tinydb::HEADER_PAGE_ID,
+      .checksum = 0,
   };
+  header.checksum = tinydb::HeaderChecksum(header);
   std::memcpy(header_page.data(), &header, sizeof(header));
 
   {
@@ -561,6 +568,90 @@ TEST(WalTest, RecoverRejectsAForeignDatabaseBeforeReplay) {
   EXPECT_EQ(status.Code(), tinydb::StatusCode::InvalidArgument);
   EXPECT_EQ(ReadWholeFile(db_path), db_before);
   EXPECT_EQ(std::filesystem::file_size(wal_path), wal_size_before);
+
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+}
+
+TEST(WalTest, RecoverRepairsATornDatabaseHeader) {
+  const auto db_path = TestPath("recover_torn_db_header");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  std::filesystem::remove(wal_path);
+  MakeDbFile(db_path, 2);
+
+  // A committed run carrying a header image, the way the engine logs one
+  // whenever an operation changes the header.
+  auto header_page = std::string(tinydb::PAGE_SIZE, '\0');
+  auto header = tinydb::FileHeader{
+      .magic = tinydb::TINYDB_FILE_MAGIC,
+      .page_size = tinydb::PAGE_SIZE,
+      .root_page_id = 1,
+      .next_page_id = 2,
+      .free_list_head = tinydb::HEADER_PAGE_ID,
+      .checksum = 0,
+  };
+  header.checksum = tinydb::HeaderChecksum(header);
+  std::memcpy(header_page.data(), &header, sizeof(header));
+
+  {
+    auto wal = tinydb::Wal::Open(wal_path).value();
+    wal.AppendPageImage(0, header_page.data());
+    ASSERT_TRUE(wal.Commit().Ok());
+  }
+
+  // Tear the on-disk header the way a crashed in-place rewrite would: the
+  // magic survives, but a checksummed field (root_page_id) changes, so the
+  // checksum no longer holds.
+  FlipByteAt(db_path, 8);
+
+  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+
+  const auto db = ReadWholeFile(db_path);
+  EXPECT_EQ(db.substr(0, tinydb::PAGE_SIZE), header_page);
+  EXPECT_EQ(std::filesystem::file_size(wal_path), WAL_HEADER_BYTES);
+
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+}
+
+TEST(WalTest, RecoverRepairsAZeroedHeaderFromACrashedCreation) {
+  const auto db_path = TestPath("recover_zeroed_header");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  std::filesystem::remove(wal_path);
+  {
+    // The database file exists, but its fresh header never reached the disk:
+    // nothing in it but zeroes.
+    std::ofstream file(db_path, std::ios::binary | std::ios::trunc);
+    const auto zeroes = std::string(tinydb::PAGE_SIZE, '\0');
+    file.write(zeroes.data(), static_cast<std::streamsize>(zeroes.size()));
+  }
+
+  auto header_page = std::string(tinydb::PAGE_SIZE, '\0');
+  auto header = tinydb::FileHeader{
+      .magic = tinydb::TINYDB_FILE_MAGIC,
+      .page_size = tinydb::PAGE_SIZE,
+      .root_page_id = 1,
+      .next_page_id = 2,
+      .free_list_head = tinydb::HEADER_PAGE_ID,
+      .checksum = 0,
+  };
+  header.checksum = tinydb::HeaderChecksum(header);
+  std::memcpy(header_page.data(), &header, sizeof(header));
+  const auto leaf_page = std::string(tinydb::PAGE_SIZE, 'l');
+
+  {
+    auto wal = tinydb::Wal::Open(wal_path).value();
+    wal.AppendPageImage(0, header_page.data());
+    wal.AppendPageImage(1, leaf_page.data());
+    ASSERT_TRUE(wal.Commit().Ok());
+  }
+
+  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+
+  const auto db = ReadWholeFile(db_path);
+  ASSERT_EQ(db.size(), 2 * tinydb::PAGE_SIZE);
+  EXPECT_EQ(db.substr(0, tinydb::PAGE_SIZE), header_page);
+  EXPECT_EQ(db.substr(tinydb::PAGE_SIZE, tinydb::PAGE_SIZE), leaf_page);
 
   std::filesystem::remove(db_path);
   std::filesystem::remove(wal_path);

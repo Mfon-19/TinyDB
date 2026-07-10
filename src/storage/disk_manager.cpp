@@ -2,6 +2,7 @@
 #include <tinydb/disk_manager.h>
 
 #include "io/syscalls.h"
+#include "util/checksums.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -10,6 +11,7 @@
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <expected>
 #include <filesystem>
@@ -26,6 +28,15 @@ namespace {
 // The failing errno as an IoError status, tagged with the operation.
 auto ErrnoStatus(std::string_view operation) -> Status {
   return Status::IoError(std::string(operation) + ": " + std::generic_category().message(errno));
+}
+
+// A copy of the header with its checksum freshly computed. Every header that
+// leaves memory — WriteHeader, TakeOpImages — goes through this, so a header
+// on disk (or replayed from the log) always carries a valid checksum.
+auto Sealed(const FileHeader &header) -> FileHeader {
+  auto sealed = header;
+  sealed.checksum = HeaderChecksum(sealed);
+  return sealed;
 }
 
 // Reads just the free-list header at the front of a free page.
@@ -64,9 +75,16 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
         .root_page_id = HEADER_PAGE_ID,
         .next_page_id = FIRST_DATA_PAGE_ID,
         .free_list_head = HEADER_PAGE_ID,
+        .checksum = 0,  // sealed on every write; see Sealed()
     };
 
     if (auto status = disk.WriteHeader(); !status.Ok()) {
+      return std::unexpected(std::move(status));
+    }
+    // Make the fresh header durable before Open returns: a crash right
+    // after creation must not leave a file with no valid header and no
+    // logged header image to repair it from.
+    if (auto status = disk.Sync(); !status.Ok()) {
       return std::unexpected(std::move(status));
     }
     return disk;
@@ -81,6 +99,25 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
   if (static_cast<std::size_t>(bytes_read) != sizeof(disk.header_) || disk.header_.magic != TINYDB_FILE_MAGIC ||
       disk.header_.page_size != PAGE_SIZE) {
     return std::unexpected(Status::InvalidArgument("not a TinyDB database file: " + path.string()));
+  }
+
+  // The magic matches, so a checksum mismatch means the header bytes
+  // themselves are damaged: a torn write that recovery had no header image
+  // to repair, or corruption at rest.
+  if (disk.header_.checksum != HeaderChecksum(disk.header_)) {
+    return std::unexpected(Status::Corruption("corrupt header in " + path.string()));
+  }
+
+  // The header's arithmetic must agree with the file before it is used to
+  // compute offsets: every allocated page has to lie within the file (a
+  // longer file is harmless — see AllocatePage), and the root has to be an
+  // allocated page.
+  const auto file_pages = static_cast<std::uint64_t>(stat_buffer.st_size) / PAGE_SIZE;
+  if (disk.header_.next_page_id < FIRST_DATA_PAGE_ID || disk.header_.next_page_id > file_pages) {
+    return std::unexpected(Status::Corruption("corrupt header in " + path.string()));
+  }
+  if (disk.header_.root_page_id != HEADER_PAGE_ID && disk.header_.root_page_id >= disk.header_.next_page_id) {
+    return std::unexpected(Status::Corruption("corrupt header in " + path.string()));
   }
 
   // Rebuild the in-memory free-page set. Walking the list here also proves
@@ -176,7 +213,8 @@ auto DiskManager::TakeOpImages() -> std::vector<PageImage> {
   if (header_changed_) {
     auto &image = images.emplace_back();
     image.page_id = HEADER_PAGE_ID;
-    std::memcpy(image.data.data(), &header_, sizeof(header_));
+    const auto sealed = Sealed(header_);
+    std::memcpy(image.data.data(), &sealed, sizeof(sealed));
     header_changed_ = false;
   }
 
@@ -237,7 +275,8 @@ auto DiskManager::WriteHeader() const -> Status {
   TINYDB_CHECK(fd_.Valid(), "writing header to a closed disk manager");
 
   auto header_page = std::array<char, PAGE_SIZE>{};
-  std::memcpy(header_page.data(), &header_, sizeof(header_));
+  const auto sealed = Sealed(header_);
+  std::memcpy(header_page.data(), &sealed, sizeof(sealed));
 
   const auto bytes_written = io::Pwrite(fd_.Get(), header_page.data(), header_page.size(), 0);
   if (bytes_written < 0) {
