@@ -31,9 +31,6 @@
 
 namespace {
 
-// Scan end bound past every key the benchmarks generate.
-constexpr const char *SCAN_END = "\x7f";
-
 // Fixed payload size. With 12-byte keys an entry costs ~120 bytes on a page,
 // so a fully packed leaf holds around 33 rows.
 constexpr std::size_t VALUE_BYTES = 100;
@@ -269,21 +266,33 @@ BENCHMARK(PointReadColdDisk)->Arg(100'000)->Unit(benchmark::kMicrosecond);
 
 void RangeScan(benchmark::State &state) {
   // Full-table scan following the leaf sibling chain. Bytes/sec counts the
-  // key and value payload returned, so this is end-to-end bandwidth
-  // including materializing the result vector.
+  // key and copied-value payload returned. The cursor retains one leaf rather
+  // than allocating storage proportional to the full result set.
   const auto rows = static_cast<std::int64_t>(state.range(0));
   auto engine = tinydb::StorageEngine::Open(PrebuiltDb(rows)).value();
 
-  const auto sample = engine.Scan("", SCAN_END).value();
-  TINYDB_CHECK(std::ssize(sample) == rows, "prebuilt database is missing rows");
   std::int64_t payload_bytes = 0;
-  for (const auto &[key, value] : sample) {
-    payload_bytes += std::ssize(key) + std::ssize(value);
+  auto sample_rows = std::int64_t{0};
+  {
+    auto transaction = engine.BeginRead().value();
+    auto cursor = transaction.Scan(tinydb::KeyRange::All()).value();
+    while (cursor.Valid()) {
+      const auto value = cursor.CopyValue().value();
+      payload_bytes += std::ssize(cursor.Key()) + std::ssize(value);
+      ++sample_rows;
+      TINYDB_CHECK(cursor.Next().Ok(), "sample cursor failed");
+    }
   }
+  TINYDB_CHECK(sample_rows == rows, "prebuilt database is missing rows");
 
   while (state.KeepRunning()) {
-    auto result = engine.Scan("", SCAN_END);
-    benchmark::DoNotOptimize(result);
+    auto transaction = engine.BeginRead().value();
+    auto cursor = transaction.Scan(tinydb::KeyRange::All()).value();
+    while (cursor.Valid()) {
+      auto value = cursor.CopyValue();
+      benchmark::DoNotOptimize(value);
+      TINYDB_CHECK(cursor.Next().Ok(), "range cursor failed");
+    }
   }
 
   state.SetItemsProcessed(state.iterations() * rows);

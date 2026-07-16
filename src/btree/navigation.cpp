@@ -10,13 +10,16 @@
 #include <utility>
 
 namespace tinydb {
+namespace {
 
 /*
-** Descend one immutable page at a time. Every handle is released before the
-** next loop iteration. Internal separator equality routes right, matching the
-** inclusive-lower-bound invariant used by page builders and verification.
+** Descend one immutable page at a time. choose_child receives a validated
+** internal view and selects the next edge. Every handle is released before
+** the next iteration. The depth bound detects parent cycles without retaining
+** an allocation-sized visited set.
 */
-auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<page_id_t> {
+template <typename ChooseChild>
+auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child) -> Result<page_id_t> {
   auto page_id = root_page_id;
   auto depth = std::size_t{0};
   for (;;) {
@@ -44,8 +47,21 @@ auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -
     if (!internal) {
       return std::unexpected(internal.error());
     }
-    page_id = internal->ChildAt(internal->FindChildIndex(key));
+    page_id = choose_child(*internal);
   }
+}
+
+}  // namespace
+
+auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<page_id_t> {
+  // Separator equality routes right, matching the inclusive-lower-bound
+  // invariant used by page builders and verification.
+  return Descend(pages, root_page_id,
+                 [key](const InternalPageView &page) { return page.ChildAt(page.FindChildIndex(key)); });
+}
+
+auto FindFirstLeaf(PageReader *pages, page_id_t root_page_id) -> Result<page_id_t> {
+  return Descend(pages, root_page_id, [](const InternalPageView &page) { return page.ChildAt(0); });
 }
 
 }  // namespace tinydb

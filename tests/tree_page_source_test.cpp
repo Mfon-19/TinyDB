@@ -158,8 +158,16 @@ TEST(PageSourceTreeTest, SparseUnderfullPagesRemainCorrect) {
   auto tree = tinydb::BPlusTree::Open(&pages, root_id).value();
   EXPECT_EQ(tree.Get("alpha").value(), std::optional<std::string>{"one"});
   EXPECT_EQ(tree.Get("omega").value(), std::optional<std::string>{"two"});
-  EXPECT_EQ(tree.Scan("", "z").value(),
-            (std::vector<std::pair<std::string, std::string>>{{"alpha", "one"}, {"omega", "two"}}));
+  auto cursor = tinydb::BTreeCursor::First(&pages, tree.RootPageId()).value();
+  ASSERT_TRUE(cursor.Valid());
+  EXPECT_EQ(cursor.Key(), "alpha");
+  EXPECT_EQ(cursor.Value(), "one");
+  ASSERT_TRUE(cursor.Next().Ok());
+  ASSERT_TRUE(cursor.Valid());
+  EXPECT_EQ(cursor.Key(), "omega");
+  EXPECT_EQ(cursor.Value(), "two");
+  ASSERT_TRUE(cursor.Next().Ok());
+  EXPECT_FALSE(cursor.Valid());
   EXPECT_EQ(pages.TotalPins(), 0U);
 }
 

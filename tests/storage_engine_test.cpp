@@ -185,8 +185,22 @@ class TinyDbContractAdapter final {
 
   auto Scan(std::optional<std::string_view> start = std::nullopt,
             std::optional<std::string_view> end = std::nullopt) -> Rows {
-    const auto upper = std::string(tinydb::txn::MAX_KEY_BYTES + 1, static_cast<char>(0xFF));
-    return engine_->Scan(start.value_or(""), end.value_or(upper)).value();
+    auto range = tinydb::KeyRange::All();
+    if (start && end) {
+      range = tinydb::KeyRange::Between(*start, *end);
+    } else if (start) {
+      range = tinydb::KeyRange::From(*start);
+    } else if (end) {
+      range = tinydb::KeyRange::Until(*end);
+    }
+    auto transaction = engine_->BeginRead().value();
+    auto cursor = transaction.Scan(std::move(range)).value();
+    auto rows = Rows{};
+    while (cursor.Valid()) {
+      rows.emplace_back(cursor.Key(), cursor.CopyValue().value());
+      EXPECT_TRUE(cursor.Next().Ok());
+    }
+    return rows;
   }
 
  private:

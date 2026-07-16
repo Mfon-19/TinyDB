@@ -38,13 +38,6 @@ auto ReportError(const tinydb::Status &status) -> int {
   return 1;
 }
 
-// An end bound greater than any storable key: keys are capped at
-// MAX_ENTRY_BYTES, so one more byte of 0xff outranks them all.
-auto ScanEverythingEnd() -> std::string {
-  auto end = std::string(tinydb::MAX_ENTRY_BYTES + 1, '\xff');
-  return end;
-}
-
 auto RunCommand(tinydb::StorageEngine &engine, std::string_view program,
                 const std::vector<std::string_view> &args) -> int {
   const auto command = args[1];
@@ -78,12 +71,24 @@ auto RunCommand(tinydb::StorageEngine &engine, std::string_view program,
   }
 
   if (command == "scan" && (args.size() == 2 || args.size() == 4)) {
-    const auto rows = args.size() == 4 ? engine.Scan(args[2], args[3]) : engine.Scan("", ScanEverythingEnd());
-    if (!rows) {
-      return ReportError(rows.error());
+    auto transaction = engine.BeginRead();
+    if (!transaction) {
+      return ReportError(transaction.error());
     }
-    for (const auto &[key, value] : *rows) {
-      std::cout << key << '\t' << value << '\n';
+    auto cursor = args.size() == 4 ? transaction->Scan(tinydb::KeyRange::Between(args[2], args[3]))
+                                   : transaction->Scan(tinydb::KeyRange::All());
+    if (!cursor) {
+      return ReportError(cursor.error());
+    }
+    while (cursor->Valid()) {
+      const auto value = cursor->CopyValue();
+      if (!value) {
+        return ReportError(value.error());
+      }
+      std::cout << cursor->Key() << '\t' << *value << '\n';
+      if (const auto status = cursor->Next(); !status.Ok()) {
+        return ReportError(status);
+      }
     }
     return 0;
   }

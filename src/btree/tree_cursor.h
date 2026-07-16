@@ -26,6 +26,7 @@ namespace tinydb {
 */
 class BTreeCursor {
  public:
+  static auto First(PageReader *pages, page_id_t root_page_id) -> Result<BTreeCursor>;
   static auto Seek(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<BTreeCursor>;
 
   BTreeCursor(const BTreeCursor &) = delete;

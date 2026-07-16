@@ -36,14 +36,19 @@ class SnapshotCursor final {
 
   auto Valid() const -> bool { return cursor_.Valid(); }
   auto Key() const -> std::string_view { return cursor_.Key(); }
-  auto Value() const -> std::string_view { return cursor_.Value(); }
+  auto ValueSize() const -> std::uint64_t { return cursor_.Value().size(); }
+  auto CopyValue() const -> Result<std::string> { return std::string(cursor_.Value()); }
+  auto First() -> Status;
+  auto Seek(std::string_view key) -> Status;
   auto Next() -> Status { return cursor_.Next(); }
 
  private:
-  SnapshotCursor(SnapshotToken snapshot, BTreeCursor cursor)
-      : snapshot_(std::move(snapshot)), cursor_(std::move(cursor)) {}
+  SnapshotCursor(SnapshotToken snapshot, PageReader *pages, page_id_t root_page_id, BTreeCursor cursor)
+      : snapshot_(std::move(snapshot)), pages_(pages), root_page_id_(root_page_id), cursor_(std::move(cursor)) {}
 
   SnapshotToken snapshot_;
+  PageReader *pages_;
+  page_id_t root_page_id_;
   BTreeCursor cursor_;
 
   friend class ReadSnapshot;
@@ -53,7 +58,9 @@ class SnapshotCursor final {
 ** Internal read-transaction core. PageReader is owned by DatabaseCore. Public
 ** ReadTransaction holds this object for its full lifetime, and convenience
 ** reads construct the same transaction temporarily. Returned point values are
-** owning copies; cursor keys and values remain borrowed from its current page.
+** owning copies. Cursor keys borrow the current page; value copies cross a
+** Result boundary now so overflow-chain I/O and corruption can use the same
+** API later without changing public ownership semantics.
 */
 class ReadSnapshot final {
  public:
@@ -66,6 +73,7 @@ class ReadSnapshot final {
 
   auto State() const -> const DatabaseState & { return snapshot_.State(); }
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
+  auto First() -> Result<SnapshotCursor>;
   auto Seek(std::string_view key) -> Result<SnapshotCursor>;
 
  private:

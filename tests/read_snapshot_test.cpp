@@ -99,7 +99,7 @@ TEST(ReadSnapshotTest, PointReadsAndCursorUseTheCapturedRoot) {
   auto cursor = snapshot.Seek("b").value();
   ASSERT_TRUE(cursor.Valid());
   EXPECT_EQ(cursor.Key(), "bravo");
-  EXPECT_EQ(cursor.Value(), "two");
+  EXPECT_EQ(cursor.CopyValue().value(), "two");
   EXPECT_TRUE(cursor.Next().Ok());
   EXPECT_FALSE(cursor.Valid());
 }
@@ -148,7 +148,7 @@ TEST(ReadSnapshotTest, PublicationWaitsUntilCursorReleasesOldPageVersion) {
   }
   ASSERT_TRUE(fixture.gate->Stats().publication_pending);
   EXPECT_FALSE(published.load(std::memory_order_acquire));
-  EXPECT_EQ(old_cursor->Value(), "one");
+  EXPECT_EQ(old_cursor->CopyValue().value(), "one");
 
   old_cursor.reset();
   publisher.join();

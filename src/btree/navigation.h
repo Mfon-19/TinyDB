@@ -16,4 +16,7 @@ class PageReader;
 */
 auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<page_id_t>;
 
+/* Return the leftmost leaf without inventing a sentinel key. */
+auto FindFirstLeaf(PageReader *pages, page_id_t root_page_id) -> Result<page_id_t>;
+
 }  // namespace tinydb

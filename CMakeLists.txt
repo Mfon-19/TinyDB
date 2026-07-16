@@ -237,6 +237,15 @@ if(BUILD_TESTING)
     gtest_discover_tests(TinyDB_checkpoint_manager_test)
   endif()
 
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cursor_test.cpp")
+    add_executable(TinyDB_cursor_test tests/cursor_test.cpp)
+    target_link_libraries(TinyDB_cursor_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_cursor_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_cursor_test)
+    gtest_discover_tests(TinyDB_cursor_test)
+  endif()
+
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/read_snapshot_test.cpp")
     add_executable(TinyDB_read_snapshot_test tests/read_snapshot_test.cpp)
     target_link_libraries(TinyDB_read_snapshot_test PRIVATE TinyDB::TinyDB GTest::gtest_main)

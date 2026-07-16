@@ -132,6 +132,43 @@ auto LifecycleError(txn::DatabaseLifecycle lifecycle, txn::DatabaseOperation ope
 
 }  // namespace
 
+auto KeyRange::All() -> KeyRange { return {}; }
+
+auto KeyRange::From(std::string_view lower) -> KeyRange { return KeyRange(std::string(lower), std::nullopt); }
+
+auto KeyRange::Until(std::string_view upper) -> KeyRange { return KeyRange(std::nullopt, std::string(upper)); }
+
+auto KeyRange::Between(std::string_view lower, std::string_view upper) -> KeyRange {
+  return KeyRange(std::string(lower), std::string(upper));
+}
+
+auto KeyRange::Prefix(std::string_view prefix) -> KeyRange {
+  auto lower = std::string(prefix);
+  auto upper = lower;
+
+  // Increment the last byte that is not 0xff and discard its suffix. Under
+  // unsigned lexicographic order this is the least key greater than every key
+  // beginning with prefix. An all-0xff prefix has no finite successor.
+  for (auto index = upper.size(); index != 0; --index) {
+    const auto byte = static_cast<unsigned char>(upper[index - 1]);
+    if (byte == 0xffU) {
+      continue;
+    }
+    upper[index - 1] = static_cast<char>(byte + 1U);
+    upper.resize(index);
+    return KeyRange(std::move(lower), std::move(upper));
+  }
+  return KeyRange(std::move(lower), std::nullopt);
+}
+
+auto KeyRange::Lower() const -> std::optional<std::string_view> {
+  return lower_ ? std::optional<std::string_view>{*lower_} : std::nullopt;
+}
+
+auto KeyRange::Upper() const -> std::optional<std::string_view> {
+  return upper_ ? std::optional<std::string_view>{*upper_} : std::nullopt;
+}
+
 namespace detail {
 
 class DatabaseCore final {
@@ -267,6 +304,53 @@ class DatabaseCore final {
 
 }  // namespace detail
 
+struct Cursor::Impl final {
+  Impl(std::shared_ptr<detail::DatabaseCore> database, txn::SnapshotCursor snapshot_cursor, KeyRange key_range)
+      : core(std::move(database)), cursor(std::move(snapshot_cursor)), range(std::move(key_range)) {}
+
+  ~Impl() { Release(); }
+
+  void Activate() noexcept { active = true; }
+
+  void Release() noexcept {
+    if (!active) {
+      return;
+    }
+    // Release the page lease and shared reader admission before taking the
+    // lifecycle mutex in ReleaseTransaction. This preserves the same lock
+    // ordering as ReadTransaction destruction.
+    cursor.reset();
+    active = false;
+    core->ReleaseTransaction();
+  }
+
+  auto Valid() const -> bool {
+    if (!active || !cursor->Valid()) {
+      return false;
+    }
+    const auto upper = range.Upper();
+    return !upper || txn::BytewiseLess{}(cursor->Key(), *upper);
+  }
+
+  auto First() -> Status {
+    const auto lower = range.Lower();
+    return lower ? cursor->Seek(*lower) : cursor->First();
+  }
+
+  auto Seek(std::string_view key) -> Status {
+    const auto lower = range.Lower();
+    if (lower && txn::BytewiseLess{}(key, *lower)) {
+      key = *lower;
+    }
+    return cursor->Seek(key);
+  }
+
+  std::shared_ptr<detail::DatabaseCore> core;
+  std::optional<txn::SnapshotCursor> cursor;
+  KeyRange range;
+  bool active{false};
+};
+
 struct ReadTransaction::Impl final {
   Impl(std::shared_ptr<detail::DatabaseCore> database, txn::ReadSnapshot read_snapshot)
       : core(std::move(database)), snapshot(std::move(read_snapshot)) {}
@@ -339,6 +423,74 @@ auto ReadTransaction::Get(std::string_view key) -> Result<std::optional<std::str
     return std::unexpected(Status::Closed("Get on an inactive read transaction"));
   }
   return impl_->snapshot->Get(key);
+}
+
+auto ReadTransaction::Scan(KeyRange range) -> Result<Cursor> {
+  if (impl_ == nullptr || !impl_->active) {
+    return std::unexpected(Status::Closed("Scan on an inactive read transaction"));
+  }
+  auto snapshot_cursor = range.Lower() ? impl_->snapshot->Seek(*range.Lower()) : impl_->snapshot->First();
+  if (!snapshot_cursor) {
+    return std::unexpected(snapshot_cursor.error());
+  }
+
+  auto cursor_impl = std::make_unique<Cursor::Impl>(impl_->core, std::move(*snapshot_cursor), std::move(range));
+  {
+    auto lock = std::lock_guard(impl_->core->lifecycle_mutex);
+    TINYDB_CHECK(impl_->core->lifecycle != txn::DatabaseLifecycle::Closed,
+                 "active read transaction belongs to a closed database");
+    ++impl_->core->active_transactions;
+  }
+  cursor_impl->Activate();
+  return Cursor(std::move(cursor_impl));
+}
+
+Cursor::Cursor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Cursor::Cursor(Cursor &&) noexcept = default;
+auto Cursor::operator=(Cursor &&) noexcept -> Cursor & = default;
+Cursor::~Cursor() = default;
+
+auto Cursor::First() -> Status {
+  if (impl_ == nullptr || !impl_->active) {
+    return Status::Closed("First on an inactive cursor");
+  }
+  return impl_->First();
+}
+
+auto Cursor::Seek(std::string_view key) -> Status {
+  if (impl_ == nullptr || !impl_->active) {
+    return Status::Closed("Seek on an inactive cursor");
+  }
+  return impl_->Seek(key);
+}
+
+auto Cursor::Next() -> Status {
+  if (impl_ == nullptr || !impl_->active) {
+    return Status::Closed("Next on an inactive cursor");
+  }
+  if (!impl_->Valid()) {
+    return Status::InvalidArgument("Next requires a valid cursor position");
+  }
+  return impl_->cursor->Next();
+}
+
+auto Cursor::Valid() const -> bool { return impl_ != nullptr && impl_->Valid(); }
+
+auto Cursor::Key() const -> std::string_view {
+  TINYDB_CHECK(Valid(), "Key requires a valid cursor position");
+  return impl_->cursor->Key();
+}
+
+auto Cursor::ValueSize() const -> std::uint64_t {
+  TINYDB_CHECK(Valid(), "ValueSize requires a valid cursor position");
+  return impl_->cursor->ValueSize();
+}
+
+auto Cursor::CopyValue() const -> Result<std::string> {
+  if (!Valid()) {
+    return std::unexpected(Status::InvalidArgument("CopyValue requires a valid cursor position"));
+  }
+  return impl_->cursor->CopyValue();
 }
 
 WriteTransaction::WriteTransaction(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -588,14 +740,17 @@ auto StorageEngine::Scan(std::string_view start,
   if (!transaction) {
     return std::unexpected(transaction.error());
   }
-  auto cursor = transaction->impl_->snapshot->Seek(start);
+  auto cursor = transaction->Scan(KeyRange::Between(start, end));
   if (!cursor) {
     return std::unexpected(cursor.error());
   }
   auto rows = std::vector<std::pair<std::string, std::string>>{};
-  const auto less = txn::BytewiseLess{};
-  while (cursor->Valid() && less(cursor->Key(), end)) {
-    rows.emplace_back(cursor->Key(), cursor->Value());
+  while (cursor->Valid()) {
+    auto value = cursor->CopyValue();
+    if (!value) {
+      return std::unexpected(value.error());
+    }
+    rows.emplace_back(cursor->Key(), std::move(*value));
     if (auto status = cursor->Next(); !status.Ok()) {
       return std::unexpected(std::move(status));
     }

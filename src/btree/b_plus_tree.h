@@ -31,7 +31,6 @@ class BPlusTree {
   auto Put(std::string_view key, std::string_view value) -> Status;
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
   auto Remove(std::string_view key) -> Status;
-  auto Scan(std::string_view start, std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>>;
 
   // The caller publishes this value with the page changes that produced it.
   auto RootPageId() const -> page_id_t { return root_page_id_; }

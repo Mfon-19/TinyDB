@@ -20,7 +20,6 @@
 #include "page_format.h"
 #include "page_source.h"
 #include "page_view.h"
-#include "tree_cursor.h"
 #include "txn/contract.h"
 
 /*
@@ -529,26 +528,6 @@ auto BPlusTree::Remove(std::string_view key) -> Status {
     return needs_repair.error();
   }
   return *needs_repair ? RepairDeleteOccupancy(pages_, *path, root_page_id_) : Status{};
-}
-
-auto BPlusTree::Scan(std::string_view start,
-                     std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>> {
-  // BTreeCursor owns seek/next validation. This compatibility API only copies
-  // borrowed rows until the exclusive end bound is reached.
-  auto rows = std::vector<std::pair<std::string, std::string>>{};
-  const auto less = txn::BytewiseLess{};
-  auto cursor = BTreeCursor::Seek(pages_, root_page_id_, start);
-  if (!cursor) {
-    return std::unexpected(std::move(cursor).error());
-  }
-
-  while (cursor->Valid() && less(cursor->Key(), end)) {
-    rows.emplace_back(cursor->Key(), cursor->Value());
-    if (auto status = cursor->Next(); !status.Ok()) {
-      return std::unexpected(std::move(status));
-    }
-  }
-  return rows;
 }
 
 auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<page_id_t> &free_pages) -> Status {

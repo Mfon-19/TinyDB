@@ -18,9 +18,72 @@ namespace detail {
 class DatabaseCore;
 }
 
+/*
+** ORDERED RANGE DESCRIPTION
+**
+** Bounds are owned because a Cursor may outlive the strings used to create
+** it. Between is half-open: [lower, upper). From and Until omit one bound.
+** Prefix computes the smallest exclusive bytewise successor when one exists;
+** an all-0xff prefix has no upper bound.
+*/
+class KeyRange final {
+ public:
+  KeyRange() = default;
+
+  static auto All() -> KeyRange;
+  static auto From(std::string_view lower) -> KeyRange;
+  static auto Until(std::string_view upper) -> KeyRange;
+  static auto Between(std::string_view lower, std::string_view upper) -> KeyRange;
+  static auto Prefix(std::string_view prefix) -> KeyRange;
+
+  auto Lower() const -> std::optional<std::string_view>;
+  auto Upper() const -> std::optional<std::string_view>;
+
+ private:
+  KeyRange(std::optional<std::string> lower, std::optional<std::string> upper)
+      : lower_(std::move(lower)), upper_(std::move(upper)) {}
+
+  std::optional<std::string> lower_;
+  std::optional<std::string> upper_;
+};
+
 struct TransactionCommitInfo {
   std::uint64_t transaction_id{0};
   std::uint64_t commit_lsn{0};
+};
+
+/*
+** A Cursor is one streaming view of a read snapshot. Key borrows the currently
+** pinned leaf and remains valid until First, Seek, Next, move-assignment, or
+** destruction. CopyValue returns owned bytes. Reaching the end of the range is
+** represented by Valid()==false after a successful movement operation.
+**
+** The cursor retains both the snapshot admission and DatabaseCore lifetime.
+** It may outlive the ReadTransaction that created it, and Close returns Busy
+** until the cursor is destroyed.
+*/
+class Cursor final {
+ public:
+  Cursor(const Cursor &) = delete;
+  auto operator=(const Cursor &) -> Cursor & = delete;
+  Cursor(Cursor &&) noexcept;
+  auto operator=(Cursor &&) noexcept -> Cursor &;
+  ~Cursor();
+
+  auto First() -> Status;
+  auto Seek(std::string_view key) -> Status;
+  auto Next() -> Status;
+  auto Valid() const -> bool;
+  auto Key() const -> std::string_view;
+  auto ValueSize() const -> std::uint64_t;
+  auto CopyValue() const -> Result<std::string>;
+
+ private:
+  struct Impl;
+  explicit Cursor(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+
+  friend class ReadTransaction;
 };
 
 /*
@@ -44,6 +107,7 @@ class ReadTransaction final {
   ~ReadTransaction();
 
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
+  auto Scan(KeyRange range = KeyRange::All()) -> Result<Cursor>;
 
  private:
   struct Impl;
