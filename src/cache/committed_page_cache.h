@@ -105,6 +105,9 @@ struct CommittedCacheStats {
   std::size_t pinned_pages{0};
   std::size_t dirty_pages{0};
   std::uint64_t checkpoint_lsn{0};
+  std::uint64_t hits{0};
+  std::uint64_t misses{0};
+  std::uint64_t evictions{0};
 };
 
 /*

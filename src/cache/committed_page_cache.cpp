@@ -114,6 +114,9 @@ struct CommittedPageCache::Impl final {
   std::size_t resident_pages{0};
   std::uint64_t access_clock{0};
   std::uint64_t checkpoint_lsn;  // eviction-safe durability frontier
+  std::uint64_t hits{0};
+  std::uint64_t misses{0};
+  std::uint64_t evictions{0};
 
   Impl(DiskManager *database_file, std::size_t byte_target, std::uint64_t initial_checkpoint_lsn)
       : disk(database_file), target_bytes(byte_target), checkpoint_lsn(initial_checkpoint_lsn) {}
@@ -148,6 +151,7 @@ struct CommittedPageCache::Impl final {
     }
     pages[victim].reset();
     --resident_pages;
+    ++evictions;
     return true;
   }
 
@@ -173,9 +177,11 @@ CommittedPageCache::~CommittedPageCache() = default;
 auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageGuard> {
   auto lock = std::lock_guard(impl_->mutex);
   if (page_id < impl_->pages.size() && impl_->pages[page_id] != nullptr) {
+    ++impl_->hits;
     impl_->Touch(impl_->pages[page_id]);
     return PageGuard(impl_->pages[page_id]);
   }
+  ++impl_->misses;
 
   // Disk reads obey the hard target. Unlike publication, a cache miss has no
   // already-approved transaction overage and may fail if every frame is pinned
@@ -349,6 +355,9 @@ auto CommittedPageCache::Stats() const -> CommittedCacheStats {
       .pinned_pages = pinned_pages,
       .dirty_pages = dirty_pages,
       .checkpoint_lsn = impl_->checkpoint_lsn,
+      .hits = impl_->hits,
+      .misses = impl_->misses,
+      .evictions = impl_->evictions,
   };
 }
 

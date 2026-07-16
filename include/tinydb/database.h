@@ -45,6 +45,14 @@ class Database final {
   // Publishes a self-contained checkpointed file without a WAL. The
   // destination must not already exist and is never exposed partially.
   auto CreateBackup(const std::filesystem::path &destination) -> Status;
+
+  // Audits one stable read snapshot without repair or persistent writes.
+  // Detected damage is represented by VerifyReport::issues; Result errors are
+  // reserved for environmental failures that prevented the audit.
+  auto Verify(VerifyOptions options = {}) -> Result<VerifyReport>;
+
+  // Returns race-free subsystem counters for diagnosis, not one transactional
+  // snapshot spanning every independently synchronized subsystem.
   auto Stats() const -> Result<DatabaseStats>;
   auto Close() -> Status;
 

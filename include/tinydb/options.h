@@ -23,6 +23,13 @@ struct CheckpointOptions final {
   std::chrono::milliseconds maximum_age{std::chrono::seconds(30)};
 };
 
+/* Verification stops recording ownership leaks after this many issues. A
+** malformed page or unsafe structural edge always stops traversal at the
+** first point where continuing would require trusting corrupted bytes. */
+struct VerifyOptions final {
+  std::size_t max_issues{64};
+};
+
 /*
 ** OPEN-TIME RESOURCE POLICY
 **

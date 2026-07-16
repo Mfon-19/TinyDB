@@ -21,3 +21,23 @@ Exit status is 0 on success, 1 for a database error or missing key, and 2 for
 invalid command syntax. Because commits are durable before they return, the
 explicit `Close` is resource cleanup and an opportunity to report checkpoint
 failure rather than the mutation durability boundary.
+
+Two offline-oriented companion programs are installed with the CLI:
+
+```text
+tinydb_dump <database>
+tinydb_salvage <damaged-source> <new-destination>
+```
+
+`tinydb_dump` performs normal recovery and full verification, then writes one
+row per line as hexadecimal key, tab, and hexadecimal value. The encoding is
+reversible for arbitrary byte strings.
+
+`tinydb_salvage` is a distinct best-effort path, never part of normal open. It
+holds a shared file lock, reads the source without modifying it, accepts
+locally checksummed leaves even when both superblocks are damaged, and writes
+surviving rows through the normal transaction path into a destination that
+must not exist. Its report distinguishes damaged pages, damaged values,
+duplicates, and whether allocator metadata was available to exclude known
+obsolete pages. Recovered rows are not claimed to be an exact committed state
+when global metadata is unavailable.

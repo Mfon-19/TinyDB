@@ -84,6 +84,11 @@ auto Materialize(tinydb::Database &engine, tinydb::KeyRange range = tinydb::KeyR
   return rows;
 }
 
+auto ReadFile(const std::filesystem::path &path) -> std::vector<char> {
+  auto input = std::ifstream(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+}
+
 class ScopedSyscallHook {
  public:
   explicit ScopedSyscallHook(tinydb::io::TestHook hook) { tinydb::io::SetTestHook(std::move(hook)); }
@@ -479,12 +484,90 @@ TEST_F(DatabaseTest, StatisticsDescribeReadersVisibilityCacheAndCheckpointFronti
   EXPECT_GT(committed.transaction_id, 0U);
   EXPECT_GT(committed.visible_lsn, committed.checkpoint_lsn);
   EXPECT_GT(committed.wal_bytes, 0U);
+  EXPECT_EQ(committed.wal_segments, 1U);
   EXPECT_GT(committed.dirty_pages, 0U);
+  EXPECT_EQ(committed.dirty_bytes, committed.dirty_pages * tinydb::PAGE_SIZE);
+  EXPECT_GT(committed.cache_hits, 0U);
+  EXPECT_GT(committed.write_attempts, 0U);
+  EXPECT_EQ(committed.write_attempts, committed.committed_writes);
+  EXPECT_GT(committed.last_write_prepare, std::chrono::nanoseconds::zero());
+  EXPECT_GT(committed.last_wal_sync, std::chrono::nanoseconds::zero());
 
   ASSERT_TRUE(database.Checkpoint().Ok());
   const auto checkpointed = database.Stats().value();
   EXPECT_EQ(checkpointed.checkpoint_lsn, checkpointed.visible_lsn);
   EXPECT_EQ(checkpointed.dirty_pages, 0U);
+}
+
+TEST_F(DatabaseTest, VerificationReportsOneReadOnlyCommittedSnapshot) {
+  auto database = tinydb::Database::Open(db_path_).value();
+  ASSERT_TRUE(database.Put("small", "value").Ok());
+  ASSERT_TRUE(database.Put("large", std::string(3U * tinydb::PAGE_SIZE, 'v')).Ok());
+  ASSERT_TRUE(database.Checkpoint().Ok());
+
+  const auto before_database = ReadFile(db_path_);
+  const auto wal_path = tinydb::Wal::PathFor(db_path_);
+  const auto before_wal = ReadFile(wal_path);
+
+  const auto report = database.Verify();
+  ASSERT_TRUE(report.has_value()) << report.error().ToString();
+  EXPECT_TRUE(report->Ok());
+  EXPECT_EQ(report->transaction_id, database.Stats()->transaction_id);
+  EXPECT_GT(report->pages_checked, 0U);
+  EXPECT_GT(report->overflow_pages, 0U);
+
+  const auto after_database = ReadFile(db_path_);
+  const auto after_wal = ReadFile(wal_path);
+  EXPECT_EQ(after_database, before_database);
+  EXPECT_EQ(after_wal, before_wal);
+}
+
+TEST_F(DatabaseTest, RetiredPagesBecomeReusableOnlyAfterCheckpointCoverage) {
+  auto database = tinydb::Database::Open(db_path_).value();
+  ASSERT_TRUE(database.Put("large", std::string(3U * tinydb::PAGE_SIZE, 'a')).Ok());
+  ASSERT_TRUE(database.Put("large", "small").Ok());
+
+  const auto retired = database.Stats().value();
+  EXPECT_GT(retired.retired_pages, 0U);
+  EXPECT_EQ(retired.reusable_pages, 0U);
+
+  ASSERT_TRUE(database.Checkpoint().Ok());
+  const auto reusable = database.Stats().value();
+  EXPECT_EQ(reusable.retired_pages, 0U);
+  EXPECT_GT(reusable.reusable_pages, 0U);
+}
+
+TEST_F(DatabaseTest, StatisticsRemainCoherentWhileWritesPublish) {
+  auto database = tinydb::Database::Open(db_path_).value();
+  auto writer_done = std::atomic<bool>{false};
+  auto writer_failed = std::atomic<bool>{false};
+  auto writer = std::thread([&] {
+    for (std::size_t index = 0; index < 100; ++index) {
+      if (!database.Put("key-" + std::to_string(index), std::string(80, 'v')).Ok()) {
+        writer_failed.store(true);
+        break;
+      }
+    }
+    writer_done.store(true);
+  });
+
+  auto incoherent = false;
+  std::size_t samples = 0;
+  while (!writer_done.load() || samples < 100) {
+    const auto stats = database.Stats();
+    if (!stats || stats->checkpoint_lsn > stats->visible_lsn ||
+        stats->dirty_bytes != stats->dirty_pages * tinydb::PAGE_SIZE ||
+        stats->committed_writes > stats->write_attempts || stats->cache_pinned_pages > stats->cache_resident_pages) {
+      incoherent = true;
+      break;
+    }
+    ++samples;
+    std::this_thread::yield();
+  }
+  writer.join();
+  EXPECT_FALSE(writer_failed.load());
+  EXPECT_FALSE(incoherent);
+  EXPECT_GE(samples, 100U);
 }
 
 TEST_F(DatabaseTest, BackupPublishesASelfContainedVerifiedDatabaseWithoutAWal) {
@@ -578,6 +661,7 @@ TEST_F(DatabaseTest, BackupKeepsReadersLiveWhileADurableWriterWaitsToPublish) {
   }
   EXPECT_TRUE(backup_status.Ok()) << backup_status.ToString();
   EXPECT_EQ(database.Get("concurrent").value(), "published-later");
+  EXPECT_GT(database.Stats()->maximum_publication_wait, std::chrono::nanoseconds::zero());
 
   auto backup = tinydb::Database::Open(second_db_path_).value();
   EXPECT_EQ(backup.Get("key").value(), "value");

@@ -32,6 +32,7 @@ auto CopyValue(PageReader *pages, LeafValueView value) -> Result<std::string>;
 auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descriptor) -> Status;
 
 auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, page_id_t high_water_page_id,
+                           std::uint64_t maximum_page_lsn,
                            const std::unordered_set<page_id_t> &free_pages,
                            const std::unordered_set<page_id_t> &allocator_pages,
                            std::unordered_set<page_id_t> *claimed_pages) -> Status;

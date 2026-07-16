@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <utility>
 
 namespace tinydb {
@@ -48,6 +50,8 @@ struct Stats {
   std::size_t consecutive_failures{0};
   std::uint64_t checkpoint_lsn{0};
   bool checkpoint_requested{false};
+  std::chrono::steady_clock::duration age_since_success{};
+  std::optional<std::string> last_error;
 };
 
 class Manager;
@@ -125,6 +129,7 @@ class Manager final {
   mutable std::mutex state_mutex_;       // protects failure/time diagnostics
   std::size_t consecutive_failures_{0};
   std::chrono::steady_clock::time_point last_success_{std::chrono::steady_clock::now()};
+  std::optional<Status> last_failure_;
 };
 
 }  // namespace checkpoint

@@ -6,6 +6,7 @@
 #include "storage/page_codec.h"
 #include "txn/database_state.h"
 #include "txn/transaction_pages.h"
+#include "verify/verifier.h"
 
 #include <algorithm>
 #include <array>
@@ -317,9 +318,9 @@ TEST(TransactionPagesTest, RootChangesAllocateOneUniqueReachablePageSet) {
   transaction.SetRootPageId(tree.RootPageId());
   ASSERT_TRUE(transaction.Freeze().Ok());
   ASSERT_TRUE(transaction.Seal(2).Ok());
-  EXPECT_TRUE(tinydb::BPlusTree::CheckIntegrity(&transaction, transaction.ResultingState().root_page_id,
-                                                transaction.ResultingState().high_water_page_id, {}, {})
-                  .Ok());
+  const auto verified = tinydb::verify::Snapshot(&transaction, transaction.ResultingState(), 256 * tinydb::PAGE_SIZE);
+  ASSERT_TRUE(verified.has_value()) << verified.error().ToString();
+  EXPECT_TRUE(verified->report.Ok());
 }
 
 }  // namespace

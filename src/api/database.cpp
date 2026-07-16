@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <expected>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -202,6 +203,14 @@ namespace detail {
 
 class DatabaseCore final {
  public:
+  struct OperationalStats final {
+    std::uint64_t write_attempts{0};
+    std::uint64_t committed_writes{0};
+    txn::CommitTiming last_commit{};
+    std::chrono::nanoseconds maximum_publication_wait{};
+    std::vector<storage::FreeExtent> free_extents;
+  };
+
   DatabaseCore(std::filesystem::path database_path, UniqueFd database_lock, std::unique_ptr<DiskManager> database_file,
                std::unique_ptr<cache::CommittedPageCache> page_cache,
                std::unique_ptr<cache::CommittedPageSource> page_source, std::unique_ptr<txn::ReaderGate> reader_gate,
@@ -272,7 +281,19 @@ class DatabaseCore final {
   auto Commit(txn::TransactionPages &transaction, BPlusTree &tree,
               txn::TransactionState &transaction_state) -> Result<CommitInfo> {
     auto coordinator = txn::CommitCoordinator(wal.get(), cache.get(), readers.get());
-    auto result = coordinator.Commit(transaction, tree, transaction_state);
+    auto timing = txn::CommitTiming{};
+    auto result = coordinator.Commit(transaction, tree, transaction_state, &timing);
+    {
+      auto lock = std::lock_guard(operational_stats_mutex);
+      ++operational_stats.write_attempts;
+      operational_stats.last_commit = timing;
+      operational_stats.maximum_publication_wait =
+          std::max(operational_stats.maximum_publication_wait, timing.publication_wait);
+      if (result) {
+        ++operational_stats.committed_writes;
+        operational_stats.free_extents = transaction.FreeExtents();
+      }
+    }
     if (!result && (result.error().Code() == StatusCode::IndeterminateCommit ||
                     result.error().Code() == StatusCode::NeedsRecovery)) {
       NeedsRecovery();
@@ -343,7 +364,35 @@ class DatabaseCore final {
   */
   auto CheckIntegrity() -> Status {
     auto snapshot = txn::ReadSnapshot::Begin(readers.get(), pages.get());
-    return verify::Snapshot(pages.get(), snapshot.State(), options.max_write_transaction_bytes);
+    auto verified = verify::Snapshot(pages.get(), snapshot.State(), options.max_write_transaction_bytes);
+    if (!verified) {
+      return verified.error();
+    }
+    if (verified->report.Ok()) {
+      auto lock = std::lock_guard(operational_stats_mutex);
+      operational_stats.free_extents = verified->free_extents;
+    }
+    return verify::StatusFrom(*verified);
+  }
+
+  /*
+  ** Verify holds an ordinary read snapshot, so publication waits while the
+  ** audit follows cross-page references.  It neither takes the writer permit
+  ** nor invokes checkpointing.  Corruption is returned in the report; only an
+  ** environmental failure prevents a report from being produced.
+  */
+  auto Verify(VerifyOptions verify_options) -> Result<VerifyReport> {
+    auto admission = AdmitMaintenance(txn::DatabaseOperation::Verify);
+    if (!admission) {
+      return std::unexpected(admission.error());
+    }
+    auto snapshot = txn::ReadSnapshot::Begin(readers.get(), pages.get());
+    auto verified =
+        verify::Snapshot(pages.get(), snapshot.State(), options.max_write_transaction_bytes, verify_options);
+    if (!verified) {
+      return std::unexpected(verified.error());
+    }
+    return std::move(verified->report);
   }
 
   /*
@@ -360,11 +409,17 @@ class DatabaseCore final {
     const auto reader_stats = readers->Stats();
     const auto cache_stats = cache->Stats();
     const auto checkpoint_stats = checkpoints->GetStats();
+    auto operation_stats = OperationalStats{};
+    {
+      auto stats_lock = std::lock_guard(operational_stats_mutex);
+      operation_stats = operational_stats;
+    }
     auto result = DatabaseStats{
         .transaction_id = state->transaction_id,
         .visible_lsn = state->visible_lsn,
         .checkpoint_lsn = state->checkpoint_lsn,
         .wal_bytes = wal->SizeBytes(),
+        .wal_segments = wal->SegmentCount(),
         .active_readers = reader_stats.active_readers,
         .publication_pending = reader_stats.publication_pending,
         .oldest_reader_age = std::nullopt,
@@ -373,11 +428,35 @@ class DatabaseCore final {
         .cache_resident_pages = cache_stats.resident_pages,
         .cache_pinned_pages = cache_stats.pinned_pages,
         .dirty_pages = cache_stats.dirty_pages,
+        .dirty_bytes = cache_stats.dirty_pages > std::numeric_limits<std::size_t>::max() / PAGE_SIZE
+                           ? std::numeric_limits<std::size_t>::max()
+                           : cache_stats.dirty_pages * PAGE_SIZE,
+        .cache_hits = cache_stats.hits,
+        .cache_misses = cache_stats.misses,
+        .cache_evictions = cache_stats.evictions,
+        .write_attempts = operation_stats.write_attempts,
+        .committed_writes = operation_stats.committed_writes,
+        .last_write_prepare = operation_stats.last_commit.prepare,
+        .last_wal_sync = operation_stats.last_commit.wal_sync,
+        .last_publication_wait = operation_stats.last_commit.publication_wait,
+        .maximum_publication_wait = operation_stats.maximum_publication_wait,
         .consecutive_checkpoint_failures = checkpoint_stats.consecutive_failures,
         .checkpoint_requested = checkpoint_stats.checkpoint_requested,
+        .checkpoint_age =
+            std::chrono::duration_cast<std::chrono::milliseconds>(checkpoint_stats.age_since_success),
+        .last_checkpoint_error = checkpoint_stats.last_error,
     };
     if (reader_stats.oldest_reader_age) {
       result.oldest_reader_age = std::chrono::duration_cast<std::chrono::milliseconds>(*reader_stats.oldest_reader_age);
+    }
+    for (const auto &extent : operation_stats.free_extents) {
+      auto *const destination = extent.retire_lsn <= state->checkpoint_lsn ? &result.reusable_pages
+                                                                          : &result.retired_pages;
+      if (extent.page_count > std::numeric_limits<std::size_t>::max() - *destination) {
+        *destination = std::numeric_limits<std::size_t>::max();
+      } else {
+        *destination += static_cast<std::size_t>(extent.page_count);
+      }
     }
     return result;
   }
@@ -422,6 +501,8 @@ class DatabaseCore final {
   std::size_t active_transactions{0};
   std::size_t active_maintenance{0};
   std::mutex writer_mutex;
+  mutable std::mutex operational_stats_mutex;
+  OperationalStats operational_stats;
 
   UniqueFd lock_fd;
   std::unique_ptr<DiskManager> disk;
@@ -890,6 +971,13 @@ auto Database::CreateBackup(const std::filesystem::path &destination) -> Status 
     return Status::Closed("CreateBackup on a moved-from database");
   }
   return impl_->core->CreateBackup(destination);
+}
+
+auto Database::Verify(VerifyOptions options) -> Result<VerifyReport> {
+  if (impl_ == nullptr) {
+    return std::unexpected(Status::Closed("Verify on a moved-from database"));
+  }
+  return impl_->core->Verify(options);
 }
 
 auto Database::Stats() const -> Result<DatabaseStats> {

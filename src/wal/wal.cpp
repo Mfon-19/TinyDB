@@ -315,6 +315,13 @@ auto Wal::SizeBytes() const -> std::uint64_t {
   return live_bytes;
 }
 
+auto Wal::SegmentCount() const -> std::size_t {
+  auto lock = std::lock_guard(*mutex_);
+  // The active append target exists for the lifetime of Wal. Archives remain
+  // observable until a checkpoint has durably covered and removed them.
+  return archived_segments_.size() + 1U;
+}
+
 auto Wal::CleanupCheckpointed(std::uint64_t checkpoint_lsn) -> Status {
   auto lock = std::lock_guard(*mutex_);
   TINYDB_CHECK(fd_.Valid(), "cleaning a moved-from log");

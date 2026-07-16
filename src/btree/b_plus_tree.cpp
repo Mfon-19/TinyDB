@@ -6,11 +6,9 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
-#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -29,7 +27,8 @@
 ** Page views validate and search one encoded page. Page builders own one
 ** mutable logical page. This file establishes relationships between pages:
 ** descent paths, split propagation, sibling repair, root replacement, leaf
-** chaining, and full-tree verification.
+** chaining. Cross-page verification belongs to verify/verifier.cpp so normal
+** tree mutation and hostile persistent-byte inspection cannot diverge.
 **
 ** Internal separators are inclusive lower bounds for their right child, so an
 ** equal key always routes right. Leaves contain all values and form a strictly
@@ -574,141 +573,6 @@ auto BPlusTree::Remove(std::string_view key) -> Status {
     }
   }
   return needs_repair->underfull ? RepairDeleteOccupancy(pages_, *path, root_page_id_) : Status{};
-}
-
-auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<page_id_t> &free_pages) -> Status {
-  return CheckIntegrity(pages_, root_page_id_, next_page_id, free_pages, {});
-}
-
-auto BPlusTree::CheckIntegrity(PageReader *pages, page_id_t root_page_id, page_id_t next_page_id,
-                               const std::unordered_set<page_id_t> &free_pages,
-                               const std::unordered_set<page_id_t> &allocator_pages) -> Status {
-  if (root_page_id == HEADER_PAGE_ID || root_page_id >= next_page_id) {
-    return Status::Corruption("root page is outside the allocation frontier");
-  }
-  if (free_pages.contains(root_page_id) || allocator_pages.contains(root_page_id)) {
-    return Status::Corruption("root page is on the free list");
-  }
-
-  /*
-  ** The recursive walk proves parent routing ranges, page ownership, and
-  ** single reachability. It records leaves in in-order traversal so a second
-  ** pass can compare the physical successor chain with logical tree order.
-  */
-  struct Summary {
-    std::optional<std::string> minimum;
-    std::optional<std::string> maximum;
-  };
-
-  auto visited = std::unordered_set<page_id_t>{};
-  auto leaf_pages = std::vector<std::pair<page_id_t, page_id_t>>{};
-  using Bound = std::optional<std::string>;
-  const auto less = txn::BytewiseLess{};
-
-  std::function<Result<Summary>(page_id_t, const Bound &, const Bound &)> visit;
-  visit = [&](page_id_t page_id, const Bound &lower, const Bound &upper) -> Result<Summary> {
-    if (page_id == HEADER_PAGE_ID || page_id >= next_page_id) {
-      return std::unexpected(Status::Corruption("tree references a page outside the allocation frontier"));
-    }
-    if (free_pages.contains(page_id)) {
-      return std::unexpected(Status::Corruption("tree references a page on the free list"));
-    }
-    if (!visited.insert(page_id).second) {
-      return std::unexpected(Status::Corruption("tree contains a duplicate page reference or cycle"));
-    }
-
-    auto page = pages->Read(page_id);
-    if (!page) {
-      return std::unexpected(std::move(page).error());
-    }
-    const auto type = RawNodeType(page->Data());
-    if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
-      const auto leaf = LeafPageView::Open(page->Data(), page->Id());
-      if (!leaf) {
-        return std::unexpected(leaf.error());
-      }
-      for (std::size_t index = 0; index < leaf->Count(); ++index) {
-        const auto key = leaf->KeyAt(index);
-        if ((lower.has_value() && less(key, *lower)) || (upper.has_value() && !less(key, *upper))) {
-          return std::unexpected(Status::Corruption("leaf key lies outside its parent routing range"));
-        }
-        const auto value = leaf->ValueAt(index);
-        if (value.IsOverflow()) {
-          if (auto status = ValidateOverflowValue(pages, value.OverflowDescriptor(), next_page_id, free_pages,
-                                                  allocator_pages, &visited);
-              !status.Ok()) {
-            return std::unexpected(std::move(status));
-          }
-        }
-      }
-      leaf_pages.emplace_back(page_id, leaf->NextLeaf());
-      if (leaf->Count() == 0) {
-        return Summary{};
-      }
-      return Summary{.minimum = std::string{leaf->KeyAt(0)}, .maximum = std::string{leaf->KeyAt(leaf->Count() - 1)}};
-    }
-    if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
-      return std::unexpected(Status::Corruption("reachable page is not a B+ tree node"));
-    }
-
-    const auto node = InternalPageView::Open(page->Data(), page->Id());
-    if (!node) {
-      return std::unexpected(node.error());
-    }
-    auto result = Summary{};
-    // Child ranges are half-open. The first inherits the caller's lower bound;
-    // the last inherits its upper bound; middle ranges use adjacent separators.
-    for (std::size_t child_index = 0; child_index <= node->SeparatorCount(); ++child_index) {
-      const auto child_lower = child_index == 0 ? lower : Bound{std::string{node->KeyAt(child_index - 1)}};
-      const auto child_upper =
-          child_index == node->SeparatorCount() ? upper : Bound{std::string{node->KeyAt(child_index)}};
-      if (child_lower.has_value() && child_upper.has_value() && !less(*child_lower, *child_upper)) {
-        return std::unexpected(Status::Corruption("internal node has an invalid routing range"));
-      }
-      auto child = visit(node->ChildAt(child_index), child_lower, child_upper);
-      if (!child) {
-        return std::unexpected(std::move(child).error());
-      }
-      if (!result.minimum.has_value() && child->minimum.has_value()) {
-        result.minimum = child->minimum;
-      }
-      if (child->maximum.has_value()) {
-        result.maximum = child->maximum;
-      }
-    }
-    return result;
-  };
-
-  auto root = visit(root_page_id, Bound{}, Bound{});
-  if (!root) {
-    return std::move(root).error();
-  }
-
-  for (std::size_t i = 0; i < leaf_pages.size(); ++i) {
-    const auto expected_next = i + 1 < leaf_pages.size() ? leaf_pages[i + 1].first : HEADER_PAGE_ID;
-    if (leaf_pages[i].second != expected_next) {
-      return Status::Corruption("leaf chain does not match tree order");
-    }
-  }
-
-  // Finally account for every ID below the high-water frontier exactly once:
-  // reachable tree, reusable extent, or allocator metadata.
-  for (const auto page_id : free_pages) {
-    if (page_id == HEADER_PAGE_ID || page_id >= next_page_id) {
-      return Status::Corruption("free-list page is outside the allocation frontier");
-    }
-  }
-  for (const auto page_id : allocator_pages) {
-    if (page_id < FIRST_DATA_PAGE_ID || page_id >= next_page_id || free_pages.contains(page_id) ||
-        visited.contains(page_id)) {
-      return Status::Corruption("allocator page has invalid ownership");
-    }
-  }
-  const auto allocated_pages = next_page_id - FIRST_DATA_PAGE_ID;
-  if (visited.size() + free_pages.size() + allocator_pages.size() != allocated_pages) {
-    return Status::Corruption("allocated page is neither reachable nor free");
-  }
-  return {};
 }
 
 }  // namespace tinydb

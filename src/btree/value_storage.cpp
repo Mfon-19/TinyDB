@@ -24,6 +24,7 @@ namespace {
 
 struct ChainConstraints {
   page_id_t high_water_page_id{std::numeric_limits<page_id_t>::max()};
+  std::uint64_t maximum_page_lsn{std::numeric_limits<std::uint64_t>::max()};
   const std::unordered_set<page_id_t> *free_pages{nullptr};
   const std::unordered_set<page_id_t> *allocator_pages{nullptr};
   std::unordered_set<page_id_t> *claimed_pages{nullptr};
@@ -73,6 +74,13 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
         storage::DecodeOverflowPage(std::as_bytes(std::span{page->Data(), PAGE_SIZE}), page->Id());
     if (!decoded) {
       return decoded.error();
+    }
+    const auto header = storage::DecodeDataPageHeader(std::as_bytes(std::span{page->Data(), PAGE_SIZE}), page->Id());
+    if (!header) {
+      return header.error();
+    }
+    if (header->page_lsn > constraints.maximum_page_lsn) {
+      return Status::Corruption("overflow page LSN is newer than the verified snapshot");
     }
     if (decoded->owner_value_id != descriptor.first_page_id || decoded->chunk_index != expected_chunk) {
       return Status::Corruption("overflow page has the wrong owner or chunk index");
@@ -214,6 +222,7 @@ auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descr
 
 /* Join chain-local validation to the verifier's global page-ownership proof. */
 auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, page_id_t high_water_page_id,
+                           std::uint64_t maximum_page_lsn,
                            const std::unordered_set<page_id_t> &free_pages,
                            const std::unordered_set<page_id_t> &allocator_pages,
                            std::unordered_set<page_id_t> *claimed_pages) -> Status {
@@ -221,6 +230,7 @@ auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &des
       pages, descriptor,
       ChainConstraints{
           .high_water_page_id = high_water_page_id,
+          .maximum_page_lsn = maximum_page_lsn,
           .free_pages = &free_pages,
           .allocator_pages = &allocator_pages,
           .claimed_pages = claimed_pages,

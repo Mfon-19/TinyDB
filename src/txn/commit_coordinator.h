@@ -5,6 +5,8 @@
 
 #include "txn/state.h"
 
+#include <chrono>
+
 namespace tinydb {
 
 class BPlusTree;
@@ -18,6 +20,12 @@ namespace txn {
 
 class ReaderGate;
 class TransactionPages;
+
+struct CommitTiming final {
+  std::chrono::nanoseconds prepare{};
+  std::chrono::nanoseconds wal_sync{};
+  std::chrono::nanoseconds publication_wait{};
+};
 
 /*
 ** DURABLE COMMIT COORDINATOR
@@ -42,7 +50,7 @@ class CommitCoordinator final {
       : wal_(wal), cache_(cache), readers_(readers) {}
 
   auto Commit(TransactionPages &transaction, BPlusTree &tree,
-              TransactionState &transaction_state) -> Result<CommitInfo>;
+              TransactionState &transaction_state, CommitTiming *timing = nullptr) -> Result<CommitInfo>;
 
  private:
   Wal *wal_;

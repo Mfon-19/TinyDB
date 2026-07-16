@@ -8,14 +8,12 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace tinydb {
 
 class PageSource;
-class PageReader;
 
 /*
 ** Ordered-map algorithms over a caller-supplied page universe. BPlusTree owns
@@ -34,12 +32,6 @@ class BPlusTree {
 
   // The caller publishes this value with the page changes that produced it.
   auto RootPageId() const -> page_id_t { return root_page_id_; }
-
-  // Validates relationships that a single-page decoder cannot see.
-  auto CheckIntegrity(page_id_t next_page_id, const std::unordered_set<page_id_t> &free_pages) -> Status;
-  static auto CheckIntegrity(PageReader *pages, page_id_t root_page_id, page_id_t next_page_id,
-                             const std::unordered_set<page_id_t> &free_pages,
-                             const std::unordered_set<page_id_t> &allocator_pages) -> Status;
 
  private:
   BPlusTree(PageSource *pages, page_id_t root_page_id) : pages_(pages), root_page_id_(root_page_id) {}

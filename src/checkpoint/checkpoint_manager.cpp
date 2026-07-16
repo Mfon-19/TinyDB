@@ -44,10 +44,12 @@ auto Manager::Record(Status status) -> Status {
   if (status.Ok()) {
     consecutive_failures_ = 0;
     last_success_ = std::chrono::steady_clock::now();
+    last_failure_.reset();
   } else {
     if (consecutive_failures_ != std::numeric_limits<std::size_t>::max()) {
       ++consecutive_failures_;
     }
+    last_failure_ = status;
   }
   return status;
 }
@@ -181,6 +183,8 @@ auto Manager::GetStats() const -> Stats {
       .checkpoint_lsn = state->checkpoint_lsn,
       .checkpoint_requested = consecutive_failures_ != 0 || wal_bytes >= policy_.wal_trigger_bytes ||
                               DirtyBytes(cache) >= policy_.dirty_trigger_bytes || age_expired,
+      .age_since_success = std::chrono::steady_clock::now() - last_success_,
+      .last_error = last_failure_ ? std::optional<std::string>{last_failure_->ToString()} : std::nullopt,
   };
 }
 

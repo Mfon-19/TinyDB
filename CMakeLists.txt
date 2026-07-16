@@ -107,6 +107,8 @@ add_library(
   src/io/unique_fd.h
   src/recovery/recovery.cpp
   src/recovery/recovery.h
+  src/salvage/salvage.cpp
+  src/salvage/salvage.h
   src/storage/disk_manager.cpp
   src/storage/disk_manager.h
   src/storage/database_uuid.h
@@ -164,6 +166,17 @@ set_target_properties(TinyDB_cli PROPERTIES OUTPUT_NAME tinydb)
 target_link_libraries(TinyDB_cli PRIVATE TinyDB::TinyDB)
 TinyDB_apply_local_tooling(TinyDB_cli)
 
+add_executable(TinyDB_dump tools/tinydb_dump.cpp)
+set_target_properties(TinyDB_dump PROPERTIES OUTPUT_NAME tinydb_dump)
+target_link_libraries(TinyDB_dump PRIVATE TinyDB::TinyDB)
+TinyDB_apply_local_tooling(TinyDB_dump)
+
+add_executable(TinyDB_salvage tools/tinydb_salvage.cpp)
+set_target_properties(TinyDB_salvage PROPERTIES OUTPUT_NAME tinydb_salvage)
+target_include_directories(TinyDB_salvage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(TinyDB_salvage PRIVATE TinyDB::TinyDB)
+TinyDB_apply_local_tooling(TinyDB_salvage)
+
 set(TINYDB_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/TinyDB)
 configure_package_config_file(
   cmake/TinyDBConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/TinyDBConfig.cmake
@@ -174,7 +187,7 @@ write_basic_package_version_file(
   COMPATIBILITY SameMajorVersion)
 
 install(
-  TARGETS TinyDB TinyDB_cli
+  TARGETS TinyDB TinyDB_cli TinyDB_dump TinyDB_salvage
   EXPORT TinyDBTargets
   FILE_SET public_headers
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}

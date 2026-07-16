@@ -9,7 +9,9 @@
 #include "btree/page_source.h"
 #include "btree/value.h"
 #include "storage/page_codec.h"
+#include "txn/database_state.h"
 #include "util/crc32.h"
+#include "verify/verifier.h"
 
 #include <unistd.h>
 
@@ -96,7 +98,14 @@ auto OverflowPage(tinydb::page_id_t page_id, tinydb::page_id_t owner, std::uint3
 }
 
 auto Integrity(MemoryPages *pages, tinydb::page_id_t high_water) -> tinydb::Status {
-  return tinydb::BPlusTree::CheckIntegrity(pages, 2, high_water, {}, {});
+  const auto state = tinydb::txn::DatabaseState{
+      .root_page_id = 2,
+      .high_water_page_id = high_water,
+      .transaction_id = 1,
+      .visible_lsn = 1,
+  };
+  const auto verified = tinydb::verify::Snapshot(pages, state, 64 * tinydb::PAGE_SIZE);
+  return verified ? tinydb::verify::StatusFrom(*verified) : verified.error();
 }
 
 TEST(OverflowIntegrityTest, RejectsDamagedMisownedReorderedAndTruncatedChains) {

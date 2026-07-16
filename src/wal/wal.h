@@ -75,6 +75,9 @@ class Wal {
   // remains physically present but counts only as its logical header.
   auto SizeBytes() const -> std::uint64_t;
 
+  // Counts the active append target plus immutable archives not yet removed.
+  auto SegmentCount() const -> std::size_t;
+
   // Required state: a durable superblock covers checkpoint_lsn. Removes only
   // immutable segments whose final record is at or before that frontier.
   // Failure may leave redundant history but never removes live recovery data.
