@@ -93,6 +93,9 @@ add_library(
   src/btree/page_view.h
   src/btree/tree_cursor.cpp
   src/btree/tree_cursor.h
+  src/btree/value.h
+  src/btree/value_storage.cpp
+  src/btree/value_storage.h
   src/cache/committed_page_cache.cpp
   src/cache/committed_page_cache.h
   src/cache/committed_page_source.cpp
@@ -244,6 +247,15 @@ if(BUILD_TESTING)
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_cursor_test)
     gtest_discover_tests(TinyDB_cursor_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/overflow_value_test.cpp")
+    add_executable(TinyDB_overflow_value_test tests/overflow_value_test.cpp)
+    target_link_libraries(TinyDB_overflow_value_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_overflow_value_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_overflow_value_test)
+    gtest_discover_tests(TinyDB_overflow_value_test)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/read_snapshot_test.cpp")

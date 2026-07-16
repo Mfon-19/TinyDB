@@ -50,12 +50,28 @@ auto LeafPageView::KeyAt(std::size_t index) const -> std::string_view {
   return {page_ + offset + LEAF_CELL_HEADER_SIZE, key_bytes};
 }
 
-auto LeafPageView::ValueAt(std::size_t index) const -> std::string_view {
+auto LeafPageView::ValueAt(std::size_t index) const -> LeafValueView {
   const auto offset = CellOffset(index);
   const auto bytes = Bytes(page_);
   const auto key_bytes = *storage::GetLittleEndian<std::uint16_t>(bytes, offset + leaf_cell_offset::KEY_BYTES);
   const auto value_bytes = *storage::GetLittleEndian<std::uint16_t>(bytes, offset + leaf_cell_offset::VALUE_BYTES);
-  return {page_ + offset + LEAF_CELL_HEADER_SIZE + key_bytes, value_bytes};
+  const auto value_offset = offset + LEAF_CELL_HEADER_SIZE + key_bytes;
+  const auto kind = static_cast<LeafValueKind>(page_[offset + leaf_cell_offset::VALUE_KIND]);
+  if (kind == LeafValueKind::Inline) {
+    return LeafValueView::Inline(std::string_view{page_ + value_offset, value_bytes});
+  }
+
+  const auto total = *storage::GetLittleEndian<std::uint64_t>(
+      bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES);
+  const auto first =
+      *storage::GetLittleEndian<page_id_t>(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID);
+  const auto checksum = *storage::GetLittleEndian<std::uint32_t>(
+      bytes, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM);
+  return LeafValueView::Overflow(OverflowValueDescriptor{
+      .total_value_bytes = total,
+      .first_page_id = first,
+      .value_checksum = checksum,
+  });
 }
 
 auto LeafPageView::LowerBound(std::string_view key) const -> std::size_t {
@@ -74,7 +90,7 @@ auto LeafPageView::LowerBound(std::string_view key) const -> std::size_t {
   return first;
 }
 
-auto LeafPageView::Get(std::string_view key) const -> std::optional<std::string_view> {
+auto LeafPageView::Get(std::string_view key) const -> std::optional<LeafValueView> {
   // LowerBound identifies the sole possible match.
   const auto index = LowerBound(key);
   if (index == cell_count_ || KeyAt(index) != key) {

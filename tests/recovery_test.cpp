@@ -108,7 +108,7 @@ class RecoveryTest : public ::testing::Test {
 
 auto DataPage(tinydb::page_id_t page_id, char marker) -> std::array<char, tinydb::PAGE_SIZE> {
   const auto payload = std::array{static_cast<std::byte>(marker)};
-  auto encoded = tinydb::storage::EncodeOverflowPage(page_id, 0, payload.size(), tinydb::HEADER_PAGE_ID, payload);
+  auto encoded = tinydb::storage::EncodeOverflowPage(page_id, 0, page_id, 0, tinydb::HEADER_PAGE_ID, payload);
   EXPECT_TRUE(encoded.has_value());
   return encoded.value_or(std::array<char, tinydb::PAGE_SIZE>{});
 }

@@ -28,9 +28,9 @@ namespace {
 TEST(LeafPageViewTest, SearchesEncodedRecordsWithoutOwningThem) {
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};
-  builder.Upsert("alpha", "one");
-  builder.Upsert("middle", "two");
-  builder.Upsert("omega", "three");
+  builder.Upsert("alpha", tinydb::LeafValue::Inline("one"));
+  builder.Upsert("middle", tinydb::LeafValue::Inline("two"));
+  builder.Upsert("omega", tinydb::LeafValue::Inline("three"));
   builder.Store(page.data(), 2);
 
   const auto view = tinydb::LeafPageView::Open(page.data(), 2);
@@ -38,17 +38,18 @@ TEST(LeafPageViewTest, SearchesEncodedRecordsWithoutOwningThem) {
   EXPECT_EQ(view->Count(), 3U);
   EXPECT_EQ(view->NextLeaf(), tinydb::HEADER_PAGE_ID);
   EXPECT_EQ(view->KeyAt(0), "alpha");
-  EXPECT_EQ(view->ValueAt(1), "two");
+  EXPECT_EQ(view->ValueAt(1).InlineBytes(), "two");
   EXPECT_EQ(view->LowerBound(""), 0U);
   EXPECT_EQ(view->LowerBound("middle"), 1U);
   EXPECT_EQ(view->LowerBound("middle!"), 2U);
   EXPECT_EQ(view->LowerBound("zulu"), 3U);
-  EXPECT_EQ(view->Get("omega"), std::optional<std::string_view>{"three"});
+  ASSERT_TRUE(view->Get("omega").has_value());
+  EXPECT_EQ(view->Get("omega")->InlineBytes(), "three");
   EXPECT_EQ(view->Get("missing"), std::nullopt);
 
   const auto value = view->ValueAt(0);
-  EXPECT_GE(value.data(), page.data());
-  EXPECT_LT(value.data(), page.data() + page.size());
+  EXPECT_GE(value.InlineBytes().data(), page.data());
+  EXPECT_LT(value.InlineBytes().data(), page.data() + page.size());
 }
 
 TEST(LeafPageViewTest, UsesUnsignedBytewiseKeyOrder) {
@@ -56,14 +57,15 @@ TEST(LeafPageViewTest, UsesUnsignedBytewiseKeyOrder) {
   auto builder = tinydb::LeafPageBuilder{};
   const auto low = std::string(1, static_cast<char>(0x7F));
   const auto high = std::string(1, static_cast<char>(0x80));
-  builder.Upsert(low, "low");
-  builder.Upsert(high, "high");
+  builder.Upsert(low, tinydb::LeafValue::Inline("low"));
+  builder.Upsert(high, tinydb::LeafValue::Inline("high"));
   builder.Store(page.data(), 2);
 
   const auto view = tinydb::LeafPageView::Open(page.data(), 2).value();
   EXPECT_EQ(view.LowerBound(low), 0U);
   EXPECT_EQ(view.LowerBound(high), 1U);
-  EXPECT_EQ(view.Get(high), std::optional<std::string_view>{"high"});
+  ASSERT_TRUE(view.Get(high).has_value());
+  EXPECT_EQ(view.Get(high)->InlineBytes(), "high");
 }
 
 TEST(InternalPageViewTest, EqualKeysRouteToTheRightChild) {
@@ -88,7 +90,7 @@ TEST(InternalPageViewTest, EqualKeysRouteToTheRightChild) {
 TEST(PageViewTest, RejectsWrongTypeIdentityAndReservedBytes) {
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto leaf = tinydb::LeafPageBuilder{};
-  leaf.Upsert("key", "value");
+  leaf.Upsert("key", tinydb::LeafValue::Inline("value"));
   leaf.Store(leaf_page.data(), 2);
 
   EXPECT_EQ(tinydb::InternalPageView::Open(leaf_page.data(), 2).error().Code(), tinydb::StatusCode::Corruption);
@@ -97,7 +99,7 @@ TEST(PageViewTest, RejectsWrongTypeIdentityAndReservedBytes) {
   auto bytes = std::as_writable_bytes(std::span{leaf_page});
   const auto slot = tinydb::storage::GetLittleEndian<tinydb::slot_t>(bytes, tinydb::LEAF_HEADER_SIZE);
   ASSERT_TRUE(slot.has_value());
-  bytes[*slot + tinydb::leaf_cell_offset::RESERVED] = std::byte{1};
+  bytes[*slot + tinydb::leaf_cell_offset::VALUE_KIND] = std::byte{0x7f};
   ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
   EXPECT_EQ(tinydb::LeafPageView::Open(leaf_page.data(), 2).error().Code(), tinydb::StatusCode::Corruption);
 }
@@ -105,7 +107,7 @@ TEST(PageViewTest, RejectsWrongTypeIdentityAndReservedBytes) {
 TEST(PageViewTest, RejectsMalformedSlotsAsCorruption) {
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};
-  builder.Upsert("key", "value");
+  builder.Upsert("key", tinydb::LeafValue::Inline("value"));
   builder.Store(page.data(), 2);
 
   auto bytes = std::as_writable_bytes(std::span{page});
@@ -155,7 +157,8 @@ TEST(PageViewTest, DecoderFuzzNeverExposesUncheckedSlotsOrCells) {
   auto seed_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};
   for (int index = 0; index < 24; ++index) {
-    builder.Upsert("key-" + std::to_string(index + 100), std::string(static_cast<std::size_t>(index), 'v'));
+    builder.Upsert("key-" + std::to_string(index + 100),
+                   tinydb::LeafValue::Inline(std::string(static_cast<std::size_t>(index), 'v')));
   }
   builder.Store(seed_page.data(), 2);
 

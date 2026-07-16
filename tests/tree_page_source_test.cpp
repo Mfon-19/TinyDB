@@ -143,8 +143,8 @@ TEST(PageSourceTreeTest, SparseUnderfullPagesRemainCorrect) {
   auto root_page = pages.Allocate().value();
 
   auto leaves = tinydb::LeafPageBuilder{};
-  leaves.Upsert("alpha", "one");
-  leaves.Upsert("omega", "two");
+  leaves.Upsert("alpha", tinydb::LeafValue::Inline("one"));
+  leaves.Upsert("omega", tinydb::LeafValue::Inline("two"));
   auto split = leaves.Split(right_page.Id(), /*tail_heavy=*/false);
   leaves.Store(left_page.MutableData(), left_page.Id());
   split.right.Store(right_page.MutableData(), right_page.Id());
@@ -161,11 +161,11 @@ TEST(PageSourceTreeTest, SparseUnderfullPagesRemainCorrect) {
   auto cursor = tinydb::BTreeCursor::First(&pages, tree.RootPageId()).value();
   ASSERT_TRUE(cursor.Valid());
   EXPECT_EQ(cursor.Key(), "alpha");
-  EXPECT_EQ(cursor.Value(), "one");
+  EXPECT_EQ(cursor.Value().InlineBytes(), "one");
   ASSERT_TRUE(cursor.Next().Ok());
   ASSERT_TRUE(cursor.Valid());
   EXPECT_EQ(cursor.Key(), "omega");
-  EXPECT_EQ(cursor.Value(), "two");
+  EXPECT_EQ(cursor.Value().InlineBytes(), "two");
   ASSERT_TRUE(cursor.Next().Ok());
   EXPECT_FALSE(cursor.Valid());
   EXPECT_EQ(pages.TotalPins(), 0U);
@@ -196,7 +196,7 @@ TEST(PageSourceTreeTest, CursorSeekAndNextBorrowOneLeafAtATime) {
   auto cursor = tinydb::BTreeCursor::Seek(&pages, tree.RootPageId(), "bravo").value();
   ASSERT_TRUE(cursor.Valid());
   EXPECT_EQ(cursor.Key(), "middle");
-  EXPECT_EQ(cursor.Value(), "two");
+  EXPECT_EQ(cursor.Value().InlineBytes(), "two");
   ASSERT_TRUE(cursor.Next().Ok());
   ASSERT_TRUE(cursor.Valid());
   EXPECT_EQ(cursor.Key(), "omega");

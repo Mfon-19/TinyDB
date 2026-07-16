@@ -8,6 +8,8 @@
 #include <optional>
 #include <string_view>
 
+#include "btree/value.h"
+
 namespace tinydb {
 
 /*
@@ -30,9 +32,9 @@ class LeafPageView {
   auto NextLeaf() const -> page_id_t { return next_leaf_; }
 
   auto KeyAt(std::size_t index) const -> std::string_view;
-  auto ValueAt(std::size_t index) const -> std::string_view;
+  auto ValueAt(std::size_t index) const -> LeafValueView;
   auto LowerBound(std::string_view key) const -> std::size_t;
-  auto Get(std::string_view key) const -> std::optional<std::string_view>;
+  auto Get(std::string_view key) const -> std::optional<LeafValueView>;
 
  private:
   LeafPageView(const char *page, std::uint16_t cell_count, page_id_t next_leaf)

@@ -63,7 +63,8 @@ static auto DataPage(tinydb::page_id_t page_id, char marker) -> std::array<char,
   // real encoded page rather than arbitrary marker-filled bytes so tests reach
   // the WAL behavior they intend to exercise.
   const auto payload = std::array{static_cast<std::byte>(marker)};
-  const auto page = tinydb::storage::EncodeOverflowPage(page_id, 0, payload.size(), tinydb::HEADER_PAGE_ID, payload);
+  const auto page =
+      tinydb::storage::EncodeOverflowPage(page_id, 0, page_id, 0, tinydb::HEADER_PAGE_ID, payload);
   EXPECT_TRUE(page.has_value());
   return page.value();
 }
@@ -127,8 +128,9 @@ static void MakeDbFile(const std::filesystem::path &path, int pages) {
   file.write(reinterpret_cast<const char *>(superblock->data()), static_cast<std::streamsize>(superblock->size()));
   file.write(reinterpret_cast<const char *>(superblock->data()), static_cast<std::streamsize>(superblock->size()));
   for (int i = static_cast<int>(tinydb::FIRST_DATA_PAGE_ID); i < pages; ++i) {
+    const auto page_id = static_cast<tinydb::page_id_t>(i);
     const auto page = tinydb::storage::EncodeOverflowPage(
-        static_cast<tinydb::page_id_t>(i), 0, 1, tinydb::HEADER_PAGE_ID, std::as_bytes(std::span{"x", std::size_t{1}}));
+        page_id, 0, page_id, 0, tinydb::HEADER_PAGE_ID, std::as_bytes(std::span{"x", std::size_t{1}}));
     ASSERT_TRUE(page.has_value());
     file.write(page->data(), static_cast<std::streamsize>(page->size()));
   }

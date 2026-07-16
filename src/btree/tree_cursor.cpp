@@ -55,7 +55,7 @@ auto BTreeCursor::Key() const -> std::string_view {
   return leaf_->KeyAt(index_);
 }
 
-auto BTreeCursor::Value() const -> std::string_view {
+auto BTreeCursor::Value() const -> LeafValueView {
   TINYDB_CHECK(Valid(), "reading value from an invalid tree cursor");
   return leaf_->ValueAt(index_);
 }

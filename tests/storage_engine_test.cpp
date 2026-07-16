@@ -45,9 +45,6 @@ auto TestUuid(std::byte last = std::byte{1}) -> tinydb::DatabaseUuid {
   return uuid;
 }
 
-// Scan end bound past every key this suite generates.
-constexpr const char *SCAN_END = "\x7f";
-
 auto RowKey(int row) -> std::string {
   char buffer[16];
   std::snprintf(buffer, sizeof(buffer), "row-%06d", row);
@@ -60,6 +57,32 @@ auto RowValue(int row, std::size_t length) -> std::string {
     value[i] = static_cast<char>('a' + (static_cast<std::size_t>(row) + i) % 26);
   }
   return value;
+}
+
+using Rows = std::vector<std::pair<std::string, std::string>>;
+
+auto Materialize(tinydb::StorageEngine &engine, tinydb::KeyRange range = tinydb::KeyRange::All())
+    -> tinydb::Result<Rows> {
+  auto transaction = engine.BeginRead();
+  if (!transaction) {
+    return std::unexpected(transaction.error());
+  }
+  auto cursor = transaction->Scan(std::move(range));
+  if (!cursor) {
+    return std::unexpected(cursor.error());
+  }
+  auto rows = Rows{};
+  while (cursor->Valid()) {
+    auto value = cursor->CopyValue();
+    if (!value) {
+      return std::unexpected(value.error());
+    }
+    rows.emplace_back(cursor->Key(), std::move(*value));
+    if (auto status = cursor->Next(); !status.Ok()) {
+      return std::unexpected(std::move(status));
+    }
+  }
+  return rows;
 }
 
 class ScopedSyscallHook {
@@ -253,11 +276,24 @@ TEST_F(StorageEngineTest, InvalidMutationLeavesTheWriteTransactionActive) {
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
   auto transaction = engine.BeginWrite().value();
   const auto oversized_key = std::string(tinydb::txn::MAX_KEY_BYTES + 1, 'x');
+  const auto oversized_value = std::string(tinydb::MAX_VALUE_BYTES + 1, 'x');
   EXPECT_EQ(transaction.Put(oversized_key, "value").Code(), tinydb::StatusCode::InvalidArgument);
+  EXPECT_EQ(transaction.Put("key", oversized_value).Code(), tinydb::StatusCode::InvalidArgument);
   EXPECT_EQ(transaction.Delete(oversized_key).Code(), tinydb::StatusCode::InvalidArgument);
   ASSERT_TRUE(transaction.Put("valid", "value").Ok());
   ASSERT_TRUE(transaction.Commit().has_value());
   EXPECT_EQ(engine.Get("valid").value(), std::optional<std::string>{"value"});
+}
+
+TEST_F(StorageEngineTest, MaximumSizedKeyIsIndependentOfValueStorage) {
+  const auto key = std::string(tinydb::txn::MAX_KEY_BYTES, 'k');
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(engine.Put(key, "value").Ok());
+  EXPECT_EQ(engine.Get(key).value(), std::optional<std::string>{"value"});
+  ASSERT_TRUE(engine.Close().Ok());
+
+  auto reopened = tinydb::StorageEngine::Open(db_path_).value();
+  EXPECT_EQ(reopened.Get(key).value(), std::optional<std::string>{"value"});
 }
 
 TEST_F(StorageEngineTest, PublicTransactionCloseIsBusyWithoutInvalidatingTransactions) {
@@ -405,7 +441,7 @@ TEST_F(StorageEngineTest, OpenCreatesEmptyDatabase) {
 
   EXPECT_TRUE(std::filesystem::exists(db_path_));
   EXPECT_EQ(engine.Get("anything").value(), std::nullopt);
-  EXPECT_TRUE(engine.Scan("", SCAN_END).value().empty());
+  EXPECT_TRUE(Materialize(engine).value().empty());
   EXPECT_TRUE(engine.Remove("anything").Ok());  // removing from an empty database is a no-op
 }
 
@@ -438,7 +474,7 @@ TEST_F(StorageEngineTest, IntegrityCheckSurvivesSplitsMergesAndReopen) {
 
   auto reopened = tinydb::StorageEngine::Open(db_path_).value();
   EXPECT_TRUE(reopened.CheckIntegrity().Ok());
-  EXPECT_EQ(reopened.Scan("", SCAN_END).value().size(), 150U);
+  EXPECT_EQ(Materialize(reopened).value().size(), 150U);
 }
 
 TEST_F(StorageEngineTest, RandomizedModelSurvivesCheckpointsAndReopens) {
@@ -474,7 +510,7 @@ TEST_F(StorageEngineTest, RandomizedModelSurvivesCheckpointsAndReopens) {
 
     const auto integrity = engine.CheckIntegrity();
     ASSERT_TRUE(integrity.Ok()) << integrity.ToString();
-    const auto rows = engine.Scan("", SCAN_END).value();
+    const auto rows = Materialize(engine).value();
     EXPECT_EQ(rows, expected.Scan());
     ASSERT_TRUE(engine.Close().Ok());
   }
@@ -487,15 +523,15 @@ TEST_F(StorageEngineTest, PutReplacesExistingValue) {
   EXPECT_TRUE(engine.Put("key", "second").Ok());
 
   EXPECT_EQ(engine.Get("key").value(), std::optional<std::string>{"second"});
-  EXPECT_EQ(engine.Scan("", SCAN_END).value().size(), 1);
+  EXPECT_EQ(Materialize(engine).value().size(), 1);
 }
 
-TEST_F(StorageEngineTest, EntrySizeCapIsEnforced) {
+TEST_F(StorageEngineTest, ValueSizeLimitIsIndependentOfLeafGeometry) {
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
 
   // Exactly at the cap is accepted.
   const auto key = std::string{"key"};
-  const auto max_value = RowValue(0, tinydb::MAX_ENTRY_BYTES - key.size());
+  const auto max_value = RowValue(0, tinydb::MAX_VALUE_BYTES);
   EXPECT_TRUE(engine.Put(key, max_value).Ok());
 
   // One byte over is rejected and must not disturb existing data.
@@ -513,12 +549,12 @@ TEST_F(StorageEngineTest, ScanBoundsAreHalfOpen) {
     ASSERT_TRUE(engine.Put(RowKey(i), RowValue(i, 20)).Ok());
   }
 
-  const auto rows = engine.Scan(RowKey(3), RowKey(6)).value();
+  const auto rows = Materialize(engine, tinydb::KeyRange::Between(RowKey(3), RowKey(6))).value();
   ASSERT_EQ(rows.size(), 3);
   EXPECT_EQ(rows.front().first, RowKey(3));
   EXPECT_EQ(rows.back().first, RowKey(5));
 
-  EXPECT_TRUE(engine.Scan(RowKey(4), RowKey(4)).value().empty());
+  EXPECT_TRUE(Materialize(engine, tinydb::KeyRange::Between(RowKey(4), RowKey(4))).value().empty());
 }
 
 TEST_F(StorageEngineTest, ClosedHandleRefusesWork) {
@@ -532,7 +568,7 @@ TEST_F(StorageEngineTest, ClosedHandleRefusesWork) {
   const auto got = engine.Get("key");
   ASSERT_FALSE(got.has_value());
   EXPECT_EQ(got.error().Code(), tinydb::StatusCode::Closed);
-  const auto rows = engine.Scan("", SCAN_END);
+  const auto rows = Materialize(engine);
   ASSERT_FALSE(rows.has_value());
   EXPECT_EQ(rows.error().Code(), tinydb::StatusCode::Closed);
   EXPECT_TRUE(engine.Close().Ok());  // closing twice is safe
@@ -601,7 +637,7 @@ TEST_F(StorageEngineTest, ReopenedDatabaseAcceptsMutations) {
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
   EXPECT_EQ(engine.Get(RowKey(5)).value(), std::nullopt);
   EXPECT_EQ(engine.Get(RowKey(100)).value(), std::optional<std::string>{RowValue(100, 30)});
-  EXPECT_EQ(engine.Scan("", SCAN_END).value().size(), 20);  // 20 - 1 + 1
+  EXPECT_EQ(Materialize(engine).value().size(), 20);  // 20 - 1 + 1
 }
 
 TEST_F(StorageEngineTest, LargeWorkloadSurvivesReopen) {
@@ -623,7 +659,7 @@ TEST_F(StorageEngineTest, LargeWorkloadSurvivesReopen) {
   }
 
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
-  const auto rows = engine.Scan("", SCAN_END).value();
+  const auto rows = Materialize(engine).value();
   ASSERT_EQ(rows.size(), model.size());
   auto it = model.begin();
   for (const auto &[key, value] : rows) {
@@ -713,7 +749,7 @@ TEST_F(StorageEngineTest, OpenRejectsForeignFilesBeforeWalReplay) {
     const auto uuid = TestUuid();
     auto wal = tinydb::Wal::Open(tinydb::Wal::PathFor(db_path_), uuid).value();
     const auto payload = std::array{std::byte{'x'}};
-    const auto image = tinydb::storage::EncodeOverflowPage(2, 1, 1, tinydb::HEADER_PAGE_ID, payload);
+    const auto image = tinydb::storage::EncodeOverflowPage(2, 1, 2, 0, tinydb::HEADER_PAGE_ID, payload);
     ASSERT_TRUE(image.has_value());
     wal.AppendPageImage(2, image->data());
     const auto committed = wal.Commit(tinydb::txn::DatabaseState{
@@ -797,7 +833,7 @@ TEST_F(StorageEngineTest, CommittedWritesSurviveACrash) {
   SnapshotDatabase();
   auto recovered = tinydb::StorageEngine::Open(second_db_path_).value();
 
-  const auto rows = recovered.Scan("", SCAN_END).value();
+  const auto rows = Materialize(recovered).value();
   ASSERT_EQ(rows.size(), 100U);
   for (int row = 100; row < 200; ++row) {
     EXPECT_EQ(recovered.Get(RowKey(row)).value(), RowValue(row, 64));
@@ -937,7 +973,7 @@ TEST_F(StorageEngineTest, LogOutgrowingItsThresholdCheckpoints) {
   // plus the shorter log reproduce every row.
   SnapshotDatabase();
   auto recovered = tinydb::StorageEngine::Open(second_db_path_).value();
-  EXPECT_EQ(recovered.Scan("", SCAN_END).value().size(), 400U);
+  EXPECT_EQ(Materialize(recovered).value().size(), 400U);
   EXPECT_EQ(recovered.Get(RowKey(399)).value(), RowValue(399, 128));
 }
 

@@ -25,16 +25,28 @@ constexpr auto MakeCrc32Table() -> std::array<std::uint32_t, 256> {
 
 inline constexpr auto CRC32_TABLE = MakeCrc32Table();
 
+class Crc32Accumulator final {
+ public:
+  void Update(std::span<const std::byte> data) noexcept {
+    for (const auto value : data) {
+      const auto byte = std::to_integer<unsigned int>(value);
+      remainder_ = CRC32_TABLE[(remainder_ ^ byte) & 0xFFU] ^ (remainder_ >> 8U);
+    }
+  }
+
+  auto Finish() const noexcept -> std::uint32_t { return remainder_ ^ 0xFFFFFFFFU; }
+
+ private:
+  std::uint32_t remainder_{0xFFFFFFFFU};
+};
+
 // Keeping the implementation byte-oriented makes the result identical across
 // host endian and alignment rules. Codecs zero their checksum field before
 // calling this function, then store the returned value little-endian.
 inline auto Crc32(std::span<const std::byte> data) noexcept -> std::uint32_t {
-  auto crc = std::uint32_t{0xFFFFFFFFU};
-  for (const auto value : data) {
-    const auto byte = std::to_integer<unsigned int>(value);
-    crc = CRC32_TABLE[(crc ^ byte) & 0xFFU] ^ (crc >> 8U);
-  }
-  return crc ^ 0xFFFFFFFFU;
+  auto accumulator = Crc32Accumulator{};
+  accumulator.Update(data);
+  return accumulator.Finish();
 }
 
 inline auto Crc32(const char *data, std::size_t size) noexcept -> std::uint32_t {

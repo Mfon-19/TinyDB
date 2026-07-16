@@ -275,14 +275,15 @@ TEST(DataPageCodecTest, OverflowLengthsIdentityAndChecksumAreValidated) {
   // Include NUL and high-bit bytes to prove values are opaque bytes rather
   // than C strings or signed characters.
   const auto payload = std::array{std::byte{0x00}, std::byte{0x7F}, std::byte{0x80}, std::byte{0xFF}};
-  const auto encoded = tinydb::storage::EncodeOverflowPage(7, 99, 12, 8, payload);
+  const auto encoded = tinydb::storage::EncodeOverflowPage(7, 99, 7, 3, 8, payload);
   ASSERT_TRUE(encoded.has_value());
   const auto bytes = std::as_bytes(std::span{*encoded});
   const auto decoded = tinydb::storage::DecodeOverflowPage(bytes, 7);
   ASSERT_TRUE(decoded.has_value());
-  EXPECT_EQ(decoded->total_value_bytes, 12U);
+  EXPECT_EQ(decoded->owner_value_id, 7U);
+  EXPECT_EQ(decoded->chunk_index, 3U);
   EXPECT_EQ(decoded->next_page_id, 8U);
-  EXPECT_EQ(decoded->payload, std::vector<std::byte>(payload.begin(), payload.end()));
+  EXPECT_TRUE(std::ranges::equal(decoded->payload, payload));
 
   EXPECT_EQ(tinydb::storage::DecodeOverflowPage(bytes, 6).error().Code(), StatusCode::Corruption);
   auto corrupted = *encoded;
@@ -318,13 +319,15 @@ TEST(DataPageCodecTest, LeafAndInternalPagesUseTheValidatedCommonHeader) {
   // retain a parallel legacy decoder beside the common page codec.
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto leaf = tinydb::LeafPageBuilder{};
-  leaf.Upsert("alpha", "one");
-  leaf.Upsert("omega", "two");
+  leaf.Upsert("alpha", tinydb::LeafValue::Inline("one"));
+  leaf.Upsert("omega", tinydb::LeafValue::Inline("two"));
   leaf.Store(leaf_page.data(), 2);
   EXPECT_TRUE(tinydb::ValidateTreePage(leaf_page.data(), 2).Ok());
   const auto loaded_leaf = tinydb::LeafPageView::Open(leaf_page.data(), 2).value();
-  EXPECT_EQ(loaded_leaf.Get("alpha"), std::optional<std::string_view>{"one"});
-  EXPECT_EQ(loaded_leaf.Get("omega"), std::optional<std::string_view>{"two"});
+  ASSERT_TRUE(loaded_leaf.Get("alpha").has_value());
+  ASSERT_TRUE(loaded_leaf.Get("omega").has_value());
+  EXPECT_EQ(loaded_leaf.Get("alpha")->InlineBytes(), "one");
+  EXPECT_EQ(loaded_leaf.Get("omega")->InlineBytes(), "two");
 
   auto internal_page = std::array<char, tinydb::PAGE_SIZE>{};
   const auto internal = tinydb::InternalPageBuilder{2, "middle", 3};
@@ -404,9 +407,11 @@ TEST(WalCodecTest, RecordMatchesGoldenBytesAndDetectsCorruption) {
 
 TEST(WalCodecTest, TransactionBindsPagesStateOrderAndLsnRange) {
   const auto first =
-      tinydb::storage::EncodeOverflowPage(2, 100, 1, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
+      tinydb::storage::EncodeOverflowPage(2, 100, 2, 0, tinydb::HEADER_PAGE_ID,
+                                          std::array{std::byte{'a'}}).value();
   const auto second =
-      tinydb::storage::EncodeOverflowPage(3, 100, 1, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
+      tinydb::storage::EncodeOverflowPage(3, 100, 3, 0, tinydb::HEADER_PAGE_ID,
+                                          std::array{std::byte{'b'}}).value();
   const auto pages = std::array{
       tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
       tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},
@@ -446,9 +451,11 @@ TEST(WalCodecTest, TransactionBindsPagesStateOrderAndLsnRange) {
 
 TEST(WalCodecTest, TransactionRejectsMissingDuplicatedReorderedAndCorruptRecords) {
   const auto first =
-      tinydb::storage::EncodeOverflowPage(2, 50, 1, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
+      tinydb::storage::EncodeOverflowPage(2, 50, 2, 0, tinydb::HEADER_PAGE_ID,
+                                          std::array{std::byte{'a'}}).value();
   const auto second =
-      tinydb::storage::EncodeOverflowPage(3, 50, 1, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
+      tinydb::storage::EncodeOverflowPage(3, 50, 3, 0, tinydb::HEADER_PAGE_ID,
+                                          std::array{std::byte{'b'}}).value();
   const auto pages = std::array{
       tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
       tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},

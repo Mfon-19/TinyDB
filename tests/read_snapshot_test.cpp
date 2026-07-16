@@ -38,7 +38,7 @@ auto Leaf(tinydb::page_id_t page_id, std::initializer_list<std::pair<std::string
     -> std::unique_ptr<tinydb::cache::PageBytes> {
   auto builder = tinydb::LeafPageBuilder{};
   for (const auto &[key, value] : rows) {
-    builder.Upsert(key, value);
+    builder.Upsert(key, tinydb::LeafValue::Inline(value));
   }
   auto page = std::make_unique<tinydb::cache::PageBytes>();
   builder.Store(page->data(), page_id);

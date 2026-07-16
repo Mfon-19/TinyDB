@@ -509,8 +509,8 @@ auto WriteTransaction::Put(std::string_view key, std::string_view value) -> Stat
   if (impl_ == nullptr || !impl_->active) {
     return Status::Closed("Put on an inactive write transaction");
   }
-  if (txn::ValidateKeySize(key.size()) != StatusCode::Ok || key.size() + value.size() > MAX_ENTRY_BYTES) {
-    return Status::InvalidArgument("key or value exceeds the current encoded entry limit");
+  if (txn::ValidateKeySize(key.size()) != StatusCode::Ok || txn::ValidateValueSize(value.size()) != StatusCode::Ok) {
+    return Status::InvalidArgument("key or value exceeds its configured size limit");
   }
   auto status = impl_->transaction->ChargeValueBytes(value.size());
   if (status.Ok()) {
@@ -732,30 +732,6 @@ auto StorageEngine::Remove(std::string_view key) -> Status {
   }
   const auto committed = transaction->Commit();
   return committed ? Status{} : committed.error();
-}
-
-auto StorageEngine::Scan(std::string_view start,
-                         std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>> {
-  auto transaction = BeginRead();
-  if (!transaction) {
-    return std::unexpected(transaction.error());
-  }
-  auto cursor = transaction->Scan(KeyRange::Between(start, end));
-  if (!cursor) {
-    return std::unexpected(cursor.error());
-  }
-  auto rows = std::vector<std::pair<std::string, std::string>>{};
-  while (cursor->Valid()) {
-    auto value = cursor->CopyValue();
-    if (!value) {
-      return std::unexpected(value.error());
-    }
-    rows.emplace_back(cursor->Key(), std::move(*value));
-    if (auto status = cursor->Next(); !status.Ok()) {
-      return std::unexpected(std::move(status));
-    }
-  }
-  return rows;
 }
 
 auto StorageEngine::CheckIntegrity() -> Status {

@@ -90,14 +90,15 @@ struct FreeExtentPage {
 };
 
 /*
-** Large values will be split across overflow pages. total_value_bytes is
-** repeated so a reader can preflight its result allocation and verify that a
-** chain reconstructs exactly the advertised logical length.
+** Borrowed view of one overflow page. owner_value_id is the chain's first page
+** and chunk_index must increase from zero without gaps. The caller keeps the
+** encoded page bytes alive while using payload.
 */
 struct OverflowPage {
-  std::uint64_t total_value_bytes;
+  page_id_t owner_value_id;
+  std::uint32_t chunk_index;
   page_id_t next_page_id;
-  std::vector<std::byte> payload;
+  std::span<const std::byte> payload;
 };
 
 auto InitializeDataPage(std::span<std::byte> page, DataPageType type, page_id_t page_id, std::uint64_t page_lsn,
@@ -118,8 +119,10 @@ auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t n
                           std::span<const FreeExtent> extents) -> Result<std::array<char, PAGE_SIZE>>;
 auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<FreeExtentPage>;
 
-auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, std::uint64_t total_value_bytes,
-                        page_id_t next_page_id,
+inline constexpr std::size_t OVERFLOW_PAGE_PAYLOAD_BYTES = PAGE_SIZE - 60;
+
+auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t owner_value_id,
+                        std::uint32_t chunk_index, page_id_t next_page_id,
                         std::span<const std::byte> payload) -> Result<std::array<char, PAGE_SIZE>>;
 auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<OverflowPage>;
 

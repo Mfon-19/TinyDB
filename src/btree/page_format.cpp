@@ -47,16 +47,38 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
     std::size_t key_bytes = 0;
     std::size_t cell_bytes = 0;
     if (type == storage::DataPageType::Leaf) {
-      // Prove lengths and the reserved byte before constructing borrowed views.
+      // Prove the kind-specific payload before constructing borrowed views.
       const auto key = storage::GetLittleEndian<std::uint16_t>(page, *slot + leaf_cell_offset::KEY_BYTES);
       const auto value = storage::GetLittleEndian<std::uint16_t>(page, *slot + leaf_cell_offset::VALUE_BYTES);
-      if (!key || !value || *slot + LEAF_CELL_HEADER_SIZE > PAGE_SIZE ||
-          page[*slot + leaf_cell_offset::RESERVED] != std::byte{0}) {
+      if (!key || !value || *slot + LEAF_CELL_HEADER_SIZE > PAGE_SIZE) {
         return Status::Corruption("invalid leaf-cell header");
+      }
+      const auto kind = std::to_integer<std::uint8_t>(page[*slot + leaf_cell_offset::VALUE_KIND]);
+      if (kind != static_cast<std::uint8_t>(LeafValueKind::Inline) &&
+          kind != static_cast<std::uint8_t>(LeafValueKind::Overflow)) {
+        return Status::Corruption("leaf cell has an unknown value kind");
       }
       key_offset = *slot + LEAF_CELL_HEADER_SIZE;
       key_bytes = *key;
       cell_bytes = LEAF_CELL_HEADER_SIZE + *key + *value;
+      if (kind == static_cast<std::uint8_t>(LeafValueKind::Overflow)) {
+        if (*value != OVERFLOW_VALUE_DESCRIPTOR_BYTES || cell_bytes > PAGE_SIZE - *slot) {
+          return Status::Corruption("overflow leaf cell has an invalid descriptor length");
+        }
+        const auto descriptor_offset = key_offset + key_bytes;
+        const auto total =
+            storage::GetLittleEndian<std::uint64_t>(page, descriptor_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES);
+        const auto first_page =
+            storage::GetLittleEndian<page_id_t>(page, descriptor_offset + overflow_descriptor_offset::FIRST_PAGE_ID);
+        const auto checksum =
+            storage::GetLittleEndian<std::uint32_t>(page, descriptor_offset + overflow_descriptor_offset::VALUE_CHECKSUM);
+        const auto reserved =
+            storage::GetLittleEndian<std::uint32_t>(page, descriptor_offset + overflow_descriptor_offset::RESERVED);
+        if (!total || !first_page || !checksum || !reserved || *total == 0 || *total > MAX_VALUE_BYTES ||
+            *first_page < FIRST_DATA_PAGE_ID || *reserved != 0) {
+          return Status::Corruption("leaf cell contains an invalid overflow descriptor");
+        }
+      }
     } else {
       // Every internal record owns a real right child.
       const auto child = storage::GetLittleEndian<page_id_t>(page, *slot + internal_cell_offset::RIGHT_CHILD);

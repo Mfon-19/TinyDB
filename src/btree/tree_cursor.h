@@ -17,8 +17,9 @@ namespace tinydb {
 ** FORWARD TREE CURSOR
 **
 ** Seek descends once, then iteration follows the leaf successor chain. The
-** cursor owns one page lease at a time. Key and Value borrow that page and
-** expire on Next or destruction.
+** cursor owns one leaf lease at a time. Key and the leaf value descriptor
+** borrow that page and expire on movement or destruction. Overflow payload
+** pages are read by the snapshot wrapper only when a value copy is requested.
 **
 ** Opening each successor validates both page-local structure and global chain
 ** order. visited_ detects cycles even through empty leaves, for which no key
@@ -36,7 +37,7 @@ class BTreeCursor {
 
   auto Valid() const -> bool { return leaf_.has_value() && index_ < leaf_->Count(); }
   auto Key() const -> std::string_view;
-  auto Value() const -> std::string_view;
+  auto Value() const -> LeafValueView;
   auto Next() -> Status;
 
  private:

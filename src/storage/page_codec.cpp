@@ -35,15 +35,22 @@ constexpr std::size_t EXTENT_ENTRY_BYTES = sizeof(page_id_t) + sizeof(std::uint6
 /*
 ** OVERFLOW PAYLOAD
 **
-**   32 total logical value bytes u64
-**   40 next overflow page u64
-**   48 bytes stored in this page u16
-**   50 payload bytes, followed by checksum-covered zero padding
+**   32 owning value ID u64 (the chain's first page)
+**   40 chunk index u32
+**   44 reserved u32
+**   48 next overflow page u64
+**   56 bytes stored in this page u16
+**   58 reserved u16
+**   60 payload bytes, followed by checksum-covered zero padding
 */
-constexpr std::size_t OVERFLOW_TOTAL_BYTES_OFFSET = data_page_offset::HEADER_BYTES;
-constexpr std::size_t OVERFLOW_NEXT_PAGE_OFFSET = OVERFLOW_TOTAL_BYTES_OFFSET + sizeof(std::uint64_t);
+constexpr std::size_t OVERFLOW_OWNER_OFFSET = data_page_offset::HEADER_BYTES;
+constexpr std::size_t OVERFLOW_CHUNK_INDEX_OFFSET = OVERFLOW_OWNER_OFFSET + sizeof(page_id_t);
+constexpr std::size_t OVERFLOW_RESERVED32_OFFSET = OVERFLOW_CHUNK_INDEX_OFFSET + sizeof(std::uint32_t);
+constexpr std::size_t OVERFLOW_NEXT_PAGE_OFFSET = OVERFLOW_RESERVED32_OFFSET + sizeof(std::uint32_t);
 constexpr std::size_t OVERFLOW_DATA_BYTES_OFFSET = OVERFLOW_NEXT_PAGE_OFFSET + sizeof(page_id_t);
-constexpr std::size_t OVERFLOW_DATA_OFFSET = OVERFLOW_DATA_BYTES_OFFSET + sizeof(std::uint16_t);
+constexpr std::size_t OVERFLOW_RESERVED16_OFFSET = OVERFLOW_DATA_BYTES_OFFSET + sizeof(std::uint16_t);
+constexpr std::size_t OVERFLOW_DATA_OFFSET = OVERFLOW_RESERVED16_OFFSET + sizeof(std::uint16_t);
+static_assert(PAGE_SIZE - OVERFLOW_DATA_OFFSET == OVERFLOW_PAGE_PAYLOAD_BYTES);
 
 auto ChecksumPage(std::span<const std::byte> input) -> std::uint32_t {
   // Work on a copy so validation never mutates a pinned cache frame merely to
@@ -268,11 +275,14 @@ auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_pa
   return result;
 }
 
-auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, std::uint64_t total_value_bytes,
-                        page_id_t next_page_id,
+auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t owner_value_id,
+                        std::uint32_t chunk_index, page_id_t next_page_id,
                         std::span<const std::byte> payload) -> Result<std::array<char, PAGE_SIZE>> {
-  if (payload.size() > PAGE_SIZE - OVERFLOW_DATA_OFFSET) {
+  if (payload.empty() || payload.size() > OVERFLOW_PAGE_PAYLOAD_BYTES) {
     return std::unexpected(Status::InvalidArgument("overflow payload exceeds one page"));
+  }
+  if (owner_value_id < FIRST_DATA_PAGE_ID) {
+    return std::unexpected(Status::InvalidArgument("overflow owner overlaps the superblocks"));
   }
   if (next_page_id != HEADER_PAGE_ID && next_page_id < FIRST_DATA_PAGE_ID) {
     return std::unexpected(Status::InvalidArgument("overflow link overlaps the superblocks"));
@@ -286,9 +296,12 @@ auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, std::uint64_t
   if (auto status = InitializeDataPage(bytes, DataPageType::Overflow, page_id, page_lsn, payload_bytes); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  const auto encoded = PutLittleEndian(bytes, OVERFLOW_TOTAL_BYTES_OFFSET, total_value_bytes) &&
+  const auto encoded = PutLittleEndian(bytes, OVERFLOW_OWNER_OFFSET, owner_value_id) &&
+                       PutLittleEndian(bytes, OVERFLOW_CHUNK_INDEX_OFFSET, chunk_index) &&
+                       PutLittleEndian(bytes, OVERFLOW_RESERVED32_OFFSET, std::uint32_t{0}) &&
                        PutLittleEndian(bytes, OVERFLOW_NEXT_PAGE_OFFSET, next_page_id) &&
                        PutLittleEndian(bytes, OVERFLOW_DATA_BYTES_OFFSET, static_cast<std::uint16_t>(payload.size())) &&
+                       PutLittleEndian(bytes, OVERFLOW_RESERVED16_OFFSET, std::uint16_t{0}) &&
                        PutBytes(bytes, OVERFLOW_DATA_OFFSET, payload);
   if (!encoded) {
     return std::unexpected(Status::Corruption("overflow page layout exceeds one page"));
@@ -308,25 +321,27 @@ auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page
       header->payload_bytes < OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES) {
     return std::unexpected(Status::Corruption("page is not an overflow page"));
   }
-  const auto total = GetLittleEndian<std::uint64_t>(page, OVERFLOW_TOTAL_BYTES_OFFSET);
+  const auto owner = GetLittleEndian<page_id_t>(page, OVERFLOW_OWNER_OFFSET);
+  const auto chunk_index = GetLittleEndian<std::uint32_t>(page, OVERFLOW_CHUNK_INDEX_OFFSET);
+  const auto reserved32 = GetLittleEndian<std::uint32_t>(page, OVERFLOW_RESERVED32_OFFSET);
   const auto next = GetLittleEndian<page_id_t>(page, OVERFLOW_NEXT_PAGE_OFFSET);
   const auto data_bytes = GetLittleEndian<std::uint16_t>(page, OVERFLOW_DATA_BYTES_OFFSET);
+  const auto reserved16 = GetLittleEndian<std::uint16_t>(page, OVERFLOW_RESERVED16_OFFSET);
   // Cross-check the inner data length against the common outer payload length.
   // Redundant lengths are useful only if inconsistent encodings are rejected.
-  if (!total || !next || !data_bytes || *data_bytes > PAGE_SIZE - OVERFLOW_DATA_OFFSET ||
+  if (!owner || !chunk_index || !reserved32 || !next || !data_bytes || !reserved16 ||
+      *owner < FIRST_DATA_PAGE_ID || *reserved32 != 0 || *reserved16 != 0 || *data_bytes == 0 ||
+      *data_bytes > OVERFLOW_PAGE_PAYLOAD_BYTES ||
       header->payload_bytes != OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES + *data_bytes ||
       (*next != HEADER_PAGE_ID && *next < FIRST_DATA_PAGE_ID)) {
     return std::unexpected(Status::Corruption("invalid overflow page lengths or link"));
   }
   auto result = OverflowPage{
-      .total_value_bytes = *total,
+      .owner_value_id = *owner,
+      .chunk_index = *chunk_index,
       .next_page_id = *next,
-      .payload = {},
+      .payload = page.subspan(OVERFLOW_DATA_OFFSET, *data_bytes),
   };
-  // Copy only the declared bytes; checksum-covered zero padding is not part of
-  // the logical value.
-  result.payload.assign(page.begin() + static_cast<std::ptrdiff_t>(OVERFLOW_DATA_OFFSET),
-                        page.begin() + static_cast<std::ptrdiff_t>(OVERFLOW_DATA_OFFSET + *data_bytes));
   return result;
 }
 

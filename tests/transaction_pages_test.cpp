@@ -64,7 +64,7 @@ auto Leaf(tinydb::page_id_t page_id,
           std::initializer_list<std::pair<std::string_view, std::string_view>> rows) -> tinydb::cache::PageBytes {
   auto builder = tinydb::LeafPageBuilder{};
   for (const auto &[key, value] : rows) {
-    builder.Upsert(key, value);
+    builder.Upsert(key, tinydb::LeafValue::Inline(value));
   }
   auto page = tinydb::cache::PageBytes{};
   builder.Store(page.data(), page_id);
@@ -95,11 +95,13 @@ TEST(TransactionPagesTest, EditAndAbortNeverChangeCommittedBytes) {
   EXPECT_EQ(tree.Get("key").value(), std::optional<std::string>{"private"});
 
   auto outside = tinydb::LeafPageView::Open(committed.Read(2)->Data(), 2).value();
-  EXPECT_EQ(outside.Get("key"), std::optional<std::string_view>{"old"});
+  ASSERT_TRUE(outside.Get("key").has_value());
+  EXPECT_EQ(outside.Get("key")->InlineBytes(), "old");
 
   transaction.Abort();
   auto after = tinydb::LeafPageView::Open(committed.Read(2)->Data(), 2).value();
-  EXPECT_EQ(after.Get("key"), std::optional<std::string_view>{"old"});
+  ASSERT_TRUE(after.Get("key").has_value());
+  EXPECT_EQ(after.Get("key")->InlineBytes(), "old");
 }
 
 TEST(TransactionPagesTest, MemoryLimitFailsBeforeASecondPrivatePageAppears) {

@@ -10,7 +10,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 namespace tinydb {
 
@@ -162,7 +161,6 @@ class StorageEngine final {
   auto Put(std::string_view key, std::string_view value) -> Status;
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
   auto Remove(std::string_view key) -> Status;
-  auto Scan(std::string_view start, std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>>;
 
   // Makes the current visible state self-contained in the database file.
   // Commits are already durable through WAL; checkpoint failure therefore

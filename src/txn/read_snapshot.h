@@ -36,8 +36,8 @@ class SnapshotCursor final {
 
   auto Valid() const -> bool { return cursor_.Valid(); }
   auto Key() const -> std::string_view { return cursor_.Key(); }
-  auto ValueSize() const -> std::uint64_t { return cursor_.Value().size(); }
-  auto CopyValue() const -> Result<std::string> { return std::string(cursor_.Value()); }
+  auto ValueSize() const -> std::uint64_t { return cursor_.Value().Size(); }
+  auto CopyValue() const -> Result<std::string>;
   auto First() -> Status;
   auto Seek(std::string_view key) -> Status;
   auto Next() -> Status { return cursor_.Next(); }

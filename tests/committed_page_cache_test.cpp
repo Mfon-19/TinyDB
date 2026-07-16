@@ -34,7 +34,7 @@ auto TestPath(std::string_view name) -> std::filesystem::path {
 auto EncodedPage(tinydb::page_id_t page_id, std::uint64_t lsn, tinydb::page_id_t marker) -> std::unique_ptr<PageBytes> {
   const auto payload =
       std::array<std::byte, sizeof(tinydb::page_id_t)>{std::byte{static_cast<unsigned char>(marker & 0xffU)}};
-  auto encoded = tinydb::storage::EncodeOverflowPage(page_id, lsn, payload.size(), tinydb::HEADER_PAGE_ID, payload);
+  auto encoded = tinydb::storage::EncodeOverflowPage(page_id, lsn, page_id, 0, tinydb::HEADER_PAGE_ID, payload);
   EXPECT_TRUE(encoded.has_value());
   return std::make_unique<PageBytes>(std::move(*encoded));
 }

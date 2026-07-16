@@ -216,6 +216,9 @@ TEST(DataModelContractTest, InvalidMutationDoesNotAbortTheTransaction) {
 }
 
 TEST(DataModelContractTest, ValuesAreNotLimitedByPageGeometry) {
+  EXPECT_EQ(tinydb::txn::ValidateValueSize(tinydb::MAX_VALUE_BYTES), StatusCode::Ok);
+  EXPECT_EQ(tinydb::txn::ValidateValueSize(tinydb::MAX_VALUE_BYTES + 1), StatusCode::InvalidArgument);
+
   auto model = TransactionModel{};
   auto transaction = model.BeginWrite();
   ASSERT_TRUE(transaction.has_value());

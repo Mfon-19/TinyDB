@@ -20,6 +20,7 @@
 #include "page_format.h"
 #include "page_source.h"
 #include "page_view.h"
+#include "value_storage.h"
 #include "txn/contract.h"
 
 /*
@@ -338,9 +339,16 @@ auto CollapseRoot(PageSource *pages, page_id_t &root_page_id) -> Status {
   }
 }
 
+struct EraseLeafResult {
+  bool removed{false};
+  bool underfull{false};
+  std::optional<OverflowValueDescriptor> retired_value;
+};
+
 // Delete correctness ends once the key is absent and the leaf is repacked.
-// The bool reports whether a separate occupancy pass would be useful.
-auto EraseLeaf(PageSource *pages, page_id_t leaf_id, std::string_view key, bool is_root) -> Result<bool> {
+// Overflow ownership is returned to the caller for transactional retirement;
+// occupancy repair remains a separate policy phase.
+auto EraseLeaf(PageSource *pages, page_id_t leaf_id, std::string_view key, bool is_root) -> Result<EraseLeafResult> {
   auto page = pages->Edit(leaf_id);
   if (!page) {
     return std::unexpected(std::move(page).error());
@@ -349,12 +357,17 @@ auto EraseLeaf(PageSource *pages, page_id_t leaf_id, std::string_view key, bool 
   if (!builder) {
     return std::unexpected(builder.error());
   }
+  const auto retired_value = builder->OverflowFor(key);
   if (!builder->Erase(key)) {
-    return false;
+    return EraseLeafResult{};
   }
   builder->Store(page->MutableData(), page->Id());
   page->MarkDirty();
-  return !is_root && builder->Underfull();
+  return EraseLeafResult{
+      .removed = true,
+      .underfull = !is_root && builder->Underfull(),
+      .retired_value = retired_value,
+  };
 }
 
 // A merge removes one parent separator and can make that parent sparse, so only
@@ -424,13 +437,15 @@ auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusT
 auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   // Upsert the destination leaf, then carry at most one separator upward. Each
   // ancestor either absorbs that edge or splits and replaces it with another.
-  TINYDB_CHECK(key.size() + value.size() <= MAX_ENTRY_BYTES, "entry exceeds MAX_ENTRY_BYTES; enforce sizes before Put");
+  TINYDB_CHECK(txn::ValidateKeySize(key.size()) == StatusCode::Ok && value.size() <= MAX_VALUE_BYTES,
+               "Put sizes must be validated at the public boundary");
   const auto path = DescendToLeaf(pages_, root_page_id_, key);
   if (!path) {
     return path.error();
   }
 
   std::optional<PendingSeparator> pending;
+  std::optional<OverflowValueDescriptor> retired_value;
   {
     auto leaf_page = pages_->Edit(path->back().page_id);
     if (!leaf_page) {
@@ -441,19 +456,35 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
       return node_result.error();
     }
     auto node = std::move(*node_result);
-    const bool at_tail = node.Upsert(key, value);
+    retired_value = node.OverflowFor(key);
+    auto prepared_value = PrepareValue(pages_, key, value);
+    if (!prepared_value) {
+      return prepared_value.error();
+    }
+    const bool at_tail = node.Upsert(key, std::move(*prepared_value));
 
     if (node.Fits()) {
       node.Store(leaf_page->MutableData(), leaf_page->Id());
       leaf_page->MarkDirty();
-      return {};
+    } else {
+      const bool tail_heavy = at_tail && node.NextLeaf() == HEADER_PAGE_ID;
+      auto split = SplitAndWrite(pages_, *leaf_page, node, tail_heavy);
+      if (!split) {
+        return std::move(split).error();
+      }
+      pending = std::move(*split);
     }
-    const bool tail_heavy = at_tail && node.NextLeaf() == HEADER_PAGE_ID;
-    auto split = SplitAndWrite(pages_, *leaf_page, node, tail_heavy);
-    if (!split) {
-      return std::move(split).error();
+  }
+
+  // The leaf descriptor changed before the old chain becomes allocator state.
+  // A later parent-split failure still aborts the complete private transaction.
+  if (retired_value.has_value()) {
+    if (auto status = RetireOverflowValue(pages_, *retired_value); !status.Ok()) {
+      return status;
     }
-    pending = std::move(*split);
+  }
+  if (!pending.has_value()) {
+    return {};
   }
 
   // level names the child that just split; decrementing selects its parent.
@@ -513,7 +544,14 @@ auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> 
     return std::unexpected(leaf.error());
   }
   const auto value = leaf->Get(key);
-  return value ? std::optional<std::string>{*value} : std::nullopt;
+  if (!value) {
+    return std::nullopt;
+  }
+  auto copied = CopyValue(pages_, *value);
+  if (!copied) {
+    return std::unexpected(copied.error());
+  }
+  return std::optional<std::string>{std::move(*copied)};
 }
 
 auto BPlusTree::Remove(std::string_view key) -> Status {
@@ -527,7 +565,15 @@ auto BPlusTree::Remove(std::string_view key) -> Status {
   if (!needs_repair) {
     return needs_repair.error();
   }
-  return *needs_repair ? RepairDeleteOccupancy(pages_, *path, root_page_id_) : Status{};
+  if (!needs_repair->removed) {
+    return {};
+  }
+  if (needs_repair->retired_value.has_value()) {
+    if (auto status = RetireOverflowValue(pages_, *needs_repair->retired_value); !status.Ok()) {
+      return status;
+    }
+  }
+  return needs_repair->underfull ? RepairDeleteOccupancy(pages_, *path, root_page_id_) : Status{};
 }
 
 auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<page_id_t> &free_pages) -> Status {
@@ -585,6 +631,14 @@ auto BPlusTree::CheckIntegrity(PageReader *pages, page_id_t root_page_id, page_i
         const auto key = leaf->KeyAt(index);
         if ((lower.has_value() && less(key, *lower)) || (upper.has_value() && !less(key, *upper))) {
           return std::unexpected(Status::Corruption("leaf key lies outside its parent routing range"));
+        }
+        const auto value = leaf->ValueAt(index);
+        if (value.IsOverflow()) {
+          if (auto status = ValidateOverflowValue(pages, value.OverflowDescriptor(), next_page_id, free_pages,
+                                                  allocator_pages, &visited);
+              !status.Ok()) {
+            return std::unexpected(std::move(status));
+          }
         }
       }
       leaf_pages.emplace_back(page_id, leaf->NextLeaf());

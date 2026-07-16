@@ -3,11 +3,13 @@
 #include <tinydb/page.h>
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "btree/page_view.h"
+#include "btree/value.h"
 
 namespace tinydb {
 
@@ -16,7 +18,7 @@ class LeafPageBuilder {
  public:
   struct Record {
     std::string key;
-    std::string value;
+    LeafValue value;
   };
 
   struct SplitResult;
@@ -28,8 +30,9 @@ class LeafPageBuilder {
   // Emits a complete canonical page whose encoded identity is page_id.
   void Store(char *page, page_id_t page_id) const;
 
-  auto Upsert(std::string_view key, std::string_view value) -> bool;
+  auto Upsert(std::string_view key, LeafValue value) -> bool;
   auto Erase(std::string_view key) -> bool;
+  auto OverflowFor(std::string_view key) const -> std::optional<OverflowValueDescriptor>;
   auto Fits() const -> bool;
   auto Underfull() const -> bool;
 

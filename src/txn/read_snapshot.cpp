@@ -3,6 +3,7 @@
 #include "btree/navigation.h"
 #include "btree/page_source.h"
 #include "btree/page_view.h"
+#include "btree/value_storage.h"
 
 #include <expected>
 #include <utility>
@@ -37,8 +38,17 @@ auto ReadSnapshot::Get(std::string_view key) -> Result<std::optional<std::string
     return std::unexpected(leaf.error());
   }
   const auto value = leaf->Get(key);
-  return value ? std::optional<std::string>{*value} : std::nullopt;
+  if (!value) {
+    return std::nullopt;
+  }
+  auto copied = tinydb::CopyValue(pages_, *value);
+  if (!copied) {
+    return std::unexpected(copied.error());
+  }
+  return std::optional<std::string>{std::move(*copied)};
 }
+
+auto SnapshotCursor::CopyValue() const -> Result<std::string> { return tinydb::CopyValue(pages_, cursor_.Value()); }
 
 auto SnapshotCursor::First() -> Status {
   auto cursor = BTreeCursor::First(pages_, root_page_id_);
