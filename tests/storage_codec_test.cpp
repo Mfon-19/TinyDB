@@ -1,8 +1,9 @@
 #include <gtest/gtest.h>
 
-#include "btree/internal_node.h"
-#include "btree/leaf_node.h"
+#include "btree/internal_page_builder.h"
+#include "btree/leaf_page_builder.h"
 #include "btree/page_format.h"
+#include "btree/page_view.h"
 #include "storage/encoding.h"
 #include "storage/page_codec.h"
 #include "storage/superblock.h"
@@ -312,24 +313,24 @@ TEST(DataPageCodecTest, RejectsUnsupportedVersionAndOppositeEndianIdentity) {
 }
 
 TEST(DataPageCodecTest, LeafAndInternalPagesUseTheValidatedCommonHeader) {
-  // Exercise the real node Store/Load implementations, ensuring tree pages did
-  // not retain a parallel legacy header path beside the common page codec.
+  // Exercise the one builder/view encoding path, ensuring tree pages did not
+  // retain a parallel legacy decoder beside the common page codec.
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
-  auto leaf = tinydb::LeafNode{};
+  auto leaf = tinydb::LeafPageBuilder{};
   leaf.Upsert("alpha", "one");
   leaf.Upsert("omega", "two");
   leaf.Store(leaf_page.data(), 2);
   EXPECT_TRUE(tinydb::ValidateTreePage(leaf_page.data(), 2).Ok());
-  const auto loaded_leaf = tinydb::LeafNode::Load(leaf_page.data());
-  EXPECT_EQ(loaded_leaf.Get("alpha"), std::optional<std::string>{"one"});
-  EXPECT_EQ(loaded_leaf.Get("omega"), std::optional<std::string>{"two"});
+  const auto loaded_leaf = tinydb::LeafPageView::Open(leaf_page.data(), 2).value();
+  EXPECT_EQ(loaded_leaf.Get("alpha"), std::optional<std::string_view>{"one"});
+  EXPECT_EQ(loaded_leaf.Get("omega"), std::optional<std::string_view>{"two"});
 
   auto internal_page = std::array<char, tinydb::PAGE_SIZE>{};
-  const auto internal = tinydb::InternalNode{2, "middle", 3};
+  const auto internal = tinydb::InternalPageBuilder{2, "middle", 3};
   internal.Store(internal_page.data(), 4);
   EXPECT_TRUE(tinydb::ValidateTreePage(internal_page.data(), 4).Ok());
-  const auto loaded_internal = tinydb::InternalNode::Load(internal_page.data());
-  EXPECT_EQ(loaded_internal.FirstChild(), 2U);
+  const auto loaded_internal = tinydb::InternalPageView::Open(internal_page.data(), 4).value();
+  EXPECT_EQ(loaded_internal.ChildAt(0), 2U);
   EXPECT_EQ(loaded_internal.ChildAt(1), 3U);
 }
 

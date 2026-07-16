@@ -15,16 +15,13 @@
 namespace tinydb {
 namespace {
 
-// Views retain the original char buffer because their public slices are
-// string_view. Convert to bytes only while reading fixed-width metadata.
+// Fixed-width fields use byte spans; record access returns char-based views.
 auto Bytes(const char *page) -> std::span<const std::byte> { return std::as_bytes(std::span{page, PAGE_SIZE}); }
 
 }  // namespace
 
 auto LeafPageView::Open(const char *page, page_id_t expected_page_id) -> Result<LeafPageView> {
-  // Establish every structural invariant once at the boundary. Accessors may
-  // then use checked offsets without repeating corruption branches for every
-  // key comparison in a binary search.
+  // One full validation makes later accessors branch-free with respect to corruption.
   if (auto status = ValidateTreePage(page, expected_page_id); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
@@ -35,8 +32,7 @@ auto LeafPageView::Open(const char *page, page_id_t expected_page_id) -> Result<
   const auto bytes = Bytes(page);
   const auto cell_count = storage::GetLittleEndian<std::uint16_t>(bytes, node_page_offset::CELL_COUNT);
   const auto next_leaf = storage::GetLittleEndian<page_id_t>(bytes, node_page_offset::LINK);
-  // ValidateTreePage already proved these fields exist. Failure here would mean
-  // the immutable bytes changed between validation and view construction.
+  // Missing fields now imply the supposedly immutable page changed after validation.
   TINYDB_CHECK(cell_count.has_value() && next_leaf.has_value(), "validated leaf header became unreadable");
   return LeafPageView(page, *cell_count, *next_leaf);
 }
@@ -49,8 +45,7 @@ auto LeafPageView::CellOffset(std::size_t index) const -> std::size_t {
 auto LeafPageView::KeyAt(std::size_t index) const -> std::string_view {
   const auto offset = CellOffset(index);
   const auto key_bytes = *storage::GetLittleEndian<std::uint16_t>(Bytes(page_), offset + leaf_cell_offset::KEY_BYTES);
-  // The returned view points directly into the encoded cell. Its lifetime is
-  // bounded by the pin that owns page_.
+  // The owning PageHandle bounds the returned slice's lifetime.
   return {page_ + offset + LEAF_CELL_HEADER_SIZE, key_bytes};
 }
 
@@ -63,8 +58,7 @@ auto LeafPageView::ValueAt(std::size_t index) const -> std::string_view {
 }
 
 auto LeafPageView::LowerBound(std::string_view key) const -> std::size_t {
-  // Slots are already in key order, so binary search needs only O(log n) cell
-  // header reads and constructs no owning key strings.
+  // Search the encoded slot order without constructing keys.
   const auto less = txn::BytewiseLess{};
   auto first = std::size_t{0};
   auto last = static_cast<std::size_t>(cell_count_);
@@ -80,8 +74,7 @@ auto LeafPageView::LowerBound(std::string_view key) const -> std::size_t {
 }
 
 auto LeafPageView::Get(std::string_view key) const -> std::optional<std::string_view> {
-  // LowerBound supplies the only possible match; equality remains a raw byte
-  // comparison and does not depend on host char signedness.
+  // LowerBound identifies the sole possible match.
   const auto index = LowerBound(key);
   if (index == cell_count_ || KeyAt(index) != key) {
     return std::nullopt;
@@ -122,16 +115,13 @@ auto InternalPageView::RightChildAt(std::size_t index) const -> page_id_t {
 }
 
 auto InternalPageView::ChildAt(std::size_t child_index) const -> page_id_t {
-  // N separators describe N+1 children. Child zero is the dedicated leftmost
-  // header link; every later child belongs to the separator on its left.
+  // Child zero is LINK; child i>0 belongs to separator i-1.
   TINYDB_CHECK(child_index <= separator_count_, "internal child index out of range");
   return child_index == 0 ? first_child_ : RightChildAt(child_index - 1);
 }
 
 auto InternalPageView::FindChildIndex(std::string_view key) const -> std::size_t {
-  // This is upper_bound over encoded separators. Advancing on equality is the
-  // B+ tree's "equal goes right" rule: a leaf split copies the first key of its
-  // right half into the parent.
+  // upper_bound implements the inclusive lower bound of every right child.
   const auto less = txn::BytewiseLess{};
   auto first = std::size_t{0};
   auto last = static_cast<std::size_t>(separator_count_);

@@ -10,8 +10,8 @@
 
 namespace tinydb {
 
-// Immutable, non-owning view over one validated leaf page. The underlying
-// page must remain pinned and unchanged for the lifetime of the view.
+// Borrowed leaf decoder. The PageHandle that owns page_ must outlive the view
+// and keep the bytes immutable.
 class LeafPageView {
  public:
   static auto Open(const char *page, page_id_t expected_page_id) -> Result<LeafPageView>;
@@ -35,8 +35,7 @@ class LeafPageView {
   page_id_t next_leaf_;
 };
 
-// Immutable, non-owning view over one validated internal page. Separators are
-// lower bounds for their right child, so an equal search key routes right.
+// Borrowed routing-page decoder. Equal keys route to the separator's right.
 class InternalPageView {
  public:
   static auto Open(const char *page, page_id_t expected_page_id) -> Result<InternalPageView>;

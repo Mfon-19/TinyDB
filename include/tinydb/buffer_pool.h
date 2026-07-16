@@ -25,7 +25,8 @@ struct Frame {
 };
 
 // New pages are returned already pinned. The caller initializes the bytes and
-// must eventually UnpinPage with dirty=true (normally through PageRef).
+// must eventually UnpinPage with dirty=true (normally through PageHandle's
+// buffer-pool adapter).
 struct NewPageResult {
   page_id_t page_id;
   char *data;

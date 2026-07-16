@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
-#include <tinydb/b_plus_tree.h>
+#include "btree/b_plus_tree.h"
+#include <tinydb/buffer_pool.h>
+#include <tinydb/disk_manager.h>
 
 #include <unistd.h>
 
@@ -16,6 +18,7 @@
 
 // The suite asserts on tree structure by inspecting raw page headers, so it
 // reaches into the library's private on-disk format header.
+#include "btree/buffer_pool_page_source.h"
 #include "btree/page_format.h"
 #include "storage/encoding.h"
 #include "storage/page_codec.h"
@@ -53,13 +56,15 @@ class BPlusTreeTest : public ::testing::Test {
 
     disk_.emplace(tinydb::DiskManager::Open(db_path_).value());
     pool_.emplace(&*disk_, FRAME_COUNT);
+    pages_.emplace(&*pool_);
     root_page_id_ = pool_->NewPage().value().page_id;  // left zeroed; the tree bootstraps it
     pool_->UnpinPage(root_page_id_, true);
-    tree_.emplace(tinydb::BPlusTree::Open(&*pool_, root_page_id_).value());
+    tree_.emplace(tinydb::BPlusTree::Open(&*pages_, root_page_id_).value());
   }
 
   void TearDown() override {
     tree_.reset();
+    pages_.reset();
     pool_.reset();
     disk_.reset();
     std::filesystem::remove(db_path_);
@@ -69,12 +74,14 @@ class BPlusTreeTest : public ::testing::Test {
     const auto key = RowKey(row);
     const auto value = RowValue(row, length);
     ASSERT_TRUE(tree_->Put(key, value).Ok());
+    PublishRoot();
     model_[key] = value;
   }
 
   void RemoveRow(int row) {
     const auto key = RowKey(row);
     ASSERT_TRUE(tree_->Remove(key).Ok());
+    PublishRoot();
     model_.erase(key);
   }
 
@@ -106,12 +113,25 @@ class BPlusTreeTest : public ::testing::Test {
     tree_.reset();
     ASSERT_TRUE(pool_->FlushAllPages().Ok());
     ASSERT_TRUE(disk_->Checkpoint().Ok());  // metadata reaches the file at a checkpoint
+    pages_.reset();
     pool_.reset();
     disk_.reset();
 
     disk_.emplace(tinydb::DiskManager::Open(db_path_).value());
     pool_.emplace(&*disk_, FRAME_COUNT);
-    tree_.emplace(tinydb::BPlusTree::Open(&*pool_, root_page_id_).value());
+    pages_.emplace(&*pool_);
+    root_page_id_ = disk_->GetRootPageId();
+    tree_.emplace(tinydb::BPlusTree::Open(&*pages_, root_page_id_).value());
+  }
+
+  // BPlusTree owns the logical root while it mutates. A real transaction
+  // publishes this value atomically with page images; this white-box fixture
+  // mirrors that handoff into DiskManager after each successful mutation.
+  void PublishRoot() {
+    if (root_page_id_ != tree_->RootPageId()) {
+      root_page_id_ = tree_->RootPageId();
+      disk_->SetRootPageId(root_page_id_);
+    }
   }
 
   auto RootType() -> tinydb::NodeType {
@@ -173,6 +193,7 @@ class BPlusTreeTest : public ::testing::Test {
   tinydb::page_id_t root_page_id_{tinydb::HEADER_PAGE_ID};
   std::optional<tinydb::DiskManager> disk_;
   std::optional<tinydb::BufferPool> pool_;
+  std::optional<tinydb::BufferPoolPageSource> pages_;
   std::optional<tinydb::BPlusTree> tree_;
   std::map<std::string, std::string> model_;
 };
@@ -260,7 +281,8 @@ TEST_F(BPlusTreeTest, ScanBoundsAreHalfOpen) {
   EXPECT_TRUE(tree_->Scan(RowKey(50), SCAN_END).value().empty());    // past the data
 }
 
-TEST_F(BPlusTreeTest, RootSplitKeepsRootPageId) {
+TEST_F(BPlusTreeTest, RootSplitAllocatesNewRootPage) {
+  const auto original_root = root_page_id_;
   int row = 0;
   while (RootType() == tinydb::NodeType::Leaf) {
     PutRow(row, 120);
@@ -268,7 +290,9 @@ TEST_F(BPlusTreeTest, RootSplitKeepsRootPageId) {
     ASSERT_LT(row, 100) << "root never split";
   }
 
-  // Same root page id serves the now two-level tree.
+  // The original leaf remains the left half; a new ordinary internal page is
+  // published as root instead of copying both halves around a permanent id.
+  EXPECT_NE(root_page_id_, original_root);
   EXPECT_EQ(TreeDepth(), 2);
   ExpectMatchesModel();
 }
@@ -281,6 +305,7 @@ TEST_F(BPlusTreeTest, GrowsThreeLevels) {
     const auto key = RowKey(i) + padding;
     const auto value = RowValue(i, 300);
     ASSERT_TRUE(tree_->Put(key, value).Ok());
+    PublishRoot();
     model_[key] = value;
   }
 
@@ -321,31 +346,29 @@ TEST_F(BPlusTreeTest, MaxSizedEntries) {
     const auto key = RowKey(i);
     const auto value = RowValue(i, tinydb::MAX_ENTRY_BYTES - key.size());
     ASSERT_TRUE(tree_->Put(key, value).Ok());
+    PublishRoot();
     model_[key] = value;
   }
 
   ExpectMatchesModel();
 }
 
-TEST_F(BPlusTreeDeathTest, CyclicLeafChainAborts) {
+TEST_F(BPlusTreeTest, CyclicLeafChainReturnsCorruption) {
   ASSERT_TRUE(tree_->Put("a", "1").Ok());
   ASSERT_TRUE(tree_->Put("b", "2").Ok());
 
   // Corrupt the root leaf's next-leaf link to point back at itself: the
-  // shape a damaged page could hand a Scan, which must abort rather than
-  // walk the chain forever.
+  // shape a damaged page could hand a Scan, which must return a library error
+  // rather than terminate the embedding process or loop forever.
   char *page = pool_->FetchPage(root_page_id_).value();
   auto page_bytes = std::as_writable_bytes(std::span{page, tinydb::PAGE_SIZE});
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(page_bytes, tinydb::node_page_offset::LINK, root_page_id_));
   ASSERT_TRUE(tinydb::storage::FinalizeDataPage(page_bytes).Ok());
   pool_->UnpinPage(root_page_id_, true);
 
-  EXPECT_DEATH(
-      {
-        const auto rows = tree_->Scan("a", SCAN_END);
-        static_cast<void>(rows);
-      },
-      "leaf chain out of key order");
+  const auto rows = tree_->Scan("a", SCAN_END);
+  ASSERT_FALSE(rows.has_value());
+  EXPECT_EQ(rows.error().Code(), tinydb::StatusCode::Corruption);
 }
 
 TEST_F(BPlusTreeDeathTest, OversizedEntryAborts) {
@@ -359,12 +382,14 @@ TEST_F(BPlusTreeTest, DrainToEmptyCollapsesRoot) {
     PutRow(i, 150);
   }
   ASSERT_GE(TreeDepth(), 2);
+  const auto expanded_root = root_page_id_;
 
   for (int i = 0; i < 250; ++i) {
     RemoveRow(i);
   }
 
   ExpectMatchesModel();
+  EXPECT_NE(root_page_id_, expanded_root);
   EXPECT_EQ(TreeDepth(), 1);
   EXPECT_EQ(RootType(), tinydb::NodeType::Leaf);
 

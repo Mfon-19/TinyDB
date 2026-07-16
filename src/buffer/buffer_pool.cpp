@@ -61,8 +61,8 @@
   What the pool requires of its callers:
 
   - Pins must balance. Every FetchPage / NewPage is one pin; each pin is
-    returned by exactly one UnpinPage, with an honest dirty flag. PageRef
-    (page_ref.h) exists so this bookkeeping happens by scope, not by hand.
+    returned by exactly one UnpinPage, with an honest dirty flag. The logical
+    page-source adapter wraps that bookkeeping in a scoped PageHandle.
 
   - FreePage only for a page with no pins and no live pointers. Its cached
     bytes are discarded, not flushed — freeing declares them dead.

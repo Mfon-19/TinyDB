@@ -3,18 +3,16 @@
 #include <tinydb/page.h>
 
 #include <cstddef>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "btree/page_view.h"
+
 namespace tinydb {
 
-// Logical, owning representation used while editing one leaf page. Load
-// validates/decodes persistent bytes into records; Store repacks all records
-// into one checksummed slotted page. Milestone 3 separates immutable page views
-// from private builders so reads no longer allocate this vector.
-class LeafNode {
+// Owning mutation state for one leaf. Reads use LeafPageView directly.
+class LeafPageBuilder {
  public:
   struct Record {
     std::string key;
@@ -23,25 +21,22 @@ class LeafNode {
 
   struct SplitResult;
 
-  LeafNode() = default;
+  LeafPageBuilder() = default;
 
-  static auto Load(const char *page) -> LeafNode;
+  static auto From(const LeafPageView &page) -> LeafPageBuilder;
 
-  // page_id is encoded into the common header and must match the page's file
-  // position when it is fetched again.
+  // Emits a complete canonical page whose encoded identity is page_id.
   void Store(char *page, page_id_t page_id) const;
 
   auto Upsert(std::string_view key, std::string_view value) -> bool;
   auto Erase(std::string_view key) -> bool;
-  auto Get(std::string_view key) const -> std::optional<std::string>;
-
   auto Fits() const -> bool;
   auto Underfull() const -> bool;
 
   auto Split(page_id_t right_page_id, bool tail_heavy) -> SplitResult;
 
-  // Concatenates an adjacent right sibling and adopts its leaf-chain link.
-  void Absorb(LeafNode &&right);
+  // Appends an adjacent right range and bypasses it in the leaf chain.
+  void Absorb(LeafPageBuilder &&right);
 
   auto Records() const -> const std::vector<Record> & { return records_; }
   auto NextLeaf() const -> page_id_t { return next_leaf_; }
@@ -54,9 +49,9 @@ class LeafNode {
   std::vector<Record> records_;
 };
 
-struct LeafNode::SplitResult {
-  // First key in right is copied into the parent as its routing separator.
-  LeafNode right;
+struct LeafPageBuilder::SplitResult {
+  // separator is right's inclusive lower bound and remains in right.
+  LeafPageBuilder right;
   std::string separator;
 };
 

@@ -68,26 +68,34 @@ endfunction()
 
 add_library(
   TinyDB
-  include/tinydb/b_plus_tree.h
   include/tinydb/buffer_pool.h
   include/tinydb/check.h
   include/tinydb/database_uuid.h
   include/tinydb/disk_manager.h
+  include/tinydb/limits.h
   include/tinydb/page.h
-  include/tinydb/page_ref.h
   include/tinydb/status.h
   include/tinydb/storage_engine.h
   include/tinydb/unique_fd.h
   include/tinydb/wal.h
   src/btree/b_plus_tree.cpp
-  src/btree/internal_node.cpp
-  src/btree/internal_node.h
-  src/btree/leaf_node.cpp
-  src/btree/leaf_node.h
+  src/btree/b_plus_tree.h
+  src/btree/buffer_pool_page_source.cpp
+  src/btree/buffer_pool_page_source.h
+  src/btree/internal_page_builder.cpp
+  src/btree/internal_page_builder.h
+  src/btree/leaf_page_builder.cpp
+  src/btree/leaf_page_builder.h
+  src/btree/navigation.cpp
+  src/btree/navigation.h
   src/btree/page_format.cpp
   src/btree/page_format.h
+  src/btree/page_source.cpp
+  src/btree/page_source.h
   src/btree/page_view.cpp
   src/btree/page_view.h
+  src/btree/tree_cursor.cpp
+  src/btree/tree_cursor.h
   src/buffer/buffer_pool.cpp
   src/engine/storage_engine.cpp
   src/io/syscalls.h
@@ -187,6 +195,15 @@ if(BUILD_TESTING)
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_page_view_test)
     gtest_discover_tests(TinyDB_page_view_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/tree_page_source_test.cpp")
+    add_executable(TinyDB_tree_page_source_test tests/tree_page_source_test.cpp)
+    target_link_libraries(TinyDB_tree_page_source_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_tree_page_source_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_tree_page_source_test)
+    gtest_discover_tests(TinyDB_tree_page_source_test)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/contract_test.cpp")

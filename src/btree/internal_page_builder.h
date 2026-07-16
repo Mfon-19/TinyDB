@@ -7,12 +7,13 @@
 #include <string_view>
 #include <vector>
 
+#include "btree/page_view.h"
+
 namespace tinydb {
 
-// Logical representation of an internal B+ tree page. `first_child_` covers
-// keys below the first separator; every Record maps its separator key to the
-// child immediately on the right.
-class InternalNode {
+// Owning mutation state for one routing page. Persistent bytes enter only
+// through InternalPageView.
+class InternalPageBuilder {
  public:
   struct Record {
     std::string key;
@@ -21,16 +22,14 @@ class InternalNode {
 
   struct SplitResult;
 
-  InternalNode() = default;
-  InternalNode(page_id_t first_child, std::string separator, page_id_t right_child);
+  InternalPageBuilder() = default;
+  InternalPageBuilder(page_id_t first_child, std::string separator, page_id_t right_child);
 
-  static auto Load(const char *page) -> InternalNode;
+  static auto From(const InternalPageView &page) -> InternalPageBuilder;
 
-  // Rebuilds and checksums the complete persistent page using page_id as its
-  // physical identity.
+  // Emits a complete canonical page whose encoded identity is page_id.
   void Store(char *page, page_id_t page_id) const;
 
-  auto FindChildIndex(std::string_view key) const -> std::size_t;
   auto ChildAt(std::size_t child_index) const -> page_id_t;
 
   auto SeparatorCount() const -> std::size_t { return records_.size(); }
@@ -44,8 +43,8 @@ class InternalNode {
 
   auto Split() -> SplitResult;
 
-  // Joins adjacent internal nodes using the separator removed from the parent.
-  void Absorb(std::string separator, InternalNode &&right);
+  // Pulls the parent separator down between two adjacent child ranges.
+  void Absorb(std::string separator, InternalPageBuilder &&right);
 
   auto FirstChild() const -> page_id_t { return first_child_; }
 
@@ -57,10 +56,9 @@ class InternalNode {
   std::vector<Record> records_;
 };
 
-struct InternalNode::SplitResult {
-  // separator is promoted to the parent and therefore appears in neither
-  // resulting child.
-  InternalNode right;
+struct InternalPageBuilder::SplitResult {
+  // separator moves to the parent; its old right child begins right.
+  InternalPageBuilder right;
   std::string separator;
 };
 

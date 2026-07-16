@@ -1,8 +1,8 @@
 #pragma once
 
-#include <tinydb/b_plus_tree.h>
 #include <tinydb/buffer_pool.h>
 #include <tinydb/disk_manager.h>
+#include <tinydb/limits.h>
 #include <tinydb/status.h>
 #include <tinydb/unique_fd.h>
 #include <tinydb/wal.h>
@@ -16,6 +16,9 @@
 #include <vector>
 
 namespace tinydb {
+
+class BPlusTree;
+class BufferPoolPageSource;
 
 // StorageEngine owns a TinyDB database handle and exposes the embedded
 // key-value API. It wires the full stack: a DiskManager for page I/O, a
@@ -83,7 +86,8 @@ class StorageEngine {
 
  private:
   StorageEngine(std::filesystem::path path, UniqueFd lock_fd, std::unique_ptr<DiskManager> disk,
-                std::unique_ptr<BufferPool> pool, std::unique_ptr<BPlusTree> tree, std::unique_ptr<Wal> wal);
+                std::unique_ptr<BufferPool> pool, std::unique_ptr<BufferPoolPageSource> pages,
+                std::unique_ptr<BPlusTree> tree, std::unique_ptr<Wal> wal);
 
   // Close() for the destructor and move assignment, which cannot surface a
   // status: failures are reported to stderr and dropped.
@@ -116,6 +120,9 @@ class StorageEngine {
   // unique_ptr keeps the addresses stable across moves.
   std::unique_ptr<DiskManager> disk_;
   std::unique_ptr<BufferPool> pool_;
+  // The page source outlives the tree that borrows it and isolates the tree
+  // from the current BufferPool implementation.
+  std::unique_ptr<BufferPoolPageSource> pages_;
   std::unique_ptr<BPlusTree> tree_;
   std::unique_ptr<Wal> wal_;
 };

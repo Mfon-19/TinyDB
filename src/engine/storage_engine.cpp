@@ -1,7 +1,11 @@
 #include <tinydb/storage_engine.h>
 #include <tinydb/unique_fd.h>
 
+#include "btree/buffer_pool_page_source.h"
+#include "btree/page_source.h"
 #include "io/syscalls.h"
+
+#include "btree/b_plus_tree.h"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -191,6 +195,7 @@ auto StorageEngine::Open(const std::filesystem::path &path) -> Result<StorageEng
   }
   auto disk = std::make_unique<DiskManager>(*std::move(disk_result));
   auto pool = std::make_unique<BufferPool>(disk.get(), POOL_FRAME_COUNT);
+  auto pages = std::make_unique<BufferPoolPageSource>(pool.get());
 
   // The log is bound to this database by its UUID: a fresh log is stamped
   // with it, an existing log must already carry it.
@@ -216,22 +221,24 @@ auto StorageEngine::Open(const std::filesystem::path &path) -> Result<StorageEng
     disk->SetRootPageId(root_page_id);
   }
 
-  auto tree_result = BPlusTree::Open(pool.get(), root_page_id);
+  auto tree_result = BPlusTree::Open(pages.get(), root_page_id);
   if (!tree_result) {
     return std::unexpected(std::move(tree_result).error());
   }
   auto tree = std::make_unique<BPlusTree>(*std::move(tree_result));
 
-  return StorageEngine(path, std::move(*lock), std::move(disk), std::move(pool), std::move(tree), std::move(wal));
+  return StorageEngine(path, std::move(*lock), std::move(disk), std::move(pool), std::move(pages), std::move(tree),
+                       std::move(wal));
 }
 
 StorageEngine::StorageEngine(std::filesystem::path path, UniqueFd lock_fd, std::unique_ptr<DiskManager> disk,
-                             std::unique_ptr<BufferPool> pool, std::unique_ptr<BPlusTree> tree,
-                             std::unique_ptr<Wal> wal)
+                             std::unique_ptr<BufferPool> pool, std::unique_ptr<BufferPoolPageSource> pages,
+                             std::unique_ptr<BPlusTree> tree, std::unique_ptr<Wal> wal)
     : path_(std::move(path)),
       lock_fd_(std::move(lock_fd)),
       disk_(std::move(disk)),
       pool_(std::move(pool)),
+      pages_(std::move(pages)),
       tree_(std::move(tree)),
       wal_(std::move(wal)) {}
 
@@ -242,6 +249,7 @@ StorageEngine::StorageEngine(StorageEngine &&other) noexcept
       lock_fd_(std::move(other.lock_fd_)),
       disk_(std::move(other.disk_)),
       pool_(std::move(other.pool_)),
+      pages_(std::move(other.pages_)),
       tree_(std::move(other.tree_)),
       wal_(std::move(other.wal_)) {
   // The moved-from handle keeps no resources; marking it closed makes
@@ -265,6 +273,7 @@ auto StorageEngine::operator=(StorageEngine &&other) noexcept -> StorageEngine &
     // disk manager is still alive) rather than letting the member-wise
     // assignments below destroy the disk manager out from under the pool.
     tree_.reset();
+    pages_.reset();
     pool_.reset();
     disk_.reset();
     wal_.reset();
@@ -278,6 +287,7 @@ auto StorageEngine::operator=(StorageEngine &&other) noexcept -> StorageEngine &
     lock_fd_ = std::move(other.lock_fd_);
     disk_ = std::move(other.disk_);
     pool_ = std::move(other.pool_);
+    pages_ = std::move(other.pages_);
     tree_ = std::move(other.tree_);
     wal_ = std::move(other.wal_);
     other.closed_ = true;
@@ -301,6 +311,11 @@ auto StorageEngine::Put(std::string_view key, std::string_view value) -> Status 
   if (auto status = tree_->Put(key, value); !status.Ok()) {
     Poison();
     return status;
+  }
+  // Root splits are ordinary tree operations now. Persist the new logical
+  // root in the same WAL operation as the pages that made it reachable.
+  if (tree_->RootPageId() != disk_->GetRootPageId()) {
+    disk_->SetRootPageId(tree_->RootPageId());
   }
   return CommitOp();
 }
@@ -327,6 +342,12 @@ auto StorageEngine::Remove(std::string_view key) -> Status {
   if (auto status = tree_->Remove(key); !status.Ok()) {
     Poison();
     return status;
+  }
+  // A collapse promotes the sole child and retires the former root. Logging
+  // this metadata beside the page/free-list images makes the new identity
+  // crash-atomic with the deletion.
+  if (tree_->RootPageId() != disk_->GetRootPageId()) {
+    disk_->SetRootPageId(tree_->RootPageId());
   }
   return CommitOp();
 }
@@ -433,6 +454,7 @@ auto StorageEngine::Close() -> Status {
   // images stay in the log because the reset below never runs.)
   if (poisoned_) {
     tree_.reset();
+    pages_.reset();
     pool_.reset();
     disk_.reset();
     wal_.reset();
@@ -447,6 +469,7 @@ auto StorageEngine::Close() -> Status {
     return status;
   }
   tree_.reset();
+  pages_.reset();
   pool_.reset();
   disk_.reset();
   wal_.reset();
