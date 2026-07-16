@@ -2,14 +2,30 @@
 #include <tinydb/buffer_pool.h>
 #include <tinydb/status.h>
 
+#include "storage/page_codec.h"
+
 #include <unistd.h>
 
 #include <array>
+#include <cstring>
 #include <filesystem>
 #include <string>
 
 static auto TestPath(const std::string &name) -> std::filesystem::path {
   return std::filesystem::temp_directory_path() / ("tinydb_buffer_" + name + "_" + std::to_string(::getpid()) + ".db");
+}
+
+static void StoreMarker(char *data, tinydb::page_id_t page_id, char marker) {
+  const auto payload = std::array{static_cast<std::byte>(marker)};
+  const auto encoded = tinydb::storage::EncodeOverflowPage(page_id, 0, payload.size(), tinydb::HEADER_PAGE_ID, payload);
+  ASSERT_TRUE(encoded.has_value());
+  std::memcpy(data, encoded->data(), encoded->size());
+}
+
+static auto ReadMarker(const char *data, tinydb::page_id_t page_id) -> char {
+  const auto decoded = tinydb::storage::DecodeOverflowPage(std::as_bytes(std::span{data, tinydb::PAGE_SIZE}), page_id);
+  EXPECT_TRUE(decoded.has_value());
+  return static_cast<char>(std::to_integer<unsigned char>(decoded->payload.front()));
 }
 
 TEST(BufferPoolTest, FlushNewPage) {
@@ -21,8 +37,7 @@ TEST(BufferPoolTest, FlushNewPage) {
     tinydb::BufferPool pool(&disk, 1);
 
     const auto [page_id, data] = pool.NewPage().value();
-    data[0] = 'b';
-    data[tinydb::PAGE_SIZE - 1] = 'p';
+    StoreMarker(data, page_id, 'b');
 
     pool.UnpinPage(page_id, true);
     ASSERT_TRUE(pool.FlushAllPages().Ok());
@@ -30,8 +45,7 @@ TEST(BufferPoolTest, FlushNewPage) {
     auto page = std::array<char, tinydb::PAGE_SIZE>{};
     ASSERT_TRUE(disk.ReadPage(page_id, page.data()).Ok());
 
-    EXPECT_EQ(page[0], 'b');
-    EXPECT_EQ(page[tinydb::PAGE_SIZE - 1], 'p');
+    EXPECT_EQ(ReadMarker(page.data(), page_id), 'b');
   }
 
   std::filesystem::remove(path);
@@ -46,15 +60,15 @@ TEST(BufferPoolTest, EvictDirtyPage) {
     tinydb::BufferPool pool(&disk, 1);
 
     const auto [first_page_id, first_page] = pool.NewPage().value();
-    first_page[0] = 'a';
+    StoreMarker(first_page, first_page_id, 'a');
     pool.UnpinPage(first_page_id, true);
 
     const auto [second_page_id, second_page] = pool.NewPage().value();
-    second_page[0] = 'z';
+    StoreMarker(second_page, second_page_id, 'z');
     pool.UnpinPage(second_page_id, true);
 
     char *fetched_page = pool.FetchPage(first_page_id).value();
-    EXPECT_EQ(fetched_page[0], 'a');
+    EXPECT_EQ(ReadMarker(fetched_page, first_page_id), 'a');
     pool.UnpinPage(first_page_id, false);
   }
 
@@ -153,6 +167,55 @@ TEST(BufferPoolTest, KeepPinnedPage) {
   std::filesystem::remove(path);
 }
 
+TEST(BufferPoolTest, FailedFetchDoesNotPoisonThePageTable) {
+  const auto path = TestPath("failed_fetch");
+  std::filesystem::remove(path);
+
+  {
+    auto disk = tinydb::DiskManager::Open(path).value();
+    tinydb::BufferPool pool(&disk, 2);
+
+    // Two pages on disk, both cached, both frames occupied and clean.
+    const auto page_a = pool.NewPage().value().page_id;
+    StoreMarker(pool.FetchPage(page_a).value(), page_a, 'a');
+    pool.UnpinPage(page_a, true);
+    pool.UnpinPage(page_a, true);
+    const auto page_b = pool.NewPage().value().page_id;
+    StoreMarker(pool.FetchPage(page_b).value(), page_b, 'b');
+    pool.UnpinPage(page_b, true);
+    pool.UnpinPage(page_b, true);
+    ASSERT_TRUE(pool.FlushAllPages().Ok());
+
+    // A fetch of an unallocated page evicts one occupant and then fails,
+    // leaving the picked frame with no page. The frame must go back to
+    // the free list — not sit abandoned still recorded under the evicted
+    // page's id.
+    const auto failed = pool.FetchPage(page_b + 100);
+    ASSERT_FALSE(failed.has_value());
+
+    // Re-cache the evicted page and hold it pinned with fresh bytes.
+    auto *const b_data = pool.FetchPage(page_b).value();
+    StoreMarker(b_data, page_b, 'c');
+
+    // Fetching the other page needs a frame. Before the fix, the sweep
+    // reused the abandoned frame and erased its stale id — the *live*
+    // mapping of the pinned page above — from the page table, leaving the
+    // pool caching that page in two frames; this unpin then died with
+    // "unpinning a page that is not in the pool".
+    ASSERT_TRUE(pool.FetchPage(page_a).has_value());
+    pool.UnpinPage(page_a, false);
+    pool.UnpinPage(page_b, true);
+
+    // The pinned page's bytes survived the shuffle.
+    ASSERT_TRUE(pool.FlushAllPages().Ok());
+    auto on_disk = std::array<char, tinydb::PAGE_SIZE>{};
+    ASSERT_TRUE(disk.ReadPage(page_b, on_disk.data()).Ok());
+    EXPECT_EQ(ReadMarker(on_disk.data(), page_b), 'c');
+  }
+
+  std::filesystem::remove(path);
+}
+
 TEST(BufferPoolTest, OpDirtyFramesAreNeitherEvictedNorFlushed) {
   const auto path = TestPath("no_steal");
   std::filesystem::remove(path);
@@ -163,14 +226,18 @@ TEST(BufferPoolTest, OpDirtyFramesAreNeitherEvictedNorFlushed) {
 
     // Two pages on disk, pool of one frame.
     const auto first = pool.NewPage().value().page_id;
+    StoreMarker(pool.FetchPage(first).value(), first, 'a');
+    pool.UnpinPage(first, true);
     pool.UnpinPage(first, true);
     const auto second = pool.NewPage().value().page_id;  // evicts (writes) first
+    StoreMarker(pool.FetchPage(second).value(), second, 'b');
+    pool.UnpinPage(second, true);
     pool.UnpinPage(second, true);
     ASSERT_TRUE(pool.FlushAllPages().Ok());
 
     pool.BeginOp();
     auto *const data = pool.FetchPage(first).value();  // evicts second, clean
-    data[0] = 'u';                                    // uncommitted from here on
+    StoreMarker(data, first, 'u');                     // uncommitted from here on
     pool.UnpinPage(first, true);
 
     // No-steal: the only frame holds uncommitted bytes, so nothing is
@@ -183,13 +250,13 @@ TEST(BufferPoolTest, OpDirtyFramesAreNeitherEvictedNorFlushed) {
     ASSERT_TRUE(pool.FlushAllPages().Ok());
     auto on_disk = std::array<char, tinydb::PAGE_SIZE>{};
     ASSERT_TRUE(disk.ReadPage(first, on_disk.data()).Ok());
-    EXPECT_EQ(on_disk[0], '\0');
+    EXPECT_EQ(ReadMarker(on_disk.data(), first), 'a');
 
     // The frame is exactly what the operation must log.
     const auto images = pool.OpDirtyFrames();
     ASSERT_EQ(images.size(), 1U);
     EXPECT_EQ(images[0].first, first);
-    EXPECT_EQ(images[0].second[0], 'u');
+    EXPECT_EQ(ReadMarker(images[0].second, first), 'u');
 
     // After EndOp the frame is ordinary dirty again: fetching the other
     // page evicts it, writing the bytes out on the way.
@@ -197,7 +264,7 @@ TEST(BufferPoolTest, OpDirtyFramesAreNeitherEvictedNorFlushed) {
     ASSERT_TRUE(pool.FetchPage(second).has_value());
     pool.UnpinPage(second, false);
     ASSERT_TRUE(disk.ReadPage(first, on_disk.data()).Ok());
-    EXPECT_EQ(on_disk[0], 'u');
+    EXPECT_EQ(ReadMarker(on_disk.data(), first), 'u');
   }
 
   std::filesystem::remove(path);

@@ -2,12 +2,13 @@
 #include <tinydb/disk_manager.h>
 
 #include "io/syscalls.h"
-#include "util/checksums.h"
+#include "storage/page_codec.h"
+#include "storage/superblock.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -15,6 +16,8 @@
 #include <cstring>
 #include <expected>
 #include <filesystem>
+#include <random>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -22,35 +25,67 @@
 #include <vector>
 
 namespace tinydb {
-
 namespace {
 
-// The failing errno as an IoError status, tagged with the operation.
 auto ErrnoStatus(std::string_view operation) -> Status {
   return Status::IoError(std::string(operation) + ": " + std::generic_category().message(errno));
 }
 
-// A copy of the header with its checksum freshly computed. Every header that
-// leaves memory — WriteHeader, TakeOpImages — goes through this, so a header
-// on disk (or replayed from the log) always carries a valid checksum.
-auto Sealed(const FileHeader &header) -> FileHeader {
-  auto sealed = header;
-  sealed.checksum = HeaderChecksum(sealed);
-  return sealed;
+auto SyncParentDirectory(const std::filesystem::path &path) -> Status {
+  auto parent = path.parent_path();
+  if (parent.empty()) {
+    parent = ".";
+  }
+  auto directory = UniqueFd(io::Open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+  if (!directory.Valid()) {
+    return ErrnoStatus("open directory");
+  }
+  if (io::Fsync(directory.Get()) < 0) {
+    return ErrnoStatus("fsync directory");
+  }
+  return {};
 }
 
-// Reads just the free-list header at the front of a free page.
-auto ReadFreePageHeader(int fd, page_id_t page_id) -> Result<FreePageHeader> {
-  FreePageHeader header{};
-  const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  const auto bytes_read = io::Pread(fd, &header, sizeof(header), static_cast<std::uint64_t>(offset));
+auto RandomUuid() -> DatabaseUuid {
+  auto uuid = DatabaseUuid{};
+  auto random = std::random_device{};
+  for (std::size_t offset = 0; offset < uuid.size(); offset += sizeof(std::uint32_t)) {
+    const auto word = random();
+    for (std::size_t byte = 0; byte < sizeof(std::uint32_t); ++byte) {
+      uuid[offset + byte] = static_cast<std::byte>((word >> (byte * 8U)) & 0xFFU);
+    }
+  }
+  if (std::ranges::all_of(uuid, [](std::byte value) { return value == std::byte{0}; })) {
+    uuid.back() = std::byte{1};
+  }
+  return uuid;
+}
+
+auto ReadWholePage(int fd, page_id_t page_id) -> Result<std::array<char, PAGE_SIZE>> {
+  auto page = std::array<char, PAGE_SIZE>{};
+  const auto bytes_read = io::Pread(fd, page.data(), page.size(), page_id * PAGE_SIZE);
   if (bytes_read < 0) {
     return std::unexpected(ErrnoStatus("pread"));
   }
-  if (static_cast<std::size_t>(bytes_read) != sizeof(header)) {
-    return std::unexpected(Status::Corruption("short read on a free page header"));
+  if (static_cast<std::size_t>(bytes_read) != page.size()) {
+    return std::unexpected(Status::Corruption("short read on a persistent page"));
   }
-  return header;
+  return page;
+}
+
+auto WriteWholePage(int fd, page_id_t page_id, const std::array<char, PAGE_SIZE> &page) -> Status {
+  const auto bytes_written = io::Pwrite(fd, page.data(), page.size(), page_id * PAGE_SIZE);
+  if (bytes_written < 0) {
+    return ErrnoStatus("pwrite");
+  }
+  if (static_cast<std::size_t>(bytes_written) != page.size()) {
+    return Status::IoError("short write on a persistent page");
+  }
+  return {};
+}
+
+auto ToBytes(const std::array<char, PAGE_SIZE> &page) -> std::span<const std::byte> {
+  return std::as_bytes(std::span{page});
 }
 
 }  // namespace
@@ -61,81 +96,103 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
     return std::unexpected(ErrnoStatus("open"));
   }
 
-  struct stat stat_buffer {};
-  if (io::Fstat(fd.Get(), &stat_buffer) < 0) {
+  struct stat file_stat {};
+  if (io::Fstat(fd.Get(), &file_stat) < 0) {
     return std::unexpected(ErrnoStatus("fstat"));
   }
-
   DiskManager disk(std::move(fd));
 
-  if (stat_buffer.st_size == 0) {
-    disk.header_ = FileHeader{
-        .magic = TINYDB_FILE_MAGIC,
-        .page_size = PAGE_SIZE,
-        .root_page_id = HEADER_PAGE_ID,
-        .next_page_id = FIRST_DATA_PAGE_ID,
-        .free_list_head = HEADER_PAGE_ID,
-        .checksum = 0,  // sealed on every write; see Sealed()
-    };
-
-    if (auto status = disk.WriteHeader(); !status.Ok()) {
-      return std::unexpected(std::move(status));
+  const auto initialize_fresh = [&]() -> Status {
+    disk.database_uuid_ = RandomUuid();
+    if (io::Ftruncate(disk.fd_.Get(), FIRST_DATA_PAGE_ID * PAGE_SIZE) < 0) {
+      return ErrnoStatus("ftruncate");
     }
-    // Make the fresh header durable before Open returns: a crash right
-    // after creation must not leave a file with no valid header and no
-    // logged header image to repair it from.
+
+    const auto initial = disk.EncodeCurrentSuperblock();
+    if (auto status = WriteWholePage(disk.fd_.Get(), SUPERBLOCK_A_PAGE_ID, initial); !status.Ok()) {
+      return status;
+    }
     if (auto status = disk.Sync(); !status.Ok()) {
+      return status;
+    }
+    if (auto status = SyncParentDirectory(path); !status.Ok()) {
+      return status;
+    }
+    if (auto status = WriteWholePage(disk.fd_.Get(), SUPERBLOCK_B_PAGE_ID, initial); !status.Ok()) {
+      return status;
+    }
+    if (auto status = disk.Sync(); !status.Ok()) {
+      return status;
+    }
+    return {};
+  };
+
+  if (file_stat.st_size == 0) {
+    if (auto status = initialize_fresh(); !status.Ok()) {
       return std::unexpected(std::move(status));
     }
     return disk;
   }
 
-  const auto bytes_read = io::Pread(disk.fd_.Get(), &disk.header_, sizeof(disk.header_), 0);
-  if (bytes_read < 0) {
-    return std::unexpected(ErrnoStatus("pread"));
+  if (file_stat.st_size < static_cast<off_t>(FIRST_DATA_PAGE_ID * PAGE_SIZE) ||
+      file_stat.st_size % static_cast<off_t>(PAGE_SIZE) != 0) {
+    return std::unexpected(Status::UnsupportedFormat("file does not contain TinyDB dual superblocks"));
   }
 
-  // A file too short to hold a header cannot be a database either.
-  if (static_cast<std::size_t>(bytes_read) != sizeof(disk.header_) || disk.header_.magic != TINYDB_FILE_MAGIC ||
-      disk.header_.page_size != PAGE_SIZE) {
-    return std::unexpected(Status::InvalidArgument("not a TinyDB database file: " + path.string()));
+  const auto page_a = ReadWholePage(disk.fd_.Get(), SUPERBLOCK_A_PAGE_ID);
+  if (!page_a) {
+    return std::unexpected(page_a.error());
+  }
+  const auto page_b = ReadWholePage(disk.fd_.Get(), SUPERBLOCK_B_PAGE_ID);
+  if (!page_b) {
+    return std::unexpected(page_b.error());
+  }
+  const auto selected = storage::SelectSuperblock(ToBytes(*page_a), ToBytes(*page_b));
+  if (!selected) {
+    const auto page_is_zero = [](const std::array<char, PAGE_SIZE> &page) {
+      return std::ranges::all_of(page, [](char byte) { return byte == 0; });
+    };
+    if (file_stat.st_size == static_cast<off_t>(FIRST_DATA_PAGE_ID * PAGE_SIZE) && page_is_zero(*page_a) &&
+        page_is_zero(*page_b)) {
+      if (auto status = initialize_fresh(); !status.Ok()) {
+        return std::unexpected(std::move(status));
+      }
+      return disk;
+    }
+    return std::unexpected(selected.error());
   }
 
-  // The magic matches, so a checksum mismatch means the header bytes
-  // themselves are damaged: a torn write that recovery had no header image
-  // to repair, or corruption at rest.
-  if (disk.header_.checksum != HeaderChecksum(disk.header_)) {
-    return std::unexpected(Status::Corruption("corrupt header in " + path.string()));
+  disk.database_uuid_ = selected->value.database_uuid;
+  disk.generation_ = selected->value.generation;
+  disk.checkpoint_lsn_ = selected->value.checkpoint_lsn;
+  disk.transaction_id_ = selected->value.transaction_id;
+  disk.root_page_id_ = selected->value.root_page_id;
+  disk.next_page_id_ = selected->value.high_water_page_id;
+  disk.free_list_head_ = selected->value.allocator_root_page_id;
+  disk.active_superblock_page_id_ =
+      selected->slot == storage::SuperblockSlot::A ? SUPERBLOCK_A_PAGE_ID : SUPERBLOCK_B_PAGE_ID;
+
+  const auto file_pages = static_cast<std::uint64_t>(file_stat.st_size) / PAGE_SIZE;
+  if (disk.next_page_id_ < FIRST_DATA_PAGE_ID || disk.next_page_id_ > file_pages) {
+    return std::unexpected(Status::Corruption("superblock allocation frontier lies outside the database file"));
   }
 
-  // The header's arithmetic must agree with the file before it is used to
-  // compute offsets: every allocated page has to lie within the file (a
-  // longer file is harmless — see AllocatePage), and the root has to be an
-  // allocated page.
-  const auto file_pages = static_cast<std::uint64_t>(stat_buffer.st_size) / PAGE_SIZE;
-  if (disk.header_.next_page_id < FIRST_DATA_PAGE_ID || disk.header_.next_page_id > file_pages) {
-    return std::unexpected(Status::Corruption("corrupt header in " + path.string()));
-  }
-  if (disk.header_.root_page_id != HEADER_PAGE_ID && disk.header_.root_page_id >= disk.header_.next_page_id) {
-    return std::unexpected(Status::Corruption("corrupt header in " + path.string()));
-  }
-
-  // Rebuild the in-memory free-page set. Walking the list here also proves
-  // it is acyclic and points only at allocated pages marked free.
-  auto free_page_id = disk.header_.free_list_head;
+  auto free_page_id = disk.free_list_head_;
   while (free_page_id != HEADER_PAGE_ID) {
-    if (free_page_id >= disk.header_.next_page_id || disk.free_pages_.contains(free_page_id)) {
-      return std::unexpected(Status::Corruption("corrupt free list in " + path.string()));
+    if (free_page_id < FIRST_DATA_PAGE_ID || free_page_id >= disk.next_page_id_ ||
+        disk.free_pages_.contains(free_page_id)) {
+      return std::unexpected(Status::Corruption("corrupt allocator free list"));
     }
-    const auto free_header = ReadFreePageHeader(disk.fd_.Get(), free_page_id);
-    if (!free_header) {
-      return std::unexpected(free_header.error());
+    const auto page = ReadWholePage(disk.fd_.Get(), free_page_id);
+    if (!page) {
+      return std::unexpected(page.error());
     }
-    if (free_header->type != FREE_PAGE_TYPE) {
-      return std::unexpected(Status::Corruption("corrupt free list in " + path.string()));
+    const auto decoded = storage::DecodeAllocatorPage(ToBytes(*page), free_page_id);
+    if (!decoded) {
+      return std::unexpected(decoded.error());
     }
     disk.free_pages_.insert(free_page_id);
-    free_page_id = free_header->next_free;
+    free_page_id = decoded->next_free;
   }
   return disk;
 }
@@ -143,147 +200,141 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
 auto DiskManager::AllocatePage() -> Result<page_id_t> {
   TINYDB_CHECK(fd_.Valid(), "allocating a page on a closed disk manager");
 
-  // Pop the most recently freed page when one is available.
-  if (header_.free_list_head != HEADER_PAGE_ID) {
-    const auto page_id = header_.free_list_head;
+  if (free_list_head_ != HEADER_PAGE_ID) {
+    const auto page_id = free_list_head_;
     auto next_free = HEADER_PAGE_ID;
-
     if (const auto pending = pending_free_links_.find(page_id); pending != pending_free_links_.end()) {
-      // Freed since the last checkpoint, so its link lives here, not on
-      // disk. Reallocating supersedes it: drop the pending write, and drop
-      // it from the in-flight operation's images if that is who freed it.
       next_free = pending->second;
       pending_free_links_.erase(pending);
       std::erase(op_freed_pages_, page_id);
     } else {
-      const auto free_header = ReadFreePageHeader(fd_.Get(), page_id);
-      if (!free_header) {
-        return std::unexpected(free_header.error());
+      const auto page = ReadWholePage(fd_.Get(), page_id);
+      if (!page) {
+        return std::unexpected(page.error());
       }
-      TINYDB_CHECK(free_header->type == FREE_PAGE_TYPE, "free list head is not a free page");
-      next_free = free_header->next_free;
+      const auto decoded = storage::DecodeAllocatorPage(ToBytes(*page), page_id);
+      if (!decoded) {
+        return std::unexpected(decoded.error());
+      }
+      next_free = decoded->next_free;
     }
-
-    header_.free_list_head = next_free;
+    free_list_head_ = next_free;
     free_pages_.erase(page_id);
     header_changed_ = true;
     return page_id;
   }
 
-  // Otherwise grow the file by one page. This write stays eager: file size
-  // is physical state, and a too-long file is harmless — next_page_id in
-  // the header is what says which pages exist.
-  const auto page_id = header_.next_page_id;
-  const auto new_size = static_cast<off_t>((page_id + 1) * PAGE_SIZE);
-
-  if (io::Ftruncate(fd_.Get(), static_cast<std::uint64_t>(new_size)) < 0) {
+  const auto page_id = next_page_id_;
+  if (io::Ftruncate(fd_.Get(), (page_id + 1) * PAGE_SIZE) < 0) {
     return std::unexpected(ErrnoStatus("ftruncate"));
   }
-
-  ++header_.next_page_id;
+  ++next_page_id_;
   header_changed_ = true;
   return page_id;
 }
 
 void DiskManager::FreePage(page_id_t page_id) {
   TINYDB_CHECK(fd_.Valid(), "freeing a page on a closed disk manager");
-  const bool allocated = page_id != HEADER_PAGE_ID && page_id < header_.next_page_id;
-  TINYDB_CHECK(allocated, "freeing a page that was never allocated");
+  TINYDB_CHECK(page_id >= FIRST_DATA_PAGE_ID && page_id < next_page_id_, "freeing a page that was never allocated");
   TINYDB_CHECK(!free_pages_.contains(page_id), "double free of a page");
 
-  // Nothing touches the file here: the link stays pending until a
-  // checkpoint writes it, and TakeOpImages hands it to the log first.
-  pending_free_links_[page_id] = header_.free_list_head;
+  pending_free_links_[page_id] = free_list_head_;
   op_freed_pages_.push_back(page_id);
   free_pages_.insert(page_id);
-  header_.free_list_head = page_id;
+  free_list_head_ = page_id;
   header_changed_ = true;
 }
 
-auto DiskManager::GetRootPageId() const -> page_id_t { return header_.root_page_id; }
+auto DiskManager::GetRootPageId() const -> page_id_t { return root_page_id_; }
+auto DiskManager::NextPageId() const -> page_id_t { return next_page_id_; }
+auto DiskManager::FreePages() const -> const std::unordered_set<page_id_t> & { return free_pages_; }
+auto DiskManager::Uuid() const -> const DatabaseUuid & { return database_uuid_; }
 
 void DiskManager::SetRootPageId(page_id_t root_page_id) {
-  header_.root_page_id = root_page_id;
+  TINYDB_CHECK(root_page_id == HEADER_PAGE_ID || (root_page_id >= FIRST_DATA_PAGE_ID && root_page_id < next_page_id_),
+               "root page is outside the allocation frontier");
+  root_page_id_ = root_page_id;
   header_changed_ = true;
+}
+
+auto DiskManager::EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE> {
+  const auto encoded = storage::EncodeSuperblock(storage::Superblock{
+      .database_uuid = database_uuid_,
+      .generation = generation_,
+      .checkpoint_lsn = checkpoint_lsn_,
+      .transaction_id = transaction_id_,
+      .root_page_id = root_page_id_,
+      .allocator_root_page_id = free_list_head_,
+      .high_water_page_id = next_page_id_,
+  });
+  TINYDB_CHECK(encoded.has_value(), "invalid in-memory superblock state");
+  auto output = std::array<char, PAGE_SIZE>{};
+  std::memcpy(output.data(), encoded->data(), encoded->size());
+  return output;
+}
+
+auto DiskManager::AdvanceSuperblock() -> page_id_t {
+  ++generation_;
+  ++transaction_id_;
+  active_superblock_page_id_ =
+      active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
+  return active_superblock_page_id_;
 }
 
 auto DiskManager::TakeOpImages() -> std::vector<PageImage> {
-  std::vector<PageImage> images;
-
+  auto images = std::vector<PageImage>{};
   if (header_changed_) {
-    auto &image = images.emplace_back();
-    image.page_id = HEADER_PAGE_ID;
-    const auto sealed = Sealed(header_);
-    std::memcpy(image.data.data(), &sealed, sizeof(sealed));
+    const auto page_id = AdvanceSuperblock();
+    images.push_back(PageImage{.page_id = page_id, .data = EncodeCurrentSuperblock()});
     header_changed_ = false;
   }
 
   for (const auto page_id : op_freed_pages_) {
     const auto link = pending_free_links_.find(page_id);
-    TINYDB_CHECK(link != pending_free_links_.end(), "freed page has no pending link");
-    const auto free_header = FreePageHeader{.type = FREE_PAGE_TYPE, .next_free = link->second};
-
-    auto &image = images.emplace_back();
-    image.page_id = page_id;
-    std::memcpy(image.data.data(), &free_header, sizeof(free_header));
+    TINYDB_CHECK(link != pending_free_links_.end(), "freed page has no pending allocator link");
+    const auto encoded = storage::EncodeAllocatorPage(page_id, transaction_id_, link->second);
+    TINYDB_CHECK(encoded.has_value(), "invalid in-memory allocator page");
+    images.push_back(PageImage{.page_id = page_id, .data = *encoded});
   }
   op_freed_pages_.clear();
-
   return images;
 }
 
 auto DiskManager::Checkpoint() -> Status {
   TINYDB_CHECK(fd_.Valid(), "checkpointing a closed disk manager");
-
-  // Everything pending is about to be on disk, so there is nothing left
-  // for a log to carry. (The engine always drains this via TakeOpImages
-  // first; standalone DiskManager users checkpoint directly.)
   op_freed_pages_.clear();
 
-  // Links are erased as they are written, so a failed checkpoint can be
-  // retried and only rewrites the remainder. Order versus the header write
-  // does not matter for crashes: the log is not reset until the whole
-  // checkpoint is fsynced, so recovery replays all of this anyway.
   for (auto link = pending_free_links_.begin(); link != pending_free_links_.end();) {
-    const auto free_header = FreePageHeader{.type = FREE_PAGE_TYPE, .next_free = link->second};
-    const auto offset = static_cast<off_t>(link->first * PAGE_SIZE);
-    const auto bytes_written =
-        io::Pwrite(fd_.Get(), &free_header, sizeof(free_header), static_cast<std::uint64_t>(offset));
-    if (bytes_written < 0) {
-      return ErrnoStatus("pwrite");
+    const auto encoded = storage::EncodeAllocatorPage(link->first, transaction_id_, link->second);
+    if (!encoded) {
+      return encoded.error();
     }
-    if (static_cast<std::size_t>(bytes_written) != sizeof(free_header)) {
-      return Status::IoError("short write on a free page header");
+    if (auto status = WriteWholePage(fd_.Get(), link->first, *encoded); !status.Ok()) {
+      return status;
     }
     link = pending_free_links_.erase(link);
   }
 
-  header_changed_ = false;
-  return WriteHeader();
+  if (header_changed_) {
+    AdvanceSuperblock();
+    header_changed_ = false;
+  }
+  return WriteCurrentSuperblock();
+}
+
+auto DiskManager::WriteCurrentSuperblock() const -> Status {
+  const auto encoded = EncodeCurrentSuperblock();
+  if (auto status = WriteWholePage(fd_.Get(), active_superblock_page_id_, encoded); !status.Ok()) {
+    return status;
+  }
+  const auto mirror = active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
+  return WriteWholePage(fd_.Get(), mirror, encoded);
 }
 
 auto DiskManager::Sync() const -> Status {
   TINYDB_CHECK(fd_.Valid(), "syncing a closed disk manager");
-
   if (io::Fsync(fd_.Get()) < 0) {
     return ErrnoStatus("fsync");
-  }
-  return {};
-}
-
-auto DiskManager::WriteHeader() const -> Status {
-  TINYDB_CHECK(fd_.Valid(), "writing header to a closed disk manager");
-
-  auto header_page = std::array<char, PAGE_SIZE>{};
-  const auto sealed = Sealed(header_);
-  std::memcpy(header_page.data(), &sealed, sizeof(sealed));
-
-  const auto bytes_written = io::Pwrite(fd_.Get(), header_page.data(), header_page.size(), 0);
-  if (bytes_written < 0) {
-    return ErrnoStatus("pwrite");
-  }
-  if (static_cast<std::size_t>(bytes_written) != PAGE_SIZE) {
-    return Status::IoError("short write on the header page");
   }
   return {};
 }
@@ -291,13 +342,10 @@ auto DiskManager::WriteHeader() const -> Status {
 auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> Status {
   TINYDB_CHECK(fd_.Valid(), "reading from a closed disk manager");
   TINYDB_CHECK(!free_pages_.contains(page_id), "reading a freed page");
-
-  if (page_id >= header_.next_page_id) {
+  if (page_id < FIRST_DATA_PAGE_ID || page_id >= next_page_id_) {
     return Status::InvalidArgument("reading a page that was never allocated");
   }
-
-  const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  const auto bytes_read = io::Pread(fd_.Get(), data, PAGE_SIZE, static_cast<std::uint64_t>(offset));
+  const auto bytes_read = io::Pread(fd_.Get(), data, PAGE_SIZE, page_id * PAGE_SIZE);
   if (bytes_read < 0) {
     return ErrnoStatus("pread");
   }
@@ -310,13 +358,10 @@ auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> Status {
 auto DiskManager::WritePage(page_id_t page_id, const char *data) const -> Status {
   TINYDB_CHECK(fd_.Valid(), "writing to a closed disk manager");
   TINYDB_CHECK(!free_pages_.contains(page_id), "writing to a freed page");
-
-  if (page_id >= header_.next_page_id) {
+  if (page_id < FIRST_DATA_PAGE_ID || page_id >= next_page_id_) {
     return Status::InvalidArgument("writing a page that was never allocated");
   }
-
-  const auto offset = static_cast<off_t>(page_id * PAGE_SIZE);
-  const auto bytes_written = io::Pwrite(fd_.Get(), data, PAGE_SIZE, static_cast<std::uint64_t>(offset));
+  const auto bytes_written = io::Pwrite(fd_.Get(), data, PAGE_SIZE, page_id * PAGE_SIZE);
   if (bytes_written < 0) {
     return ErrnoStatus("pwrite");
   }

@@ -7,9 +7,11 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -18,36 +20,23 @@
 #include "page_format.h"
 
 /**
-  B+ tree algorithms over the LeafNode / InternalNode codecs.
+  B+ tree algorithms: descend, split, repair, collapse.
 
-  Design notes:
+  Division of labor inside src/btree/:
 
-  - Every mutation loads the whole node into sorted records, edits them, and
-    rewrites the page fully packed. Pages are 4 KiB, so the rewrite is cheap,
-    and it buys a lot: no fragmentation, no tombstone bookkeeping, no
-    in-place fast paths to keep consistent with a slow path. (Cells with
-    flags != 0 are treated as tombstones: skipped on load and dropped on the
-    next rewrite.)
+      page_format.h        the raw on-disk structs and their layout rules
+      leaf_node.cpp        page bytes <-> sorted (key, value) records
+      internal_node.cpp    page bytes <-> routing table
+      this file            everything that spans more than one node
 
-  - Nothing fails silently: I/O failures propagate out as statuses before
-    any dependent page is written, impossible states abort via TINYDB_CHECK,
-    and no structural change is written until everything it depends on is
-    known to fit. Entries are capped at MAX_ENTRY_BYTES, which guarantees
-    every overflowing node has a valid split point (see page_format.h). The
-    one deliberate soft spot: if a rebalance would promote a separator too
-    fat for the parent, the repair is skipped and the child stays underfull —
-    the tree remains correct, only occupancy suffers.
+  The codecs own single-page concerns: decoding, validation, packing,
+  choosing split points. This file owns the relationships between pages —
+  which child a key descends into, how a split's separator climbs the
+  tree, how an underfull node borrows from or merges with a sibling. It
+  touches raw page bytes in exactly two places: sniffing a page's node
+  type before choosing a codec, and copying a whole page in CollapseRoot.
 
-  - The root page id never changes. A root split moves both halves to new
-    pages and rewrites the root as an internal node; a root collapse copies
-    the last child over the root page.
-
-  - Pages orphaned by merges and root collapses are handed back to the
-    buffer pool (BufferPool::FreePage), which drops any cached copy and puts
-    them on the disk manager's free list for reuse. Scan's end bound is
-    exclusive.
-
-  Logical shape and separator rule:
+  The logical shape, and the separator rule that search depends on:
 
              internal root
           +-----------------+
@@ -57,48 +46,120 @@
       < K10   >= K10  >= K20  >= K40
               < K20   < K40
 
-      Internal records are "separator -> right child"; the first child is
-      stored separately. Searching uses upper_bound, so a key equal to a
-      separator descends to the separator's right child. Leaves hold every
-      value and are linked left to right:
+  An internal node is a routing table: records of "separator key -> right
+  child", plus one extra child (the first child) for keys below every
+  separator. Search descends with upper_bound, which makes the rule "equal
+  goes right": a key equal to a separator lives under that separator's
+  right child. All values live in the leaves — internal nodes never store
+  data — and the leaves are chained left to right in key order, so a range
+  scan walks the chain instead of re-descending:
 
           leaf A        leaf B        leaf C
         [a b c]  ---> [k m n]  ---> [x y z]
 
-  Mutation shape:
+  A fresh tree is one page serving as both root and leaf. All growth is
+  split-driven: a full leaf splits in two and pushes one separator into
+  its parent, a full parent pushes one further up, and the tree gains a
+  level exactly when that carry reaches the root. Shrinking mirrors it:
+  merges remove separators, and the root collapses away once it is down to
+  a single child.
 
-      Load page bytes -> edit sorted records in memory -> prove the result
-      fits or split/repair first -> Store rewrites a fully packed page.
+  Every mutation follows one shape:
 
-      No structural change is written before the pages it depends on are
-      known to fit. When a split creates a separator, that separator is
-      propagated upward like a carry bit in addition:
+      load page bytes into a node
+        -> edit the sorted records in memory
+        -> prove the result fits, splitting or repairing first if not
+        -> Store rewrites the page fully packed
 
-          leaf split produces (separator, right_child)
-                    |
-                    v
-          insert into parent, maybe parent splits too
+  Nodes are rewritten whole on every change. A 4 KiB page is cheap to
+  re-encode, and it buys a lot of simplicity: no fragmentation, no
+  tombstone bookkeeping, no in-place fast path to keep consistent with a
+  slow path.
+
+  Invariants this file maintains:
+
+  1. Keys are unique and sorted inside every node, and the separator rule
+     sends each key to exactly one leaf. The codecs re-verify sortedness
+     on every Load, so a broken page aborts the process at the next read
+     rather than silently misrouting searches.
+
+  2. The root page id never changes for the life of the tree. A root split
+     moves both halves out to fresh pages and rewrites the root page in
+     place as an internal node above them; a root collapse copies the last
+     surviving child over the root page. The engine can therefore record
+     the root id once and never chase it.
+
+  3. The leaf chain stays complete and in key order: a leaf split splices
+     the new right leaf into the chain, and a merge adopts the absorbed
+     leaf's next pointer before that page is freed.
+
+  4. Nodes stay at least half full after deletes, with two exceptions: the
+     root, and one deliberate soft spot — when fixing an underfull node
+     would push a separator into a parent that has no room for it, the
+     repair is skipped. The node stays underfull, searches stay correct,
+     only occupancy suffers.
+
+  5. Pages orphaned by merges and root collapses go back to the buffer
+     pool (BufferPool::FreePage), which drops its cached copy and hands
+     the page to the disk manager's free list. The pool insists a freed
+     page be unpinned first; the extra brace scopes just before each
+     FreePage call exist to end the PageRef pins.
+
+  What this file asks of its caller (the storage engine), and promises:
+
+  - Entries must be pre-screened: Put aborts if key + value exceeds
+    MAX_ENTRY_BYTES. The cap is what guarantees an
+    overflowing node always has a split point where both halves fit (see
+    the static_asserts in page_format.h).
+
+  - The root page must be allocated before Open. A zeroed page is
+    bootstrapped into an empty leaf; a page holding anything that is not a
+    tree node is Corruption.
+
+  - I/O failures come back as statuses, and no dependent page is written
+    once one occurs. But a failed mutation may already have rewritten
+    other pages in the buffer pool, and a redo-only design has no undo:
+    after a failed Put or Remove the tree must not be touched again. The
+    engine enforces that by poisoning the handle (see storage_engine.cpp).
 */
 
 namespace tinydb {
 namespace {
 
+// One node on a root-to-leaf path: the page, and which child slot of its
+// parent points at it (0 for the root, which has no parent).
 struct PathStep {
   page_id_t page_id;
-  std::size_t child_index;  // this node's position under its parent
+  std::size_t child_index;
 };
 
 auto DescendToLeaf(BufferPool *pool, page_id_t root_page_id, std::string_view key) -> Result<std::vector<PathStep>> {
   /*
-    Walk from the stable root page to the leaf that owns key.
+    Walk from the stable root page down to the one leaf that owns key,
+    recording every node passed through:
 
-      path[0] = {root_page_id, 0}
-      path[1] = {child page, index under root}
-      path[2] = {leaf page,  index under parent}
+        path[0]     = {root page,  0}
+        path[1]     = {child page, index of that child under the root}
+        ...
+        path.back() = {leaf page,  index under its parent}
 
-    The child_index values are saved for deletion repair. If the leaf later
-    underflows, repair can reopen the parent and know which child position
-    points at the underfull node without searching for page ids.
+    Every tree operation starts here; the recorded positions are what the
+    mutations lean on afterward. Put walks the path back up to insert
+    split separators into the right ancestors. Remove needs the
+    child_index values: when a delete leaves a node underfull, the repair
+    reopens the parent and must know which child slot points at the
+    underfull node — recording that on the way down means the repair never
+    searches a parent for a page id.
+
+    Pinning is transient: each level's page is pinned only long enough to
+    pick the next child, so the descent holds one pin at a time and the
+    callers re-fetch pages by id when they mutate.
+
+    The depth check is the cycle guard. Parent-child links live on disk,
+    and a corrupt page could point back into the path and loop the descent
+    forever; no legitimate tree comes close, since even at the minimum
+    fanout of two, sixty-four levels would need more pages than a 64-bit
+    page id can name.
   */
   auto path = std::vector<PathStep>{{root_page_id, 0}};
   for (;;) {
@@ -107,31 +168,32 @@ auto DescendToLeaf(BufferPool *pool, page_id_t root_page_id, std::string_view ke
     if (!page) {
       return std::unexpected(std::move(page).error());
     }
-    const auto type = ReadAs<NodeHeader>(page->Data()).type;
-    if (type == NodeType::Leaf) {
+    const auto type = RawNodeType(page->Data());
+    if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
       return path;
     }
-    TINYDB_CHECK(type == NodeType::Internal, "descended into a non-tree page");
+    TINYDB_CHECK(type == static_cast<std::uint16_t>(NodeType::Internal), "descended into a non-tree page");
     const auto node = InternalNode::Load(page->Data());
     const auto child_index = node.FindChildIndex(key);
     path.push_back({node.ChildAt(child_index), child_index});
   }
 }
 
+// A separator waiting to be inserted one level up: produced by a split,
+// consumed by the parent — which may overflow in turn and produce another.
 struct PendingSeparator {
   std::string key;
   page_id_t right_child;
 };
 
-// Writes out the two halves of an overflowing leaf. For a non-root leaf the
-// left half reuses the leaf's page and the separator is returned for the
-// caller to insert into the parent. For the root, both halves move to new
-// pages and the root page is rewritten as an internal node above them, so
-// the root page id never changes.
+// Writes out both halves of an overflowing leaf and returns what the
+// parent must learn about it, if anything.
 auto SplitAndWrite(BufferPool *pool, PageRef &page, LeafNode &node, bool is_root,
                    bool tail_heavy) -> Result<std::optional<PendingSeparator>> {
   /*
-    Non-root leaf split:
+    An ordinary (non-root) leaf reuses its own page for the left half and
+    moves the right half to a fresh page, already spliced into the chain
+    by LeafNode::Split:
 
         before:
           page P: [a b c k m z] -> old_next
@@ -139,36 +201,46 @@ auto SplitAndWrite(BufferPool *pool, PageRef &page, LeafNode &node, bool is_root
         after:
           page P: [a b c] -> page R: [k m z] -> old_next
 
-        return separator:
-          (key = "k", right_child = R)
+        returned for the parent:
+          (separator "k", right_child R)
 
-    Root leaf split:
+    The root leaf cannot do that, because the root page id is the one page
+    id the engine persists and this tree never changes it. So a root split
+    keeps the page and replaces its contents: both halves move out to
+    fresh pages, and the root page is rewritten in place as an internal
+    node over them. Nothing is returned — the separator was absorbed into
+    the rebuilt root, and the tree just grew a level:
 
-        root page id must stay stable, so the old root page becomes an
-        internal page and the two leaf halves move out to fresh pages:
+        before:
+          root P (leaf): [a b c k m z]
 
-          before: root P is leaf [a ... z]
+        after:
+          root P (internal): first_child = L, ["k" -> R]
 
-          after:  root P is internal ["k" -> R]
-                   first_child = L
+          L: [a b c] -> R: [k m z]
 
-                  L: [a b c] -> R: [k m z]
+    tail_heavy is the ascending-load optimization. When the new key landed
+    at the very end of the rightmost leaf, an even split would leave a
+    trail of half-full pages behind a bulk sequential insert; splitting as
+    "everything old | just the new record" leaves dense leaves instead
+    (see LeafNode::Split for the picture).
 
-    `tail_heavy` is the sequential-insert optimization: when the inserted
-    key lands at the tail of the rightmost leaf, split as
-    "all old records | the new record" so a bulk ascending load leaves
-    dense leaves behind.
+    Failure note: if allocating a page fails partway through, some pages
+    are already rewritten in the pool while the parent still routes every
+    key to the old leaf. This function makes no attempt to roll that back
+    — it is one of the reasons a failed mutation poisons the whole engine
+    (see the file comment).
   */
   auto right_page = PageRef::New(pool);
   if (!right_page) {
     return std::unexpected(std::move(right_page).error());
   }
   auto split = node.Split(right_page->Id(), tail_heavy);
-  split.right.Store(right_page->Data());
+  split.right.Store(right_page->Data(), right_page->Id());
   right_page->MarkDirty();
 
   if (!is_root) {
-    node.Store(page.Data());
+    node.Store(page.Data(), page.Id());
     page.MarkDirty();
     return std::optional{PendingSeparator{std::move(split.separator), right_page->Id()}};
   }
@@ -177,44 +249,52 @@ auto SplitAndWrite(BufferPool *pool, PageRef &page, LeafNode &node, bool is_root
   if (!left_page) {
     return std::unexpected(std::move(left_page).error());
   }
-  node.Store(left_page->Data());
+  node.Store(left_page->Data(), left_page->Id());
   left_page->MarkDirty();
 
   const InternalNode new_root(left_page->Id(), std::move(split.separator), right_page->Id());
-  new_root.Store(page.Data());
+  new_root.Store(page.Data(), page.Id());
   page.MarkDirty();
   return std::optional<PendingSeparator>{};
 }
 
-// Same as above for an overflowing internal node; no leaf chain or
-// tail-heavy concerns here.
+// The internal-node overload: the same page dance as the leaf version,
+// minus the leaf chain and the tail-heavy special case.
 auto SplitAndWrite(BufferPool *pool, PageRef &page, InternalNode &node,
                    bool is_root) -> Result<std::optional<PendingSeparator>> {
   /*
-    Internal split differs from leaf split in one important way: the
-    separator moves up and does not stay in either child.
+    The important difference from a leaf split is what happens to the
+    middle separator: it leaves the node entirely. A leaf keeps its
+    separator key (the parent stores a copy) because leaves must hold
+    every value; internal keys are pure routing, so once the parent holds
+    the promoted key, a copy left in a child would just be a wasted slot.
 
-      before:
-        first=C0, records=[K0->C1, K1->C2, K2->C3, K3->C4]
+        before:
+          first=C0, records=[K0->C1, K1->C2, K2->C3, K3->C4]
 
-      split at K2:
-        left:      first=C0, records=[K0->C1, K1->C2]
-        separator: K2
-        right:     first=C3, records=[K3->C4]
+        split at K2:
+          left (this page):  first=C0, records=[K0->C1, K1->C2]
+          promoted:          K2
+          right (new page):  first=C3, records=[K3->C4]
 
-    For a root split, the root page is again rewritten in place as the new
-    internal root and the two halves live on new child pages.
+    K2's old right child C3 becomes the right half's first_child — that
+    handoff is what keeps "N separators, N + 1 children" true on both
+    sides after K2 climbs out (see InternalNode::Split).
+
+    A root split rewrites the root page in place as a new two-child
+    internal node, exactly like the leaf overload: both halves move to
+    fresh pages and the root page id stays put.
   */
   auto right_page = PageRef::New(pool);
   if (!right_page) {
     return std::unexpected(std::move(right_page).error());
   }
   auto split = node.Split();
-  split.right.Store(right_page->Data());
+  split.right.Store(right_page->Data(), right_page->Id());
   right_page->MarkDirty();
 
   if (!is_root) {
-    node.Store(page.Data());
+    node.Store(page.Data(), page.Id());
     page.MarkDirty();
     return std::optional{PendingSeparator{std::move(split.separator), right_page->Id()}};
   }
@@ -223,52 +303,57 @@ auto SplitAndWrite(BufferPool *pool, PageRef &page, InternalNode &node,
   if (!left_page) {
     return std::unexpected(std::move(left_page).error());
   }
-  node.Store(left_page->Data());
+  node.Store(left_page->Data(), left_page->Id());
   left_page->MarkDirty();
 
   const InternalNode new_root(left_page->Id(), std::move(split.separator), right_page->Id());
-  new_root.Store(page.Data());
+  new_root.Store(page.Data(), page.Id());
   page.MarkDirty();
   return std::optional<PendingSeparator>{};
 }
 
-// Repairs an underfull leaf by combining it with a sibling (prefer the one
-// to its left) into a single logical node: if that fits in one page the pair
-// merges into the left page; otherwise the records are redistributed evenly
-// and the parent separator is updated. Returns true iff the pair merged
-// (i.e. the parent lost a separator and may itself be underfull now).
+// Fixes an underfull leaf by combining it with an adjacent sibling. Returns
+// true iff the two pages merged into one — the only outcome that removes a
+// separator from the parent and can therefore leave the parent underfull.
 auto RepairLeafChild(BufferPool *pool, page_id_t parent_id, const PathStep &child) -> Result<bool> {
   /*
-    Leaf repair always works on adjacent siblings under the same parent.
-    If the underfull child has a left sibling, use that pair; otherwise use
-    the child and its right sibling.
+    The pair to combine is always two adjacent children of the same
+    parent: the underfull child with its left sibling if it has one,
+    otherwise with its right sibling. Staying under one parent keeps the
+    repair local — the only routing affected is sep[i], the separator
+    between the pair.
 
-      parent before:
-          ... | sep[i] = first key of R | ...
-                    /                 \
-              left leaf L          right leaf R
+        parent:  ... | sep[i] | ...
+                     /        \
+               left leaf L   right leaf R     (sep[i] = first key of R)
 
-    Combine the two leaves in memory:
+    Both leaves are loaded and concatenated in memory, and then one of
+    three things happens:
 
-          combined = L records + R records
+    Merge — the combined records fit in one page:
 
-    Case 1: combined fits in one page.
+        L      := all records, adopting R's next-leaf pointer
+        parent := sep[i] and the R child erased
+        R      := freed
 
-          L := combined
-          parent erases sep[i] and the R pointer
-          R is freed
+      The parent lost a separator, so it may now be underfull itself;
+      returning true tells the caller to keep repairing upward.
 
-      The parent lost one separator, so the caller may have to repair the
-      parent too.
+    Rebalance — the combined records do not fit in one page:
 
-    Case 2: combined does not fit.
+        split combined evenly back into L and R
+        parent sep[i] := first key of the new R
 
-          split combined back into L and R
-          parent sep[i] := first key of new R
+      Redistributing is literally a fresh split of the combined node, so
+      both leaves come out near half full — which is what "repaired"
+      means. The parent's child count is unchanged; the cascade stops.
 
-      The parent keeps the same child count, so repair stops here. If the
-      replacement separator is too fat for the parent, skip the repair:
-      the child can remain underfull without breaking search correctness.
+    Skip — the rebalanced separator does not fit in the parent:
+
+      Nothing is stored. The child stays underfull, which costs occupancy
+      but breaks nothing: separators route correctly around a sparse node.
+      The fit is checked before any page is written, so a skipped repair
+      leaves no partial state behind.
   */
   auto parent_page = PageRef::Fetch(pool, parent_id);
   if (!parent_page) {
@@ -276,9 +361,14 @@ auto RepairLeafChild(BufferPool *pool, page_id_t parent_id, const PathStep &chil
   }
   auto parent = InternalNode::Load(parent_page->Data());
   if (parent.SeparatorCount() == 0) {
-    return false;  // an only child has no sibling to repair against
+    // A parent with no separators has exactly one child: there is no
+    // sibling to combine with. CollapseRoot handles that shape.
+    return false;
   }
 
+  // sep[i] sits between the pair: a child with a left sibling pairs
+  // leftward (the separator just before it); the leftmost child has no
+  // left sibling and pairs rightward instead.
   const std::size_t sep_index = child.child_index > 0 ? child.child_index - 1 : 0;
   const page_id_t left_id = parent.ChildAt(sep_index);
   const page_id_t right_id = parent.ChildAt(sep_index + 1);
@@ -296,59 +386,68 @@ auto RepairLeafChild(BufferPool *pool, page_id_t parent_id, const PathStep &chil
     combined.Absorb(LeafNode::Load(right_page->Data()));
 
     if (!combined.Fits()) {
-      // Rebalance: redistribute evenly (this is exactly a split of the
-      // combined node) and promote the new separator into the parent.
+      // Rebalance. Split hands back an even redistribution; the new right
+      // half's first key becomes the replacement separator.
       auto split = combined.Split(right_id, /*tail_heavy=*/false);
       parent.SetSeparatorKey(sep_index, std::move(split.separator));
       if (!parent.Fits()) {
-        // The fatter separator does not fit in the parent. Skip the repair
-        // before touching anything: the child stays underfull but the tree
-        // stays correct.
+        // Skip: the replacement separator is fatter than the one it
+        // replaces and the parent has no room for it. Nothing has been
+        // stored yet, so bailing out here leaves every page untouched.
         return false;
       }
-      combined.Store(left_page->Data());
+      combined.Store(left_page->Data(), left_page->Id());
       left_page->MarkDirty();
-      split.right.Store(right_page->Data());
+      split.right.Store(right_page->Data(), right_page->Id());
       right_page->MarkDirty();
-      parent.Store(parent_page->Data());
+      parent.Store(parent_page->Data(), parent_page->Id());
       parent_page->MarkDirty();
       return false;
     }
 
-    // Merge into the left page.
-    combined.Store(left_page->Data());
+    // Merge: everything lives in the left page now, and the parent forgets
+    // the right child ever existed.
+    combined.Store(left_page->Data(), left_page->Id());
     left_page->MarkDirty();
     parent.EraseSeparator(sep_index);
-    parent.Store(parent_page->Data());
+    parent.Store(parent_page->Data(), parent_page->Id());
     parent_page->MarkDirty();
   }
 
-  // The merged-away sibling, unpinned above.
+  // Free the merged-away sibling. Deferred to here because the pool
+  // insists on an unpinned page, and the scope above just released the pin.
   pool->FreePage(right_id);
   return true;
 }
 
-// The internal-node version of the repair above. The one difference: the
-// parent separator comes down between the two halves when they combine.
+// RepairLeafChild's counterpart for internal nodes: same pairing rule, same
+// merge / rebalance / skip outcomes, same return value. The difference is
+// what combining means — the parent's separator physically moves down
+// between the two halves.
 auto RepairInternalChild(BufferPool *pool, page_id_t parent_id, const PathStep &child) -> Result<bool> {
   /*
-    Internal repair has the same merge-vs-redistribute shape as leaf repair,
-    but internal nodes have N separators and N+1 children. The separator in
-    the parent is not just a boundary label: it is the key that belongs
-    between the two child nodes when they combine.
+    Two adjacent leaves can simply concatenate, because leaves hold every
+    key. Two adjacent internal nodes cannot: the keys under R's first
+    child fall between L's last separator and R's first one, and the only
+    key describing that boundary is sep[i] in the parent. So the combine
+    pulls the parent separator down to stitch the halves together:
 
-      parent:
-             sep[i]
-            /      \
-         left      right
+        parent:   ... | sep[i] | ...
+                      /        \
+            L: first=C0,      R: first=C2,
+               [K0->C1]          [K2->C3]
 
-      combined logical order:
+        combined: first=C0, [K0->C1, sep[i]->C2, K2->C3]
 
-         left records, sep[i] -> right.first_child, right records
+    sep[i] takes R's old first child as its right child — exactly the
+    subtree holding keys >= sep[i] and below R's first separator.
 
-      If combined fits, it replaces the left page and sep[i] disappears
-      from the parent. If it does not fit, combined is split again and the
-      new middle separator replaces sep[i] in the parent.
+    From there the outcomes mirror the leaf repair. If combined fits, it
+    replaces L, the parent erases sep[i], and R is freed (merge — returns
+    true, the parent may now be underfull). If it does not fit, combined
+    is split again and the freshly promoted middle key replaces sep[i] in
+    the parent (rebalance). And if that promoted key is too fat for the
+    parent, the repair is skipped before anything is stored.
   */
   auto parent_page = PageRef::Fetch(pool, parent_id);
   if (!parent_page) {
@@ -356,9 +455,12 @@ auto RepairInternalChild(BufferPool *pool, page_id_t parent_id, const PathStep &
   }
   auto parent = InternalNode::Load(parent_page->Data());
   if (parent.SeparatorCount() == 0) {
-    return false;  // an only child has no sibling to repair against
+    // A parent with no separators has exactly one child: there is no
+    // sibling to combine with. CollapseRoot handles that shape.
+    return false;
   }
 
+  // sep[i] sits between the pair; see RepairLeafChild.
   const std::size_t sep_index = child.child_index > 0 ? child.child_index - 1 : 0;
   const page_id_t left_id = parent.ChildAt(sep_index);
   const page_id_t right_id = parent.ChildAt(sep_index + 1);
@@ -381,43 +483,53 @@ auto RepairInternalChild(BufferPool *pool, page_id_t parent_id, const PathStep &
       if (!parent.Fits()) {
         return false;
       }
-      combined.Store(left_page->Data());
+      combined.Store(left_page->Data(), left_page->Id());
       left_page->MarkDirty();
-      split.right.Store(right_page->Data());
+      split.right.Store(right_page->Data(), right_page->Id());
       right_page->MarkDirty();
-      parent.Store(parent_page->Data());
+      parent.Store(parent_page->Data(), parent_page->Id());
       parent_page->MarkDirty();
       return false;
     }
 
-    combined.Store(left_page->Data());
+    combined.Store(left_page->Data(), left_page->Id());
     left_page->MarkDirty();
     parent.EraseSeparator(sep_index);
-    parent.Store(parent_page->Data());
+    parent.Store(parent_page->Data(), parent_page->Id());
     parent_page->MarkDirty();
   }
 
-  // The merged-away sibling, unpinned above.
+  // Free the merged-away sibling. Deferred to here because the pool
+  // insists on an unpinned page, and the scope above just released the pin.
   pool->FreePage(right_id);
   return true;
 }
 
-// While the root is an internal node with no separators, its single child is
-// the whole tree: copy the child over the root page (stable root page id).
+// Shrinks the tree after deletes: while the root is an internal node with
+// no separators left, its lone child is the entire tree, so the child is
+// copied over the root page and the child's page is freed.
 auto CollapseRoot(BufferPool *pool, page_id_t root_page_id) -> Status {
   /*
-    Root collapse preserves the root page id just like root split.
+    The inverse of a root split, with the same motivation: the engine
+    persists one root page id and this tree never changes it, so the tree
+    must shrink by pulling content up into the root page rather than by
+    declaring some other page the new root.
 
-      before:
-        root page P: internal, first_child = C, no separators
-        child C:     leaf or internal containing the whole tree
+        before:
+          root page P: internal, first_child = C, no separators
+          page C:      leaf or internal holding the whole remaining tree
 
-      after:
-        root page P: byte-for-byte copy of C
-        page C:      freed
+        after:
+          root page P: byte-for-byte copy of C
+          page C:      freed
 
-    The loop handles cascaded collapses, for example when P copies an
-    internal child that also has a single child.
+    The copy is deliberately raw: C may be a leaf or an internal node, and
+    a whole-page memcpy is correct for either without decoding it. This is
+    one of the two places this file touches page bytes directly.
+
+    The loop handles cascades — if C was itself an internal node with a
+    single child, the freshly copied root collapses again — and stops as
+    soon as the root is a leaf or has at least one separator.
   */
   for (;;) {
     page_id_t child_id = HEADER_PAGE_ID;
@@ -426,7 +538,7 @@ auto CollapseRoot(BufferPool *pool, page_id_t root_page_id) -> Status {
       if (!root_page) {
         return std::move(root_page).error();
       }
-      if (ReadAs<NodeHeader>(root_page->Data()).type != NodeType::Internal) {
+      if (RawNodeType(root_page->Data()) != static_cast<std::uint16_t>(NodeType::Internal)) {
         return {};
       }
       const auto root = InternalNode::Load(root_page->Data());
@@ -438,7 +550,13 @@ auto CollapseRoot(BufferPool *pool, page_id_t root_page_id) -> Status {
       if (!child_page) {
         return std::move(child_page).error();
       }
-      std::memcpy(root_page->Data(), child_page->Data(), PAGE_SIZE);
+      const auto child_type = RawNodeType(child_page->Data());
+      if (child_type == static_cast<std::uint16_t>(NodeType::Leaf)) {
+        LeafNode::Load(child_page->Data()).Store(root_page->Data(), root_page->Id());
+      } else {
+        TINYDB_CHECK(child_type == static_cast<std::uint16_t>(NodeType::Internal), "root child is not a tree node");
+        InternalNode::Load(child_page->Data()).Store(root_page->Data(), root_page->Id());
+      }
       root_page->MarkDirty();
     }
     // The swallowed child's page, unpinned above.
@@ -448,19 +566,26 @@ auto CollapseRoot(BufferPool *pool, page_id_t root_page_id) -> Status {
 
 }  // namespace
 
+// Attaches to the tree rooted at root_page_id. The caller allocates the
+// root page; a zeroed page is bootstrapped into an empty leaf here, so the
+// engine never needs to know what an empty tree looks like on disk. Fails
+// if the root page cannot be read or holds something that is not a tree
+// node.
 auto BPlusTree::Open(BufferPool *buffer_pool, page_id_t root_page_id) -> Result<BPlusTree> {
   TINYDB_CHECK(buffer_pool != nullptr, "buffer pool is null");
   TINYDB_CHECK(root_page_id != HEADER_PAGE_ID, "root page id is the reserved header page");
 
-  // A freshly allocated page is all zeroes; bootstrap it as an empty leaf.
-  // NodeType has no zero enumerator, so inspect the raw bytes.
+  // A freshly allocated page arrives zeroed, and NodeType deliberately has
+  // no zero enumerator, so "type bytes are zero" reliably identifies a
+  // virgin root. Sniff the raw bytes rather than casting: any value other
+  // than zero, Leaf, or Internal means this page was never a tree root.
   auto root_page = PageRef::Fetch(buffer_pool, root_page_id);
   if (!root_page) {
     return std::unexpected(std::move(root_page).error());
   }
-  const auto raw_type = ReadAs<std::uint16_t>(root_page->Data());
+  const auto raw_type = RawNodeType(root_page->Data());
   if (raw_type == 0) {
-    LeafNode{}.Store(root_page->Data());
+    LeafNode{}.Store(root_page->Data(), root_page->Id());
     root_page->MarkDirty();
     return BPlusTree(buffer_pool, root_page_id);
   }
@@ -474,19 +599,27 @@ auto BPlusTree::Open(BufferPool *buffer_pool, page_id_t root_page_id) -> Result<
 
 auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   /*
-    Insert/update path:
+    Insert or update, structured as descend + upsert + carry propagation:
 
-      1. Descend to the owning leaf.
-      2. Upsert in memory.
-      3. If the leaf fits, rewrite it and stop.
-      4. If it overflows, split it. A non-root split returns a pending
-         separator for the parent; a root split builds a new root in place.
-      5. Propagate the pending separator upward until some parent absorbs
-         it or the root splits.
+      1. Descend to the leaf that owns key, recording the path.
+      2. Upsert into that leaf's records in memory.
+      3. If the leaf still fits, rewrite its page — the common case; done.
+      4. Otherwise split it. A non-root split hands back a separator that
+         must be inserted one level up; a root split rebuilds the root in
+         place and hands back nothing.
+      5. Insert the pending separator into the parent, which may overflow
+         and split in turn. Walk up the recorded path until some ancestor
+         absorbs the separator or the root itself splits.
 
     The pending separator is the only state carried between levels:
 
         pending = (separator key, right child page id)
+
+    Each iteration of the loop below either consumes it (the parent had
+    room) or replaces it with the next level's separator (the parent
+    split). The check that the carry never outruns the recorded path holds
+    because a root split always ends the cascade: SplitAndWrite absorbs
+    the separator into the rebuilt root and returns nothing.
   */
   TINYDB_CHECK(key.size() + value.size() <= MAX_ENTRY_BYTES, "entry exceeds MAX_ENTRY_BYTES; enforce sizes before Put");
   const auto path = DescendToLeaf(buffer_pool_, root_page_id_, key);
@@ -504,7 +637,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     const bool at_tail = node.Upsert(key, value);
 
     if (node.Fits()) {
-      node.Store(leaf_page->Data());
+      node.Store(leaf_page->Data(), leaf_page->Id());
       leaf_page->MarkDirty();
       return {};
     }
@@ -517,7 +650,8 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     pending = std::move(*split);
   }
 
-  // Insert the pending separator into the ancestors, splitting as needed.
+  // Carry the pending separator up the recorded path, splitting whichever
+  // ancestors overflow along the way.
   std::size_t level = path->size() - 1;
   while (pending.has_value()) {
     TINYDB_CHECK(level > 0, "pending separator escaped the root");
@@ -530,7 +664,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     node.InsertSeparator(std::move(pending->key), pending->right_child);
 
     if (node.Fits()) {
-      node.Store(page->Data());
+      node.Store(page->Data(), page->Id());
       page->MarkDirty();
       return {};
     }
@@ -543,6 +677,9 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   return {};
 }
 
+// A point lookup is the descent and nothing else: find the one leaf that
+// can hold key, then binary search its records. Missing keys and present
+// keys cost the same page reads.
 auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> {
   const auto path = DescendToLeaf(buffer_pool_, root_page_id_, key);
   if (!path) {
@@ -557,21 +694,30 @@ auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> 
 
 auto BPlusTree::Remove(std::string_view key) -> Status {
   /*
-    Delete path:
+    Delete, structured as descend + erase + bottom-up repair:
 
-      1. Descend to the owning leaf.
-      2. Remove the record and rewrite the leaf.
-      3. If the leaf is still at least half full, stop.
-      4. Otherwise repair bottom-up.
+      1. Descend to the leaf that owns key, recording the path.
+      2. Erase the key and rewrite the leaf. A missing key is success —
+         the key is absent either way — and writes nothing.
+      3. If the leaf is still at least half full, or is the root (which
+         has no minimum), done.
+      4. Otherwise repair upward along the recorded path.
 
-    A repair can end three ways:
+    Each repair combines the underfull node with an adjacent sibling and
+    ends one of three ways (see RepairLeafChild for the details):
 
-      rebalance: child count unchanged, parent separator updated, stop
-      skipped:   child remains underfull but routing is still correct, stop
-      merge:     parent loses one separator, so the parent may underflow too
+        rebalance: records redistributed, parent separator swapped; the
+                   parent's child count is unchanged, so stop.
+        skip:      the repair would not fit in the parent; the node stays
+                   underfull but routing is intact, so stop.
+        merge:     two children became one and the parent lost a
+                   separator — the parent may now be underfull itself,
+                   so continue to the next level up.
 
-    When the cascade reaches the root, CollapseRoot removes useless single
-    child internal roots while keeping root_page_id_ stable.
+    Only merges propagate, which is why the loop keys off the repair's
+    returned bool and re-checks the parent at each level. If a merge
+    cascade empties the root down to a single child, CollapseRoot shrinks
+    the tree's height while keeping root_page_id_ stable.
   */
   const auto path = DescendToLeaf(buffer_pool_, root_page_id_, key);
   if (!path) {
@@ -586,7 +732,7 @@ auto BPlusTree::Remove(std::string_view key) -> Status {
     if (!node.Erase(key)) {
       return {};
     }
-    node.Store(leaf_page->Data());
+    node.Store(leaf_page->Data(), leaf_page->Id());
     leaf_page->MarkDirty();
 
     const bool is_root_leaf = path->size() == 1;
@@ -595,8 +741,9 @@ auto BPlusTree::Remove(std::string_view key) -> Status {
     }
   }
 
-  // Repair underfull nodes bottom-up. A rebalance (or a skipped repair) ends
-  // the walk; a merge shrinks the parent, which may need repair itself.
+  // The bottom-up repair walk. The first iteration repairs the leaf, so it
+  // pairs leaves; every later iteration repairs an internal node that lost
+  // a separator to a merge below it.
   bool leaf_level = true;
   for (std::size_t level = path->size() - 1; level > 0; --level) {
     const auto merged = leaf_level ? RepairLeafChild(buffer_pool_, (*path)[level - 1].page_id, (*path)[level])
@@ -610,7 +757,10 @@ auto BPlusTree::Remove(std::string_view key) -> Status {
     leaf_level = false;
 
     if (level - 1 == 0) {
-      break;  // the parent is the root; handled by CollapseRoot below
+      // The parent is the root, and the root has no underfull threshold —
+      // its only degenerate shape is "single child", which CollapseRoot
+      // fixes below.
+      break;
     }
     auto parent_page = PageRef::Fetch(buffer_pool_, (*path)[level - 1].page_id);
     if (!parent_page) {
@@ -626,18 +776,32 @@ auto BPlusTree::Remove(std::string_view key) -> Status {
 auto BPlusTree::Scan(std::string_view start,
                      std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>> {
   /*
-    Range scan is a seek plus leaf-chain walk:
+    A range scan over [start, end) — end exclusive — is one descent
+    followed by a walk along the leaf chain:
 
-      DescendToLeaf(start)
-              |
-              v
-        lower_bound(start) in first leaf
-              |
-              v
-        emit records until key >= end, following next_leaf links
+        DescendToLeaf(start)
+                |
+                v
+        first leaf: lower_bound skips records below start
+                |
+                v
+        emit records in key order, hopping next_leaf links,
+        until a key reaches end or the chain runs out
 
-    The end bound is exclusive. Internal pages are not touched after the
-    initial seek; the linked leaves are the ordered scan structure.
+    Internal nodes are only touched by the initial descent. After that the
+    linked leaves are the entire iteration structure — this walk is the
+    reason the chain exists.
+
+    The chain's end sentinel is HEADER_PAGE_ID: page 0 is superblock A and
+    can never be a tree page, so "next leaf is page 0" safely
+    doubles as "no next leaf".
+
+    The walk carries its own cycle guard (DescendToLeaf's depth check
+    only protects the descent). A healthy chain is strictly ascending —
+    each leaf's first key sorts after everything the previous leaf held —
+    and a corrupt next_leaf link that loops the chain back on itself
+    breaks that ordering at the first revisited leaf, because keys are
+    unique. So checking the order at every hop is a cycle check too.
   */
   auto rows = std::vector<std::pair<std::string, std::string>>{};
   const auto path = DescendToLeaf(buffer_pool_, root_page_id_, start);
@@ -646,6 +810,7 @@ auto BPlusTree::Scan(std::string_view start,
   }
 
   auto page_id = path->back().page_id;
+  auto previous_last_key = std::optional<std::string>{};
   while (page_id != HEADER_PAGE_ID) {
     auto leaf_page = PageRef::Fetch(buffer_pool_, page_id);
     if (!leaf_page) {
@@ -653,6 +818,11 @@ auto BPlusTree::Scan(std::string_view start,
     }
     const auto node = LeafNode::Load(leaf_page->Data());
     const auto &records = node.Records();
+    if (!records.empty()) {
+      const bool ascending = !previous_last_key.has_value() || *previous_last_key < records.front().key;
+      TINYDB_CHECK(ascending, "leaf chain out of key order; page cycle likely");
+      previous_last_key = records.back().key;
+    }
     auto it =
         std::lower_bound(records.begin(), records.end(), start,
                          [](const LeafNode::Record &record, std::string_view target) { return record.key < target; });
@@ -665,6 +835,104 @@ auto BPlusTree::Scan(std::string_view start,
     page_id = node.NextLeaf();
   }
   return rows;
+}
+
+auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<page_id_t> &free_pages) -> Status {
+  if (root_page_id_ == HEADER_PAGE_ID || root_page_id_ >= next_page_id) {
+    return Status::Corruption("root page is outside the allocation frontier");
+  }
+  if (free_pages.contains(root_page_id_)) {
+    return Status::Corruption("root page is on the free list");
+  }
+
+  struct Summary {
+    std::optional<std::string> minimum;
+    std::optional<std::string> maximum;
+  };
+
+  auto visited = std::unordered_set<page_id_t>{};
+  auto leaf_pages = std::vector<std::pair<page_id_t, page_id_t>>{};
+  using Bound = std::optional<std::string>;
+
+  std::function<Result<Summary>(page_id_t, const Bound &, const Bound &)> visit;
+  visit = [&](page_id_t page_id, const Bound &lower, const Bound &upper) -> Result<Summary> {
+    if (page_id == HEADER_PAGE_ID || page_id >= next_page_id) {
+      return std::unexpected(Status::Corruption("tree references a page outside the allocation frontier"));
+    }
+    if (free_pages.contains(page_id)) {
+      return std::unexpected(Status::Corruption("tree references a page on the free list"));
+    }
+    if (!visited.insert(page_id).second) {
+      return std::unexpected(Status::Corruption("tree contains a duplicate page reference or cycle"));
+    }
+
+    auto page = PageRef::Fetch(buffer_pool_, page_id);
+    if (!page) {
+      return std::unexpected(std::move(page).error());
+    }
+    const auto type = RawNodeType(page->Data());
+    if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
+      const auto node = LeafNode::Load(page->Data());
+      const auto &records = node.Records();
+      for (const auto &record : records) {
+        if ((lower.has_value() && record.key < *lower) || (upper.has_value() && record.key >= *upper)) {
+          return std::unexpected(Status::Corruption("leaf key lies outside its parent routing range"));
+        }
+      }
+      leaf_pages.emplace_back(page_id, node.NextLeaf());
+      if (records.empty()) {
+        return Summary{};
+      }
+      return Summary{.minimum = records.front().key, .maximum = records.back().key};
+    }
+    if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
+      return std::unexpected(Status::Corruption("reachable page is not a B+ tree node"));
+    }
+
+    const auto node = InternalNode::Load(page->Data());
+    auto result = Summary{};
+    for (std::size_t child_index = 0; child_index <= node.SeparatorCount(); ++child_index) {
+      const auto child_lower = child_index == 0 ? lower : Bound{node.SeparatorKeyAt(child_index - 1)};
+      const auto child_upper = child_index == node.SeparatorCount() ? upper : Bound{node.SeparatorKeyAt(child_index)};
+      if (child_lower.has_value() && child_upper.has_value() && *child_lower >= *child_upper) {
+        return std::unexpected(Status::Corruption("internal node has an invalid routing range"));
+      }
+      auto child = visit(node.ChildAt(child_index), child_lower, child_upper);
+      if (!child) {
+        return std::unexpected(std::move(child).error());
+      }
+      if (!result.minimum.has_value() && child->minimum.has_value()) {
+        result.minimum = child->minimum;
+      }
+      if (child->maximum.has_value()) {
+        result.maximum = child->maximum;
+      }
+    }
+    return result;
+  };
+
+  auto root = visit(root_page_id_, Bound{}, Bound{});
+  if (!root) {
+    return std::move(root).error();
+  }
+
+  for (std::size_t i = 0; i < leaf_pages.size(); ++i) {
+    const auto expected_next = i + 1 < leaf_pages.size() ? leaf_pages[i + 1].first : HEADER_PAGE_ID;
+    if (leaf_pages[i].second != expected_next) {
+      return Status::Corruption("leaf chain does not match tree order");
+    }
+  }
+
+  for (const auto page_id : free_pages) {
+    if (page_id == HEADER_PAGE_ID || page_id >= next_page_id) {
+      return Status::Corruption("free-list page is outside the allocation frontier");
+    }
+  }
+  const auto allocated_pages = next_page_id - FIRST_DATA_PAGE_ID;
+  if (visited.size() + free_pages.size() != allocated_pages) {
+    return Status::Corruption("allocated page is neither reachable nor free");
+  }
+  return {};
 }
 
 }  // namespace tinydb

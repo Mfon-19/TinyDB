@@ -8,9 +8,11 @@
 
 namespace tinydb {
 
-// Pins a page in the buffer pool for the lifetime of the object; unpins on
-// destruction. Call MarkDirty() after writing through Data() so the unpin
-// records the page as dirty.
+// A scoped pin on one buffer-pool page: the pool's pin/unpin bookkeeping,
+// done by object lifetime instead of by hand. While a PageRef lives, its
+// page cannot be evicted and Data() stays valid; destruction returns the
+// pin, reporting the page dirty iff MarkDirty() was called — so call it
+// after every write through Data(), or the change may never reach disk.
 class PageRef {
  public:
   // Pins page_id, fetching it from disk if it is not already cached.

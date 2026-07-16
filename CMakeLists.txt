@@ -71,8 +71,8 @@ add_library(
   include/tinydb/b_plus_tree.h
   include/tinydb/buffer_pool.h
   include/tinydb/check.h
+  include/tinydb/database_uuid.h
   include/tinydb/disk_manager.h
-  include/tinydb/file_header.h
   include/tinydb/page.h
   include/tinydb/page_ref.h
   include/tinydb/status.h
@@ -84,19 +84,23 @@ add_library(
   src/btree/internal_node.h
   src/btree/leaf_node.cpp
   src/btree/leaf_node.h
+  src/btree/page_format.cpp
   src/btree/page_format.h
   src/buffer/buffer_pool.cpp
   src/engine/storage_engine.cpp
   src/io/syscalls.h
   src/storage/disk_manager.cpp
   src/storage/encoding.h
+  src/storage/page_codec.cpp
+  src/storage/page_codec.h
   src/storage/superblock.cpp
   src/storage/superblock.h
   src/txn/contract.h
   src/txn/state.h
   src/util/crc32.h
-  src/util/checksums.h
-  src/wal/wal.cpp)
+  src/wal/wal.cpp
+  src/wal/wal_codec.cpp
+  src/wal/wal_codec.h)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
 target_compile_features(TinyDB PUBLIC cxx_std_23)
 target_include_directories(
@@ -139,6 +143,8 @@ if(BUILD_TESTING)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/buffer_pool_test.cpp")
     add_executable(TinyDB_buffer_pool_test tests/buffer_pool_test.cpp)
     target_link_libraries(TinyDB_buffer_pool_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_buffer_pool_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_buffer_pool_test)
     gtest_discover_tests(TinyDB_buffer_pool_test)
   endif()

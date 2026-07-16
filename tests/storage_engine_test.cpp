@@ -1,9 +1,13 @@
 #include <gtest/gtest.h>
+#include <tinydb/page.h>
 #include <tinydb/status.h>
 #include <tinydb/storage_engine.h>
 #include <tinydb/wal.h>
 
 #include "io/syscalls.h"
+#include "storage/superblock.h"
+#include "support/transaction_model.h"
+#include "wal/wal_codec.h"
 
 #include <unistd.h>
 
@@ -14,11 +18,18 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace {
+
+auto TestUuid(std::byte last = std::byte{1}) -> tinydb::DatabaseUuid {
+  auto uuid = tinydb::DatabaseUuid{};
+  uuid.back() = last;
+  return uuid;
+}
 
 // Scan end bound past every key this suite generates.
 constexpr const char *SCAN_END = "\x7f";
@@ -113,6 +124,63 @@ TEST_F(StorageEngineTest, PutGetRemoveRoundTrip) {
   EXPECT_EQ(engine.Get("banana").value(), std::optional<std::string>{"yellow"});
 }
 
+TEST_F(StorageEngineTest, IntegrityCheckSurvivesSplitsMergesAndReopen) {
+  {
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
+    for (int row = 0; row < 500; ++row) {
+      ASSERT_TRUE(engine.Put(RowKey(row), RowValue(row, 700)).Ok());
+    }
+    for (int row = 0; row < 350; ++row) {
+      ASSERT_TRUE(engine.Remove(RowKey(row)).Ok());
+    }
+    EXPECT_TRUE(engine.CheckIntegrity().Ok());
+    ASSERT_TRUE(engine.Close().Ok());
+  }
+
+  auto reopened = tinydb::StorageEngine::Open(db_path_).value();
+  EXPECT_TRUE(reopened.CheckIntegrity().Ok());
+  EXPECT_EQ(reopened.Scan("", SCAN_END).value().size(), 150U);
+}
+
+TEST_F(StorageEngineTest, RandomizedModelSurvivesCheckpointsAndReopens) {
+  auto expected = tinydb::test_support::TransactionModel{};
+  auto random = std::mt19937_64{0x54494e594442ULL};
+
+  for (int epoch = 0; epoch < 10; ++epoch) {
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
+    for (int step = 0; step < 200; ++step) {
+      const auto row = static_cast<int>(random() % 300U);
+      const auto key = RowKey(row);
+      const auto action = random() % 4U;
+      if (action < 2U) {
+        const auto length = static_cast<std::size_t>((random() % 850U) + 1U);
+        const auto value = RowValue(row + epoch + step, length);
+        ASSERT_TRUE(engine.Put(key, value).Ok());
+        auto transaction = expected.BeginWrite();
+        ASSERT_TRUE(transaction.has_value());
+        ASSERT_EQ(transaction->Put(key, value), tinydb::StatusCode::Ok);
+        ASSERT_TRUE(transaction->Commit());
+      } else if (action == 2U) {
+        ASSERT_TRUE(engine.Remove(key).Ok());
+        auto transaction = expected.BeginWrite();
+        ASSERT_TRUE(transaction.has_value());
+        ASSERT_EQ(transaction->Delete(key), tinydb::StatusCode::Ok);
+        ASSERT_TRUE(transaction->Commit());
+      } else {
+        const auto found = engine.Get(key);
+        ASSERT_TRUE(found.has_value());
+        EXPECT_EQ(*found, expected.Get(key));
+      }
+    }
+
+    const auto integrity = engine.CheckIntegrity();
+    ASSERT_TRUE(integrity.Ok()) << integrity.ToString();
+    const auto rows = engine.Scan("", SCAN_END).value();
+    EXPECT_EQ(rows, expected.Scan());
+    ASSERT_TRUE(engine.Close().Ok());
+  }
+}
+
 TEST_F(StorageEngineTest, PutReplacesExistingValue) {
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
 
@@ -173,6 +241,27 @@ TEST_F(StorageEngineTest, ClosedHandleRefusesWork) {
   // The pre-close write reached the file.
   auto reopened = tinydb::StorageEngine::Open(db_path_).value();
   EXPECT_EQ(reopened.Get("key").value(), std::optional<std::string>{"value"});
+}
+
+TEST_F(StorageEngineTest, OpenFailsWhileAnotherHandleHoldsTheDatabase) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(engine.Put(RowKey(1), "first").Ok());
+
+  // The exclusive lock turns a second Open away — before its recovery
+  // could truncate the log the live handle is still appending to.
+  const auto second = tinydb::StorageEngine::Open(db_path_);
+  ASSERT_FALSE(second.has_value());
+  EXPECT_EQ(second.error().Code(), tinydb::StatusCode::Busy);
+
+  // The live handle is unharmed by the refused attempt.
+  ASSERT_TRUE(engine.Put(RowKey(2), "second").Ok());
+
+  // Close releases the lock, and everything written under it survives.
+  ASSERT_TRUE(engine.Close().Ok());
+  auto reopened = tinydb::StorageEngine::Open(db_path_);
+  ASSERT_TRUE(reopened.has_value());
+  EXPECT_EQ(reopened->Get(RowKey(1)).value(), std::optional<std::string>{"first"});
+  EXPECT_EQ(reopened->Get(RowKey(2)).value(), std::optional<std::string>{"second"});
 }
 
 TEST_F(StorageEngineTest, DataSurvivesExplicitClose) {
@@ -308,7 +397,7 @@ TEST_F(StorageEngineTest, OpenRejectsForeignFiles) {
 
   const auto result = tinydb::StorageEngine::Open(db_path_);
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::InvalidArgument);
+  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::UnsupportedFormat);
 }
 
 TEST_F(StorageEngineTest, OpenRejectsForeignFilesBeforeWalReplay) {
@@ -322,16 +411,18 @@ TEST_F(StorageEngineTest, OpenRejectsForeignFilesBeforeWalReplay) {
   }();
 
   {
-    auto wal = tinydb::Wal::Open(tinydb::Wal::PathFor(db_path_)).value();
-    const auto image = std::string(tinydb::PAGE_SIZE, 'x');
-    wal.AppendPageImage(0, image.data());
+    const auto uuid = TestUuid();
+    auto wal = tinydb::Wal::Open(tinydb::Wal::PathFor(db_path_), uuid).value();
+    const auto image = tinydb::storage::EncodeSuperblock(tinydb::storage::Superblock{.database_uuid = uuid});
+    ASSERT_TRUE(image.has_value());
+    wal.AppendPageImage(0, reinterpret_cast<const char *>(image->data()));
     ASSERT_TRUE(wal.Commit().Ok());
   }
   const auto wal_size_before = std::filesystem::file_size(tinydb::Wal::PathFor(db_path_));
 
   const auto result = tinydb::StorageEngine::Open(db_path_);
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::InvalidArgument);
+  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::UnsupportedFormat);
 
   {
     auto file = std::ifstream{db_path_, std::ios::binary};
@@ -341,7 +432,51 @@ TEST_F(StorageEngineTest, OpenRejectsForeignFilesBeforeWalReplay) {
   EXPECT_EQ(std::filesystem::file_size(tinydb::Wal::PathFor(db_path_)), wal_size_before);
 }
 
+TEST_F(StorageEngineTest, OpenReturnsCorruptionForADamagedDataPage) {
+  {
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
+    ASSERT_TRUE(engine.Put("key", "value").Ok());
+    ASSERT_TRUE(engine.Close().Ok());
+  }
+
+  {
+    auto file = std::fstream{db_path_, std::ios::binary | std::ios::in | std::ios::out};
+    ASSERT_TRUE(file.is_open());
+    file.seekp(static_cast<std::streamoff>(tinydb::FIRST_DATA_PAGE_ID) * tinydb::PAGE_SIZE);
+    const char damaged_magic = '\0';
+    file.write(&damaged_magic, 1);
+    ASSERT_TRUE(file.good());
+  }
+
+  const auto result = tinydb::StorageEngine::Open(db_path_);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::Corruption);
+}
+
 }  // namespace
+
+TEST_F(StorageEngineTest, OpenRefusesAWalFromAnotherDatabase) {
+  // Two healthy databases, each with its own UUID and its own (empty) log.
+  {
+    auto engine = tinydb::StorageEngine::Open(db_path_).value();
+    ASSERT_TRUE(engine.Put(RowKey(1), "mine").Ok());
+    ASSERT_TRUE(engine.Close().Ok());
+  }
+  {
+    auto engine = tinydb::StorageEngine::Open(second_db_path_).value();
+    ASSERT_TRUE(engine.Put(RowKey(1), "theirs").Ok());
+    ASSERT_TRUE(engine.Close().Ok());
+  }
+
+  // Pair the first database with the second one's log — the copy-paste
+  // accident the UUID exists to catch.
+  std::filesystem::remove(tinydb::Wal::PathFor(db_path_));
+  std::filesystem::copy_file(tinydb::Wal::PathFor(second_db_path_), tinydb::Wal::PathFor(db_path_));
+
+  const auto result = tinydb::StorageEngine::Open(db_path_);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::InvalidArgument);
+}
 
 TEST_F(StorageEngineTest, CommittedWritesSurviveACrash) {
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
@@ -376,10 +511,10 @@ TEST_F(StorageEngineTest, CleanCloseEmptiesTheLog) {
     ASSERT_TRUE(engine.Close().Ok());
   }
 
-  // Close checkpointed: the log is down to its 4-byte header, and the
+  // Close checkpointed: the log is down to its encoded header, and the
   // database file alone carries the data.
   const auto wal_path = tinydb::Wal::PathFor(db_path_);
-  EXPECT_EQ(std::filesystem::file_size(wal_path), 4U);
+  EXPECT_EQ(std::filesystem::file_size(wal_path), tinydb::wal_format::HEADER_BYTES);
 
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
   EXPECT_EQ(engine.Get("k").value(), "v");

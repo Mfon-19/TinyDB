@@ -17,6 +17,8 @@
 // The suite asserts on tree structure by inspecting raw page headers, so it
 // reaches into the library's private on-disk format header.
 #include "btree/page_format.h"
+#include "storage/encoding.h"
+#include "storage/page_codec.h"
 
 namespace {
 
@@ -114,7 +116,7 @@ class BPlusTreeTest : public ::testing::Test {
 
   auto RootType() -> tinydb::NodeType {
     char *page = pool_->FetchPage(root_page_id_).value();
-    const auto type = reinterpret_cast<tinydb::NodeHeader *>(page)->type;
+    const auto type = static_cast<tinydb::NodeType>(tinydb::RawNodeType(page));
     pool_->UnpinPage(root_page_id_, false);
     return type;
   }
@@ -125,8 +127,10 @@ class BPlusTreeTest : public ::testing::Test {
     auto page_id = root_page_id_;
     for (;;) {
       char *page = pool_->FetchPage(page_id).value();
-      const auto type = reinterpret_cast<tinydb::NodeHeader *>(page)->type;
-      const auto first_child = reinterpret_cast<tinydb::InternalHeader *>(page)->first_child;
+      const auto type = static_cast<tinydb::NodeType>(tinydb::RawNodeType(page));
+      const auto first_child = tinydb::storage::GetLittleEndian<tinydb::page_id_t>(
+                                   std::as_bytes(std::span{page, tinydb::PAGE_SIZE}), tinydb::node_page_offset::LINK)
+                                   .value();
       pool_->UnpinPage(page_id, false);
       if (type == tinydb::NodeType::Leaf) {
         return depth;
@@ -141,8 +145,10 @@ class BPlusTreeTest : public ::testing::Test {
     auto page_id = root_page_id_;
     for (;;) {
       char *page = pool_->FetchPage(page_id).value();
-      const auto type = reinterpret_cast<tinydb::NodeHeader *>(page)->type;
-      const auto first_child = reinterpret_cast<tinydb::InternalHeader *>(page)->first_child;
+      const auto type = static_cast<tinydb::NodeType>(tinydb::RawNodeType(page));
+      const auto first_child = tinydb::storage::GetLittleEndian<tinydb::page_id_t>(
+                                   std::as_bytes(std::span{page, tinydb::PAGE_SIZE}), tinydb::node_page_offset::LINK)
+                                   .value();
       pool_->UnpinPage(page_id, false);
       if (type == tinydb::NodeType::Leaf) {
         break;
@@ -153,7 +159,9 @@ class BPlusTreeTest : public ::testing::Test {
     int length = 0;
     while (page_id != tinydb::HEADER_PAGE_ID) {
       char *page = pool_->FetchPage(page_id).value();
-      const auto next_leaf = reinterpret_cast<tinydb::LeafHeader *>(page)->next_leaf;
+      const auto next_leaf = tinydb::storage::GetLittleEndian<tinydb::page_id_t>(
+                                 std::as_bytes(std::span{page, tinydb::PAGE_SIZE}), tinydb::node_page_offset::LINK)
+                                 .value();
       pool_->UnpinPage(page_id, false);
       page_id = next_leaf;
       ++length;
@@ -319,6 +327,27 @@ TEST_F(BPlusTreeTest, MaxSizedEntries) {
   ExpectMatchesModel();
 }
 
+TEST_F(BPlusTreeDeathTest, CyclicLeafChainAborts) {
+  ASSERT_TRUE(tree_->Put("a", "1").Ok());
+  ASSERT_TRUE(tree_->Put("b", "2").Ok());
+
+  // Corrupt the root leaf's next-leaf link to point back at itself: the
+  // shape a damaged page could hand a Scan, which must abort rather than
+  // walk the chain forever.
+  char *page = pool_->FetchPage(root_page_id_).value();
+  auto page_bytes = std::as_writable_bytes(std::span{page, tinydb::PAGE_SIZE});
+  ASSERT_TRUE(tinydb::storage::PutLittleEndian(page_bytes, tinydb::node_page_offset::LINK, root_page_id_));
+  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(page_bytes).Ok());
+  pool_->UnpinPage(root_page_id_, true);
+
+  EXPECT_DEATH(
+      {
+        const auto rows = tree_->Scan("a", SCAN_END);
+        static_cast<void>(rows);
+      },
+      "leaf chain out of key order");
+}
+
 TEST_F(BPlusTreeDeathTest, OversizedEntryAborts) {
   const auto key = RowKey(1);
   const auto value = RowValue(1, tinydb::MAX_ENTRY_BYTES - key.size() + 1);
@@ -441,37 +470,39 @@ TEST_F(BPlusTreeTest, SurvivesReopen) {
 // them itself.
 TEST_F(BPlusTreeTest, TombstoneCellsStayDead) {
   const auto [page_id, page] = pool_->NewPage().value();
-
-  auto *header = reinterpret_cast<tinydb::LeafHeader *>(page);
-  *header = tinydb::LeafHeader{
-      .type = tinydb::NodeType::Leaf,
-      .cell_count = 0,
-      .free_start = sizeof(tinydb::LeafHeader),
-      .free_end = static_cast<std::uint16_t>(tinydb::PAGE_SIZE),
-      .next_leaf = tinydb::HEADER_PAGE_ID,
-  };
-  auto *slots = reinterpret_cast<std::uint16_t *>(page + sizeof(tinydb::LeafHeader));
+  auto bytes = std::as_writable_bytes(std::span{page, tinydb::PAGE_SIZE});
+  ASSERT_TRUE(tinydb::storage::InitializeDataPage(
+                  bytes, tinydb::storage::DataPageType::Leaf, page_id, 0,
+                  static_cast<std::uint16_t>(tinydb::PAGE_SIZE - tinydb::storage::data_page_offset::HEADER_BYTES))
+                  .Ok());
+  auto cell_count = std::uint16_t{0};
+  auto free_end = static_cast<std::uint16_t>(tinydb::PAGE_SIZE);
 
   const auto append_cell = [&](const std::string &key, const std::string &value, std::uint8_t flags) {
-    const auto cell_size = sizeof(tinydb::LeafCellHeader) + key.size() + value.size();
-    const auto offset =
-        static_cast<std::uint16_t>((header->free_end - cell_size) & ~std::size_t{alignof(tinydb::LeafCellHeader) - 1});
-    const auto cell_header = tinydb::LeafCellHeader{
-        .key_size = static_cast<std::uint16_t>(key.size()),
-        .value_size = static_cast<std::uint16_t>(value.size()),
-        .flags = flags,
-    };
-    std::memcpy(page + offset, &cell_header, sizeof(cell_header));
-    std::copy_n(key.data(), key.size(), page + offset + sizeof(cell_header));
-    std::copy_n(value.data(), value.size(), page + offset + sizeof(cell_header) + key.size());
-    slots[header->cell_count] = offset;
-    ++header->cell_count;
-    header->free_start = static_cast<std::uint16_t>(header->free_start + sizeof(std::uint16_t));
-    header->free_end = offset;
+    const auto cell_size = tinydb::LEAF_CELL_HEADER_SIZE + key.size() + value.size();
+    const auto offset = static_cast<std::uint16_t>(free_end - cell_size);
+    ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, offset + tinydb::leaf_cell_offset::KEY_BYTES,
+                                                 static_cast<std::uint16_t>(key.size())));
+    ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, offset + tinydb::leaf_cell_offset::VALUE_BYTES,
+                                                 static_cast<std::uint16_t>(value.size())));
+    bytes[offset + tinydb::leaf_cell_offset::FLAGS] = static_cast<std::byte>(flags);
+    std::copy_n(key.data(), key.size(), page + offset + tinydb::LEAF_CELL_HEADER_SIZE);
+    std::copy_n(value.data(), value.size(), page + offset + tinydb::LEAF_CELL_HEADER_SIZE + key.size());
+    ASSERT_TRUE(
+        tinydb::storage::PutLittleEndian(bytes, tinydb::LEAF_HEADER_SIZE + cell_count * tinydb::SLOT_SIZE, offset));
+    ++cell_count;
+    free_end = offset;
   };
 
   append_cell("live", "here", 0);
   append_cell("zombie", "gone", 1);
+  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::node_page_offset::CELL_COUNT, cell_count));
+  ASSERT_TRUE(tinydb::storage::PutLittleEndian(
+      bytes, tinydb::node_page_offset::FREE_START,
+      static_cast<std::uint16_t>(tinydb::LEAF_HEADER_SIZE + cell_count * tinydb::SLOT_SIZE)));
+  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::node_page_offset::FREE_END, free_end));
+  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::node_page_offset::LINK, tinydb::HEADER_PAGE_ID));
+  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
   pool_->UnpinPage(page_id, true);
 
   auto tree = tinydb::BPlusTree::Open(&*pool_, page_id).value();

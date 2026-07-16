@@ -1,5 +1,6 @@
 #pragma once
 
+#include <tinydb/database_uuid.h>
 #include <tinydb/page.h>
 #include <tinydb/status.h>
 
@@ -10,7 +11,6 @@
 
 namespace tinydb::storage {
 
-using DatabaseUuid = std::array<std::byte, 16>;
 using SuperblockPage = std::array<std::byte, PAGE_SIZE>;
 
 inline constexpr auto SUPERBLOCK_MAGIC = std::array{
@@ -20,7 +20,7 @@ inline constexpr auto SUPERBLOCK_MAGIC = std::array{
 inline constexpr std::uint16_t FORMAT_MAJOR = 1;
 inline constexpr std::uint16_t FORMAT_MINOR = 0;
 inline constexpr std::uint64_t SUPPORTED_REQUIRED_FEATURES = 0;
-inline constexpr page_id_t FIRST_FORMAT_DATA_PAGE_ID = 2;
+inline constexpr page_id_t FIRST_FORMAT_DATA_PAGE_ID = FIRST_DATA_PAGE_ID;
 
 namespace superblock_offset {
 inline constexpr std::size_t MAGIC = 0;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -25,6 +26,7 @@ enum class Syscall {
   Pwrite,
   Fsync,
   Ftruncate,
+  Flock,
 };
 
 struct Call {
@@ -120,6 +122,13 @@ inline auto Ftruncate(int fd, std::uint64_t size) -> int {
     return -1;
   }
   return ::ftruncate(fd, static_cast<off_t>(size));
+}
+
+inline auto Flock(int fd, int operation) -> int {
+  if (MaybeFault(Call{.syscall = Syscall::Flock, .path = PathForFd(fd), .fd = fd, .flags = operation})) {
+    return -1;
+  }
+  return ::flock(fd, operation);
 }
 
 }  // namespace tinydb::io
