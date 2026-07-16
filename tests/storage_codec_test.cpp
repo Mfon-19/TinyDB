@@ -19,6 +19,12 @@
 #include <string>
 #include <vector>
 
+/*
+** Persistent-format tests use byte-distinct golden values and mutate encoded
+** fields only after deliberately resealing their checksums. This separates
+** framing/checksum failures from semantic validation and detects accidental
+** dependence on host endianness, padding, or native struct layout.
+*/
 namespace {
 
 using tinydb::DatabaseUuid;

@@ -15,9 +15,18 @@ class PageReader;
 
 namespace tinydb::txn {
 
-// Cursor over one admitted committed state. The snapshot token is declared
-// before the tree cursor so the page lease is destroyed before reader
-// admission is released.
+/*
+** SNAPSHOT READS
+**
+** A ReadSnapshot combines one ReaderGate admission with the committed page
+** reader. All operations start at the root captured in that admission. A
+** SnapshotCursor copies the admission token, so it may outlive the wrapper
+** that created it without allowing publication to invalidate its page bytes.
+**
+** Member destruction order is significant: snapshot_ is declared before the
+** tree cursor, so the cursor's page lease is released before the final reader
+** admission can be released.
+*/
 class SnapshotCursor final {
  public:
   SnapshotCursor(const SnapshotCursor &) = delete;
@@ -40,9 +49,13 @@ class SnapshotCursor final {
   friend class ReadSnapshot;
 };
 
-// Internal read-transaction core. PageReader is owned by the database and
-// remains alive while this token prevents Close; the captured DatabaseState
-// supplies the root for every operation in the snapshot.
+/*
+** Internal read-transaction core. PageReader is owned by the database. The
+** current compatibility facade completes snapshots inside one API call; the
+** public transaction layer will count the admission when deciding whether
+** Close is Busy. Returned point values are owning copies; cursor keys and
+** values remain borrowed from its current page.
+*/
 class ReadSnapshot final {
  public:
   static auto Begin(ReaderGate *gate, PageReader *pages) -> ReadSnapshot;

@@ -27,6 +27,20 @@
 namespace tinydb {
 namespace {
 
+/*
+** DATABASE FILE DURABILITY
+**
+** Pages 0 and 1 are alternating superblocks. Opening selects the valid copy
+** with the greatest generation. A fresh file is created in this order:
+**
+**   reserve pages -> write A -> fsync file -> fsync parent directory
+**                 -> write B -> fsync file
+**
+** Thus any completed creation has at least one durable, checksummed root of
+** state, and a crash before completion leaves either a retryable zero file or
+** a valid first copy. Data-page writes occur during checkpoint. The WAL stays
+** authoritative until those writes and the matching superblocks are synced.
+*/
 auto ErrnoStatus(std::string_view operation) -> Status {
   // Capture errno immediately at the syscall boundary; later library work can
   // overwrite the thread-local value and produce a misleading status.
@@ -190,6 +204,8 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
     return std::unexpected(selected.error());
   }
 
+  // Adopt the selected state only after both pages have been independently
+  // decoded. No persistent mutation occurs on the existing-file open path.
   disk.database_uuid_ = selected->value.database_uuid;
   disk.generation_ = selected->value.generation;
   disk.checkpoint_lsn_ = selected->value.checkpoint_lsn;
@@ -247,6 +263,8 @@ auto DiskManager::EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE>
 auto DiskManager::PrepareStateImage(page_id_t root_page_id, page_id_t allocator_root_page_id,
                                     page_id_t high_water_page_id, std::uint64_t transaction_id,
                                     std::uint64_t checkpoint_lsn) const -> Result<PageImage> {
+  // Preparing uses the inactive slot and next generation but deliberately
+  // leaves every in-memory published field unchanged.
   const auto page_id = active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
   const auto encoded = EncodeSuperblock(root_page_id, allocator_root_page_id, high_water_page_id, transaction_id,
                                         checkpoint_lsn, generation_ + 1);
@@ -265,6 +283,9 @@ void DiskManager::AdoptState(page_id_t root_page_id, page_id_t allocator_root_pa
   TINYDB_CHECK(allocator_root_page_id == HEADER_PAGE_ID ||
                    (allocator_root_page_id >= FIRST_DATA_PAGE_ID && allocator_root_page_id < high_water_page_id),
                "adopting an invalid allocator root");
+  // This method performs no I/O. It mirrors an already durable state image in
+  // memory so subsequent checkpoint and open-state queries describe what was
+  // just published.
   ++generation_;
   active_superblock_page_id_ =
       active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
@@ -289,6 +310,8 @@ auto DiskManager::EnsurePageCount(page_id_t high_water_page_id) -> Status {
   if (high_water_page_id < FIRST_DATA_PAGE_ID) {
     return Status::InvalidArgument("allocation frontier overlaps superblocks");
   }
+  // File growth is physical preparation for checkpoint, not page allocation.
+  // The logical frontier was already committed before this call.
   if (io::Ftruncate(fd_.Get(), high_water_page_id * PAGE_SIZE) < 0) {
     return ErrnoStatus("ftruncate");
   }

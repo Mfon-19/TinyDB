@@ -12,9 +12,18 @@
 namespace tinydb {
 namespace {
 
-// Validation observes persistent bytes; it never normalizes them in place.
+/*
+** Validation observes persistent bytes and never normalizes them in place.
+** Once this routine succeeds, page views rely on its proof and use internal
+** checks only to detect an impossible mutation of supposedly immutable bytes.
+*/
 auto Bytes(const char *page) -> std::span<const std::byte> { return std::as_bytes(std::span{page, PAGE_SIZE}); }
 
+/*
+** Validate the complete slot/cell region for one node. In addition to local
+** bounds, this proves canonical free_start, strict key order, legal child
+** references, and non-overlapping interpretation of the cell payloads.
+*/
 auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, std::uint16_t cell_count,
                    std::uint16_t free_start, std::uint16_t free_end) -> Status {
   // Builders emit one canonical slot boundary. Exact equality catches a cell
@@ -81,6 +90,7 @@ auto RawNodeType(const char *page) -> std::uint16_t {
 }
 
 auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status {
+  // Common framing and checksum validation always precede tree-local offsets.
   const auto bytes = Bytes(page);
   const auto common = storage::DecodeDataPageHeader(bytes, expected_page_id);
   if (!common) {

@@ -15,6 +15,12 @@
 #include <utility>
 #include <vector>
 
+/*
+** Cache tests distinguish three properties that are easy to conflate:
+** immutable version lifetime, eviction eligibility, and LRU policy. Encoded
+** overflow pages provide checksummed marker bytes, so every assertion reads a
+** valid persistent image rather than inspecting an ad-hoc test buffer.
+*/
 namespace {
 
 using tinydb::cache::CommittedPageCache;

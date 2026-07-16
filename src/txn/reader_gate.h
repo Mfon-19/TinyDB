@@ -14,9 +14,27 @@ class PublicationGuard;
 struct ReaderGateControl;
 struct SnapshotLease;
 
-// Copying a token shares one reader admission. A transaction and all cursors
-// created from it therefore count as one active reader until the final copy is
-// destroyed, regardless of which thread performs that destruction.
+/*
+** READER ADMISSION AND PUBLICATION
+**
+** The gate gives many readers one immutable DatabaseState while allowing one
+** publisher to replace that state atomically. Write preparation does not use
+** the gate and may overlap readers.
+**
+** Admission has two phases:
+**
+**   OPEN:     BeginRead captures current state and increments active_readers.
+**   DRAINING: a publisher blocks new readers and waits for the count to reach
+**             zero. It may then replace committed pages and DatabaseState.
+**
+** Marking publication pending before waiting is the fairness boundary. A
+** steady stream of new readers cannot indefinitely postpone a writer that is
+** already waiting to publish.
+**
+** Copying SnapshotToken shares one admission. A transaction and all cursors
+** created from it count as one active reader until the final token copy is
+** destroyed, even if that destruction occurs on another thread.
+*/
 class SnapshotToken final {
  public:
   SnapshotToken() = default;
@@ -39,9 +57,6 @@ struct ReaderGateStats {
   std::optional<std::chrono::steady_clock::duration> oldest_reader_age;
 };
 
-// Coordinates snapshot admission with the short publication phase. Preparing
-// a write does not touch this gate; only publication closes admission and
-// waits for readers that captured the previous committed state.
 class ReaderGate final {
  public:
   explicit ReaderGate(std::shared_ptr<const DatabaseState> initial_state);
@@ -58,9 +73,12 @@ class ReaderGate final {
   std::shared_ptr<ReaderGateControl> control_;
 };
 
-// BeginPublication returns with admission closed and every previous reader
-// drained. The caller may splice cache pages and replace State while holding
-// this guard; destruction always reopens admission, including failure paths.
+/*
+** BeginPublication returns a guard only after admission is closed and every
+** previous reader has drained. The caller may replace pages and State while
+** holding it. Destruction always reopens admission, including an abandoned
+** pre-publication path.
+*/
 class PublicationGuard final {
  public:
   PublicationGuard() = default;

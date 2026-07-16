@@ -24,20 +24,27 @@
 #include "txn/contract.h"
 
 /*
- * Cross-page B+ tree algorithms live here. Page views validate and search one
- * encoded page; page builders own one mutable logical page. This file decides
- * which pages are related: descent paths, split propagation, sibling repair,
- * root replacement, and full-tree verification.
- *
- * Internal separators are inclusive lower bounds for their right child, so an
- * equal key always routes right. Leaves contain all values and form a strictly
- * increasing forward chain. Root identity is ordinary logical state: growth
- * allocates a root above the old one, and collapse promotes the sole child.
- *
- * Mutations rebuild complete pages. Underfull pages are valid; repair is a
- * space policy applied after logical deletion. A page is retired only after
- * every handle to it has left scope.
- */
+** CROSS-PAGE B+ TREE ALGORITHMS
+**
+** Page views validate and search one encoded page. Page builders own one
+** mutable logical page. This file establishes relationships between pages:
+** descent paths, split propagation, sibling repair, root replacement, leaf
+** chaining, and full-tree verification.
+**
+** Internal separators are inclusive lower bounds for their right child, so an
+** equal key always routes right. Leaves contain all values and form a strictly
+** increasing forward chain. Root identity is ordinary logical state: growth
+** allocates a new root above the old one, and collapse promotes the sole child.
+**
+** Put writes the destination leaf, then carries at most one pending separator
+** upward. Each ancestor absorbs that separator or splits and replaces it with
+** another. Remove first completes logical deletion. Occupancy repair is a
+** separate space policy: underfull pages remain correct, redistribution may
+** stop propagation, and only a merge removes a parent edge and continues up.
+**
+** Pages are retired only after every handle to them leaves scope. PageSource,
+** not the tree, decides when the retired physical ID may be reused.
+*/
 
 namespace tinydb {
 namespace {
@@ -558,6 +565,11 @@ auto BPlusTree::CheckIntegrity(PageReader *pages, page_id_t root_page_id, page_i
     return Status::Corruption("root page is on the free list");
   }
 
+  /*
+  ** The recursive walk proves parent routing ranges, page ownership, and
+  ** single reachability. It records leaves in in-order traversal so a second
+  ** pass can compare the physical successor chain with logical tree order.
+  */
   struct Summary {
     std::optional<std::string> minimum;
     std::optional<std::string> maximum;
@@ -611,6 +623,8 @@ auto BPlusTree::CheckIntegrity(PageReader *pages, page_id_t root_page_id, page_i
       return std::unexpected(node.error());
     }
     auto result = Summary{};
+    // Child ranges are half-open. The first inherits the caller's lower bound;
+    // the last inherits its upper bound; middle ranges use adjacent separators.
     for (std::size_t child_index = 0; child_index <= node->SeparatorCount(); ++child_index) {
       const auto child_lower = child_index == 0 ? lower : Bound{std::string{node->KeyAt(child_index - 1)}};
       const auto child_upper =
@@ -644,6 +658,8 @@ auto BPlusTree::CheckIntegrity(PageReader *pages, page_id_t root_page_id, page_i
     }
   }
 
+  // Finally account for every ID below the high-water frontier exactly once:
+  // reachable tree, reusable extent, or allocator metadata.
   for (const auto page_id : free_pages) {
     if (page_id == HEADER_PAGE_ID || page_id >= next_page_id) {
       return Status::Corruption("free-list page is outside the allocation frontier");

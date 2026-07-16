@@ -8,8 +8,22 @@
 
 namespace tinydb {
 
-// Move-only lease that keeps page bytes stable. The opaque owner and function
-// pointer type-erase release without allocating on reads.
+/*
+** PAGE ACCESS BOUNDARY
+**
+** B+ tree algorithms know only four operations: Read, Edit, Allocate and
+** Free. They do not know whether bytes came from the committed cache, a write
+** transaction overlay, or an in-memory test model.
+**
+** Every successful operation returns a move-only PageHandle. While the handle
+** lives, its byte address and page identity are stable. A source may not reuse
+** or destroy the underlying page until the handle invokes its release
+** callback. Read handles are immutable. Edit and Allocate handles accumulate
+** a sticky dirty bit that is returned to their source exactly once.
+**
+** The opaque owner and function pointer type-erase release without allocating
+** a wrapper on the ordinary read path.
+*/
 class PageHandle {
  public:
   using Release = void (*)(void *owner, page_id_t page_id, bool dirty);
@@ -59,8 +73,7 @@ class PageHandle {
   std::shared_ptr<const void> keepalive_;
 };
 
-// Read algorithms depend only on stable immutable leases. Mutation contexts
-// extend this boundary instead of making read-only caches expose fake writes.
+/* Read algorithms depend only on stable immutable leases. */
 class PageReader {
  public:
   virtual ~PageReader() = default;
@@ -68,8 +81,11 @@ class PageReader {
   virtual auto Read(page_id_t page_id) -> Result<PageHandle> = 0;
 };
 
-// The mutation vocabulary used by a write overlay or the legacy buffer-pool
-// adapter. Free may only retire an ID with no outstanding lease.
+/*
+** Mutation contexts add copy/edit, allocation, and retirement. Free declares
+** the page logically unreachable; it may be called only with no outstanding
+** lease. The concrete source decides when physical ID reuse becomes safe.
+*/
 class PageSource : public PageReader {
  public:
   virtual auto Edit(page_id_t page_id) -> Result<PageHandle> = 0;

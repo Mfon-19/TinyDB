@@ -18,6 +18,12 @@
 #include <utility>
 #include <vector>
 
+/*
+** DiskManager tests exercise the physical-file boundary independently of tree
+** allocation. They verify prepared-versus-adopted metadata, dual-superblock
+** selection, creation synchronization order, short-file rejection, and the
+** distinction between logical high-water state and physical file extension.
+*/
 namespace {
 
 auto TestPath(const std::string &name) -> std::filesystem::path {

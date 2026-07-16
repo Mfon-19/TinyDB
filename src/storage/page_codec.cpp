@@ -13,15 +13,33 @@
 namespace tinydb::storage {
 namespace {
 
+/*
+** FREE-EXTENT PAYLOAD
+**
+**   32 next allocator page u64
+**   40 extent count u16
+**   42 reserved u16
+**   44 reserved u32
+**   48 repeated entries:
+**        first page u64, page count u64, retirement LSN u64
+**
+** The outer common header carries the exact live payload length. The unused
+** tail remains zero and participates in the page checksum.
+*/
 constexpr std::size_t EXTENT_NEXT_PAGE_OFFSET = data_page_offset::HEADER_BYTES;
 constexpr std::size_t EXTENT_COUNT_OFFSET = EXTENT_NEXT_PAGE_OFFSET + sizeof(page_id_t);
 constexpr std::size_t EXTENT_RESERVED_OFFSET = EXTENT_COUNT_OFFSET + sizeof(std::uint16_t);
 constexpr std::size_t EXTENT_ENTRIES_OFFSET = EXTENT_RESERVED_OFFSET + sizeof(std::uint16_t) + sizeof(std::uint32_t);
 constexpr std::size_t EXTENT_ENTRY_BYTES = sizeof(page_id_t) + sizeof(std::uint64_t) + sizeof(std::uint64_t);
 
-// Overflow payload: logical total length, next link, this page's byte count,
-// then exactly that many bytes. Keeping the local byte count explicit avoids
-// inferring live data from zero padding.
+/*
+** OVERFLOW PAYLOAD
+**
+**   32 total logical value bytes u64
+**   40 next overflow page u64
+**   48 bytes stored in this page u16
+**   50 payload bytes, followed by checksum-covered zero padding
+*/
 constexpr std::size_t OVERFLOW_TOTAL_BYTES_OFFSET = data_page_offset::HEADER_BYTES;
 constexpr std::size_t OVERFLOW_NEXT_PAGE_OFFSET = OVERFLOW_TOTAL_BYTES_OFFSET + sizeof(std::uint64_t);
 constexpr std::size_t OVERFLOW_DATA_BYTES_OFFSET = OVERFLOW_NEXT_PAGE_OFFSET + sizeof(page_id_t);
@@ -157,6 +175,9 @@ auto DecodeDataPageHeader(std::span<const std::byte> page, page_id_t expected_pa
 
 auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t next_page_id,
                           std::span<const FreeExtent> extents) -> Result<std::array<char, PAGE_SIZE>> {
+  // Validate the complete logical page before emitting any bytes. In
+  // particular, adjacent extents must already have been coalesced by the
+  // transaction allocator so there is one canonical representation.
   if (next_page_id != HEADER_PAGE_ID && next_page_id < FIRST_DATA_PAGE_ID) {
     return std::unexpected(Status::InvalidArgument("free-extent link overlaps the superblocks"));
   }

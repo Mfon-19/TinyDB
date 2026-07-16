@@ -19,6 +19,12 @@
 #include <thread>
 #include <utility>
 
+/*
+** These integration tests join ReaderGate, committed cache, PageReader, and
+** B+ tree cursor behavior. They verify that a captured root remains stable,
+** cursor admission outlives its wrapper, and publication cannot replace old
+** page versions until the final cursor lease is released.
+*/
 namespace {
 
 using namespace std::chrono_literals;

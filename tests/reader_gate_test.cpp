@@ -11,6 +11,12 @@
 #include <utility>
 #include <vector>
 
+/*
+** Reader-gate tests force the visibility state machine at thread boundaries:
+** shared admission, token copies, publisher fairness, draining, abandoned
+** publication, and admission reopening. Atomic flags coordinate only the test;
+** correctness under test remains entirely inside ReaderGate.
+*/
 namespace {
 
 using namespace std::chrono_literals;

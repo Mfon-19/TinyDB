@@ -12,17 +12,30 @@
 
 namespace tinydb {
 
-// A physical page image suitable for redo logging. The bytes are already in
-// their final on-disk representation, including identity and checksum, so WAL
-// recovery never needs to invoke B+ tree or allocator logic.
+/*
+** DISK MANAGER BOUNDARY
+**
+** DiskManager owns the database file descriptor and the metadata represented
+** by the currently published superblock. It performs physical page I/O and
+** durable superblock selection; it does not allocate, retire, or reuse logical
+** page IDs. Those operations belong to TransactionPages.
+**
+** Logical publication and checkpointing are separate. PrepareStateImage
+** creates a redo-ready alternate superblock without changing this object's
+** published fields. AdoptState changes those fields only after WAL durability
+** and cache publication. Checkpoint writes the current state to the database
+** file so that older WAL can eventually be discarded.
+*/
+
+/*
+** A physical image suitable for redo. The bytes already contain their final
+** identity and checksum, so recovery does not invoke tree or allocator logic.
+*/
 struct PageImage {
   page_id_t page_id;
   std::array<char, PAGE_SIZE> data;
 };
 
-// Owns database-file I/O and the currently published superblock state. Logical
-// allocation belongs to TransactionPages; this layer never reserves, frees,
-// or reuses a page ID on behalf of an uncommitted operation.
 class DiskManager {
  public:
   static auto Open(const std::filesystem::path &path) -> Result<DiskManager>;

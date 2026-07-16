@@ -6,8 +6,12 @@ namespace tinydb::cache {
 
 class CommittedPageCache;
 
-// Read-only bridge from immutable cache guards to the B+ tree's page-reader
-// boundary. Write vocabulary is absent by type, not rejected at runtime.
+/*
+** Read-only bridge from cache guards to the tree's PageReader boundary.
+** Write vocabulary is absent by type rather than rejected at runtime. Guard
+** conversion transfers the existing cache pin and shared frame lifetime into
+** a generic PageHandle without copying encoded bytes.
+*/
 class CommittedPageSource final : public PageReader {
  public:
   explicit CommittedPageSource(CommittedPageCache *cache) : cache_(cache) {}

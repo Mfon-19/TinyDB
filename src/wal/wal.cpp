@@ -30,15 +30,37 @@
 namespace tinydb {
 namespace {
 
-// PAGE_IMAGE payload: [page ID u64][exact 4096-byte encoded page]. The page
-// retains its own checksum and identity in addition to the WAL record CRC.
+/*
+** CURRENT WAL PROTOCOL
+**
+** The current compatibility writer collects final page images in memory,
+** appends the complete run and its binding Commit record, then calls fsync.
+** That fsync is the durability point. StorageEngine may publish only after it
+** succeeds. On append or sync failure the durable tail is not advanced in
+** memory and the engine stops accepting work until reopen.
+**
+** Recovery scans complete records from the header. It retains one transaction
+** run in memory and writes no database page until the Commit record validates
+** the run. A malformed record in the durable middle is corruption; an
+** incomplete final run is an uncommitted torn tail. Redo writes physical page
+** images, fsyncs the database, and only then truncates the WAL back to its
+** header. Repeating recovery after a crash is therefore idempotent.
+*/
+
+/*
+** PAGE_IMAGE payload: [page ID u64][exact 4096-byte encoded page]. The page
+** retains its own checksum and identity in addition to the WAL record CRC.
+*/
 constexpr std::size_t PAGE_IMAGE_PAGE_ID_OFFSET = 0;
 constexpr std::size_t PAGE_IMAGE_DATA_OFFSET = sizeof(page_id_t);
 constexpr std::size_t PAGE_IMAGE_PAYLOAD_BYTES = PAGE_IMAGE_DATA_OFFSET + PAGE_SIZE;
-// COMMIT payload: [image count u32][CRC of encoded image records u32]
-//                 [commit-record LSN u64].
-// These redundant bindings prevent a valid-looking commit record from
-// accepting a run with a missing, duplicated, or reordered middle image.
+/*
+** COMMIT payload: [image count u32][CRC of encoded image records u32]
+**                 [commit-record LSN u64].
+**
+** These redundant bindings prevent a valid-looking commit record from
+** accepting a run with a missing, duplicated, or reordered middle image.
+*/
 constexpr std::size_t COMMIT_IMAGE_COUNT_OFFSET = 0;
 constexpr std::size_t COMMIT_DIGEST_OFFSET = 4;
 constexpr std::size_t COMMIT_LSN_OFFSET = 8;
@@ -249,6 +271,13 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
   auto created_db_file = false;
   auto offset = static_cast<std::uint64_t>(wal_format::HEADER_BYTES);
 
+  /*
+  ** PASS THROUGH THE LOG
+  **
+  ** The current implementation validates and replays each committed run in a
+  ** single pass. Milestone 7 will separate validation from replay, but the
+  ** committed-run and torn-tail rules here remain the protocol foundation.
+  */
   while (offset < wal_size) {
     // Read only the total-length prefix first. This bounds allocation before a
     // corrupt record can make recovery allocate an arbitrary amount of memory.
@@ -482,8 +511,13 @@ auto Wal::Commit() -> Status {
   TINYDB_CHECK(commit.has_value(), "failed to encode WAL commit record");
   pending_.insert(pending_.end(), commit->begin(), commit->end());
 
-  // One contiguous append preserves run ordering; the following fsync is the
-  // exact point after which StorageEngine may acknowledge durability.
+  /*
+  ** DURABILITY POINT
+  **
+  ** One contiguous append preserves record order. The subsequent fsync is the
+  ** exact point after which StorageEngine may acknowledge durability. Nothing
+  ** below advances the known-good tail until that synchronization succeeds.
+  */
   if (auto status = FullPwrite(fd_.Get(), pending_.data(), pending_.size(), size_bytes_); !status.Ok()) {
     return status;
   }

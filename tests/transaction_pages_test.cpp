@@ -23,6 +23,13 @@
 #include <utility>
 #include <vector>
 
+/*
+** Transaction overlay tests compare private allocation and mutation with a
+** simple immutable committed-page model. Tests cover definite abort at every
+** memory boundary, checkpoint-gated reuse, allocator-index growth, root
+** changes, and randomized commit/abort sequences. Publishing in this harness
+** is explicit so assertions can inspect base state before and after transfer.
+*/
 namespace {
 
 class MemoryCommitted final : public tinydb::PageReader {

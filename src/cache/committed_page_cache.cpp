@@ -16,6 +16,12 @@
 
 namespace tinydb::cache {
 
+/*
+** A frame owns exactly one immutable encoded page version. page_lsn orders
+** physical versions of the same page; transaction_id associates the version
+** with its logical publication. checkpointed controls eviction eligibility,
+** not visibility.
+*/
 struct CommittedFrame final {
   CommittedFrame(page_id_t initial_page_id, std::uint64_t initial_page_lsn, std::uint64_t initial_transaction_id,
                  std::unique_ptr<PageBytes> initial_bytes, bool initially_checkpointed)
@@ -25,10 +31,10 @@ struct CommittedFrame final {
         bytes(std::move(initial_bytes)),
         checkpointed(initially_checkpointed) {}
 
-  page_id_t page_id;
-  std::uint64_t page_lsn;
-  std::uint64_t transaction_id;
-  std::unique_ptr<PageBytes> bytes;
+  page_id_t page_id;                 // physical page identity
+  std::uint64_t page_lsn;            // physical version ordering
+  std::uint64_t transaction_id;      // logical publication that installed it
+  std::unique_ptr<PageBytes> bytes;  // immutable after construction
 
   // Pins and checkpoint status are cache metadata, not page contents. The
   // encoded bytes remain const after this object is constructed.
@@ -83,6 +89,9 @@ void PageGuard::Reset() noexcept {
 
 auto PageGuard::IntoPageHandle() && -> PageHandle {
   TINYDB_CHECK(frame_ != nullptr, "transferring an empty committed-page guard");
+  // PageHandle type-erases the shared owner. keeper preserves the frame after
+  // this guard relinquishes its shared_ptr, while release transfers the exact
+  // existing pin instead of incrementing and decrementing around conversion.
   auto keeper = std::static_pointer_cast<const void>(frame_);
   auto *const frame = const_cast<CommittedFrame *>(frame_.get());
   const auto release = [](void *owner, page_id_t page_id, bool dirty) {
@@ -102,13 +111,13 @@ struct CommittedPageCache::Impl final {
     std::list<page_id_t>::iterator lru_position;
   };
 
-  DiskManager *disk;
+  DiskManager *disk;  // backing checkpointed database file
   const std::size_t target_bytes;
-  mutable std::mutex mutex;
+  mutable std::mutex mutex;  // protects every field below
   std::unordered_map<page_id_t, ResidentPage> pages;
   std::unordered_map<page_id_t, std::shared_ptr<CommittedFrame>> dirty_pages;
-  std::list<page_id_t> lru;
-  std::uint64_t checkpoint_lsn;
+  std::list<page_id_t> lru;      // most-recently-used page at the front
+  std::uint64_t checkpoint_lsn;  // eviction-safe durability frontier
 
   Impl(DiskManager *database_file, std::size_t byte_target, std::uint64_t initial_checkpoint_lsn)
       : disk(database_file), target_bytes(byte_target), checkpoint_lsn(initial_checkpoint_lsn) {}
@@ -120,6 +129,8 @@ struct CommittedPageCache::Impl final {
   }
 
   auto TryEvictOne() -> bool {
+    // Search from least-recently-used toward most-recently-used. A pinned or
+    // WAL-only frame is skipped rather than allowing policy to violate safety.
     for (auto candidate = lru.rbegin(); candidate != lru.rend(); ++candidate) {
       auto page = pages.find(*candidate);
       TINYDB_CHECK(page != pages.end(), "cache LRU references a missing page");
@@ -164,11 +175,16 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageGuard> {
     return PageGuard(existing->second.frame);
   }
 
+  // Disk reads obey the hard target. Unlike publication, a cache miss has no
+  // already-approved transaction overage and may fail if every frame is pinned
+  // or waiting for checkpoint.
   impl_->MakeRoomForRead();
   if ((impl_->pages.size() + 1) * PAGE_SIZE > impl_->target_bytes) {
     return std::unexpected(Status::ResourceExhausted("committed cache is full of pinned or uncheckpointed pages"));
   }
 
+  // The cache mutex remains held across I/O. This deliberately serializes a
+  // miss so a second reader cannot load and install a duplicate frame.
   auto bytes = std::make_unique<PageBytes>();
   if (auto status = impl_->disk->ReadPage(page_id, bytes->data()); !status.Ok()) {
     return std::unexpected(std::move(status));
@@ -201,6 +217,8 @@ auto CommittedPageCache::Install(CommittedPageImage image) -> Status {
   }
 
   auto lock = std::lock_guard(impl_->mutex);
+  // Replacement changes only the latest-version table. Guards retain shared
+  // ownership of the previous immutable frame until old snapshots drain.
   auto frame = std::make_shared<CommittedFrame>(image.page_id, image.page_lsn, image.transaction_id,
                                                 std::move(image.bytes), image.page_lsn <= impl_->checkpoint_lsn);
   if (const auto existing = impl_->pages.find(image.page_id); existing != impl_->pages.end()) {
@@ -241,6 +259,8 @@ void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
   TINYDB_CHECK(checkpoint_lsn >= impl_->checkpoint_lsn, "committed cache checkpoint frontier moved backward");
   impl_->checkpoint_lsn = checkpoint_lsn;
 
+  // Only versions at or below the new frontier are now reproducible from the
+  // database file. Later committed versions remain WAL-backed and non-evictable.
   for (auto page = impl_->dirty_pages.begin(); page != impl_->dirty_pages.end();) {
     if (page->second->page_lsn <= checkpoint_lsn) {
       page->second->checkpointed.store(true, std::memory_order_release);
@@ -278,6 +298,8 @@ auto CommittedPageCache::DirtyPages() -> std::vector<PageGuard> {
     ids.push_back(page_id);
   }
   std::ranges::sort(ids);
+  // Return guards in page-ID order. Checkpointing receives a stable version of
+  // every frame even if a later publication replaces the page-table entry.
   auto result = std::vector<PageGuard>{};
   result.reserve(ids.size());
   for (const auto page_id : ids) {

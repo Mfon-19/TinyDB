@@ -14,6 +14,12 @@
 namespace tinydb::storage {
 namespace {
 
+/*
+** A superblock encoder and decoder share the same semantic rules but report
+** violations differently. Impossible state supplied by in-memory code is an
+** InvalidArgument. The same impossible state reconstructed from a validly
+** framed page is Corruption.
+*/
 // Semantic checks that cannot be expressed by field widths alone. Encoding
 // reports these as InvalidArgument because the caller supplied impossible
 // state; decoding reports the same findings as Corruption because the state
@@ -192,6 +198,8 @@ auto SelectSuperblock(std::span<const std::byte> page_a,
     return SelectedSuperblock{.value = *first, .slot = SuperblockSlot::A};
   }
   if (first) {
+    // A single valid copy is sufficient. The next successful checkpoint will
+    // restore redundancy by writing the alternate slot.
     return SelectedSuperblock{.value = *first, .slot = SuperblockSlot::A};
   }
   if (second) {

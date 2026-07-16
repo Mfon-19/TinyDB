@@ -19,10 +19,17 @@
 #include "txn/contract.h"
 
 /*
- * LeafPageBuilder is private mutation state. It copies records from one
- * validated view, preserves strict key order and the successor link, and emits
- * one canonical packed page. It never interprets raw persistent offsets.
- */
+** LEAF PAGE MUTATION
+**
+** LeafPageBuilder is private mutation state. It copies logical records from
+** one validated view, preserves strict key order and the successor link, and
+** emits one canonical packed page. It never interprets persistent offsets.
+**
+** Every Store rebuilds the complete page, which removes fragmentation and
+** stale bytes. Splits choose an encoded-byte boundary rather than a record
+** count because values vary in size. The separator copied to the parent is the
+** right page's minimum key and remains present in that leaf.
+*/
 
 namespace tinydb {
 namespace {
@@ -139,6 +146,8 @@ auto LeafPageBuilder::ChooseSplitIndex() const -> std::size_t {
     prefix[i + 1] = prefix[i] + RecordFootprint(records_[i]);
   }
 
+  // Only boundaries where both encoded halves fit are candidates. Among
+  // those, prefer the smallest byte imbalance to stabilize occupancy.
   std::size_t best_split = 0;
   std::size_t best_imbalance = 0;
   bool found = false;

@@ -11,12 +11,18 @@ namespace tinydb::txn {
 
 using Clock = std::chrono::steady_clock;
 
+/*
+** Shared control outlives ReaderGate whenever admitted SnapshotTokens or an
+** in-progress PublicationGuard still exist. All non-atomic fields below are
+** protected by mutex. changed is notified when either admission reopens or a
+** reader departs, the two events on which a waiter can make progress.
+*/
 struct ReaderGateControl final {
-  mutable std::mutex mutex;
-  std::condition_variable changed;
+  mutable std::mutex mutex;         // protects every field below
+  std::condition_variable changed;  // admission or drain may progress
   std::shared_ptr<const DatabaseState> state;
-  bool publication_pending{false};
-  std::size_t active_readers{0};
+  bool publication_pending{false};  // admission is closed when true
+  std::size_t active_readers{0};    // leases, not token copies
 
   // A multiset preserves exact oldest-reader diagnostics even when several
   // transactions begin during the same clock tick.
@@ -34,6 +40,11 @@ struct SnapshotLease final {
       return;
     }
 
+    /*
+    ** The final shared token owns the one count decrement. The timestamp is
+    ** removed under the same mutex so Stats can never observe a count and age
+    ** derived from different reader populations.
+    */
     auto lock = std::lock_guard(control->mutex);
     TINYDB_CHECK(control->active_readers != 0, "reader gate active count underflow");
     const auto start = control->reader_starts.find(started_at);
@@ -72,6 +83,8 @@ auto ReaderGate::BeginRead() -> SnapshotToken {
   auto lock = std::unique_lock(control_->mutex);
   control_->changed.wait(lock, [this] { return !control_->publication_pending; });
 
+  // Capture the state and join the active set in one critical section. A
+  // publisher can therefore order this reader wholly before or after itself.
   const auto started_at = Clock::now();
   control_->reader_starts.insert(started_at);
   lease->state = control_->state;
@@ -138,6 +151,8 @@ void PublicationGuard::Publish(std::shared_ptr<const DatabaseState> state) {
   auto lock = std::lock_guard(control_->mutex);
   TINYDB_CHECK(control_->publication_pending && control_->active_readers == 0,
                "publishing outside an exclusive visibility phase");
+  // This pointer replacement is the visibility event. No admitted reader can
+  // observe it halfway through because the active reader population is empty.
   control_->state = std::move(state);
 }
 

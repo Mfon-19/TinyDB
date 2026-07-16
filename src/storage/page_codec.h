@@ -11,9 +11,21 @@
 
 namespace tinydb::storage {
 
-// Every non-superblock page starts with the same independently validated
-// header. This lets the buffer pool reject misplaced, stale, or corrupted
-// bytes before a page-type-specific decoder follows offsets inside them.
+/*
+** DATA PAGE FORMAT
+**
+** Every non-superblock page starts with one independently validated header.
+** A reader validates size, magic, checksum, format, type, physical page ID,
+** payload bounds, and flags before any type-specific decoder follows offsets
+** inside the payload. Persistent bytes are untrusted input; decode failures
+** return Corruption or UnsupportedFormat and never invoke TINYDB_CHECK.
+**
+** Page construction has two phases. InitializeDataPage zeroes the complete
+** page and writes the common fields. A type-specific builder writes its
+** payload. FinalizeDataPage then seals all 4096 bytes with a checksum. This
+** ordering prevents deleted records, allocator fragments, or stale memory from
+** surviving in checksum-covered free space.
+*/
 inline constexpr auto DATA_PAGE_MAGIC = std::array{
     std::byte{0x54},
     std::byte{0x44},
@@ -29,14 +41,16 @@ enum class DataPageType : std::uint16_t {
   Overflow = 4,
 };
 
-// Common 32-byte page header:
-//
-//   0  magic[4]       8  page ID u64       24 payload bytes u16
-//   4  type u16      16  page LSN u64      26 flags u16
-//   6  version u16                         28 page CRC-32 u32
-//
-// The checksum covers all 4 KiB with its own field treated as zero. Thus both
-// meaningful fields and unused/reserved bytes are protected from corruption.
+/*
+** Common 32-byte page header:
+**
+**   0  magic[4]       8  page ID u64       24 payload bytes u16
+**   4  type u16      16  page LSN u64      26 flags u16
+**   6  version u16                         28 page CRC-32 u32
+**
+** The checksum covers all 4 KiB with its own field treated as zero. Both
+** meaningful fields and unused or reserved bytes are therefore protected.
+*/
 namespace data_page_offset {
 inline constexpr std::size_t MAGIC = 0;
 inline constexpr std::size_t TYPE = 4;
@@ -65,33 +79,37 @@ struct FreeExtent {
   auto operator==(const FreeExtent &) const -> bool = default;
 };
 
-// Allocator pages form a forward chain containing sorted, non-overlapping free
-// extents. The retirement frontier prevents reuse while an older checkpoint or
-// WAL history can still attach the page ID to its previous contents.
+/*
+** Allocator pages form a forward chain of sorted, non-overlapping, coalesced
+** extents. retire_lsn prevents reuse while an older checkpoint or WAL history
+** can still associate the page ID with its previous contents.
+*/
 struct FreeExtentPage {
   page_id_t next_page_id;
   std::vector<FreeExtent> extents;
 };
 
-// Large values will be split across overflow pages. total_value_bytes is
-// repeated on the chain so readers can preflight allocation and validate that
-// the chain reconstructs exactly the advertised logical value.
+/*
+** Large values will be split across overflow pages. total_value_bytes is
+** repeated so a reader can preflight its result allocation and verify that a
+** chain reconstructs exactly the advertised logical length.
+*/
 struct OverflowPage {
   std::uint64_t total_value_bytes;
   page_id_t next_page_id;
   std::vector<std::byte> payload;
 };
 
-// Page construction is deliberately two-phase. InitializeDataPage zeroes the
-// page and writes the common header; the type-specific encoder then writes its
-// payload; FinalizeDataPage seals the finished bytes with their checksum.
 auto InitializeDataPage(std::span<std::byte> page, DataPageType type, page_id_t page_id, std::uint64_t page_lsn,
                         std::uint16_t payload_bytes) -> Status;
 auto FinalizeDataPage(std::span<std::byte> page) -> Status;
 auto RewriteDataPageLsn(std::span<std::byte> page, page_id_t expected_page_id, std::uint64_t page_lsn) -> Status;
 
-// expected_page_id is the page's physical file position. Persisting the ID in
-// the page and checking it here detects misplaced writes and stale page reuse.
+/*
+** expected_page_id is the physical file position. Comparing it with the
+** persisted identity detects misplaced writes and stale bytes exposed by page
+** reuse.
+*/
 auto DecodeDataPageHeader(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<DataPageHeader>;
 
 inline constexpr std::size_t FREE_EXTENTS_PER_PAGE = 168;

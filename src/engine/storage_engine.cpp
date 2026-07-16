@@ -34,6 +34,33 @@
 namespace tinydb {
 namespace {
 
+/*
+** STORAGE ENGINE COORDINATION
+**
+** The engine joins four state domains:
+**
+**   TransactionPages       private, mutable, and discardable
+**   WAL                    durable state newer than the checkpoint
+**   CommittedPageCache     currently visible immutable page versions
+**   DiskManager            checkpointed file and published metadata
+**
+** A mutation follows this order:
+**
+**   acquire writer -> prepare private tree/allocator changes -> freeze
+**   -> encode final state -> append and fsync WAL -> drain old readers
+**   -> install pages and roots -> reopen reader admission -> optionally ckpt
+**
+** Before WAL synchronization, every failure is a definite abort because no
+** shared state has changed. After synchronization the transaction is durable
+** and publication must complete. The current bridge still performs cache
+** installation after that point; Milestone 6 replaces it with a fully prepared
+** noexcept publication plan.
+**
+** Checkpoint writes visible dirty pages and matching superblocks to the
+** database file, fsyncs that file, and only then resets WAL. Close is resource
+** release plus a final checkpoint; successful mutations do not depend on it
+** for durability.
+*/
 constexpr std::size_t CACHE_TARGET_BYTES = 64 * PAGE_SIZE;
 constexpr std::size_t WRITE_TRANSACTION_LIMIT_BYTES = 16U << 20U;
 constexpr std::uint64_t CHECKPOINT_THRESHOLD_BYTES = 1U << 20U;
@@ -97,6 +124,14 @@ auto InitialState(const DiskManager &disk) -> std::shared_ptr<const txn::Databas
 }  // namespace
 
 auto StorageEngine::Open(const std::filesystem::path &path) -> Result<StorageEngine> {
+  /*
+  ** OPEN ORDER
+  **
+  ** Process ownership comes first because recovery mutates both database and
+  ** WAL. Recovery completes before DiskManager selects superblocks and before
+  ** any cache can retain page bytes. Only after all layers agree on one state
+  ** is the handle exposed to the caller.
+  */
   auto lock = AcquireDatabaseLock(path);
   if (!lock) {
     return std::unexpected(std::move(lock).error());
@@ -218,6 +253,7 @@ auto StorageEngine::Get(std::string_view key) -> Result<std::optional<std::strin
   if (poisoned_) {
     return std::unexpected(Status::Closed("Get on a poisoned handle; reopen to recover"));
   }
+  // Admission captures root and visibility frontier before tree descent.
   auto snapshot = txn::ReadSnapshot::Begin(readers_.get(), pages_.get());
   return snapshot.Get(key);
 }
@@ -246,6 +282,8 @@ auto StorageEngine::Scan(std::string_view start,
   if (!cursor) {
     return std::unexpected(std::move(cursor).error());
   }
+  // The public compatibility API materializes rows, but traversal itself is a
+  // streaming snapshot cursor and retains only one leaf page at a time.
   auto rows = std::vector<std::pair<std::string, std::string>>{};
   const auto less = txn::BytewiseLess{};
   while (cursor->Valid() && less(cursor->Key(), end)) {
@@ -265,6 +303,8 @@ auto StorageEngine::CheckIntegrity() -> Status {
     return Status::Closed("CheckIntegrity on a poisoned handle; reopen to recover");
   }
 
+  // Decode the allocator through TransactionPages so verification and normal
+  // allocation share one interpretation of free extents and metadata pages.
   const auto state = readers_->CurrentState();
   auto transaction = txn::TransactionPages::Begin(pages_.get(), *state, WRITE_TRANSACTION_LIMIT_BYTES);
   if (!transaction) {
@@ -283,6 +323,13 @@ auto StorageEngine::CheckIntegrity() -> Status {
 }
 
 auto StorageEngine::Mutate(Mutation mutation, std::string_view key, std::string_view value) -> Status {
+  /*
+  ** PREPARE PRIVATE STATE
+  **
+  ** writer_mutex_ admits one mutable overlay. Readers remain admitted and see
+  ** base while all tree splits, merges, root changes, and allocator updates are
+  ** confined to TransactionPages.
+  */
   auto writer = std::lock_guard(*writer_mutex_);
   // Readers remain admitted during preparation and continue seeing base while
   // every B+ tree and allocator change lives in the private overlay.
@@ -294,6 +341,8 @@ auto StorageEngine::Mutate(Mutation mutation, std::string_view key, std::string_
 
   auto root_page_id = base->root_page_id;
   if (root_page_id == HEADER_PAGE_ID) {
+    // Fresh database bootstrap is an ordinary private allocation. Releasing
+    // the handle before BPlusTree::Open satisfies its edit-lease discipline.
     auto root = transaction->Allocate();
     if (!root) {
       transaction->Abort();
@@ -327,11 +376,17 @@ auto StorageEngine::Mutate(Mutation mutation, std::string_view key, std::string_
     return status;
   }
   if (!transaction->HasChanges()) {
+    // Removing a missing key produces no WAL traffic or visibility event.
     return {};
   }
 
-  // Everything through Freeze is a definite-abort region. No shared page,
-  // root, frontier, or free extent has changed if one of those steps fails.
+  /*
+  ** BUILD FINAL IMAGES
+  **
+  ** Everything through Freeze is a definite-abort region. No shared page,
+  ** root, frontier, or free extent has changed if one of those steps fails.
+  ** PrepareStateImage likewise changes no DiskManager field.
+  */
   const auto state = transaction->ResultingState();
   auto state_image = disk_->PrepareStateImage(state.root_page_id, state.allocator_root_page_id,
                                               state.high_water_page_id, state.transaction_id, state.checkpoint_lsn);
@@ -345,9 +400,13 @@ auto StorageEngine::Mutate(Mutation mutation, std::string_view key, std::string_
   }
   auto published_state = std::make_shared<const txn::DatabaseState>(state);
 
-  // The current WAL is a temporary durability bridge until Milestone 6. The
-  // final ownership direction is already established: private images are
-  // logged before they can become visible.
+  /*
+  ** MAKE DURABLE
+  **
+  ** The current WAL is a temporary bridge until Milestone 6, but the permanent
+  ** ownership direction is already established: final private page and state
+  ** images are logged before any of them can become visible.
+  */
   for (const auto &page : *committed_pages) {
     wal_->AppendPageImage(page.page_id, page.bytes->data());
   }
@@ -358,8 +417,14 @@ auto StorageEngine::Mutate(Mutation mutation, std::string_view key, std::string_
   }
 
   {
-    // Closing admission drains readers of base. Cache replacement, retirement,
-    // and the new roots then become one visibility transition.
+    /*
+    ** PUBLISH
+    **
+    ** Closing admission drains every reader of base. Cache replacement,
+    ** retirement, DiskManager metadata adoption, and root replacement then
+    ** occur while no reader can begin or remain active. Publish performs the
+    ** one DatabaseState pointer replacement that makes the transaction visible.
+    */
     auto publication = readers_->BeginPublication();
     for (auto &page : *committed_pages) {
       const auto installed = cache_->Install(std::move(page));
@@ -381,6 +446,17 @@ auto StorageEngine::Mutate(Mutation mutation, std::string_view key, std::string_
 }
 
 auto StorageEngine::Checkpoint() -> Status {
+  /*
+  ** CHECKPOINT ORDER
+  **
+  **   extend file -> write dirty committed pages -> write both superblocks
+  **   -> fsync database -> reset and fsync WAL -> mark frames checkpointed
+  **   -> publish the advanced checkpoint frontier
+  **
+  ** Any failure before WAL reset leaves the WAL authoritative and retryable.
+  ** Resetting it before database synchronization would lose the only durable
+  ** copy of newer page versions after a crash.
+  */
   const auto state = readers_->CurrentState();
   auto next = *state;
   next.checkpoint_lsn = state->visible_lsn;
@@ -413,6 +489,8 @@ auto StorageEngine::Checkpoint() -> Status {
 }
 
 void StorageEngine::Poison() {
+  // The temporary single-operation path cannot classify or repair every
+  // post-append failure. Refuse further work so reopen can recover durable WAL.
   poisoned_ = true;
   wal_->DiscardPending();
 }
@@ -421,6 +499,8 @@ auto StorageEngine::Close() -> Status {
   if (!disk_) {
     return {};
   }
+  // Serialize with mutation so destruction cannot tear down borrowed layers
+  // while a private transaction is preparing or publishing.
   auto writer = std::lock_guard(*writer_mutex_);
   closed_ = true;
 
@@ -429,6 +509,7 @@ auto StorageEngine::Close() -> Status {
       return status;
     }
   }
+  // Release borrowers before owners, then drop the process lock last.
   readers_.reset();
   pages_.reset();
   cache_.reset();

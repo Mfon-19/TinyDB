@@ -17,8 +17,12 @@ namespace tinydb {
 class PageSource;
 class PageReader;
 
-// Ordered map algorithms over pages supplied by PageSource. This type owns the
-// current root id but owns no page memory.
+/*
+** Ordered-map algorithms over a caller-supplied page universe. BPlusTree owns
+** the transaction's current root identity but owns no page memory. A root
+** split or collapse changes RootPageId; the caller must commit that identity
+** atomically with the physical page images that produced it.
+*/
 class BPlusTree {
  public:
   // Existing roots are validated; a zero-filled allocated root becomes a leaf.

@@ -21,8 +21,22 @@ using PageBytes = std::array<char, PAGE_SIZE>;
 
 struct CommittedFrame;
 
-// A guard is the only way cache clients retain page bytes. Guards are
-// move-only so one cache pin has one obvious owner and one release point.
+/*
+** IMMUTABLE COMMITTED PAGE CACHE
+**
+** The page table contains only the newest visible committed version of each
+** page. Installed frame bytes never change. Replacing a page swaps the table's
+** shared frame pointer, while an older PageGuard can continue reading the old
+** immutable frame until its snapshot drains.
+**
+** Frames newer than checkpoint_lsn are dirty in the cache sense: WAL contains
+** their durable image, but the database file does not yet. Such frames cannot
+** be evicted. The byte target is consequently soft; publication may exceed it
+** until checkpointing advances the frontier.
+**
+** PageGuard is the only cache-facing byte lease. It is move-only so one cache
+** pin has one owner and one release point.
+*/
 class PageGuard final {
  public:
   PageGuard() = default;
@@ -51,8 +65,7 @@ class PageGuard final {
   friend class CommittedPageCache;
 };
 
-// A write transaction eventually transfers these bytes directly into a
-// committed frame. unique_ptr makes the no-copy ownership transfer explicit.
+/* A frozen transaction transfers this allocation directly into a frame. */
 struct CommittedPageImage {
   page_id_t page_id{HEADER_PAGE_ID};
   std::uint64_t page_lsn{0};
@@ -69,9 +82,11 @@ struct CommittedCacheStats {
   std::uint64_t checkpoint_lsn{0};
 };
 
-// Thread-safe cache for the latest committed page versions. Page bytes are
-// immutable after installation; synchronization protects only the page table,
-// LRU metadata, pin accounting, and checkpoint eligibility.
+/*
+** Thread-safe cache for latest committed versions. Its mutex protects the
+** page table, LRU policy, and dirty index. Pin and checkpoint flags are atomic
+** because guards release outside that mutex.
+*/
 class CommittedPageCache final {
  public:
   CommittedPageCache(DiskManager *disk, std::size_t target_bytes, std::uint64_t checkpoint_lsn);

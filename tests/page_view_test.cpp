@@ -16,6 +16,13 @@
 #include <string>
 #include <string_view>
 
+/*
+** Page-view tests establish the trust boundary between untrusted encoded
+** bytes and unchecked borrowed accessors. Valid pages exercise direct search
+** and routing. Corruption and fuzz cases alter identity, slots, lengths,
+** links, ordering, and reserved fields and require Open to reject them before
+** any accessor can expose a slice.
+*/
 namespace {
 
 TEST(LeafPageViewTest, SearchesEncodedRecordsWithoutOwningThem) {

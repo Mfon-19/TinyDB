@@ -11,6 +11,11 @@
 
 namespace tinydb {
 
+/*
+** Descend one immutable page at a time. Every handle is released before the
+** next loop iteration. Internal separator equality routes right, matching the
+** inclusive-lower-bound invariant used by page builders and verification.
+*/
 auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<page_id_t> {
   auto page_id = root_page_id;
   auto depth = std::size_t{0};

@@ -10,8 +10,18 @@
 
 namespace tinydb {
 
-// Borrowed leaf decoder. The PageHandle that owns page_ must outlive the view
-// and keep the bytes immutable.
+/*
+** BORROWED PAGE VIEWS
+**
+** Open performs full persistent validation once. Subsequent accessors borrow
+** keys and values directly from the encoded slot directory without allocating
+** or decoding the complete node. The PageHandle owning page_ must outlive the
+** view and keep its bytes immutable.
+**
+** Leaf LowerBound returns the first key not less than the target. Internal
+** FindChildIndex implements upper_bound because separator equality belongs to
+** the child on the separator's right.
+*/
 class LeafPageView {
  public:
   static auto Open(const char *page, page_id_t expected_page_id) -> Result<LeafPageView>;
@@ -35,7 +45,7 @@ class LeafPageView {
   page_id_t next_leaf_;
 };
 
-// Borrowed routing-page decoder. Equal keys route to the separator's right.
+/* Borrowed routing-page decoder. Equal keys route right. */
 class InternalPageView {
  public:
   static auto Open(const char *page, page_id_t expected_page_id) -> Result<InternalPageView>;

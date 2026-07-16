@@ -24,6 +24,12 @@
 #include <utility>
 #include <vector>
 
+/*
+** WAL tests treat record framing and syscall ordering as part of the durable
+** contract. They construct complete and torn runs, inject failures at append,
+** sync, database redo, and truncation boundaries, and require recovery to
+** preserve a valid committed prefix without accepting corrupt middle records.
+*/
 static constexpr std::uint64_t WAL_HEADER_BYTES = tinydb::wal_format::HEADER_BYTES;
 static constexpr std::uint64_t PAGE_IMAGE_RECORD_BYTES =
     tinydb::wal_format::RECORD_HEADER_BYTES + sizeof(tinydb::page_id_t) + tinydb::PAGE_SIZE;

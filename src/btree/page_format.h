@@ -10,18 +10,30 @@
 
 namespace tinydb {
 
-// Tree types are aliases of the common page codec's persisted type values.
+/*
+** B+ TREE PAGE FORMAT
+**
+** Tree pages use the common checksummed data-page header followed by a node
+** header, an ascending slot directory, free space, and cells packed downward
+** from the end of the page:
+**
+**   common header | node header | slots -> ... free ... <- encoded cells
+**
+** Slots appear in strict unsigned-byte key order. A leaf LINK is its forward
+** successor or zero at end-of-chain. An internal LINK is its mandatory
+** leftmost child; each separator cell stores the child on its right. Internal
+** separators are inclusive lower bounds, so equality routes right.
+**
+** ValidateTreePage proves every offset, length, identity, link, reserved field,
+** and key-order invariant before PageView exposes unchecked borrowed slices.
+*/
+
+/* Tree types are aliases of the common codec's persisted type values. */
 enum class NodeType : std::uint16_t {
   Leaf = static_cast<std::uint16_t>(storage::DataPageType::Leaf),
   Internal = static_cast<std::uint16_t>(storage::DataPageType::Internal),
 };
 
-// Tree pages share this packed layout:
-//
-//   common header | node header | slots -> ... free ... <- encoded cells
-//
-// Slots grow upward in key order; cells grow downward. LINK is the leaf
-// successor or the internal page's leftmost child.
 namespace node_page_offset {
 inline constexpr std::size_t CELL_COUNT = storage::data_page_offset::HEADER_BYTES;
 inline constexpr std::size_t FREE_START = CELL_COUNT + sizeof(std::uint16_t);

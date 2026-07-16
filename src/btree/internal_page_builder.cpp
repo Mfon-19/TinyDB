@@ -18,11 +18,18 @@
 #include "txn/contract.h"
 
 /*
- * InternalPageBuilder is private routing-page mutation state. N ordered
- * separators describe N+1 children: first_child_ owns keys below the first
- * separator, and each record owns the child on that separator's right.
- * Persistent bytes enter only through InternalPageView.
- */
+** INTERNAL PAGE MUTATION
+**
+** InternalPageBuilder is private routing-page state. N ordered separators
+** describe N+1 children: first_child_ owns keys below the first separator and
+** each record owns the child on its right. Persistent bytes enter only through
+** InternalPageView.
+**
+** Store emits one complete canonical page. A split promotes one separator to
+** the parent; the promoted key belongs to neither resulting child and its old
+** right child becomes the new right page's first child. Absorb performs the
+** inverse operation by pulling a parent separator between adjacent children.
+*/
 
 namespace tinydb {
 namespace {
@@ -146,6 +153,8 @@ auto InternalPageBuilder::ChooseSplitIndex() const -> std::size_t {
     prefix[i + 1] = prefix[i] + RecordFootprint(records_[i]);
   }
 
+  // The first and last separators cannot be promoted because each resulting
+  // internal page must retain at least one routing record.
   std::size_t best_split = 0;
   std::size_t best_imbalance = 0;
   bool found = false;

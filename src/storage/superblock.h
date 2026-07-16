@@ -11,9 +11,24 @@
 
 namespace tinydb::storage {
 
-// Pages 0 and 1 each hold one complete copy of this encoded page. Updates go
-// to alternating slots and carry a monotonically increasing generation, so a
-// torn metadata write can leave at most one copy unusable.
+/*
+** SUPERBLOCK FORMAT AND SELECTION
+**
+** Pages 0 and 1 each hold one complete database-state root. Updates normally
+** target the inactive slot with a monotonically increasing generation. A torn
+** metadata write can therefore invalidate at most the copy being replaced.
+** Opening decodes the slots independently and chooses the valid copy with the
+** greatest generation.
+**
+** If both copies have the same generation they must describe identical state;
+** otherwise there is no principled winner and opening reports corruption. One
+** valid copy is sufficient. Unknown required features reject the format, while
+** optional feature bits may be retained and ignored.
+**
+** All fields use explicit little-endian offsets. Reserved bytes are zero and
+** participate in the page checksum. No native C++ object representation is
+** ever copied into the database file.
+*/
 using SuperblockPage = std::array<std::byte, PAGE_SIZE>;
 
 inline constexpr auto SUPERBLOCK_MAGIC = std::array{
@@ -25,17 +40,17 @@ inline constexpr std::uint16_t FORMAT_MINOR = 0;
 inline constexpr std::uint64_t SUPPORTED_REQUIRED_FEATURES = 0;
 inline constexpr page_id_t FIRST_FORMAT_DATA_PAGE_ID = FIRST_DATA_PAGE_ID;
 
-// Stable byte offsets in the on-disk superblock. Keep these explicit even
-// when adjacent fields happen to match a C++ struct layout: they are a file
-// format, not an object representation.
-//
-//   0   magic[8]                 48  generation u64
-//   8   format major/minor       56  checkpoint LSN u64
-//   12  page size u32            64  transaction ID u64
-//   16  required features u64    72  B+ tree root page ID u64
-//   24  optional features u64    80  allocator root page ID u64
-//   32  database UUID[16]        88  high-water page ID u64
-//   96  CRC-32 u32              100..4095 reserved zero bytes
+/*
+** Stable byte offsets in the on-disk superblock:
+**
+**   0   magic[8]                 48  generation u64
+**   8   format major/minor       56  checkpoint LSN u64
+**   12  page size u32            64  transaction ID u64
+**   16  required features u64    72  B+ tree root page ID u64
+**   24  optional features u64    80  allocator root page ID u64
+**   32  database UUID[16]        88  high-water page ID u64
+**   96  CRC-32 u32              100..4095 reserved zero bytes
+*/
 namespace superblock_offset {
 inline constexpr std::size_t MAGIC = 0;
 inline constexpr std::size_t FORMAT_MAJOR = 8;

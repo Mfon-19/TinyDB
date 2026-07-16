@@ -7,15 +7,42 @@
 
 namespace tinydb::txn {
 
-// Lifecycle describes whether the database handle admits an operation. It is
-// deliberately distinct from DatabaseState, the immutable roots/LSN snapshot
-// captured by a read transaction.
+/*
+** DATABASE AND TRANSACTION STATE MACHINES
+**
+** DatabaseLifecycle answers whether a handle may admit a kind of operation.
+** It is intentionally different from DatabaseState, which is the immutable
+** root and LSN snapshot captured by readers.
+**
+** Database lifecycle transitions:
+**
+**   Open <--------> CheckpointDegraded
+**     |                       |
+**     +----> NeedsRecovery <--+
+**     +----> Corrupt <--------+
+**     +----> Closed <---------+
+**
+** NeedsRecovery and Corrupt are terminal except for Close. Reopening creates
+** a new handle only after recovery or verification establishes trustworthy
+** state.
+**
+** Write transaction transitions:
+**
+**   Active -> Frozen -> WritingWal -> Durable -> Published
+**      |         |           |
+**      +---------+-----------+-> Aborted
+**                            +-> Indeterminate
+**
+** Durable has exactly one legal successor. Once WAL synchronization proves a
+** transaction durable, publication must be prepared already and cannot be
+** abandoned. Only terminal transaction states have a CommitOutcome.
+*/
 enum class DatabaseLifecycle {
-  Open,
-  CheckpointDegraded,
-  NeedsRecovery,
-  Corrupt,
-  Closed,
+  Open,                // all operations admitted subject to normal conflicts
+  CheckpointDegraded,  // reads/writes continue; WAL/cache pressure may block
+  NeedsRecovery,       // commit outcome or durable tail cannot be trusted live
+  Corrupt,             // persistent state was structurally invalid
+  Closed,              // resources released; only repeated Close is valid
 };
 
 enum class DatabaseOperation {
@@ -28,9 +55,11 @@ enum class DatabaseOperation {
   Close,
 };
 
-// This is only the state-level admission decision. An admitted operation can
-// still fail for its own reasons, such as a write reaching a memory limit while
-// checkpointing is degraded or Close finding a live transaction.
+/*
+** Return the state-level admission decision only. An admitted operation may
+** still fail for an operation-specific reason, such as memory exhaustion.
+** Close is additionally Busy while any transaction retains its admission.
+*/
 constexpr auto StateStatus(DatabaseLifecycle state, DatabaseOperation operation,
                            std::size_t active_transactions = 0) noexcept -> StatusCode {
   auto status = StatusCode::Corruption;
@@ -91,13 +120,13 @@ constexpr auto CanTransition(DatabaseLifecycle from, DatabaseLifecycle to) noexc
 }
 
 enum class TransactionState {
-  Active,
-  Frozen,
-  WritingWal,
-  Durable,
-  Published,
-  Aborted,
-  Indeterminate,
+  Active,         // application and tree mutations are still permitted
+  Frozen,         // final images/state are immutable but not yet appended
+  WritingWal,     // durable outcome has not yet been established
+  Durable,        // commit record crossed the synchronization boundary
+  Published,      // durable state is also the visible committed state
+  Aborted,        // definitely absent from durable and visible state
+  Indeterminate,  // caller must reopen to discover whether commit survived
 };
 
 enum class CommitOutcome {

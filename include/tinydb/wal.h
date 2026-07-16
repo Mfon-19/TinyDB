@@ -12,12 +12,18 @@
 
 namespace tinydb {
 
-// Redo-only write-ahead log containing final physical page images.
-//
-// AppendPageImage only builds an in-memory transaction. Commit appends all
-// pending records plus their binding commit record and fsyncs once; that fsync
-// is the mutation durability point. Reset is legal only after the database
-// file has been checkpointed and fsynced by the caller.
+/*
+** Redo-only write-ahead log containing final physical page images.
+**
+** AppendPageImage builds an in-memory transaction. Commit appends every image
+** plus its binding commit record and synchronizes once; that synchronization
+** is the mutation durability point. Reset is legal only after the caller has
+** written and synchronized the same state into the database file.
+**
+** Recover is the only path that interprets non-empty durable record history.
+** Open requires a clean header-only log, preventing normal operation from
+** accidentally bypassing crash recovery.
+*/
 class Wal {
  public:
   // The companion path is deterministic so recovery can run before the

@@ -13,6 +13,13 @@
 #include <string_view>
 #include <utility>
 
+/*
+** These tests are executable product contracts rather than implementation
+** tests. They enumerate every legal lifecycle and transaction transition and
+** run reusable key/value scenarios against a reference transaction model.
+** When the real public transaction API arrives, the same scenarios are run
+** against TinyDB without changing their expected semantics.
+*/
 namespace {
 
 using tinydb::StatusCode;

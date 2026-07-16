@@ -13,8 +13,17 @@
 
 namespace tinydb {
 
-// Forward leaf-chain cursor. Key and Value borrow the one page held by page_
-// and expire on Next or destruction.
+/*
+** FORWARD TREE CURSOR
+**
+** Seek descends once, then iteration follows the leaf successor chain. The
+** cursor owns one page lease at a time. Key and Value borrow that page and
+** expire on Next or destruction.
+**
+** Opening each successor validates both page-local structure and global chain
+** order. visited_ detects cycles even through empty leaves, for which no key
+** boundary exists. Empty underfull leaves are legal and are skipped.
+*/
 class BTreeCursor {
  public:
   static auto Seek(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<BTreeCursor>;

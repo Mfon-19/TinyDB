@@ -8,14 +8,20 @@
 
 namespace tinydb::txn {
 
+/*
+** PERSISTENT KEY CONTRACT
+**
+** Keys are arbitrary byte strings. Their order must not depend on whether the
+** platform's plain char is signed, because the same encoded B+ tree must route
+** identically after reopening on every supported build. Empty keys are valid;
+** the upper size bound limits separators copied into internal pages.
+*/
 inline constexpr std::size_t MAX_KEY_BYTES = 1024;
 
 constexpr auto ValidateKeySize(std::size_t size) noexcept -> StatusCode {
   return size <= MAX_KEY_BYTES ? StatusCode::Ok : StatusCode::InvalidArgument;
 }
 
-// std::string ordering is not the persistent contract. Spell out unsigned
-// bytewise ordering so keys sort identically even where char is signed.
 struct BytewiseLess {
   using is_transparent = void;
 

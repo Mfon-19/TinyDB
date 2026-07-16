@@ -17,6 +17,13 @@
 #include <utility>
 #include <vector>
 
+/*
+** This suite runs B+ tree algorithms against the smallest complete PageSource
+** model. The harness deliberately has no cache, WAL, or disk behavior. It
+** verifies that the tree depends only on lease stability and the four page
+** operations, and that allocation failures release every lease without
+** leaving a partially reachable tree.
+*/
 namespace {
 
 // A minimal owner for the logical page-source contract. Heap-owned arrays keep

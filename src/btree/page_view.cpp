@@ -21,7 +21,8 @@ auto Bytes(const char *page) -> std::span<const std::byte> { return std::as_byte
 }  // namespace
 
 auto LeafPageView::Open(const char *page, page_id_t expected_page_id) -> Result<LeafPageView> {
-  // One full validation makes later accessors branch-free with respect to corruption.
+  // One full validation makes later accessors branch-free with respect to
+  // persistent corruption. They retain only programmer-invariant checks.
   if (auto status = ValidateTreePage(page, expected_page_id); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
@@ -121,7 +122,8 @@ auto InternalPageView::ChildAt(std::size_t child_index) const -> page_id_t {
 }
 
 auto InternalPageView::FindChildIndex(std::string_view key) const -> std::size_t {
-  // upper_bound implements the inclusive lower bound of every right child.
+  // upper_bound implements the inclusive lower bound of every right child:
+  // child i owns [separator i-1, separator i).
   const auto less = txn::BytewiseLess{};
   auto first = std::size_t{0};
   auto last = static_cast<std::size_t>(separator_count_);

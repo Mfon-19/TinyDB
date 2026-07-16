@@ -9,15 +9,19 @@
 
 namespace tinydb::storage {
 
-// These are the only primitives persistent codecs should use for fixed-width
-// integers. Encoding field-by-field avoids persisting C++ padding, alignment,
-// native byte order, enum representation, or compiler ABI details.
-//
-// All helpers are bounds checked and intentionally return bool/optional rather
-// than asserting. Input bytes come from untrusted files, so a malformed offset
-// must become Status::Corruption at the codec boundary, not terminate the host
-// application. The encoder uses the same checks to make layout drift visible
-// during development.
+/*
+** PERSISTENT ENCODING PRIMITIVES
+**
+** These are the only primitives persistent codecs use for fixed-width fields.
+** Encoding field-by-field avoids persisting C++ padding, alignment, native byte
+** order, enum representation, or compiler ABI details.
+**
+** Every helper is bounds-checked and returns bool or optional rather than
+** asserting. Decode offsets ultimately address untrusted files, so malformed
+** bytes must become Corruption at the owning codec boundary instead of
+** terminating the host application. Encoders use the same checks so a future
+** layout that no longer fits its buffer fails visibly during development.
+*/
 template <typename Integer>
   requires std::is_unsigned_v<Integer>
 constexpr auto PutLittleEndian(std::span<std::byte> output, std::size_t offset, Integer value) noexcept -> bool {

@@ -12,6 +12,11 @@
 
 namespace tinydb::txn {
 
+/*
+** Open a write overlay on one immutable base state. The allocator index is
+** decoded eagerly so corruption is reported before callers begin modifying
+** tree pages. A successful return owns no page lease.
+*/
 auto TransactionPages::Begin(PageReader *committed, DatabaseState base_state,
                              std::size_t memory_limit_bytes) -> Result<TransactionPages> {
   if (committed == nullptr) {
@@ -100,6 +105,8 @@ auto TransactionPages::Read(page_id_t page_id) -> Result<PageHandle> {
   if (retired_page_ids_.contains(page_id)) {
     return std::unexpected(Status::Corruption("transaction read a page it already retired"));
   }
+  // Read-your-writes is a map lookup; committed state is consulted only when
+  // this transaction has never copied or allocated the page.
   if (const auto page = pages_.find(page_id); page != pages_.end()) {
     return PrivateHandle(page->second.get(), false);
   }
@@ -165,6 +172,8 @@ auto TransactionPages::AllocateHighWaterPage() -> Result<PrivateFrame *> {
 
 auto TransactionPages::Allocate() -> Result<PageHandle> {
   RequireActive();
+  // Reuse is preferred because it bounds file growth. Falling back to the
+  // private frontier changes only resulting_state_, not the physical file.
   auto page_id = AllocateReusablePage();
   PrivateFrame *frame = nullptr;
   if (page_id.has_value()) {
@@ -196,6 +205,8 @@ auto TransactionPages::Free(page_id_t page_id) -> Status {
     return Status::Corruption("transaction retired allocator metadata");
   }
   // A retired private image must not appear in the final physical image set.
+  // Removing it also refunds its page charge; the page ID itself remains
+  // quarantined in retired_page_ids_ through the end of this transaction.
   if (const auto page = pages_.find(page_id); page != pages_.end()) {
     if (page->second->pin_count != 0) {
       return Status::Corruption("transaction retired a leased page");
@@ -257,9 +268,17 @@ auto TransactionPages::LoadFreeExtents() -> Status {
     allocator_page_ids_.push_back(page_id);
     page_id = decoded->next_page_id;
   }
+  // Retain metadata IDs separately from free extents. Integrity verification
+  // and allocation must treat allocator pages as allocated but non-tree pages.
   return {};
 }
 
+/*
+** Add this transaction's retirements to the persistent extent model. Extents
+** are sorted and coalesced so the encoded index is canonical. Coalescing uses
+** the newest LSN of adjacent ranges: this may delay reuse of an older page but
+** can never permit reuse too early.
+*/
 void TransactionPages::AddRetiredExtents(std::uint64_t retire_lsn) {
   auto retired = std::vector<page_id_t>(retired_page_ids_.begin(), retired_page_ids_.end());
   std::ranges::sort(retired);
@@ -299,6 +318,8 @@ auto TransactionPages::StoreFreeExtentIndex(std::uint64_t page_lsn) -> Status {
     allocator_page_ids_.push_back((*page)->page_id);
   }
 
+  // Rewrite the whole metadata chain. Unused retained pages encode empty
+  // ranges rather than being retired recursively while the index is changing.
   for (std::size_t index = 0; index < allocator_page_ids_.size(); ++index) {
     auto page = CreatePrivatePage(allocator_page_ids_[index], true);
     if (!page) {
@@ -332,6 +353,8 @@ auto TransactionPages::Freeze(std::uint64_t retire_lsn) -> Status {
       return status;
     }
   }
+  // A transaction identity advances for any logical state change, even if the
+  // change consists only of a root/frontier/retirement metadata update.
   const auto changed = std::ranges::any_of(pages_, [](const auto &entry) { return entry.second->dirty; }) ||
                        resulting_state_.root_page_id != base_state_.root_page_id ||
                        resulting_state_.allocator_root_page_id != base_state_.allocator_root_page_id ||
@@ -382,6 +405,8 @@ auto TransactionPages::ResultingState() const -> const DatabaseState & {
 
 auto TransactionPages::PageImages() const -> std::vector<std::pair<page_id_t, const char *>> {
   TINYDB_CHECK(frozen_, "reading transaction pages before freeze");
+  // Stable ordering makes WAL construction deterministic and lets a commit
+  // digest bind one unambiguous physical transaction representation.
   auto result = std::vector<std::pair<page_id_t, const char *>>{};
   result.reserve(pages_.size());
   for (const auto &[page_id, page] : pages_) {
@@ -415,6 +440,8 @@ auto TransactionPages::TakePages(std::uint64_t transaction_id) -> Result<std::ve
         .bytes = std::move(page->bytes),
     });
   }
+  // Any clean private copy served read-your-writes but has no committed image
+  // to transfer. Clearing the map releases those copies with the dirty ones.
   pages_.clear();
   memory_used_bytes_ = 0;
   return result;

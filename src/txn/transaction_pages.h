@@ -16,9 +16,25 @@
 
 namespace tinydb::txn {
 
-// Private copy-on-write page context for one write transaction. Nothing in
-// this object is reachable through the committed cache until its frozen page
-// images are handed to the later commit coordinator.
+/*
+** TRANSACTION-LOCAL PAGE OVERLAY
+**
+** TransactionPages is the complete mutable page universe of one writer. A
+** read first consults the private map and otherwise borrows committed bytes.
+** The first Edit copies a committed page once; later edits reuse the same
+** stable heap-owned frame. Allocate reserves either a checkpoint-safe free ID
+** or the private high-water frontier. Free removes a private image and records
+** a retirement without changing committed allocator state.
+**
+** Nothing owned here is reachable through the committed cache. Therefore
+** abort requires no undo: dropping the overlay restores the base state. Freeze
+** serializes allocator metadata, assigns final page LSNs, and makes the page
+** set immutable for WAL construction and publication.
+**
+** Memory accounting covers private pages and retained value bytes. All page
+** handles must be released before Freeze, Abort, ownership transfer, or
+** destruction, because those operations may invalidate frame ownership.
+*/
 class TransactionPages final : public PageSource {
  public:
   static auto Begin(PageReader *committed, DatabaseState base_state,
@@ -59,10 +75,10 @@ class TransactionPages final : public PageSource {
 
  private:
   struct PrivateFrame {
-    page_id_t page_id{HEADER_PAGE_ID};
-    std::unique_ptr<cache::PageBytes> bytes;
-    std::size_t pin_count{0};
-    bool dirty{false};
+    page_id_t page_id{HEADER_PAGE_ID};        // immutable identity of this frame
+    std::unique_ptr<cache::PageBytes> bytes;  // stable address until transfer
+    std::size_t pin_count{0};                 // outstanding PageHandles
+    bool dirty{false};                        // needs WAL/publication image
   };
 
   TransactionPages(PageReader *committed, DatabaseState base_state, std::size_t memory_limit_bytes)
@@ -83,14 +99,14 @@ class TransactionPages final : public PageSource {
   void RequireActive() const;
   void RequireUnpinned() const;
 
-  PageReader *committed_;
-  DatabaseState base_state_;
-  DatabaseState resulting_state_;
-  std::size_t memory_limit_bytes_;
+  PageReader *committed_;           // immutable fallback for reads
+  DatabaseState base_state_;        // captured at Begin
+  DatabaseState resulting_state_;   // private roots/frontiers
+  std::size_t memory_limit_bytes_;  // pages plus retained values
   std::size_t memory_used_bytes_{0};
-  bool frozen_{false};
-  bool aborted_{false};
-  bool allocator_dirty_{false};
+  bool frozen_{false};           // no further mutation permitted
+  bool aborted_{false};          // private state was discarded
+  bool allocator_dirty_{false};  // extent index needs rewriting
 
   std::unordered_map<page_id_t, std::unique_ptr<PrivateFrame>> pages_;
   std::unordered_set<page_id_t> retired_page_ids_;

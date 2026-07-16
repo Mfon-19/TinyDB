@@ -7,6 +7,7 @@
 
 namespace tinydb::cache {
 
+/* Convert the cache guard without copying bytes or introducing write access. */
 auto CommittedPageSource::Read(page_id_t page_id) -> Result<PageHandle> {
   auto page = cache_->Read(page_id);
   if (!page) {

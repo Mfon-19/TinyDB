@@ -25,6 +25,12 @@
 #include <utility>
 #include <vector>
 
+/*
+** Storage-engine tests cover behavior across all layers: ordered-map semantics,
+** reopen and crash durability, checkpoint ordering, exclusive process
+** ownership, churn, corruption reporting, and reader visibility during private
+** write preparation. Randomized cases compare every operation with std::map.
+*/
 namespace {
 
 auto TestUuid(std::byte last = std::byte{1}) -> tinydb::DatabaseUuid {

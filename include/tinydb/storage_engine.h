@@ -25,10 +25,18 @@ namespace txn {
 class ReaderGate;
 }  // namespace txn
 
-// Compatibility facade for the current single-operation API. Reads use
-// immutable committed snapshots; each mutation is prepared in a private page
-// transaction before the existing WAL makes it durable. The explicit public
-// transaction API and final commit coordinator arrive in Milestone 6.
+/*
+** Compatibility facade for the current single-operation API.
+**
+** Reads capture immutable committed snapshots. Each mutation acquires the
+** sole writer permit, prepares B+ tree and allocator changes privately, makes
+** their final physical images durable in WAL, drains readers of the old state,
+** and publishes all new pages and roots together.
+**
+** Put and Remove are currently one-operation transactions. Milestone 6 exposes
+** the same machinery as a multi-key WriteTransaction and replaces the
+** temporary WAL/publication bridge with a prebuilt infallible commit plan.
+*/
 class StorageEngine {
  public:
   StorageEngine(const StorageEngine &) = delete;
@@ -63,7 +71,13 @@ class StorageEngine {
   bool closed_{false};
   bool poisoned_{false};
 
-  // The process lock is declared first and released last.
+  /*
+  ** Members are declared in ownership order. The process lock is acquired
+  ** before recovery and released last. Page sources borrow the cache, the
+  ** cache borrows DiskManager, and snapshots borrow the page source during an
+  ** admitted operation. Milestone 6 will expose those admissions publicly and
+  ** make Close report Busy while one remains live.
+  */
   UniqueFd lock_fd_;
   std::unique_ptr<DiskManager> disk_;
   std::unique_ptr<cache::CommittedPageCache> cache_;

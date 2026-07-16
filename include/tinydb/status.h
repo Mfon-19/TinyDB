@@ -6,21 +6,25 @@
 
 namespace tinydb {
 
-/**
-  Error handling in TinyDB is split three ways:
-
-  - Environmental failures (a read, write, sync, or open failed; a fixed
-    resource ran out) travel as Status / Result<T> return values. They are
-    expected outcomes on a healthy binary and every caller has a decision
-    to make about them. Nothing in the library throws.
-
-  - Invariant violations (double free, unpinning an unpinned page) abort
-    via TINYDB_CHECK: they only fire on a bug, and a status would launder
-    the bug into an "error" no caller can act on.
-
-  - Corruption is both, by when it is found: rejected with a status at open
-    time (nothing has been trusted yet), aborted on mid-operation (the
-    engine has already acted on state it believed).
+/*
+** ERROR MODEL
+**
+** Status and Result<T> carry every failure an embedding application might
+** reasonably encounter: invalid input, resource exhaustion, I/O failure,
+** unsupported formats, and detected persistent corruption. TinyDB does not
+** throw exceptions across its API and does not terminate the host merely
+** because bytes read from disk are malformed.
+**
+** TINYDB_CHECK is deliberately outside this model. It is reserved for an
+** internal programming error, such as releasing one page lease twice or
+** performing an impossible state transition. Turning such a bug into a
+** Status would make the database appear recoverable when its implementation
+** invariant has already failed.
+**
+** Commit failures need two distinct statuses. IndeterminateCommit reports
+** that the durability boundary may have been crossed. NeedsRecovery reports
+** that the handle can no longer answer safely and must be reopened before the
+** application inspects the transaction outcome.
 */
 
 enum class StatusCode {
@@ -36,9 +40,12 @@ enum class StatusCode {
   Closed,               // the handle no longer accepts work
 };
 
-// The result of an operation that produces no value. nodiscard on the class
-// makes every function returning Status by value nodiscard: an ignored
-// error is the classic status-code bug.
+/*
+** The result of an operation that produces no value. Marking the class itself
+** nodiscard also marks every function returning Status by value. This makes
+** an accidentally ignored environmental or corruption error a compiler
+** diagnostic instead of a silent continuation.
+*/
 class [[nodiscard]] Status {
  public:
   Status() = default;  // Ok
@@ -70,9 +77,7 @@ class [[nodiscard]] Status {
   static auto IndeterminateCommit(std::string message) -> Status {
     return {StatusCode::IndeterminateCommit, std::move(message)};
   }
-  static auto NeedsRecovery(std::string message) -> Status {
-    return {StatusCode::NeedsRecovery, std::move(message)};
-  }
+  static auto NeedsRecovery(std::string message) -> Status { return {StatusCode::NeedsRecovery, std::move(message)}; }
   static auto Closed(std::string message) -> Status { return {StatusCode::Closed, std::move(message)}; }
 
  private:
@@ -108,8 +113,7 @@ class [[nodiscard]] Status {
   std::string message_;
 };
 
-// The result of an operation that produces a value: the value, or the
-// Status explaining why there is none.
+/* A value-producing operation returns either the value or its Status. */
 template <typename T>
 using Result = std::expected<T, Status>;
 
