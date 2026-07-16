@@ -13,6 +13,7 @@
 namespace tinydb {
 
 class DiskManager;
+class PageHandle;
 
 namespace cache {
 
@@ -35,6 +36,10 @@ class PageGuard final {
   auto Data() const -> std::span<const char, PAGE_SIZE>;
   auto PageLsn() const -> std::uint64_t;
   auto TransactionId() const -> std::uint64_t;
+
+  // Transfers this exact pin into the tree's generic page lease. The frame's
+  // shared owner keeps old immutable bytes alive after cache replacement.
+  auto IntoPageHandle() && -> PageHandle;
   explicit operator bool() const noexcept { return frame_ != nullptr; }
 
  private:
@@ -69,8 +74,7 @@ struct CommittedCacheStats {
 // LRU metadata, pin accounting, and checkpoint eligibility.
 class CommittedPageCache final {
  public:
-  CommittedPageCache(DiskManager *disk, std::size_t target_bytes,
-                     std::uint64_t checkpoint_lsn);
+  CommittedPageCache(DiskManager *disk, std::size_t target_bytes, std::uint64_t checkpoint_lsn);
   CommittedPageCache(const CommittedPageCache &) = delete;
   auto operator=(const CommittedPageCache &) -> CommittedPageCache & = delete;
   ~CommittedPageCache();

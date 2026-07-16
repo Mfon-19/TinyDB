@@ -8,7 +8,7 @@ namespace tinydb {
 
 auto PageHandle::MutableData() -> char * {
   TINYDB_CHECK(editable_, "mutable access through a read-only page handle");
-  return data_;
+  return mutable_data_;
 }
 
 void PageHandle::MarkDirty() {
@@ -23,7 +23,9 @@ void PageHandle::Reset() noexcept {
   }
   owner_ = nullptr;
   data_ = nullptr;
+  mutable_data_ = nullptr;
   release_ = nullptr;
+  keepalive_.reset();
 }
 
 void PageHandle::Take(PageHandle &&other) noexcept {
@@ -31,13 +33,16 @@ void PageHandle::Take(PageHandle &&other) noexcept {
   owner_ = other.owner_;
   page_id_ = other.page_id_;
   data_ = other.data_;
+  mutable_data_ = other.mutable_data_;
   editable_ = other.editable_;
   dirty_ = other.dirty_;
   release_ = other.release_;
+  keepalive_ = std::move(other.keepalive_);
 
   // Ownership moves with the callback; the source object must release nothing.
   other.owner_ = nullptr;
   other.data_ = nullptr;
+  other.mutable_data_ = nullptr;
   other.release_ = nullptr;
   other.dirty_ = false;
 }

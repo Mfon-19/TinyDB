@@ -99,6 +99,8 @@ add_library(
   src/buffer/buffer_pool.cpp
   src/cache/committed_page_cache.cpp
   src/cache/committed_page_cache.h
+  src/cache/committed_page_source.cpp
+  src/cache/committed_page_source.h
   src/engine/storage_engine.cpp
   src/io/syscalls.h
   src/storage/disk_manager.cpp
@@ -111,6 +113,8 @@ add_library(
   src/txn/database_state.h
   src/txn/reader_gate.cpp
   src/txn/reader_gate.h
+  src/txn/read_snapshot.cpp
+  src/txn/read_snapshot.h
   src/txn/state.h
   src/util/crc32.h
   src/wal/wal.cpp
@@ -236,6 +240,15 @@ if(BUILD_TESTING)
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_committed_page_cache_test)
     gtest_discover_tests(TinyDB_committed_page_cache_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/read_snapshot_test.cpp")
+    add_executable(TinyDB_read_snapshot_test tests/read_snapshot_test.cpp)
+    target_link_libraries(TinyDB_read_snapshot_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_read_snapshot_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_read_snapshot_test)
+    gtest_discover_tests(TinyDB_read_snapshot_test)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/wal_test.cpp")

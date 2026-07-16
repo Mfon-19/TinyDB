@@ -3,6 +3,7 @@
 #include <tinydb/check.h>
 #include <tinydb/disk_manager.h>
 
+#include "btree/page_source.h"
 #include "storage/page_codec.h"
 
 #include <algorithm>
@@ -16,10 +17,8 @@
 namespace tinydb::cache {
 
 struct CommittedFrame final {
-  CommittedFrame(page_id_t initial_page_id, std::uint64_t initial_page_lsn,
-                 std::uint64_t initial_transaction_id,
-                 std::unique_ptr<PageBytes> initial_bytes,
-                 bool initially_checkpointed)
+  CommittedFrame(page_id_t initial_page_id, std::uint64_t initial_page_lsn, std::uint64_t initial_transaction_id,
+                 std::unique_ptr<PageBytes> initial_bytes, bool initially_checkpointed)
       : page_id(initial_page_id),
         page_lsn(initial_page_lsn),
         transaction_id(initial_transaction_id),
@@ -37,13 +36,11 @@ struct CommittedFrame final {
   std::atomic<bool> checkpointed{false};
 };
 
-PageGuard::PageGuard(std::shared_ptr<const CommittedFrame> frame)
-    : frame_(std::move(frame)) {
+PageGuard::PageGuard(std::shared_ptr<const CommittedFrame> frame) : frame_(std::move(frame)) {
   frame_->pin_count.fetch_add(1, std::memory_order_relaxed);
 }
 
-PageGuard::PageGuard(PageGuard &&other) noexcept
-    : frame_(std::move(other.frame_)) {}
+PageGuard::PageGuard(PageGuard &&other) noexcept : frame_(std::move(other.frame_)) {}
 
 auto PageGuard::operator=(PageGuard &&other) noexcept -> PageGuard & {
   if (this != &other) {
@@ -84,6 +81,21 @@ void PageGuard::Reset() noexcept {
   frame_.reset();
 }
 
+auto PageGuard::IntoPageHandle() && -> PageHandle {
+  TINYDB_CHECK(frame_ != nullptr, "transferring an empty committed-page guard");
+  auto keeper = std::static_pointer_cast<const void>(frame_);
+  auto *const frame = const_cast<CommittedFrame *>(frame_.get());
+  const auto release = [](void *owner, page_id_t page_id, bool dirty) {
+    auto *const released = static_cast<CommittedFrame *>(owner);
+    TINYDB_CHECK(released->page_id == page_id, "committed-page lease changed identity");
+    TINYDB_CHECK(!dirty, "immutable committed page was marked dirty");
+    const auto previous = released->pin_count.fetch_sub(1, std::memory_order_release);
+    TINYDB_CHECK(previous != 0, "committed-page pin count underflow");
+  };
+  frame_.reset();  // PageHandle now owns both the pin and shared lifetime.
+  return PageHandle(frame, frame->page_id, frame->bytes->data(), release, std::move(keeper));
+}
+
 struct CommittedPageCache::Impl final {
   struct ResidentPage {
     std::shared_ptr<CommittedFrame> frame;
@@ -98,11 +110,8 @@ struct CommittedPageCache::Impl final {
   std::list<page_id_t> lru;
   std::uint64_t checkpoint_lsn;
 
-  Impl(DiskManager *database_file, std::size_t byte_target,
-       std::uint64_t initial_checkpoint_lsn)
-      : disk(database_file),
-        target_bytes(byte_target),
-        checkpoint_lsn(initial_checkpoint_lsn) {}
+  Impl(DiskManager *database_file, std::size_t byte_target, std::uint64_t initial_checkpoint_lsn)
+      : disk(database_file), target_bytes(byte_target), checkpoint_lsn(initial_checkpoint_lsn) {}
 
   void Touch(ResidentPage &page) {
     // Splice preserves the list node and iterator while moving this page to
@@ -140,8 +149,7 @@ struct CommittedPageCache::Impl final {
   }
 };
 
-CommittedPageCache::CommittedPageCache(DiskManager *disk, std::size_t target_bytes,
-                                       std::uint64_t checkpoint_lsn)
+CommittedPageCache::CommittedPageCache(DiskManager *disk, std::size_t target_bytes, std::uint64_t checkpoint_lsn)
     : impl_(std::make_unique<Impl>(disk, target_bytes, checkpoint_lsn)) {
   TINYDB_CHECK(disk != nullptr, "committed cache requires a database file");
   TINYDB_CHECK(target_bytes >= PAGE_SIZE, "committed cache target must hold at least one page");
@@ -158,25 +166,22 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageGuard> {
 
   impl_->MakeRoomForRead();
   if ((impl_->pages.size() + 1) * PAGE_SIZE > impl_->target_bytes) {
-    return std::unexpected(Status::ResourceExhausted(
-        "committed cache is full of pinned or uncheckpointed pages"));
+    return std::unexpected(Status::ResourceExhausted("committed cache is full of pinned or uncheckpointed pages"));
   }
 
   auto bytes = std::make_unique<PageBytes>();
   if (auto status = impl_->disk->ReadPage(page_id, bytes->data()); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  const auto header = storage::DecodeDataPageHeader(
-      std::as_bytes(std::span<const char, PAGE_SIZE>(*bytes)), page_id);
+  const auto header = storage::DecodeDataPageHeader(std::as_bytes(std::span<const char, PAGE_SIZE>(*bytes)), page_id);
   if (!header) {
     return std::unexpected(header.error());
   }
 
-  auto frame = std::make_shared<CommittedFrame>(page_id, header->page_lsn, 0,
-                                                std::move(bytes), true);
+  auto frame = std::make_shared<CommittedFrame>(page_id, header->page_lsn, 0, std::move(bytes), true);
   impl_->lru.push_front(page_id);
-  const auto [inserted, unique] = impl_->pages.emplace(
-      page_id, Impl::ResidentPage{.frame = frame, .lru_position = impl_->lru.begin()});
+  const auto [inserted, unique] =
+      impl_->pages.emplace(page_id, Impl::ResidentPage{.frame = frame, .lru_position = impl_->lru.begin()});
   TINYDB_CHECK(unique, "cache miss raced with an existing page under its mutex");
   (void)inserted;
   return PageGuard(std::move(frame));
@@ -186,8 +191,8 @@ auto CommittedPageCache::Install(CommittedPageImage image) -> Status {
   if (image.bytes == nullptr) {
     return Status::InvalidArgument("committed page image has no bytes");
   }
-  const auto header = storage::DecodeDataPageHeader(
-      std::as_bytes(std::span<const char, PAGE_SIZE>(*image.bytes)), image.page_id);
+  const auto header =
+      storage::DecodeDataPageHeader(std::as_bytes(std::span<const char, PAGE_SIZE>(*image.bytes)), image.page_id);
   if (!header) {
     return header.error();
   }
@@ -196,11 +201,9 @@ auto CommittedPageCache::Install(CommittedPageImage image) -> Status {
   }
 
   auto lock = std::lock_guard(impl_->mutex);
-  auto frame = std::make_shared<CommittedFrame>(
-      image.page_id, image.page_lsn, image.transaction_id,
-      std::move(image.bytes), image.page_lsn <= impl_->checkpoint_lsn);
-  if (const auto existing = impl_->pages.find(image.page_id);
-      existing != impl_->pages.end()) {
+  auto frame = std::make_shared<CommittedFrame>(image.page_id, image.page_lsn, image.transaction_id,
+                                                std::move(image.bytes), image.page_lsn <= impl_->checkpoint_lsn);
+  if (const auto existing = impl_->pages.find(image.page_id); existing != impl_->pages.end()) {
     if (existing->second.frame->page_lsn > image.page_lsn) {
       return Status::InvalidArgument("committed page version moves backward");
     }
@@ -210,9 +213,7 @@ auto CommittedPageCache::Install(CommittedPageImage image) -> Status {
   }
 
   impl_->lru.push_front(image.page_id);
-  impl_->pages.emplace(image.page_id,
-                       Impl::ResidentPage{.frame = frame,
-                                          .lru_position = impl_->lru.begin()});
+  impl_->pages.emplace(image.page_id, Impl::ResidentPage{.frame = frame, .lru_position = impl_->lru.begin()});
   if (!frame->checkpointed.load(std::memory_order_relaxed)) {
     impl_->dirty_pages.emplace(image.page_id, frame);
   }
@@ -222,8 +223,7 @@ auto CommittedPageCache::Install(CommittedPageImage image) -> Status {
 
 void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
   auto lock = std::lock_guard(impl_->mutex);
-  TINYDB_CHECK(checkpoint_lsn >= impl_->checkpoint_lsn,
-               "committed cache checkpoint frontier moved backward");
+  TINYDB_CHECK(checkpoint_lsn >= impl_->checkpoint_lsn, "committed cache checkpoint frontier moved backward");
   impl_->checkpoint_lsn = checkpoint_lsn;
 
   for (auto page = impl_->dirty_pages.begin(); page != impl_->dirty_pages.end();) {

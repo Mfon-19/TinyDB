@@ -17,7 +17,7 @@ namespace tinydb {
 // and expire on Next or destruction.
 class BTreeCursor {
  public:
-  static auto Seek(PageSource *pages, page_id_t root_page_id, std::string_view key) -> Result<BTreeCursor>;
+  static auto Seek(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<BTreeCursor>;
 
   BTreeCursor(const BTreeCursor &) = delete;
   auto operator=(const BTreeCursor &) -> BTreeCursor & = delete;
@@ -30,13 +30,13 @@ class BTreeCursor {
   auto Next() -> Status;
 
  private:
-  explicit BTreeCursor(PageSource *pages) : pages_(pages) {}
+  explicit BTreeCursor(PageReader *pages) : pages_(pages) {}
 
   auto OpenLeaf(page_id_t page_id, std::size_t index) -> Status;
   auto AdvanceToNonEmptyLeaf(page_id_t page_id) -> Status;
   void RememberLastKey();
 
-  PageSource *pages_;
+  PageReader *pages_;
   PageHandle page_;
   std::optional<LeafPageView> leaf_;
   std::size_t index_{0};

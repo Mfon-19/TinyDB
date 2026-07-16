@@ -11,7 +11,7 @@
 
 namespace tinydb {
 
-auto FindLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key) -> Result<page_id_t> {
+auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<page_id_t> {
   auto page_id = root_page_id;
   auto depth = std::size_t{0};
   for (;;) {

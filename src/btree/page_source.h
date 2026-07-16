@@ -3,6 +3,7 @@
 #include <tinydb/page.h>
 #include <tinydb/status.h>
 
+#include <memory>
 #include <utility>
 
 namespace tinydb {
@@ -15,7 +16,12 @@ class PageHandle {
 
   PageHandle() = default;
   PageHandle(void *owner, page_id_t page_id, char *data, bool editable, Release release)
-      : owner_(owner), page_id_(page_id), data_(data), editable_(editable), release_(release) {}
+      : owner_(owner), page_id_(page_id), data_(data), mutable_data_(data), editable_(editable), release_(release) {}
+
+  // Immutable caches retain a frame through keepalive while release updates
+  // frame-local pin accounting. No per-read wrapper allocation is required.
+  PageHandle(void *owner, page_id_t page_id, const char *data, Release release, std::shared_ptr<const void> keepalive)
+      : owner_(owner), page_id_(page_id), data_(data), release_(release), keepalive_(std::move(keepalive)) {}
 
   PageHandle(const PageHandle &) = delete;
   auto operator=(const PageHandle &) -> PageHandle & = delete;
@@ -45,19 +51,27 @@ class PageHandle {
 
   void *owner_{nullptr};
   page_id_t page_id_{HEADER_PAGE_ID};
-  char *data_{nullptr};
+  const char *data_{nullptr};
+  char *mutable_data_{nullptr};
   bool editable_{false};
   bool dirty_{false};
   Release release_{nullptr};
+  std::shared_ptr<const void> keepalive_;
 };
 
-// The tree's complete page vocabulary. Implementations define ownership and
-// reuse policy but must keep leased addresses stable and Free only unleased ids.
-class PageSource {
+// Read algorithms depend only on stable immutable leases. Mutation contexts
+// extend this boundary instead of making read-only caches expose fake writes.
+class PageReader {
  public:
-  virtual ~PageSource() = default;
+  virtual ~PageReader() = default;
 
   virtual auto Read(page_id_t page_id) -> Result<PageHandle> = 0;
+};
+
+// The mutation vocabulary used by a write overlay or the legacy buffer-pool
+// adapter. Free may only retire an ID with no outstanding lease.
+class PageSource : public PageReader {
+ public:
   virtual auto Edit(page_id_t page_id) -> Result<PageHandle> = 0;
   virtual auto Allocate() -> Result<PageHandle> = 0;
   virtual auto Free(page_id_t page_id) -> Status = 0;

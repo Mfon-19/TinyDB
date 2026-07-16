@@ -11,7 +11,7 @@
 
 namespace tinydb {
 
-auto BTreeCursor::Seek(PageSource *pages, page_id_t root_page_id, std::string_view key) -> Result<BTreeCursor> {
+auto BTreeCursor::Seek(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<BTreeCursor> {
   // Descent finds the only leaf that may contain key; LowerBound establishes
   // the first cursor position without copying the encoded key.
   auto leaf_id = FindLeaf(pages, root_page_id, key);

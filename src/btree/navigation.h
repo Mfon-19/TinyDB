@@ -7,9 +7,9 @@
 
 namespace tinydb {
 
-class PageSource;
+class PageReader;
 
 // Constant-space descent for reads. Mutation descent retains a separate path.
-auto FindLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key) -> Result<page_id_t>;
+auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<page_id_t>;
 
 }  // namespace tinydb
