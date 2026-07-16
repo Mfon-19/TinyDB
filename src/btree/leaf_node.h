@@ -10,6 +10,10 @@
 
 namespace tinydb {
 
+// Logical, owning representation used while editing one leaf page. Load
+// validates/decodes persistent bytes into records; Store repacks all records
+// into one checksummed slotted page. Milestone 3 separates immutable page views
+// from private builders so reads no longer allocate this vector.
 class LeafNode {
  public:
   struct Record {
@@ -22,6 +26,9 @@ class LeafNode {
   LeafNode() = default;
 
   static auto Load(const char *page) -> LeafNode;
+
+  // page_id is encoded into the common header and must match the page's file
+  // position when it is fetched again.
   void Store(char *page, page_id_t page_id) const;
 
   auto Upsert(std::string_view key, std::string_view value) -> bool;
@@ -32,6 +39,8 @@ class LeafNode {
   auto Underfull() const -> bool;
 
   auto Split(page_id_t right_page_id, bool tail_heavy) -> SplitResult;
+
+  // Concatenates an adjacent right sibling and adopts its leaf-chain link.
   void Absorb(LeafNode &&right);
 
   auto Records() const -> const std::vector<Record> & { return records_; }
@@ -46,6 +55,7 @@ class LeafNode {
 };
 
 struct LeafNode::SplitResult {
+  // First key in right is copied into the parent as its routing separator.
   LeafNode right;
   std::string separator;
 };

@@ -12,15 +12,22 @@
 namespace tinydb::storage {
 namespace {
 
+// Allocator payload: one little-endian page ID immediately after the common
+// header. Page zero terminates the intrusive free-list chain.
 constexpr std::size_t ALLOCATOR_NEXT_FREE_OFFSET = data_page_offset::HEADER_BYTES;
 constexpr std::uint16_t ALLOCATOR_PAYLOAD_BYTES = sizeof(page_id_t);
 
+// Overflow payload: logical total length, next link, this page's byte count,
+// then exactly that many bytes. Keeping the local byte count explicit avoids
+// inferring live data from zero padding.
 constexpr std::size_t OVERFLOW_TOTAL_BYTES_OFFSET = data_page_offset::HEADER_BYTES;
 constexpr std::size_t OVERFLOW_NEXT_PAGE_OFFSET = OVERFLOW_TOTAL_BYTES_OFFSET + sizeof(std::uint64_t);
 constexpr std::size_t OVERFLOW_DATA_BYTES_OFFSET = OVERFLOW_NEXT_PAGE_OFFSET + sizeof(page_id_t);
 constexpr std::size_t OVERFLOW_DATA_OFFSET = OVERFLOW_DATA_BYTES_OFFSET + sizeof(std::uint16_t);
 
 auto ChecksumPage(std::span<const std::byte> input) -> std::uint32_t {
+  // Work on a copy so validation never mutates a pinned cache frame merely to
+  // zero its checksum field.
   auto page = std::array<std::byte, PAGE_SIZE>{};
   std::ranges::copy(input, page.begin());
   std::ranges::fill(page.begin() + static_cast<std::ptrdiff_t>(data_page_offset::CHECKSUM),
@@ -30,6 +37,8 @@ auto ChecksumPage(std::span<const std::byte> input) -> std::uint32_t {
 }
 
 auto IsKnownType(DataPageType type) -> bool {
+  // Do not use a numeric range check: future format versions may intentionally
+  // leave holes in the persisted type namespace.
   switch (type) {
     case DataPageType::Leaf:
     case DataPageType::Internal:
@@ -44,6 +53,9 @@ auto IsKnownType(DataPageType type) -> bool {
 
 auto InitializeDataPage(std::span<std::byte> page, DataPageType type, page_id_t page_id, std::uint64_t page_lsn,
                         std::uint16_t payload_bytes) -> Status {
+  // This function accepts builder-owned memory, so bad arguments are caller
+  // errors. DecodeDataPageHeader maps equivalent failures from disk to
+  // Corruption/UnsupportedFormat instead.
   if (page.size() != PAGE_SIZE) {
     return Status::InvalidArgument("data page is not exactly one page");
   }
@@ -57,6 +69,8 @@ auto InitializeDataPage(std::span<std::byte> page, DataPageType type, page_id_t 
     return Status::InvalidArgument("data-page payload exceeds one page");
   }
 
+  // Rebuilding from a zero page ensures removed records and old free-space
+  // fragments do not survive into checksummed persistent bytes.
   std::ranges::fill(page, std::byte{0});
   const auto encoded = PutBytes(page, data_page_offset::MAGIC, DATA_PAGE_MAGIC) &&
                        PutLittleEndian(page, data_page_offset::TYPE, static_cast<std::uint16_t>(type)) &&
@@ -73,6 +87,8 @@ auto FinalizeDataPage(std::span<std::byte> page) -> Status {
   if (page.size() != PAGE_SIZE) {
     return Status::InvalidArgument("data page is not exactly one page");
   }
+  // Always clear a previous checksum first. Builders may reuse a buffer that
+  // previously held a valid page, and that old value must not influence CRC.
   if (!PutLittleEndian(page, data_page_offset::CHECKSUM, std::uint32_t{0}) ||
       !PutLittleEndian(page, data_page_offset::CHECKSUM, ChecksumPage(page))) {
     return Status::Corruption("data-page checksum field exceeds one page");
@@ -88,6 +104,9 @@ auto DecodeDataPageHeader(std::span<const std::byte> page, page_id_t expected_pa
     return std::unexpected(Status::Corruption("unrecognized data-page magic"));
   }
 
+  // Authenticate the complete page before trusting type-specific offsets or
+  // lengths. A valid checksum is necessary but semantic checks below are still
+  // required because a correctly checksummed page can be misplaced or stale.
   const auto stored_checksum = GetLittleEndian<std::uint32_t>(page, data_page_offset::CHECKSUM);
   if (!stored_checksum || *stored_checksum != ChecksumPage(page)) {
     return std::unexpected(Status::Corruption("data-page checksum mismatch"));
@@ -110,9 +129,13 @@ auto DecodeDataPageHeader(std::span<const std::byte> page, page_id_t expected_pa
     return std::unexpected(Status::Corruption("unknown data-page type"));
   }
   if (*page_id != expected_page_id || *page_id < FIRST_DATA_PAGE_ID) {
+    // The physical-position check catches a page image written to the wrong
+    // offset and stale bytes exposed by allocator reuse.
     return std::unexpected(Status::Corruption("data-page ID does not match its file position"));
   }
   if (*payload_bytes > PAGE_SIZE - data_page_offset::HEADER_BYTES || *flags != 0) {
+    // Unknown flag semantics require a format version/feature bit; silently
+    // accepting them would let this reader misinterpret a newer page.
     return std::unexpected(Status::Corruption("invalid data-page length or flags"));
   }
   return DataPageHeader{
@@ -140,6 +163,8 @@ auto EncodeAllocatorPage(page_id_t page_id, std::uint64_t page_lsn,
 }
 
 auto DecodeAllocatorPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<AllocatorPage> {
+  // Common validation verifies checksum, identity, version, and generic
+  // bounds before this decoder interprets the allocator-specific payload.
   const auto header = DecodeDataPageHeader(page, expected_page_id);
   if (!header) {
     return std::unexpected(header.error());
@@ -163,6 +188,8 @@ auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, std::uint64_t
   if (next_page_id != HEADER_PAGE_ID && next_page_id < FIRST_DATA_PAGE_ID) {
     return std::unexpected(Status::InvalidArgument("overflow link overlaps the superblocks"));
   }
+  // Common payload_bytes includes overflow metadata plus live data, but not
+  // the zero-filled tail of the physical page.
   const auto payload_bytes =
       static_cast<std::uint16_t>(OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES + payload.size());
   auto output = std::array<char, PAGE_SIZE>{};
@@ -195,6 +222,8 @@ auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page
   const auto total = GetLittleEndian<std::uint64_t>(page, OVERFLOW_TOTAL_BYTES_OFFSET);
   const auto next = GetLittleEndian<page_id_t>(page, OVERFLOW_NEXT_PAGE_OFFSET);
   const auto data_bytes = GetLittleEndian<std::uint16_t>(page, OVERFLOW_DATA_BYTES_OFFSET);
+  // Cross-check the inner data length against the common outer payload length.
+  // Redundant lengths are useful only if inconsistent encodings are rejected.
   if (!total || !next || !data_bytes || *data_bytes > PAGE_SIZE - OVERFLOW_DATA_OFFSET ||
       header->payload_bytes != OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES + *data_bytes ||
       (*next != HEADER_PAGE_ID && *next < FIRST_DATA_PAGE_ID)) {
@@ -205,6 +234,8 @@ auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page
       .next_page_id = *next,
       .payload = {},
   };
+  // Copy only the declared bytes; checksum-covered zero padding is not part of
+  // the logical value.
   result.payload.assign(page.begin() + static_cast<std::ptrdiff_t>(OVERFLOW_DATA_OFFSET),
                         page.begin() + static_cast<std::ptrdiff_t>(OVERFLOW_DATA_OFFSET + *data_bytes));
   return result;

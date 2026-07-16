@@ -7,6 +7,10 @@
 
 namespace tinydb {
 
+// IEEE CRC-32 (reflected polynomial 0xEDB88320), used as a corruption and
+// torn-write detector for persistent pages and WAL frames. It is not a
+// cryptographic authenticity check: an attacker who can rewrite the file can
+// also recompute it.
 constexpr auto MakeCrc32Table() -> std::array<std::uint32_t, 256> {
   auto table = std::array<std::uint32_t, 256>{};
   for (std::uint32_t byte = 0; byte < table.size(); ++byte) {
@@ -21,6 +25,9 @@ constexpr auto MakeCrc32Table() -> std::array<std::uint32_t, 256> {
 
 inline constexpr auto CRC32_TABLE = MakeCrc32Table();
 
+// Keeping the implementation byte-oriented makes the result identical across
+// host endian and alignment rules. Codecs zero their checksum field before
+// calling this function, then store the returned value little-endian.
 inline auto Crc32(std::span<const std::byte> data) noexcept -> std::uint32_t {
   auto crc = std::uint32_t{0xFFFFFFFFU};
   for (const auto value : data) {

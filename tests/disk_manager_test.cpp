@@ -21,6 +21,8 @@
 #include <vector>
 
 static auto TestPath(const std::string &name) -> std::filesystem::path {
+  // PID isolation keeps concurrently running test binaries from sharing a
+  // database path and accidentally testing the process lock instead.
   return std::filesystem::temp_directory_path() / ("tinydb_" + name + "_" + std::to_string(::getpid()) + ".db");
 }
 
@@ -31,6 +33,8 @@ static auto ParentPath(const std::filesystem::path &path) -> std::filesystem::pa
 
 class ScopedSyscallHook {
  public:
+  // RAII is important here: a failed ASSERT must not leak a fault injector into
+  // the next test and make an unrelated durability assertion nondeterministic.
   explicit ScopedSyscallHook(tinydb::io::TestHook hook) { tinydb::io::SetTestHook(std::move(hook)); }
   ScopedSyscallHook(const ScopedSyscallHook &) = delete;
   auto operator=(const ScopedSyscallHook &) -> ScopedSyscallHook & = delete;
@@ -48,6 +52,8 @@ static auto FindCall(const std::vector<tinydb::io::Call> &calls, tinydb::io::Sys
 }
 
 static void FlipByteAt(const std::filesystem::path &path, std::uint64_t offset) {
+  // Damage exactly one persistent byte while preserving length and geometry,
+  // forcing the codec/checksum path rather than the short-file path.
   std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
   file.seekg(static_cast<std::streamoff>(offset));
   char byte = 0;
@@ -176,6 +182,8 @@ TEST(DiskManagerTest, RejectsTheOldSingleHeaderFormatWithoutMutation) {
     auto file = std::ofstream{path, std::ios::binary | std::ios::trunc};
     file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   }
+  // Opening an unsupported format is read-only diagnosis. Record geometry so
+  // an accidental "migration" or fresh-file reinitialization is caught.
   const auto before = std::filesystem::file_size(path);
 
   const auto result = tinydb::DiskManager::Open(path);
@@ -219,6 +227,8 @@ TEST(DiskManagerTest, OneValidSuperblockSurvivesDamageToTheOther) {
     ASSERT_TRUE(disk.Sync().Ok());
   }
 
+  // Checkpoint mirrors identical state to both slots; damage only A and prove B
+  // carries the allocation frontier needed to continue safely.
   FlipByteAt(path, tinydb::storage::superblock_offset::GENERATION);
   const auto reopened = tinydb::DiskManager::Open(path);
   ASSERT_TRUE(reopened.has_value());

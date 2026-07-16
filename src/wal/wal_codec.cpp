@@ -13,17 +13,23 @@
 namespace tinydb::wal_format {
 namespace {
 
+// Zero is the uninitialized sentinel shared with the database superblock
+// codec, never a valid durable identity.
 auto NonzeroUuid(const DatabaseUuid &uuid) -> bool {
   return std::ranges::any_of(uuid, [](std::byte byte) { return byte != std::byte{0}; });
 }
 
 auto ChecksumWithZeroedField(std::span<const std::byte> input, std::size_t checksum_offset) -> std::uint32_t {
+  // Headers and records have different sizes, so use one generic helper. The
+  // caller supplies a format-constant offset, never an offset read from disk.
   auto copy = std::vector<std::byte>(input.begin(), input.end());
   std::ranges::fill(copy.begin() + static_cast<std::ptrdiff_t>(checksum_offset),
                     copy.begin() + static_cast<std::ptrdiff_t>(checksum_offset + sizeof(std::uint32_t)), std::byte{0});
   return Crc32(copy);
 }
 
+// Enumerate accepted values explicitly so reserved numeric codes cannot be
+// mistaken for records whose semantics this recovery implementation knows.
 auto KnownRecordType(RecordType type) -> bool { return type == RecordType::PageImage || type == RecordType::Commit; }
 
 }  // namespace
@@ -36,6 +42,8 @@ auto EncodeHeader(const Header &header) -> Result<std::vector<char>> {
     return std::unexpected(Status::UnsupportedFormat("unsupported required WAL feature"));
   }
 
+  // Zero initialization canonicalizes the reserved extension area and makes
+  // its contents part of the checksum contract.
   auto output = std::vector<char>(HEADER_BYTES, 0);
   auto bytes = std::as_writable_bytes(std::span{output});
   const auto encoded =
@@ -61,6 +69,8 @@ auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header> {
     return std::unexpected(Status::Corruption("WAL header has the wrong length"));
   }
   if (!std::ranges::equal(MAGIC, bytes.subspan(header_offset::MAGIC, MAGIC.size()))) {
+    // As with superblocks, a foreign/old magic is a compatibility result;
+    // damage to recognized current framing is corruption.
     return std::unexpected(Status::UnsupportedFormat("unrecognized TinyDB WAL magic"));
   }
   const auto checksum = storage::GetLittleEndian<std::uint32_t>(bytes, header_offset::CHECKSUM);
@@ -94,6 +104,8 @@ auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header> {
   }
   if (std::ranges::any_of(bytes.subspan(header_offset::ENCODED_BYTES),
                           [](std::byte byte) { return byte != std::byte{0}; })) {
+    // Nonzero reserved bytes may carry semantics in a future format and cannot
+    // be ignored merely because the CRC is otherwise valid.
     return std::unexpected(Status::Corruption("nonzero reserved WAL header bytes"));
   }
   return result;
@@ -105,6 +117,8 @@ auto EncodeRecord(RecordType type, std::uint64_t transaction_id, std::uint64_t l
       payload.size() > std::numeric_limits<std::uint32_t>::max() - RECORD_HEADER_BYTES) {
     return std::unexpected(Status::InvalidArgument("invalid WAL record metadata"));
   }
+  // total_bytes is stored as u32 and includes the fixed header. The explicit
+  // overflow guard above keeps the narrowing conversion exact.
   const auto total_bytes = RECORD_HEADER_BYTES + payload.size();
   auto output = std::vector<char>(total_bytes, 0);
   auto bytes = std::as_writable_bytes(std::span{output});
@@ -135,6 +149,9 @@ auto DecodeRecord(std::span<const std::byte> bytes) -> Result<Record> {
   const auto lsn = storage::GetLittleEndian<std::uint64_t>(bytes, record_offset::LSN);
   const auto checksum = storage::GetLittleEndian<std::uint32_t>(bytes, record_offset::CHECKSUM);
   const auto reserved = storage::GetLittleEndian<std::uint32_t>(bytes, record_offset::RESERVED);
+  // Decode all fixed fields with checked helpers before any payload is
+  // exposed. `bytes` must contain exactly one record, not a prefix followed by
+  // ignored data.
   if (!total || !raw_type || !flags || !transaction_id || !lsn || !checksum || !reserved || *total != bytes.size() ||
       *total < RECORD_HEADER_BYTES) {
     return std::unexpected(Status::Corruption("invalid WAL record length"));
@@ -144,6 +161,8 @@ auto DecodeRecord(std::span<const std::byte> bytes) -> Result<Record> {
   }
   const auto type = static_cast<RecordType>(*raw_type);
   if (!KnownRecordType(type) || *flags != 0 || *reserved != 0 || *transaction_id == 0 || *lsn < HEADER_BYTES) {
+    // A valid CRC says the bytes arrived intact; it does not make impossible
+    // metadata meaningful. Semantic validation remains mandatory.
     return std::unexpected(Status::Corruption("invalid WAL record metadata"));
   }
   return Record{.type = type,

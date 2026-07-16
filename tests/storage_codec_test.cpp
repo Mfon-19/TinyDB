@@ -27,6 +27,9 @@ using tinydb::storage::Superblock;
 using tinydb::storage::SuperblockPage;
 using tinydb::storage::SuperblockSlot;
 
+// Deliberately choose asymmetric, byte-distinct numbers. A native-endian or
+// misaligned field will then disagree visibly with the golden fixture instead
+// of accidentally passing because the value is zero or palindromic.
 auto Fixture(std::uint64_t generation = 0x0102030405060708ULL) -> Superblock {
   auto uuid = DatabaseUuid{};
   for (std::size_t i = 0; i < uuid.size(); ++i) {
@@ -44,6 +47,8 @@ auto Fixture(std::uint64_t generation = 0x0102030405060708ULL) -> Superblock {
 }
 
 void Reseal(SuperblockPage &page) {
+  // Tests that change semantic fields must recompute CRC so they exercise
+  // version/feature validation rather than stopping at checksum validation.
   auto bytes = std::span<std::byte>{page};
   ASSERT_TRUE(tinydb::storage::PutLittleEndian<std::uint32_t>(bytes, tinydb::storage::superblock_offset::CHECKSUM, 0));
   ASSERT_TRUE(
@@ -92,6 +97,9 @@ TEST(SuperblockCodecTest, MatchesTheGoldenLittleEndianFixture) {
   const auto encoded = tinydb::storage::EncodeSuperblock(Fixture());
   ASSERT_TRUE(encoded.has_value());
 
+  // This byte array is intentionally independent of EncodeSuperblock helpers.
+  // It is the compatibility contract: refactoring the codec may not change it
+  // merely because round-trip tests still agree with themselves.
   constexpr auto golden_prefix = std::array<std::byte, 100>{
       std::byte{0x54}, std::byte{0x49}, std::byte{0x4E}, std::byte{0x59}, std::byte{0x44}, std::byte{0x42},
       std::byte{0x30}, std::byte{0x34}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
@@ -120,6 +128,8 @@ TEST(SuperblockCodecTest, MatchesTheGoldenLittleEndianFixture) {
 TEST(SuperblockCodecTest, CompletePageChecksumDetectsEveryFieldAndReservedBytes) {
   const auto original = tinydb::storage::EncodeSuperblock(Fixture());
   ASSERT_TRUE(original.has_value());
+  // Touch one byte in every logical field plus the first reserved byte. The
+  // decoder must not leave any persistent region outside checksum coverage.
   for (const auto offset :
        {tinydb::storage::superblock_offset::FORMAT_MAJOR, tinydb::storage::superblock_offset::FORMAT_MINOR,
         tinydb::storage::superblock_offset::PAGE_SIZE, tinydb::storage::superblock_offset::REQUIRED_FEATURES,
@@ -141,6 +151,8 @@ TEST(SuperblockCodecTest, RejectsUnsupportedVersionRequiredFeaturesAndEndian) {
   const auto original = tinydb::storage::EncodeSuperblock(Fixture());
   ASSERT_TRUE(original.has_value());
 
+  // Resealing proves the classification is UnsupportedFormat because of
+  // semantics, not Corruption because bytes were damaged in transit.
   for (const auto patch :
        {tinydb::storage::superblock_offset::FORMAT_MAJOR, tinydb::storage::superblock_offset::FORMAT_MINOR,
         tinydb::storage::superblock_offset::REQUIRED_FEATURES}) {
@@ -207,6 +219,8 @@ TEST(SuperblockSelectionTest, EveryTornWriteBoundaryLeavesAValidGeneration) {
   ASSERT_TRUE(old_b.has_value());
   ASSERT_TRUE(new_b.has_value());
 
+  // Model a sector/device tear at every possible byte: a prefix of new B lands
+  // over old B while A remains the previous durable generation.
   for (std::size_t cut = 0; cut <= tinydb::PAGE_SIZE; ++cut) {
     auto torn_b = *old_b;
     std::ranges::copy_n(new_b->begin(), static_cast<std::ptrdiff_t>(cut), torn_b.begin());
@@ -233,6 +247,8 @@ TEST(SuperblockSelectionTest, EqualGenerationsMustDescribeIdenticalState) {
 TEST(DataPageCodecTest, AllocatorPageMatchesGoldenBytesAndRoundTrips) {
   const auto encoded = tinydb::storage::EncodeAllocatorPage(2, 0x0102030405060708ULL, 4);
   ASSERT_TRUE(encoded.has_value());
+  // Includes the independently precomputed CRC, so the test covers more than
+  // just field placement and self-consistent encode/decode behavior.
   constexpr auto golden_prefix = std::array<std::byte, 40>{
       std::byte{0x54}, std::byte{0x44}, std::byte{0x50}, std::byte{0x34}, std::byte{0x03}, std::byte{0x00},
       std::byte{0x01}, std::byte{0x00}, std::byte{0x02}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
@@ -254,6 +270,8 @@ TEST(DataPageCodecTest, AllocatorPageMatchesGoldenBytesAndRoundTrips) {
 }
 
 TEST(DataPageCodecTest, OverflowLengthsIdentityAndChecksumAreValidated) {
+  // Include NUL and high-bit bytes to prove values are opaque bytes rather
+  // than C strings or signed characters.
   const auto payload = std::array{std::byte{0x00}, std::byte{0x7F}, std::byte{0x80}, std::byte{0xFF}};
   const auto encoded = tinydb::storage::EncodeOverflowPage(7, 99, 12, 8, payload);
   ASSERT_TRUE(encoded.has_value());
@@ -294,6 +312,8 @@ TEST(DataPageCodecTest, RejectsUnsupportedVersionAndOppositeEndianIdentity) {
 }
 
 TEST(DataPageCodecTest, LeafAndInternalPagesUseTheValidatedCommonHeader) {
+  // Exercise the real node Store/Load implementations, ensuring tree pages did
+  // not retain a parallel legacy header path beside the common page codec.
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto leaf = tinydb::LeafNode{};
   leaf.Upsert("alpha", "one");

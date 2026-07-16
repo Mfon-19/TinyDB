@@ -29,6 +29,10 @@ static constexpr std::uint64_t PAGE_IMAGE_RECORD_BYTES =
     tinydb::wal_format::RECORD_HEADER_BYTES + sizeof(tinydb::page_id_t) + tinydb::PAGE_SIZE;
 static constexpr std::uint64_t COMMIT_RECORD_BYTES = tinydb::wal_format::RECORD_HEADER_BYTES + 16;
 
+// Keep expected record geometry derived from public format constants, but not
+// from Wal::SizeBytes itself. These assertions catch accidental framing growth
+// that would otherwise remain internally self-consistent.
+
 // The database identity this suite stamps into its files and logs; tests
 // about mismatched pairs use a different value on one side.
 static auto Uuid(std::byte last) -> tinydb::DatabaseUuid {
@@ -41,6 +45,9 @@ static const auto TEST_UUID = Uuid(std::byte{1});
 static const auto OTHER_UUID = Uuid(std::byte{2});
 
 static auto DataPage(tinydb::page_id_t page_id, char marker) -> std::array<char, tinydb::PAGE_SIZE> {
+  // WAL recovery now validates every page image before replay. Use a minimal
+  // real encoded page rather than arbitrary marker-filled bytes so tests reach
+  // the WAL behavior they intend to exercise.
   const auto payload = std::array{static_cast<std::byte>(marker)};
   const auto page = tinydb::storage::EncodeOverflowPage(page_id, 0, payload.size(), tinydb::HEADER_PAGE_ID, payload);
   EXPECT_TRUE(page.has_value());
@@ -50,6 +57,9 @@ static auto DataPage(tinydb::page_id_t page_id, char marker) -> std::array<char,
 static auto SuperblockPage(const tinydb::DatabaseUuid &uuid = TEST_UUID, std::uint64_t generation = 2,
                            tinydb::page_id_t high_water = tinydb::FIRST_DATA_PAGE_ID)
     -> std::array<char, tinydb::PAGE_SIZE> {
+  // Superblock images exercise the metadata half of physical redo; generation
+  // and frontier are parameters because recovery tests need both fresh and
+  // advanced database states.
   const auto page = tinydb::storage::EncodeSuperblock(tinydb::storage::Superblock{
       .database_uuid = uuid,
       .generation = generation,
@@ -67,6 +77,8 @@ static auto TestPath(const std::string &name) -> std::filesystem::path {
 
 class ScopedSyscallHook {
  public:
+  // Always remove the process-global hook, including when an ASSERT exits the
+  // current test early.
   explicit ScopedSyscallHook(tinydb::io::TestHook hook) { tinydb::io::SetTestHook(std::move(hook)); }
   ScopedSyscallHook(const ScopedSyscallHook &) = delete;
   auto operator=(const ScopedSyscallHook &) -> ScopedSyscallHook & = delete;
@@ -88,7 +100,8 @@ static auto FindCall(const std::vector<tinydb::io::Call> &calls, tinydb::io::Sys
   return std::numeric_limits<std::size_t>::max();
 }
 
-// A database file of `pages` pages, page i filled with the byte '0' + i.
+// Creates a fully codec-valid database of `pages` pages. Using encoded pages is
+// essential now that recovery refuses to replay/checkpoint opaque junk.
 static void MakeDbFile(const std::filesystem::path &path, int pages) {
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   const auto superblock = tinydb::storage::EncodeSuperblock(tinydb::storage::Superblock{
@@ -113,6 +126,9 @@ static auto ReadWholeFile(const std::filesystem::path &path) -> std::string {
 }
 
 static void FlipByteAt(const std::filesystem::path &path, std::uint64_t offset) {
+  // Preserve record length and file geometry so the checksum path, not simple
+  // truncation handling, decides whether the location is a torn tail or durable
+  // middle corruption.
   std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
   file.seekg(static_cast<std::streamoff>(offset));
   char byte = 0;

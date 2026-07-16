@@ -16,6 +16,9 @@ static auto TestPath(const std::string &name) -> std::filesystem::path {
 }
 
 static void StoreMarker(char *data, tinydb::page_id_t page_id, char marker) {
+  // Buffer-pool tests care about caching, not a particular tree layout. A tiny
+  // overflow page provides codec-valid opaque content whose marker survives
+  // flush/eviction and whose embedded page identity can be checked on read.
   const auto payload = std::array{static_cast<std::byte>(marker)};
   const auto encoded = tinydb::storage::EncodeOverflowPage(page_id, 0, payload.size(), tinydb::HEADER_PAGE_ID, payload);
   ASSERT_TRUE(encoded.has_value());
@@ -23,6 +26,8 @@ static void StoreMarker(char *data, tinydb::page_id_t page_id, char marker) {
 }
 
 static auto ReadMarker(const char *data, tinydb::page_id_t page_id) -> char {
+  // Decoding here also proves eviction wrote a complete checksummed page rather
+  // than merely preserving the one byte the old tests used to inspect.
   const auto decoded = tinydb::storage::DecodeOverflowPage(std::as_bytes(std::span{data, tinydb::PAGE_SIZE}), page_id);
   EXPECT_TRUE(decoded.has_value());
   return static_cast<char>(std::to_integer<unsigned char>(decoded->payload.front()));

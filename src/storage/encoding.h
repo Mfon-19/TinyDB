@@ -9,9 +9,20 @@
 
 namespace tinydb::storage {
 
+// These are the only primitives persistent codecs should use for fixed-width
+// integers. Encoding field-by-field avoids persisting C++ padding, alignment,
+// native byte order, enum representation, or compiler ABI details.
+//
+// All helpers are bounds checked and intentionally return bool/optional rather
+// than asserting. Input bytes come from untrusted files, so a malformed offset
+// must become Status::Corruption at the codec boundary, not terminate the host
+// application. The encoder uses the same checks to make layout drift visible
+// during development.
 template <typename Integer>
   requires std::is_unsigned_v<Integer>
 constexpr auto PutLittleEndian(std::span<std::byte> output, std::size_t offset, Integer value) noexcept -> bool {
+  // The subtraction form avoids overflow in `offset + sizeof(Integer)` when
+  // offset itself came from a corrupt or otherwise untrusted source.
   if (offset > output.size() || output.size() - offset < sizeof(Integer)) {
     return false;
   }
@@ -26,6 +37,8 @@ template <typename Integer>
   requires std::is_unsigned_v<Integer>
 constexpr auto GetLittleEndian(std::span<const std::byte> input,
                                std::size_t offset) noexcept -> std::optional<Integer> {
+  // Accumulate in the widest supported scratch type so shifting a small
+  // Integer (for example uint16_t) never promotes through signed int.
   static_assert(sizeof(Integer) <= sizeof(std::uint64_t));
   if (offset > input.size() || input.size() - offset < sizeof(Integer)) {
     return std::nullopt;
@@ -39,6 +52,8 @@ constexpr auto GetLittleEndian(std::span<const std::byte> input,
 
 constexpr auto PutBytes(std::span<std::byte> output, std::size_t offset,
                         std::span<const std::byte> value) noexcept -> bool {
+  // Byte strings such as magic values and UUIDs have no endian conversion;
+  // they are copied exactly as the file-format specification spells them.
   if (offset > output.size() || output.size() - offset < value.size()) {
     return false;
   }
