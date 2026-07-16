@@ -2,6 +2,8 @@
 #include <tinydb/status.h>
 
 #include "support/transaction_model.h"
+#include "support/transaction_scenarios.h"
+#include "txn/contract.h"
 #include "txn/state.h"
 
 #include <algorithm>
@@ -88,6 +90,22 @@ TEST(DatabaseStateTest, AdmissionPolicyDefinesEveryOperationInEveryState) {
   }
 }
 
+TEST(DatabaseStateTest, CloseIsBusyUntilEveryTransactionReleasesItsSnapshot) {
+  for (const auto state :
+       {DatabaseState::Open, DatabaseState::CheckpointDegraded, DatabaseState::NeedsRecovery, DatabaseState::Corrupt}) {
+    EXPECT_EQ(tinydb::txn::StateStatus(state, DatabaseOperation::Close, 1), StatusCode::Busy);
+    EXPECT_EQ(tinydb::txn::StateStatus(state, DatabaseOperation::Close, 2), StatusCode::Busy);
+    EXPECT_EQ(tinydb::txn::StateStatus(state, DatabaseOperation::Close, 0), StatusCode::Ok);
+  }
+
+  EXPECT_EQ(tinydb::txn::StateStatus(DatabaseState::Closed, DatabaseOperation::Close, 0), StatusCode::Ok);
+}
+
+TEST(DatabaseStateTest, OpeningAnOwnedDatabaseIsBusy) {
+  EXPECT_EQ(tinydb::txn::OpenStatus(false), StatusCode::Ok);
+  EXPECT_EQ(tinydb::txn::OpenStatus(true), StatusCode::Busy);
+}
+
 TEST(TransactionStateTest, CommitPathAndFailurePathsAreExplicit) {
   constexpr auto states = std::array{
       TransactionState::Active,    TransactionState::Frozen,  TransactionState::WritingWal,   TransactionState::Durable,
@@ -114,102 +132,89 @@ TEST(TransactionStateTest, CommitPathAndFailurePathsAreExplicit) {
 
 TEST(TransactionStateTest, OnlyTerminalStatesHaveCommitOutcomes) {
   EXPECT_EQ(tinydb::txn::Outcome(TransactionState::Published), CommitOutcome::Committed);
-  EXPECT_EQ(tinydb::txn::Outcome(TransactionState::Aborted), CommitOutcome::Aborted);
+  EXPECT_EQ(tinydb::txn::Outcome(TransactionState::Aborted), CommitOutcome::DefinitelyAborted);
   EXPECT_EQ(tinydb::txn::Outcome(TransactionState::Indeterminate), CommitOutcome::Indeterminate);
-  EXPECT_EQ(tinydb::txn::Outcome(TransactionState::Active), std::nullopt);
-  EXPECT_EQ(tinydb::txn::Outcome(TransactionState::Durable), std::nullopt);
+  for (const auto state :
+       {TransactionState::Active, TransactionState::Frozen, TransactionState::WritingWal, TransactionState::Durable}) {
+    EXPECT_EQ(tinydb::txn::Outcome(state), std::nullopt);
+  }
 }
 
-TEST(TransactionModelTest, CommitPublishesAllChangesTogether) {
+TEST(TransactionContractTest, CommitPublishesAllChangesTogether) {
+  auto model = TransactionModel{};
+  tinydb::test_support::CommitPublishesAtomically(model);
+}
+
+TEST(TransactionContractTest, AbortDiscardsEveryChange) {
+  auto model = TransactionModel{};
+  tinydb::test_support::AbortDiscardsAllChanges(model);
+}
+
+TEST(TransactionContractTest, DestructionAbortsAndReleasesTheWriter) {
+  auto model = TransactionModel{};
+  tinydb::test_support::DestructionAborts(model);
+}
+
+TEST(TransactionContractTest, OverwriteDeleteAndReadYourWritesMatchTheContract) {
+  auto model = TransactionModel{};
+  tinydb::test_support::OverwriteDeleteAndReadOwnWrites(model);
+}
+
+TEST(TransactionContractTest, RangesAreHalfOpenAndMayBeUnbounded) {
+  auto model = TransactionModel{};
+  tinydb::test_support::ScanUsesHalfOpenOptionalBounds(model);
+}
+
+TEST(TransactionContractTest, KeysUseUnsignedLexicographicByteOrder) {
+  auto model = TransactionModel{};
+  tinydb::test_support::KeysUseUnsignedByteOrder(model);
+}
+
+TEST(TransactionContractTest, OnlyOneWriterMayExist) {
+  auto model = TransactionModel{};
+  tinydb::test_support::OnlyOneWriterIsAdmitted(model);
+}
+
+TEST(DataModelContractTest, EmptyAndMaximumSizedKeysAreValid) {
+  EXPECT_EQ(tinydb::txn::ValidateKeySize(0), StatusCode::Ok);
+  EXPECT_EQ(tinydb::txn::ValidateKeySize(tinydb::txn::MAX_KEY_BYTES), StatusCode::Ok);
+  EXPECT_EQ(tinydb::txn::ValidateKeySize(tinydb::txn::MAX_KEY_BYTES + 1), StatusCode::InvalidArgument);
+
+  auto model = TransactionModel{};
+  auto transaction = model.BeginWrite();
+  ASSERT_TRUE(transaction.has_value());
+  const auto maximum_key = std::string(tinydb::txn::MAX_KEY_BYTES, 'k');
+  ASSERT_EQ(transaction->Put("", ""), StatusCode::Ok);
+  ASSERT_EQ(transaction->Put(maximum_key, "maximum"), StatusCode::Ok);
+  ASSERT_TRUE(transaction->Commit());
+  EXPECT_EQ(model.Get(""), std::optional<std::string>{""});
+  EXPECT_EQ(model.Get(maximum_key), std::optional<std::string>{"maximum"});
+}
+
+TEST(DataModelContractTest, InvalidMutationDoesNotAbortTheTransaction) {
   auto model = TransactionModel{};
   auto transaction = model.BeginWrite();
   ASSERT_TRUE(transaction.has_value());
 
-  transaction->Put("doc/1", "new contents");
-  transaction->Put("tag/database/doc/1", "");
-
-  EXPECT_EQ(transaction->Get("doc/1"), std::optional<std::string>{"new contents"});
-  EXPECT_EQ(model.Get("doc/1"), std::nullopt);
-  EXPECT_EQ(model.Get("tag/database/doc/1"), std::nullopt);
-
+  const auto oversized_key = std::string(tinydb::txn::MAX_KEY_BYTES + 1, 'x');
+  EXPECT_EQ(transaction->Put(oversized_key, "value"), StatusCode::InvalidArgument);
+  EXPECT_EQ(transaction->Delete(oversized_key), StatusCode::InvalidArgument);
+  EXPECT_EQ(transaction->Put("valid", "value"), StatusCode::Ok);
   ASSERT_TRUE(transaction->Commit());
-  EXPECT_EQ(model.Get("doc/1"), std::optional<std::string>{"new contents"});
-  EXPECT_EQ(model.Get("tag/database/doc/1"), std::optional<std::string>{""});
+
+  EXPECT_EQ(model.Get(oversized_key), std::nullopt);
+  EXPECT_EQ(model.Get("valid"), std::optional<std::string>{"value"});
 }
 
-TEST(TransactionModelTest, AbortAndDestructionDiscardEveryChange) {
-  auto model = TransactionModel{};
-  {
-    auto transaction = model.BeginWrite();
-    ASSERT_TRUE(transaction.has_value());
-    transaction->Put("key", "aborted");
-    transaction->Abort();
-  }
-  EXPECT_EQ(model.Get("key"), std::nullopt);
-
-  {
-    auto transaction = model.BeginWrite();
-    ASSERT_TRUE(transaction.has_value());
-    transaction->Put("key", "also aborted");
-  }
-  EXPECT_EQ(model.Get("key"), std::nullopt);
-  EXPECT_TRUE(model.BeginWrite().has_value());
-}
-
-TEST(TransactionModelTest, OverwriteDeleteAndReadYourWritesMatchTheContract) {
-  auto model = TransactionModel{};
-  auto first = model.BeginWrite();
-  ASSERT_TRUE(first.has_value());
-  first->Put("key", "first");
-  ASSERT_TRUE(first->Commit());
-
-  auto second = model.BeginWrite();
-  ASSERT_TRUE(second.has_value());
-  second->Put("key", "second");
-  second->Delete("absent");
-  EXPECT_EQ(second->Get("key"), std::optional<std::string>{"second"});
-  second->Delete("key");
-  EXPECT_EQ(second->Get("key"), std::nullopt);
-  ASSERT_TRUE(second->Commit());
-  EXPECT_EQ(model.Get("key"), std::nullopt);
-}
-
-TEST(TransactionModelTest, RangesAreHalfOpenAndMayBeUnbounded) {
+TEST(DataModelContractTest, ValuesAreNotLimitedByPageGeometry) {
   auto model = TransactionModel{};
   auto transaction = model.BeginWrite();
   ASSERT_TRUE(transaction.has_value());
-  for (const auto *key : {"a", "b", "c", "d"}) {
-    transaction->Put(key, key);
-  }
+
+  const auto value = std::string(16 * 1024, 'v');
+  ASSERT_EQ(transaction->Put("large", value), StatusCode::Ok);
   ASSERT_TRUE(transaction->Commit());
-
-  EXPECT_EQ(model.Scan("b", "d"), (TransactionModel::Rows{{"b", "b"}, {"c", "c"}}));
-  EXPECT_EQ(model.Scan(std::nullopt, "c"), (TransactionModel::Rows{{"a", "a"}, {"b", "b"}}));
-  EXPECT_EQ(model.Scan("c", std::nullopt), (TransactionModel::Rows{{"c", "c"}, {"d", "d"}}));
-  EXPECT_TRUE(model.Scan("c", "c").empty());
-}
-
-TEST(TransactionModelTest, KeysUseUnsignedLexicographicByteOrder) {
-  auto model = TransactionModel{};
-  auto transaction = model.BeginWrite();
-  ASSERT_TRUE(transaction.has_value());
-  transaction->Put(std::string{"\x80", 1}, "high");
-  transaction->Put(std::string{"\x7f", 1}, "low");
-  ASSERT_TRUE(transaction->Commit());
-
-  const auto rows = model.Scan();
-  ASSERT_EQ(rows.size(), 2U);
-  EXPECT_EQ(rows[0].first, (std::string{"\x7f", 1}));
-  EXPECT_EQ(rows[1].first, (std::string{"\x80", 1}));
-}
-
-TEST(TransactionModelTest, OnlyOneWriterMayExist) {
-  auto model = TransactionModel{};
-  auto first = model.BeginWrite();
-  ASSERT_TRUE(first.has_value());
-  EXPECT_FALSE(model.BeginWrite().has_value());
-  first->Abort();
-  EXPECT_TRUE(model.BeginWrite().has_value());
+  EXPECT_EQ(model.Get("large"), std::optional<std::string>{value});
 }
 
 }  // namespace

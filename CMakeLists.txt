@@ -89,6 +89,7 @@ add_library(
   src/engine/storage_engine.cpp
   src/io/syscalls.h
   src/storage/disk_manager.cpp
+  src/txn/contract.h
   src/txn/state.h
   src/util/checksums.h
   src/wal/wal.cpp)

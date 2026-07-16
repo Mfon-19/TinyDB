@@ -2,6 +2,7 @@
 
 #include <tinydb/status.h>
 
+#include <cstddef>
 #include <optional>
 
 namespace tinydb::txn {
@@ -27,29 +28,46 @@ enum class DatabaseOperation {
 // This is only the state-level admission decision. An admitted operation can
 // still fail for its own reasons, such as a write reaching a memory limit while
 // checkpointing is degraded or Close finding a live transaction.
-constexpr auto StateStatus(DatabaseState state, DatabaseOperation operation) noexcept -> StatusCode {
+constexpr auto StateStatus(DatabaseState state, DatabaseOperation operation,
+                           std::size_t active_transactions = 0) noexcept -> StatusCode {
+  auto status = StatusCode::Corruption;
   switch (state) {
     case DatabaseState::Open:
     case DatabaseState::CheckpointDegraded:
-      return StatusCode::Ok;
+      status = StatusCode::Ok;
+      break;
 
     case DatabaseState::NeedsRecovery:
       if (operation == DatabaseOperation::Stats || operation == DatabaseOperation::Close) {
-        return StatusCode::Ok;
+        status = StatusCode::Ok;
+      } else {
+        status = StatusCode::NeedsRecovery;
       }
-      return StatusCode::NeedsRecovery;
+      break;
 
     case DatabaseState::Corrupt:
       if (operation == DatabaseOperation::Verify || operation == DatabaseOperation::Stats ||
           operation == DatabaseOperation::Close) {
-        return StatusCode::Ok;
+        status = StatusCode::Ok;
+      } else {
+        status = StatusCode::Corruption;
       }
-      return StatusCode::Corruption;
+      break;
 
     case DatabaseState::Closed:
-      return operation == DatabaseOperation::Close ? StatusCode::Ok : StatusCode::Closed;
+      status = operation == DatabaseOperation::Close ? StatusCode::Ok : StatusCode::Closed;
+      break;
   }
-  return StatusCode::Corruption;
+
+  if (status == StatusCode::Ok && operation == DatabaseOperation::Close && state != DatabaseState::Closed &&
+      active_transactions != 0) {
+    return StatusCode::Busy;
+  }
+  return status;
+}
+
+constexpr auto OpenStatus(bool database_is_owned) noexcept -> StatusCode {
+  return database_is_owned ? StatusCode::Busy : StatusCode::Ok;
 }
 
 constexpr auto CanTransition(DatabaseState from, DatabaseState to) noexcept -> bool {
@@ -81,7 +99,7 @@ enum class TransactionState {
 
 enum class CommitOutcome {
   Committed,
-  Aborted,
+  DefinitelyAborted,
   Indeterminate,
 };
 
@@ -109,7 +127,7 @@ constexpr auto Outcome(TransactionState state) noexcept -> std::optional<CommitO
     case TransactionState::Published:
       return CommitOutcome::Committed;
     case TransactionState::Aborted:
-      return CommitOutcome::Aborted;
+      return CommitOutcome::DefinitelyAborted;
     case TransactionState::Indeterminate:
       return CommitOutcome::Indeterminate;
     case TransactionState::Active:

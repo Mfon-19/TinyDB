@@ -1,5 +1,9 @@
 #pragma once
 
+#include "txn/contract.h"
+
+#include <tinydb/status.h>
+
 #include <map>
 #include <optional>
 #include <string>
@@ -34,9 +38,23 @@ class TransactionModel {
 
     auto Get(std::string_view key) const -> std::optional<std::string> { return Find(working_, key); }
 
-    void Put(std::string key, std::string value) { working_.insert_or_assign(std::move(key), std::move(value)); }
+    [[nodiscard]] auto Put(std::string key, std::string value) -> StatusCode {
+      if (const auto status = txn::ValidateKeySize(key.size()); status != StatusCode::Ok) {
+        return status;
+      }
+      working_.insert_or_assign(std::move(key), std::move(value));
+      return StatusCode::Ok;
+    }
 
-    void Delete(std::string_view key) { working_.erase(std::string{key}); }
+    [[nodiscard]] auto Delete(std::string_view key) -> StatusCode {
+      if (const auto status = txn::ValidateKeySize(key.size()); status != StatusCode::Ok) {
+        return status;
+      }
+      if (const auto found = working_.find(key); found != working_.end()) {
+        working_.erase(found);
+      }
+      return StatusCode::Ok;
+    }
 
     auto Scan(std::optional<std::string_view> start = std::nullopt,
               std::optional<std::string_view> end = std::nullopt) const -> Rows {
@@ -63,7 +81,7 @@ class TransactionModel {
 
     explicit WriteTransaction(TransactionModel &owner) : owner_(&owner), working_(owner.committed_) {}
 
-    static auto Find(const std::map<std::string, std::string, std::less<>> &rows,
+    static auto Find(const std::map<std::string, std::string, txn::BytewiseLess> &rows,
                      std::string_view key) -> std::optional<std::string> {
       const auto found = rows.find(key);
       return found == rows.end() ? std::nullopt : std::optional<std::string>{found->second};
@@ -75,7 +93,7 @@ class TransactionModel {
     }
 
     TransactionModel *owner_;
-    std::map<std::string, std::string, std::less<>> working_;
+    std::map<std::string, std::string, txn::BytewiseLess> working_;
   };
 
   auto BeginWrite() -> std::optional<WriteTransaction> {
@@ -97,18 +115,18 @@ class TransactionModel {
   }
 
  private:
-  static auto ScanRows(const std::map<std::string, std::string, std::less<>> &rows,
+  static auto ScanRows(const std::map<std::string, std::string, txn::BytewiseLess> &rows,
                        std::optional<std::string_view> start, std::optional<std::string_view> end) -> Rows {
     auto result = Rows{};
     auto current = start ? rows.lower_bound(*start) : rows.begin();
-    while (current != rows.end() && (!end || current->first < *end)) {
+    while (current != rows.end() && (!end || txn::BytewiseLess{}(current->first, *end))) {
       result.emplace_back(current->first, current->second);
       ++current;
     }
     return result;
   }
 
-  std::map<std::string, std::string, std::less<>> committed_;
+  std::map<std::string, std::string, txn::BytewiseLess> committed_;
   bool writer_active_{false};
 };
 
