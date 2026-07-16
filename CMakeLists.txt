@@ -97,6 +97,8 @@ add_library(
   src/btree/tree_cursor.cpp
   src/btree/tree_cursor.h
   src/buffer/buffer_pool.cpp
+  src/cache/committed_page_cache.cpp
+  src/cache/committed_page_cache.h
   src/engine/storage_engine.cpp
   src/io/syscalls.h
   src/storage/disk_manager.cpp
@@ -106,6 +108,9 @@ add_library(
   src/storage/superblock.cpp
   src/storage/superblock.h
   src/txn/contract.h
+  src/txn/database_state.h
+  src/txn/reader_gate.cpp
+  src/txn/reader_gate.h
   src/txn/state.h
   src/util/crc32.h
   src/wal/wal.cpp
@@ -213,6 +218,24 @@ if(BUILD_TESTING)
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_contract_test)
     gtest_discover_tests(TinyDB_contract_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/reader_gate_test.cpp")
+    add_executable(TinyDB_reader_gate_test tests/reader_gate_test.cpp)
+    target_link_libraries(TinyDB_reader_gate_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_reader_gate_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_reader_gate_test)
+    gtest_discover_tests(TinyDB_reader_gate_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/committed_page_cache_test.cpp")
+    add_executable(TinyDB_committed_page_cache_test tests/committed_page_cache_test.cpp)
+    target_link_libraries(TinyDB_committed_page_cache_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_committed_page_cache_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_committed_page_cache_test)
+    gtest_discover_tests(TinyDB_committed_page_cache_test)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/wal_test.cpp")

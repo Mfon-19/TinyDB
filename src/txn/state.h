@@ -7,7 +7,10 @@
 
 namespace tinydb::txn {
 
-enum class DatabaseState {
+// Lifecycle describes whether the database handle admits an operation. It is
+// deliberately distinct from DatabaseState, the immutable roots/LSN snapshot
+// captured by a read transaction.
+enum class DatabaseLifecycle {
   Open,
   CheckpointDegraded,
   NeedsRecovery,
@@ -28,16 +31,16 @@ enum class DatabaseOperation {
 // This is only the state-level admission decision. An admitted operation can
 // still fail for its own reasons, such as a write reaching a memory limit while
 // checkpointing is degraded or Close finding a live transaction.
-constexpr auto StateStatus(DatabaseState state, DatabaseOperation operation,
+constexpr auto StateStatus(DatabaseLifecycle state, DatabaseOperation operation,
                            std::size_t active_transactions = 0) noexcept -> StatusCode {
   auto status = StatusCode::Corruption;
   switch (state) {
-    case DatabaseState::Open:
-    case DatabaseState::CheckpointDegraded:
+    case DatabaseLifecycle::Open:
+    case DatabaseLifecycle::CheckpointDegraded:
       status = StatusCode::Ok;
       break;
 
-    case DatabaseState::NeedsRecovery:
+    case DatabaseLifecycle::NeedsRecovery:
       if (operation == DatabaseOperation::Stats || operation == DatabaseOperation::Close) {
         status = StatusCode::Ok;
       } else {
@@ -45,7 +48,7 @@ constexpr auto StateStatus(DatabaseState state, DatabaseOperation operation,
       }
       break;
 
-    case DatabaseState::Corrupt:
+    case DatabaseLifecycle::Corrupt:
       if (operation == DatabaseOperation::Verify || operation == DatabaseOperation::Stats ||
           operation == DatabaseOperation::Close) {
         status = StatusCode::Ok;
@@ -54,12 +57,12 @@ constexpr auto StateStatus(DatabaseState state, DatabaseOperation operation,
       }
       break;
 
-    case DatabaseState::Closed:
+    case DatabaseLifecycle::Closed:
       status = operation == DatabaseOperation::Close ? StatusCode::Ok : StatusCode::Closed;
       break;
   }
 
-  if (status == StatusCode::Ok && operation == DatabaseOperation::Close && state != DatabaseState::Closed &&
+  if (status == StatusCode::Ok && operation == DatabaseOperation::Close && state != DatabaseLifecycle::Closed &&
       active_transactions != 0) {
     return StatusCode::Busy;
   }
@@ -70,18 +73,18 @@ constexpr auto OpenStatus(bool database_is_owned) noexcept -> StatusCode {
   return database_is_owned ? StatusCode::Busy : StatusCode::Ok;
 }
 
-constexpr auto CanTransition(DatabaseState from, DatabaseState to) noexcept -> bool {
+constexpr auto CanTransition(DatabaseLifecycle from, DatabaseLifecycle to) noexcept -> bool {
   switch (from) {
-    case DatabaseState::Open:
-      return to == DatabaseState::CheckpointDegraded || to == DatabaseState::NeedsRecovery ||
-             to == DatabaseState::Corrupt || to == DatabaseState::Closed;
-    case DatabaseState::CheckpointDegraded:
-      return to == DatabaseState::Open || to == DatabaseState::NeedsRecovery || to == DatabaseState::Corrupt ||
-             to == DatabaseState::Closed;
-    case DatabaseState::NeedsRecovery:
-    case DatabaseState::Corrupt:
-      return to == DatabaseState::Closed;
-    case DatabaseState::Closed:
+    case DatabaseLifecycle::Open:
+      return to == DatabaseLifecycle::CheckpointDegraded || to == DatabaseLifecycle::NeedsRecovery ||
+             to == DatabaseLifecycle::Corrupt || to == DatabaseLifecycle::Closed;
+    case DatabaseLifecycle::CheckpointDegraded:
+      return to == DatabaseLifecycle::Open || to == DatabaseLifecycle::NeedsRecovery ||
+             to == DatabaseLifecycle::Corrupt || to == DatabaseLifecycle::Closed;
+    case DatabaseLifecycle::NeedsRecovery:
+    case DatabaseLifecycle::Corrupt:
+      return to == DatabaseLifecycle::Closed;
+    case DatabaseLifecycle::Closed:
       return false;
   }
   return false;

@@ -19,7 +19,7 @@ using tinydb::StatusCode;
 using tinydb::test_support::TransactionModel;
 using tinydb::txn::CommitOutcome;
 using tinydb::txn::DatabaseOperation;
-using tinydb::txn::DatabaseState;
+using tinydb::txn::DatabaseLifecycle;
 using tinydb::txn::TransactionState;
 
 TEST(StatusContractTest, NewCodesHaveStableNames) {
@@ -37,19 +37,20 @@ TEST(StatusContractTest, NewCodesHaveStableNames) {
 }
 
 TEST(DatabaseStateTest, OnlyDefinedTransitionsAreLegal) {
-  constexpr auto states = std::array{DatabaseState::Open, DatabaseState::CheckpointDegraded,
-                                     DatabaseState::NeedsRecovery, DatabaseState::Corrupt, DatabaseState::Closed};
+  constexpr auto states = std::array{DatabaseLifecycle::Open, DatabaseLifecycle::CheckpointDegraded,
+                                     DatabaseLifecycle::NeedsRecovery, DatabaseLifecycle::Corrupt,
+                                     DatabaseLifecycle::Closed};
   constexpr auto allowed = std::array{
-      std::pair{DatabaseState::Open, DatabaseState::CheckpointDegraded},
-      std::pair{DatabaseState::Open, DatabaseState::NeedsRecovery},
-      std::pair{DatabaseState::Open, DatabaseState::Corrupt},
-      std::pair{DatabaseState::Open, DatabaseState::Closed},
-      std::pair{DatabaseState::CheckpointDegraded, DatabaseState::Open},
-      std::pair{DatabaseState::CheckpointDegraded, DatabaseState::NeedsRecovery},
-      std::pair{DatabaseState::CheckpointDegraded, DatabaseState::Corrupt},
-      std::pair{DatabaseState::CheckpointDegraded, DatabaseState::Closed},
-      std::pair{DatabaseState::NeedsRecovery, DatabaseState::Closed},
-      std::pair{DatabaseState::Corrupt, DatabaseState::Closed},
+      std::pair{DatabaseLifecycle::Open, DatabaseLifecycle::CheckpointDegraded},
+      std::pair{DatabaseLifecycle::Open, DatabaseLifecycle::NeedsRecovery},
+      std::pair{DatabaseLifecycle::Open, DatabaseLifecycle::Corrupt},
+      std::pair{DatabaseLifecycle::Open, DatabaseLifecycle::Closed},
+      std::pair{DatabaseLifecycle::CheckpointDegraded, DatabaseLifecycle::Open},
+      std::pair{DatabaseLifecycle::CheckpointDegraded, DatabaseLifecycle::NeedsRecovery},
+      std::pair{DatabaseLifecycle::CheckpointDegraded, DatabaseLifecycle::Corrupt},
+      std::pair{DatabaseLifecycle::CheckpointDegraded, DatabaseLifecycle::Closed},
+      std::pair{DatabaseLifecycle::NeedsRecovery, DatabaseLifecycle::Closed},
+      std::pair{DatabaseLifecycle::Corrupt, DatabaseLifecycle::Closed},
   };
 
   for (const auto from : states) {
@@ -66,18 +67,18 @@ TEST(DatabaseStateTest, AdmissionPolicyDefinesEveryOperationInEveryState) {
       DatabaseOperation::Read,   DatabaseOperation::Write, DatabaseOperation::Checkpoint, DatabaseOperation::Backup,
       DatabaseOperation::Verify, DatabaseOperation::Stats, DatabaseOperation::Close};
   constexpr auto cases = std::array{
-      std::pair{DatabaseState::Open, std::array{StatusCode::Ok, StatusCode::Ok, StatusCode::Ok, StatusCode::Ok,
+      std::pair{DatabaseLifecycle::Open, std::array{StatusCode::Ok, StatusCode::Ok, StatusCode::Ok, StatusCode::Ok,
                                                 StatusCode::Ok, StatusCode::Ok, StatusCode::Ok}},
-      std::pair{DatabaseState::CheckpointDegraded,
+      std::pair{DatabaseLifecycle::CheckpointDegraded,
                 std::array{StatusCode::Ok, StatusCode::Ok, StatusCode::Ok, StatusCode::Ok, StatusCode::Ok,
                            StatusCode::Ok, StatusCode::Ok}},
-      std::pair{DatabaseState::NeedsRecovery,
+      std::pair{DatabaseLifecycle::NeedsRecovery,
                 std::array{StatusCode::NeedsRecovery, StatusCode::NeedsRecovery, StatusCode::NeedsRecovery,
                            StatusCode::NeedsRecovery, StatusCode::NeedsRecovery, StatusCode::Ok, StatusCode::Ok}},
-      std::pair{DatabaseState::Corrupt,
+      std::pair{DatabaseLifecycle::Corrupt,
                 std::array{StatusCode::Corruption, StatusCode::Corruption, StatusCode::Corruption,
                            StatusCode::Corruption, StatusCode::Ok, StatusCode::Ok, StatusCode::Ok}},
-      std::pair{DatabaseState::Closed,
+      std::pair{DatabaseLifecycle::Closed,
                 std::array{StatusCode::Closed, StatusCode::Closed, StatusCode::Closed, StatusCode::Closed,
                            StatusCode::Closed, StatusCode::Closed, StatusCode::Ok}},
   };
@@ -92,13 +93,14 @@ TEST(DatabaseStateTest, AdmissionPolicyDefinesEveryOperationInEveryState) {
 
 TEST(DatabaseStateTest, CloseIsBusyUntilEveryTransactionReleasesItsSnapshot) {
   for (const auto state :
-       {DatabaseState::Open, DatabaseState::CheckpointDegraded, DatabaseState::NeedsRecovery, DatabaseState::Corrupt}) {
+       {DatabaseLifecycle::Open, DatabaseLifecycle::CheckpointDegraded, DatabaseLifecycle::NeedsRecovery,
+        DatabaseLifecycle::Corrupt}) {
     EXPECT_EQ(tinydb::txn::StateStatus(state, DatabaseOperation::Close, 1), StatusCode::Busy);
     EXPECT_EQ(tinydb::txn::StateStatus(state, DatabaseOperation::Close, 2), StatusCode::Busy);
     EXPECT_EQ(tinydb::txn::StateStatus(state, DatabaseOperation::Close, 0), StatusCode::Ok);
   }
 
-  EXPECT_EQ(tinydb::txn::StateStatus(DatabaseState::Closed, DatabaseOperation::Close, 0), StatusCode::Ok);
+  EXPECT_EQ(tinydb::txn::StateStatus(DatabaseLifecycle::Closed, DatabaseOperation::Close, 0), StatusCode::Ok);
 }
 
 TEST(DatabaseStateTest, OpeningAnOwnedDatabaseIsBusy) {
