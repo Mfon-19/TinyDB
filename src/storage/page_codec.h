@@ -57,10 +57,20 @@ struct DataPageHeader {
   std::uint16_t flags;
 };
 
-// A freed page becomes an allocator page whose payload is one link in the
-// persistent LIFO free list. Page zero is the null/sentinel link.
-struct AllocatorPage {
-  page_id_t next_free;
+struct FreeExtent {
+  page_id_t first_page_id;
+  std::uint64_t page_count;
+  std::uint64_t retire_lsn;
+
+  auto operator==(const FreeExtent &) const -> bool = default;
+};
+
+// Allocator pages form a forward chain containing sorted, non-overlapping free
+// extents. The retirement frontier prevents reuse while an older checkpoint or
+// WAL history can still attach the page ID to its previous contents.
+struct FreeExtentPage {
+  page_id_t next_page_id;
+  std::vector<FreeExtent> extents;
 };
 
 // Large values will be split across overflow pages. total_value_bytes is
@@ -78,14 +88,17 @@ struct OverflowPage {
 auto InitializeDataPage(std::span<std::byte> page, DataPageType type, page_id_t page_id, std::uint64_t page_lsn,
                         std::uint16_t payload_bytes) -> Status;
 auto FinalizeDataPage(std::span<std::byte> page) -> Status;
+auto RewriteDataPageLsn(std::span<std::byte> page, page_id_t expected_page_id, std::uint64_t page_lsn) -> Status;
 
 // expected_page_id is the page's physical file position. Persisting the ID in
 // the page and checking it here detects misplaced writes and stale page reuse.
 auto DecodeDataPageHeader(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<DataPageHeader>;
 
-auto EncodeAllocatorPage(page_id_t page_id, std::uint64_t page_lsn,
-                         page_id_t next_free) -> Result<std::array<char, PAGE_SIZE>>;
-auto DecodeAllocatorPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<AllocatorPage>;
+inline constexpr std::size_t FREE_EXTENTS_PER_PAGE = 168;
+
+auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t next_page_id,
+                          std::span<const FreeExtent> extents) -> Result<std::array<char, PAGE_SIZE>>;
+auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<FreeExtentPage>;
 
 auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, std::uint64_t total_value_bytes,
                         page_id_t next_page_id,

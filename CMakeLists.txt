@@ -68,7 +68,6 @@ endfunction()
 
 add_library(
   TinyDB
-  include/tinydb/buffer_pool.h
   include/tinydb/check.h
   include/tinydb/database_uuid.h
   include/tinydb/disk_manager.h
@@ -80,8 +79,6 @@ add_library(
   include/tinydb/wal.h
   src/btree/b_plus_tree.cpp
   src/btree/b_plus_tree.h
-  src/btree/buffer_pool_page_source.cpp
-  src/btree/buffer_pool_page_source.h
   src/btree/internal_page_builder.cpp
   src/btree/internal_page_builder.h
   src/btree/leaf_page_builder.cpp
@@ -96,7 +93,6 @@ add_library(
   src/btree/page_view.h
   src/btree/tree_cursor.cpp
   src/btree/tree_cursor.h
-  src/buffer/buffer_pool.cpp
   src/cache/committed_page_cache.cpp
   src/cache/committed_page_cache.h
   src/cache/committed_page_source.cpp
@@ -116,6 +112,8 @@ add_library(
   src/txn/read_snapshot.cpp
   src/txn/read_snapshot.h
   src/txn/state.h
+  src/txn/transaction_pages.cpp
+  src/txn/transaction_pages.h
   src/util/crc32.h
   src/wal/wal.cpp
   src/wal/wal_codec.cpp
@@ -157,26 +155,6 @@ if(BUILD_TESTING)
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_disk_manager_test)
     gtest_discover_tests(TinyDB_disk_manager_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/buffer_pool_test.cpp")
-    add_executable(TinyDB_buffer_pool_test tests/buffer_pool_test.cpp)
-    target_link_libraries(TinyDB_buffer_pool_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_buffer_pool_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_buffer_pool_test)
-    gtest_discover_tests(TinyDB_buffer_pool_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/b_plus_tree_test.cpp")
-    add_executable(TinyDB_b_plus_tree_test tests/b_plus_tree_test.cpp)
-    target_link_libraries(TinyDB_b_plus_tree_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    # White-box tests: the suite inspects on-disk page headers, which live in
-    # the library's private page_format.h.
-    target_include_directories(TinyDB_b_plus_tree_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_b_plus_tree_test)
-    gtest_discover_tests(TinyDB_b_plus_tree_test)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/storage_engine_test.cpp")
@@ -249,6 +227,15 @@ if(BUILD_TESTING)
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_read_snapshot_test)
     gtest_discover_tests(TinyDB_read_snapshot_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/transaction_pages_test.cpp")
+    add_executable(TinyDB_transaction_pages_test tests/transaction_pages_test.cpp)
+    target_link_libraries(TinyDB_transaction_pages_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_transaction_pages_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_transaction_pages_test)
+    gtest_discover_tests(TinyDB_transaction_pages_test)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/wal_test.cpp")

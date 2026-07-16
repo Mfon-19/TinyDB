@@ -1,6 +1,5 @@
 #pragma once
 
-#include <tinydb/buffer_pool.h>
 #include <tinydb/disk_manager.h>
 #include <tinydb/limits.h>
 #include <tinydb/status.h>
@@ -9,6 +8,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -17,28 +17,18 @@
 
 namespace tinydb {
 
-class BPlusTree;
-class BufferPoolPageSource;
+namespace cache {
+class CommittedPageCache;
+class CommittedPageSource;
+}  // namespace cache
+namespace txn {
+class ReaderGate;
+}  // namespace txn
 
-// StorageEngine owns a TinyDB database handle and exposes the embedded
-// key-value API. It wires the full stack: a DiskManager for page I/O, a
-// BufferPool caching pages above it, a B+ tree indexing the data, and a
-// write-ahead log making every mutation durable.
-//
-// Durability: when Put or Remove returns Ok, the operation's page images
-// are fsynced in the log, so it survives a crash — Open() replays the log
-// before anything else. The database file itself is only brought up to
-// date at a checkpoint (when the log outgrows its threshold, and at
-// Close()).
-//
-// A failure mid-mutation leaves the in-memory tree state half-changed with
-// no way to undo it (the log is redo-only), so it poisons the handle:
-// every later operation fails with StatusCode::Closed, and reopening the
-// database recovers everything that ever committed.
-//
-// Failures travel as Status / Result values (see status.h); nothing throws.
-// Handles are movable but not copyable. After Close(), every operation
-// fails with StatusCode::Closed.
+// Compatibility facade for the current single-operation API. Reads use
+// immutable committed snapshots; each mutation is prepared in a private page
+// transaction before the existing WAL makes it durable. The explicit public
+// transaction API and final commit coordinator arrive in Milestone 6.
 class StorageEngine {
  public:
   StorageEngine(const StorageEngine &) = delete;
@@ -48,82 +38,39 @@ class StorageEngine {
   auto operator=(StorageEngine &&other) noexcept -> StorageEngine &;
   ~StorageEngine();
 
-  // Opens or creates the database at path, first replaying any write-ahead
-  // log a crash left behind. Holds an exclusive lock on the database file
-  // for the life of the handle: a second Open of the same path — from this
-  // process or any other — fails with Busy until the handle closes.
-  // Fails with InvalidArgument if the file is not a TinyDB database and
-  // IoError on environment failures.
   static auto Open(const std::filesystem::path &path) -> Result<StorageEngine>;
 
-  // Inserts key or replaces its existing value; durable once it returns
-  // Ok. Fails with InvalidArgument if key + value exceeds MAX_ENTRY_BYTES;
-  // this is the layer that enforces the cap, the tree below assumes it
-  // holds.
   auto Put(std::string_view key, std::string_view value) -> Status;
-
-  // Returns the value stored under key, or std::nullopt if key is missing.
-  // Not const: reads pin pages in the buffer pool.
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
-
-  // Removes key if it exists; durable once it returns Ok.
   auto Remove(std::string_view key) -> Status;
-
-  // Returns rows with start <= key < end, in key order.
   auto Scan(std::string_view start, std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>>;
-
-  // Performs a full structural walk. Intended for diagnostics, tests, and
-  // post-recovery verification rather than latency-sensitive request paths.
   auto CheckIntegrity() -> Status;
-
-  // Flushes everything to the storage device (fsync) and releases resources
-  // owned by this handle. Safe to call more than once. On failure the
-  // handle rejects reads and writes but keeps its resources, so Close() can
-  // be called again to retry the flush. The destructor calls this too but
-  // can only report errors to stderr, so call Close() directly when flush
-  // errors must be handled.
   auto Close() -> Status;
 
  private:
+  enum class Mutation { Bootstrap, Put, Remove };
+
   StorageEngine(std::filesystem::path path, UniqueFd lock_fd, std::unique_ptr<DiskManager> disk,
-                std::unique_ptr<BufferPool> pool, std::unique_ptr<BufferPoolPageSource> pages,
-                std::unique_ptr<BPlusTree> tree, std::unique_ptr<Wal> wal);
+                std::unique_ptr<cache::CommittedPageCache> cache, std::unique_ptr<cache::CommittedPageSource> pages,
+                std::unique_ptr<txn::ReaderGate> readers, std::unique_ptr<Wal> wal);
 
-  // Close() for the destructor and move assignment, which cannot surface a
-  // status: failures are reported to stderr and dropped.
   void CloseBestEffort() noexcept;
-
-  // The logging half of every mutation: append the images of what the
-  // operation touched, fsync the log, then release the frames. A commit
-  // with nothing to log is skipped (the operation changed nothing).
-  auto CommitOp() -> Status;
-
-  // Flushes everything the log describes into the database file, fsyncs
-  // it, and only then empties the log.
+  auto Mutate(Mutation mutation, std::string_view key = {}, std::string_view value = {}) -> Status;
   auto Checkpoint() -> Status;
-
-  // Stops accepting work after a mid-mutation failure; see the class
-  // comment. Committed operations stay safe in the log.
   void Poison();
 
   std::filesystem::path path_;
   bool closed_{false};
   bool poisoned_{false};
 
-  // The exclusive flock on the database file. Declared before the layers
-  // below so reverse destruction order releases it last — no other handle
-  // may open the database while this one is still tearing down.
+  // The process lock is declared first and released last.
   UniqueFd lock_fd_;
-
-  // The pool holds a pointer to the disk manager and the tree a pointer to
-  // the pool, so member order fixes construction/destruction order and
-  // unique_ptr keeps the addresses stable across moves.
   std::unique_ptr<DiskManager> disk_;
-  std::unique_ptr<BufferPool> pool_;
-  // The page source outlives the tree that borrows it and isolates the tree
-  // from the current BufferPool implementation.
-  std::unique_ptr<BufferPoolPageSource> pages_;
-  std::unique_ptr<BPlusTree> tree_;
+  std::unique_ptr<cache::CommittedPageCache> cache_;
+  std::unique_ptr<cache::CommittedPageSource> pages_;
+  std::unique_ptr<txn::ReaderGate> readers_;
   std::unique_ptr<Wal> wal_;
+  std::unique_ptr<std::mutex> writer_mutex_;
 };
+
 }  // namespace tinydb

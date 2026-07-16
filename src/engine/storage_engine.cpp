@@ -1,11 +1,16 @@
+#include <tinydb/check.h>
 #include <tinydb/storage_engine.h>
 #include <tinydb/unique_fd.h>
 
-#include "btree/buffer_pool_page_source.h"
-#include "btree/page_source.h"
-#include "io/syscalls.h"
-
 #include "btree/b_plus_tree.h"
+#include "cache/committed_page_cache.h"
+#include "cache/committed_page_source.h"
+#include "io/syscalls.h"
+#include "txn/contract.h"
+#include "txn/database_state.h"
+#include "txn/read_snapshot.h"
+#include "txn/reader_gate.h"
+#include "txn/transaction_pages.h"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -22,133 +27,38 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
-/*
-  StorageEngine wires the stack together and owns the one protocol that
-  spans every layer: how a mutation becomes durable, and how the database
-  file eventually catches up. This comment is the canonical statement of
-  that protocol — wal.cpp, buffer_pool.cpp, and disk_manager.cpp each
-  document their own slice and defer to this one for the ordering.
-
-  The layers, and what each owns:
-
-      StorageEngine   the ordering below; poisoning on failure
-      BPlusTree       which pages a mutation touches
-      BufferPool      the page cache; the op_dirty quarantine (no-steal)
-      Wal             the durability point (a redo-only, fsynced log)
-      DiskManager     the database file; deferred metadata
-
-  One mutation (Put or Remove):
-
-      1. pool->BeginOp()           open the quarantine bracket
-      2. tree->Put / Remove        mutate pages in the pool; every frame
-                                   dirtied is quarantined op_dirty
-      3. pool->OpDirtyFrames()     the operation's data-page images, and
-         disk->TakeOpImages()      its metadata images (header, free
-                                   links) — each drained exactly once
-      4. wal->AppendPageImage ×N   buffer all of them, then
-         wal->Commit()             one contiguous append + one fsync:
-                                   the operation is durable the moment
-                                   this returns Ok
-      5. pool->EndOp()             close the bracket; the frames become
-                                   ordinary dirty pages, free to evict
-
-      A failure in step 2 or 4 skips EndOp and poisons the handle
-      instead; see below.
-
-  The checkpoint, which brings the database file up to date:
-
-      1. pool->FlushAllPages()     every committed-dirty page -> db file
-      2. disk->Checkpoint()        pending free links + header -> db file
-      3. disk->Sync()              fsync: the db file is now current
-      4. wal->Reset()              only now may the log forget
-
-      It runs when the log outgrows its threshold, and at Close(). Steps
-      1–3 may crash or tear in any order and any state: until step 4
-      completes, the log still holds images of everything being written,
-      and the next Open replays them over whatever the crash left.
-
-  The invariant chain that makes a crash at any instant safe:
-
-      - An operation is durable if and only if its COMMIT record is in
-        the fsynced log (recovery discards trailing runs with no commit).
-      - Every image the operation depends on precedes its COMMIT record,
-        appended as one contiguous run.
-      - Uncommitted bytes never reach the database file: the pool never
-        writes op_dirty frames, and metadata leaves the disk manager only
-        as logged images or checkpoint writes.
-      - The log is reset only once the database file durably holds
-        everything the log describes.
-
-  Poisoning is the failure story. A mutation that dies midway has already
-  rewritten pages in the pool, and a redo-only log cannot undo them. So
-  the handle turns every later call into StatusCode::Closed, discards the
-  operation's pending log images, and — deliberately — never calls
-  EndOp: the tainted frames stay quarantined so no flush or eviction path
-  can ever write them. Close() on a poisoned handle skips the checkpoint
-  and leaves the log intact; reopening the database replays exactly the
-  operations that committed and nothing else.
-
-  One note on Open's ordering. The exclusive file lock comes first —
-  before even recovery, because replaying and truncating the log while
-  another handle is appending to it destroys acknowledged writes (see
-  AcquireDatabaseLock). Recovery then runs before DiskManager::Open
-  parses the header, because replay may rewrite any page — the header
-  included. And the fresh-database bootstrap (allocating the root) is
-  deliberately not made durable on its own: the header change rides into
-  the first logged operation's images, and until then a crash simply
-  re-bootstraps an equally empty database.
-*/
-
 namespace tinydb {
-
 namespace {
-constexpr std::size_t POOL_FRAME_COUNT = 64;
 
-// When the log outgrows this, the committing operation checkpoints: the
-// pool and deferred metadata are flushed to the database file, fsynced,
-// and the log starts over. Roughly 250 page images.
+constexpr std::size_t CACHE_TARGET_BYTES = 64 * PAGE_SIZE;
+constexpr std::size_t WRITE_TRANSACTION_LIMIT_BYTES = 16U << 20U;
 constexpr std::uint64_t CHECKPOINT_THRESHOLD_BYTES = 1U << 20U;
 
-// The failing errno as an IoError status, tagged with the operation.
 auto ErrnoStatus(std::string_view operation) -> Status {
   return Status::IoError(std::string(operation) + ": " + std::generic_category().message(errno));
 }
 
-// A new file's data can be durable while its directory entry is not; the
-// entry is durable only once the directory itself has been fsynced.
 auto SyncParentDirectory(const std::filesystem::path &path) -> Status {
   auto parent = path.parent_path();
   if (parent.empty()) {
     parent = ".";
   }
-
-  auto dir_fd = UniqueFd(io::Open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-  if (!dir_fd.Valid()) {
+  auto directory = UniqueFd(io::Open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+  if (!directory.Valid()) {
     return ErrnoStatus("open directory");
   }
-  if (io::Fsync(dir_fd.Get()) < 0) {
+  if (io::Fsync(directory.Get()) < 0) {
     return ErrnoStatus("fsync directory");
   }
   return {};
 }
 
-// One live handle per database, enforced with an exclusive flock on the
-// database file, held until the handle closes. This must happen before
-// recovery runs — not merely before DiskManager::Open — because a second
-// process's recovery would replay and truncate the log while the first
-// process's Wal still remembers the old tail: the first handle's next
-// commit would then land past a hole, and recovery after a crash would
-// stop at the hole and drop acknowledged writes. flock is per open file
-// description, so a second handle in the same process conflicts too.
-//
-// Locking may create the file (an empty one; DiskManager::Open writes the
-// header later). When it does, the directory entry gets fsynced here:
-// recovery may go on to replay committed pages into this file, and it
-// only syncs the parent directory for files it created itself — an
-// entry-less file with a truncated log would lose everything.
+// Ownership is acquired before recovery because replay and WAL truncation are
+// writes. flock also rejects a second open file description in this process.
 auto AcquireDatabaseLock(const std::filesystem::path &path) -> Result<UniqueFd> {
   auto fd = UniqueFd(io::Open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
   if (!fd.Valid()) {
@@ -172,75 +82,74 @@ auto AcquireDatabaseLock(const std::filesystem::path &path) -> Result<UniqueFd> 
   }
   return fd;
 }
+
+auto InitialState(const DiskManager &disk) -> std::shared_ptr<const txn::DatabaseState> {
+  return std::make_shared<const txn::DatabaseState>(txn::DatabaseState{
+      .root_page_id = disk.GetRootPageId(),
+      .allocator_root_page_id = disk.GetAllocatorRootPageId(),
+      .high_water_page_id = disk.HighWaterPageId(),
+      .transaction_id = disk.TransactionId(),
+      .visible_lsn = disk.TransactionId(),
+      .checkpoint_lsn = disk.CheckpointLsn(),
+  });
+}
+
 }  // namespace
 
 auto StorageEngine::Open(const std::filesystem::path &path) -> Result<StorageEngine> {
-  // The lock comes first — even recovery must not touch a database that
-  // another handle has open (see AcquireDatabaseLock).
   auto lock = AcquireDatabaseLock(path);
   if (!lock) {
     return std::unexpected(std::move(lock).error());
   }
 
-  // Recovery runs before anything reads the database file: replay may
-  // rewrite any page, including the header DiskManager::Open parses.
+  // Recovery precedes normal decoders and cache construction because replay
+  // may replace either superblock and any data page.
   const auto wal_path = Wal::PathFor(path);
   if (auto status = Wal::Recover(path, wal_path); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-
   auto disk_result = DiskManager::Open(path);
   if (!disk_result) {
     return std::unexpected(std::move(disk_result).error());
   }
   auto disk = std::make_unique<DiskManager>(*std::move(disk_result));
-  auto pool = std::make_unique<BufferPool>(disk.get(), POOL_FRAME_COUNT);
-  auto pages = std::make_unique<BufferPoolPageSource>(pool.get());
+  auto cache = std::make_unique<cache::CommittedPageCache>(disk.get(), CACHE_TARGET_BYTES, disk->CheckpointLsn());
+  auto pages = std::make_unique<cache::CommittedPageSource>(cache.get());
+  auto readers = std::make_unique<txn::ReaderGate>(InitialState(*disk));
 
-  // The log is bound to this database by its UUID: a fresh log is stamped
-  // with it, an existing log must already carry it.
   auto wal_result = Wal::Open(wal_path, disk->Uuid());
   if (!wal_result) {
     return std::unexpected(std::move(wal_result).error());
   }
   auto wal = std::make_unique<Wal>(*std::move(wal_result));
 
-  // A fresh database has no root yet: allocate one zeroed page, record its
-  // id in the in-memory header, and let the tree bootstrap it as an empty
-  // leaf. None of this needs to be durable — the header change rides into
-  // the first logged operation's images, and until then a crash just
-  // re-bootstraps an equally empty database.
-  auto root_page_id = disk->GetRootPageId();
-  if (root_page_id == HEADER_PAGE_ID) {
-    const auto new_page = pool->NewPage();
-    if (!new_page) {
-      return std::unexpected(new_page.error());
+  auto engine = StorageEngine(path, std::move(*lock), std::move(disk), std::move(cache), std::move(pages),
+                              std::move(readers), std::move(wal));
+  // A fresh empty root is published through the same private-page and WAL
+  // path as every later mutation; no unlogged bootstrap state is exposed.
+  if (engine.disk_->GetRootPageId() == HEADER_PAGE_ID) {
+    if (auto status = engine.Mutate(Mutation::Bootstrap); !status.Ok()) {
+      return std::unexpected(std::move(status));
     }
-    root_page_id = new_page->page_id;
-    pool->UnpinPage(root_page_id, true);
-    disk->SetRootPageId(root_page_id);
   }
-
-  auto tree_result = BPlusTree::Open(pages.get(), root_page_id);
-  if (!tree_result) {
-    return std::unexpected(std::move(tree_result).error());
+  if (auto status = engine.CheckIntegrity(); !status.Ok()) {
+    return std::unexpected(std::move(status));
   }
-  auto tree = std::make_unique<BPlusTree>(*std::move(tree_result));
-
-  return StorageEngine(path, std::move(*lock), std::move(disk), std::move(pool), std::move(pages), std::move(tree),
-                       std::move(wal));
+  return engine;
 }
 
 StorageEngine::StorageEngine(std::filesystem::path path, UniqueFd lock_fd, std::unique_ptr<DiskManager> disk,
-                             std::unique_ptr<BufferPool> pool, std::unique_ptr<BufferPoolPageSource> pages,
-                             std::unique_ptr<BPlusTree> tree, std::unique_ptr<Wal> wal)
+                             std::unique_ptr<cache::CommittedPageCache> cache,
+                             std::unique_ptr<cache::CommittedPageSource> pages,
+                             std::unique_ptr<txn::ReaderGate> readers, std::unique_ptr<Wal> wal)
     : path_(std::move(path)),
       lock_fd_(std::move(lock_fd)),
       disk_(std::move(disk)),
-      pool_(std::move(pool)),
+      cache_(std::move(cache)),
       pages_(std::move(pages)),
-      tree_(std::move(tree)),
-      wal_(std::move(wal)) {}
+      readers_(std::move(readers)),
+      wal_(std::move(wal)),
+      writer_mutex_(std::make_unique<std::mutex>()) {}
 
 StorageEngine::StorageEngine(StorageEngine &&other) noexcept
     : path_(std::move(other.path_)),
@@ -248,12 +157,11 @@ StorageEngine::StorageEngine(StorageEngine &&other) noexcept
       poisoned_(other.poisoned_),
       lock_fd_(std::move(other.lock_fd_)),
       disk_(std::move(other.disk_)),
-      pool_(std::move(other.pool_)),
+      cache_(std::move(other.cache_)),
       pages_(std::move(other.pages_)),
-      tree_(std::move(other.tree_)),
-      wal_(std::move(other.wal_)) {
-  // The moved-from handle keeps no resources; marking it closed makes
-  // every later call on it a clean Closed status instead of a null deref.
+      readers_(std::move(other.readers_)),
+      wal_(std::move(other.wal_)),
+      writer_mutex_(std::move(other.writer_mutex_)) {
   other.closed_ = true;
 }
 
@@ -266,33 +174,27 @@ void StorageEngine::CloseBestEffort() noexcept {
 }
 
 auto StorageEngine::operator=(StorageEngine &&other) noexcept -> StorageEngine & {
-  if (this != &other) {
-    CloseBestEffort();
-    // If the close failed, the members are still live: release them in
-    // dependency order (the pool's destructor retries its flush while the
-    // disk manager is still alive) rather than letting the member-wise
-    // assignments below destroy the disk manager out from under the pool.
-    tree_.reset();
-    pages_.reset();
-    pool_.reset();
-    disk_.reset();
-    wal_.reset();
-
-    path_ = std::move(other.path_);
-    closed_ = other.closed_;
-    poisoned_ = other.poisoned_;
-    // The lock is adopted only after this handle's own teardown above:
-    // releasing our old lock any earlier would let another handle open
-    // the database while our pool was still flushing into it.
-    lock_fd_ = std::move(other.lock_fd_);
-    disk_ = std::move(other.disk_);
-    pool_ = std::move(other.pool_);
-    pages_ = std::move(other.pages_);
-    tree_ = std::move(other.tree_);
-    wal_ = std::move(other.wal_);
-    other.closed_ = true;
+  if (this == &other) {
+    return *this;
   }
+  CloseBestEffort();
+  readers_.reset();
+  pages_.reset();
+  cache_.reset();
+  disk_.reset();
+  wal_.reset();
 
+  path_ = std::move(other.path_);
+  closed_ = other.closed_;
+  poisoned_ = other.poisoned_;
+  lock_fd_ = std::move(other.lock_fd_);
+  disk_ = std::move(other.disk_);
+  cache_ = std::move(other.cache_);
+  pages_ = std::move(other.pages_);
+  readers_ = std::move(other.readers_);
+  wal_ = std::move(other.wal_);
+  writer_mutex_ = std::move(other.writer_mutex_);
+  other.closed_ = true;
   return *this;
 }
 
@@ -301,23 +203,12 @@ auto StorageEngine::Put(std::string_view key, std::string_view value) -> Status 
     return Status::Closed("Put on a closed handle");
   }
   if (poisoned_) {
-    return Status::Closed("Put on a poisoned handle; reopen the database to recover");
+    return Status::Closed("Put on a poisoned handle; reopen to recover");
   }
   if (key.size() + value.size() > MAX_ENTRY_BYTES) {
     return Status::InvalidArgument("key + value exceeds MAX_ENTRY_BYTES");
   }
-
-  pool_->BeginOp();
-  if (auto status = tree_->Put(key, value); !status.Ok()) {
-    Poison();
-    return status;
-  }
-  // Root splits are ordinary tree operations now. Persist the new logical
-  // root in the same WAL operation as the pages that made it reachable.
-  if (tree_->RootPageId() != disk_->GetRootPageId()) {
-    disk_->SetRootPageId(tree_->RootPageId());
-  }
-  return CommitOp();
+  return Mutate(Mutation::Put, key, value);
 }
 
 auto StorageEngine::Get(std::string_view key) -> Result<std::optional<std::string>> {
@@ -325,9 +216,10 @@ auto StorageEngine::Get(std::string_view key) -> Result<std::optional<std::strin
     return std::unexpected(Status::Closed("Get on a closed handle"));
   }
   if (poisoned_) {
-    return std::unexpected(Status::Closed("Get on a poisoned handle; reopen the database to recover"));
+    return std::unexpected(Status::Closed("Get on a poisoned handle; reopen to recover"));
   }
-  return tree_->Get(key);
+  auto snapshot = txn::ReadSnapshot::Begin(readers_.get(), pages_.get());
+  return snapshot.Get(key);
 }
 
 auto StorageEngine::Remove(std::string_view key) -> Status {
@@ -335,21 +227,9 @@ auto StorageEngine::Remove(std::string_view key) -> Status {
     return Status::Closed("Remove on a closed handle");
   }
   if (poisoned_) {
-    return Status::Closed("Remove on a poisoned handle; reopen the database to recover");
+    return Status::Closed("Remove on a poisoned handle; reopen to recover");
   }
-
-  pool_->BeginOp();
-  if (auto status = tree_->Remove(key); !status.Ok()) {
-    Poison();
-    return status;
-  }
-  // A collapse promotes the sole child and retires the former root. Logging
-  // this metadata beside the page/free-list images makes the new identity
-  // crash-atomic with the deletion.
-  if (tree_->RootPageId() != disk_->GetRootPageId()) {
-    disk_->SetRootPageId(tree_->RootPageId());
-  }
-  return CommitOp();
+  return Mutate(Mutation::Remove, key);
 }
 
 auto StorageEngine::Scan(std::string_view start,
@@ -358,9 +238,23 @@ auto StorageEngine::Scan(std::string_view start,
     return std::unexpected(Status::Closed("Scan on a closed handle"));
   }
   if (poisoned_) {
-    return std::unexpected(Status::Closed("Scan on a poisoned handle; reopen the database to recover"));
+    return std::unexpected(Status::Closed("Scan on a poisoned handle; reopen to recover"));
   }
-  return tree_->Scan(start, end);
+
+  auto snapshot = txn::ReadSnapshot::Begin(readers_.get(), pages_.get());
+  auto cursor = snapshot.Seek(start);
+  if (!cursor) {
+    return std::unexpected(std::move(cursor).error());
+  }
+  auto rows = std::vector<std::pair<std::string, std::string>>{};
+  const auto less = txn::BytewiseLess{};
+  while (cursor->Valid() && less(cursor->Key(), end)) {
+    rows.emplace_back(cursor->Key(), cursor->Value());
+    if (auto status = cursor->Next(); !status.Ok()) {
+      return std::unexpected(std::move(status));
+    }
+  }
+  return rows;
 }
 
 auto StorageEngine::CheckIntegrity() -> Status {
@@ -368,112 +262,180 @@ auto StorageEngine::CheckIntegrity() -> Status {
     return Status::Closed("CheckIntegrity on a closed handle");
   }
   if (poisoned_) {
-    return Status::Closed("CheckIntegrity on a poisoned handle; reopen the database to recover");
+    return Status::Closed("CheckIntegrity on a poisoned handle; reopen to recover");
   }
-  return tree_->CheckIntegrity(disk_->NextPageId(), disk_->FreePages());
+
+  const auto state = readers_->CurrentState();
+  auto transaction = txn::TransactionPages::Begin(pages_.get(), *state, WRITE_TRANSACTION_LIMIT_BYTES);
+  if (!transaction) {
+    return std::move(transaction).error();
+  }
+  auto free_pages = std::unordered_set<page_id_t>{};
+  for (const auto &extent : transaction->FreeExtents()) {
+    for (page_id_t page_id = extent.first_page_id; page_id < extent.first_page_id + extent.page_count; ++page_id) {
+      free_pages.insert(page_id);
+    }
+  }
+  const auto allocator_pages =
+      std::unordered_set<page_id_t>(transaction->AllocatorPageIds().begin(), transaction->AllocatorPageIds().end());
+  return BPlusTree::CheckIntegrity(pages_.get(), state->root_page_id, state->high_water_page_id, free_pages,
+                                   allocator_pages);
 }
 
-// Steps 3 through 5 of the mutation protocol in the file comment: collect
-// the operation's images, make them durable, release the quarantine —
-// then checkpoint if the log has grown past its threshold.
-auto StorageEngine::CommitOp() -> Status {
-  const auto frames = pool_->OpDirtyFrames();
-  const auto disk_images = disk_->TakeOpImages();
+auto StorageEngine::Mutate(Mutation mutation, std::string_view key, std::string_view value) -> Status {
+  auto writer = std::lock_guard(*writer_mutex_);
+  // Readers remain admitted during preparation and continue seeing base while
+  // every B+ tree and allocator change lives in the private overlay.
+  const auto base = readers_->CurrentState();
+  auto transaction = txn::TransactionPages::Begin(pages_.get(), *base, WRITE_TRANSACTION_LIMIT_BYTES);
+  if (!transaction) {
+    return std::move(transaction).error();
+  }
 
-  // Nothing changed (say, removing an absent key): nothing to make
-  // durable, and Wal::Commit treats an empty commit as a bug.
-  if (frames.empty() && disk_images.empty()) {
-    pool_->EndOp();
+  auto root_page_id = base->root_page_id;
+  if (root_page_id == HEADER_PAGE_ID) {
+    auto root = transaction->Allocate();
+    if (!root) {
+      transaction->Abort();
+      return std::move(root).error();
+    }
+    root_page_id = root->Id();
+    root = PageHandle{};
+  }
+  auto tree = BPlusTree::Open(&*transaction, root_page_id);
+  if (!tree) {
+    transaction->Abort();
+    return std::move(tree).error();
+  }
+
+  auto status = Status{};
+  if (mutation == Mutation::Put) {
+    status = transaction->ChargeValueBytes(value.size());
+    if (status.Ok()) {
+      status = tree->Put(key, value);
+    }
+  } else if (mutation == Mutation::Remove) {
+    status = tree->Remove(key);
+  }
+  if (!status.Ok()) {
+    transaction->Abort();
+    return status;
+  }
+  transaction->SetRootPageId(tree->RootPageId());
+  if (status = transaction->Freeze(base->visible_lsn + 1); !status.Ok()) {
+    transaction->Abort();
+    return status;
+  }
+  if (!transaction->HasChanges()) {
     return {};
   }
 
-  for (const auto &[page_id, data] : frames) {
-    wal_->AppendPageImage(page_id, data);
+  // Everything through Freeze is a definite-abort region. No shared page,
+  // root, frontier, or free extent has changed if one of those steps fails.
+  const auto state = transaction->ResultingState();
+  auto state_image = disk_->PrepareStateImage(state.root_page_id, state.allocator_root_page_id,
+                                              state.high_water_page_id, state.transaction_id, state.checkpoint_lsn);
+  if (!state_image) {
+    return std::move(state_image).error();
   }
-  for (const auto &image : disk_images) {
-    wal_->AppendPageImage(image.page_id, image.data.data());
+  auto retired = std::vector<page_id_t>(transaction->RetiredPageIds().begin(), transaction->RetiredPageIds().end());
+  auto committed_pages = transaction->TakePages(state.transaction_id);
+  if (!committed_pages) {
+    return std::move(committed_pages).error();
   }
-  if (auto status = wal_->Commit(); !status.Ok()) {
+  auto published_state = std::make_shared<const txn::DatabaseState>(state);
+
+  // The current WAL is a temporary durability bridge until Milestone 6. The
+  // final ownership direction is already established: private images are
+  // logged before they can become visible.
+  for (const auto &page : *committed_pages) {
+    wal_->AppendPageImage(page.page_id, page.bytes->data());
+  }
+  wal_->AppendPageImage(state_image->page_id, state_image->data.data());
+  if (auto commit = wal_->Commit(); !commit.Ok()) {
     Poison();
-    return status;
+    return commit;
   }
-  // The images are durable: the frames go back to being ordinary dirty
-  // pages, safe to evict.
-  pool_->EndOp();
+
+  {
+    // Closing admission drains readers of base. Cache replacement, retirement,
+    // and the new roots then become one visibility transition.
+    auto publication = readers_->BeginPublication();
+    for (auto &page : *committed_pages) {
+      const auto installed = cache_->Install(std::move(page));
+      TINYDB_CHECK(installed.Ok(), "durable page failed committed-cache installation");
+    }
+    cache_->Retire(retired);
+    disk_->AdoptState(state.root_page_id, state.allocator_root_page_id, state.high_water_page_id, state.transaction_id,
+                      state.checkpoint_lsn);
+    publication.Publish(std::move(published_state));
+  }
 
   if (wal_->SizeBytes() > CHECKPOINT_THRESHOLD_BYTES) {
-    // The operation itself already committed; a checkpoint failure poisons
-    // the handle but loses nothing — the log still holds every image.
-    if (auto status = Checkpoint(); !status.Ok()) {
+    if (auto checkpoint = Checkpoint(); !checkpoint.Ok()) {
       Poison();
-      return status;
+      return checkpoint;
     }
   }
   return {};
 }
 
-// The checkpoint protocol from the file comment. The ordering is the
-// entire point: the log may only forget (Reset) once everything it
-// describes is durably in the database file — flushed, checkpointed, and
-// fsynced. The first three steps are free to fail or tear; recovery
-// replays them from the still-intact log.
 auto StorageEngine::Checkpoint() -> Status {
-  if (auto status = pool_->FlushAllPages(); !status.Ok()) {
+  const auto state = readers_->CurrentState();
+  auto next = *state;
+  next.checkpoint_lsn = state->visible_lsn;
+  auto checkpointed_state = std::make_shared<const txn::DatabaseState>(std::move(next));
+  // Materialize pages before either mirrored superblock advertises the new
+  // checkpoint. The WAL remains authoritative until the final file sync.
+  if (auto status = disk_->EnsurePageCount(state->high_water_page_id); !status.Ok()) {
     return status;
   }
+  auto pages = cache_->DirtyPages();
+  for (const auto &page : pages) {
+    if (auto status = disk_->WritePage(page.Id(), page.Data().data()); !status.Ok()) {
+      return status;
+    }
+  }
+  disk_->AdvanceCheckpoint(state->visible_lsn);
   if (auto status = disk_->Checkpoint(); !status.Ok()) {
     return status;
   }
   if (auto status = disk_->Sync(); !status.Ok()) {
     return status;
   }
-  // Only now, with the database file caught up and durable, may the log
-  // forget: truncating any earlier is data loss on the next crash.
-  return wal_->Reset();
+  if (auto status = wal_->Reset(); !status.Ok()) {
+    return status;
+  }
+  cache_->MarkCheckpointed(state->visible_lsn);
+  auto publication = readers_->BeginPublication();
+  publication.Publish(std::move(checkpointed_state));
+  return {};
 }
 
-// See "Poisoning" in the file comment. The two calls this makes — and the
-// one it pointedly does not — are the whole mechanism: mark the handle,
-// drop the dead operation's buffered log images, and never call EndOp, so
-// the pool keeps the half-written frames quarantined forever.
 void StorageEngine::Poison() {
   poisoned_ = true;
   wal_->DiscardPending();
 }
 
 auto StorageEngine::Close() -> Status {
-  if (!disk_) {  // fully closed already, or moved from
+  if (!disk_) {
     return {};
   }
+  auto writer = std::lock_guard(*writer_mutex_);
   closed_ = true;
 
-  // A poisoned engine's in-memory state is not trustworthy, so none of it
-  // is flushed as a checkpoint; the log already holds every committed
-  // operation and the next Open() replays it. (The pool's destructor still
-  // best-effort-writes committed-dirty frames, which is harmless: their
-  // images stay in the log because the reset below never runs.)
-  if (poisoned_) {
-    tree_.reset();
-    pages_.reset();
-    pool_.reset();
-    disk_.reset();
-    wal_.reset();
-    lock_fd_ = UniqueFd{};  // the next opener recovers from the log
-    return {};
+  if (!poisoned_) {
+    if (auto status = Checkpoint(); !status.Ok()) {
+      return status;
+    }
   }
-
-  // Release resources only after the checkpoint succeeds: if any step
-  // fails, everything stays live — the database lock included — and a
-  // second Close() retries, rewriting only what has not been written.
-  if (auto status = Checkpoint(); !status.Ok()) {
-    return status;
-  }
-  tree_.reset();
+  readers_.reset();
   pages_.reset();
-  pool_.reset();
+  cache_.reset();
   disk_.reset();
   wal_.reset();
   lock_fd_ = UniqueFd{};
   return {};
 }
+
 }  // namespace tinydb

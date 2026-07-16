@@ -85,6 +85,7 @@ class CommittedPageCache final {
   // Installs the latest committed version. The cache may exceed its soft target
   // while uncheckpointed pages are not eligible for eviction.
   auto Install(CommittedPageImage image) -> Status;
+  void Retire(std::span<const page_id_t> page_ids);
 
   // The caller invokes this only after the database file and superblock make
   // every page through checkpoint_lsn durable.
@@ -92,6 +93,7 @@ class CommittedPageCache final {
   void Trim();
 
   auto DirtyPageIds() const -> std::vector<page_id_t>;
+  auto DirtyPages() -> std::vector<PageGuard>;
   auto Stats() const -> CommittedCacheStats;
 
  private:

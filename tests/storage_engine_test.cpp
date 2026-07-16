@@ -11,6 +11,7 @@
 
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -586,4 +588,34 @@ TEST_F(StorageEngineTest, LogOutgrowingItsThresholdCheckpoints) {
   auto recovered = tinydb::StorageEngine::Open(second_db_path_).value();
   EXPECT_EQ(recovered.Scan("", SCAN_END).value().size(), 400U);
   EXPECT_EQ(recovered.Get(RowKey(399)).value(), RowValue(399, 128));
+}
+
+TEST_F(StorageEngineTest, ReadersSeeOnlyWholeCommittedValuesDuringWrites) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(engine.Put("shared", "value-0").Ok());
+  auto stop = std::atomic<bool>{false};
+  auto failures = std::atomic<std::size_t>{0};
+  auto readers = std::vector<std::thread>{};
+  for (int index = 0; index < 6; ++index) {
+    readers.emplace_back([&] {
+      while (!stop.load(std::memory_order_acquire)) {
+        const auto value = engine.Get("shared");
+        if (!value || !value->has_value() || !value->value().starts_with("value-")) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  for (int version = 1; version <= 100; ++version) {
+    if (!engine.Put("shared", "value-" + std::to_string(version)).Ok()) {
+      failures.fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
+  }
+  stop.store(true, std::memory_order_release);
+  for (auto &reader : readers) {
+    reader.join();
+  }
+  EXPECT_EQ(failures.load(), 0U);
+  EXPECT_EQ(engine.Get("shared").value(), std::optional<std::string>{"value-100"});
 }

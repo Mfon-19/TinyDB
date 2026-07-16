@@ -245,29 +245,23 @@ TEST(SuperblockSelectionTest, EqualGenerationsMustDescribeIdenticalState) {
   EXPECT_EQ(selected.error().Code(), StatusCode::Corruption);
 }
 
-TEST(DataPageCodecTest, AllocatorPageMatchesGoldenBytesAndRoundTrips) {
-  const auto encoded = tinydb::storage::EncodeAllocatorPage(2, 0x0102030405060708ULL, 4);
-  ASSERT_TRUE(encoded.has_value());
-  // Includes the independently precomputed CRC, so the test covers more than
-  // just field placement and self-consistent encode/decode behavior.
-  constexpr auto golden_prefix = std::array<std::byte, 40>{
-      std::byte{0x54}, std::byte{0x44}, std::byte{0x50}, std::byte{0x34}, std::byte{0x03}, std::byte{0x00},
-      std::byte{0x01}, std::byte{0x00}, std::byte{0x02}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x08}, std::byte{0x07},
-      std::byte{0x06}, std::byte{0x05}, std::byte{0x04}, std::byte{0x03}, std::byte{0x02}, std::byte{0x01},
-      std::byte{0x08}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x92}, std::byte{0xCD},
-      std::byte{0x11}, std::byte{0xA8}, std::byte{0x04}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+TEST(DataPageCodecTest, FreeExtentPageRoundTripsSortedRetirementMetadata) {
+  const auto extents = std::array{
+      tinydb::storage::FreeExtent{.first_page_id = 4, .page_count = 3, .retire_lsn = 11},
+      tinydb::storage::FreeExtent{.first_page_id = 20, .page_count = 5, .retire_lsn = 17},
   };
+  const auto encoded = tinydb::storage::EncodeFreeExtentPage(2, 0x0102030405060708ULL, 3, extents);
+  ASSERT_TRUE(encoded.has_value());
   const auto bytes = std::as_bytes(std::span{*encoded});
-  EXPECT_TRUE(std::ranges::equal(golden_prefix, bytes.first(golden_prefix.size())));
-  EXPECT_TRUE(
-      std::ranges::all_of(bytes.subspan(golden_prefix.size()), [](std::byte byte) { return byte == std::byte{0}; }));
-
-  const auto decoded = tinydb::storage::DecodeAllocatorPage(bytes, 2);
+  const auto decoded = tinydb::storage::DecodeFreeExtentPage(bytes, 2);
   ASSERT_TRUE(decoded.has_value());
-  EXPECT_EQ(decoded->next_free, 4U);
+  EXPECT_EQ(decoded->next_page_id, 3U);
+  EXPECT_EQ(decoded->extents, std::vector(extents.begin(), extents.end()));
   EXPECT_EQ(tinydb::storage::DecodeDataPageHeader(bytes, 2)->page_lsn, 0x0102030405060708ULL);
+
+  auto adjacent = extents;
+  adjacent[1].first_page_id = 7;
+  EXPECT_EQ(tinydb::storage::EncodeFreeExtentPage(2, 0, 0, adjacent).error().Code(), StatusCode::InvalidArgument);
 }
 
 TEST(DataPageCodecTest, OverflowLengthsIdentityAndChecksumAreValidated) {
@@ -291,7 +285,7 @@ TEST(DataPageCodecTest, OverflowLengthsIdentityAndChecksumAreValidated) {
 }
 
 TEST(DataPageCodecTest, RejectsUnsupportedVersionAndOppositeEndianIdentity) {
-  const auto encoded = tinydb::storage::EncodeAllocatorPage(2, 0, 0);
+  const auto encoded = tinydb::storage::EncodeFreeExtentPage(2, 0, 0, std::span<const tinydb::storage::FreeExtent>{});
   ASSERT_TRUE(encoded.has_value());
 
   auto unsupported = *encoded;

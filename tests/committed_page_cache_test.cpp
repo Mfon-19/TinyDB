@@ -22,29 +22,27 @@ using tinydb::cache::CommittedPageImage;
 using tinydb::cache::PageBytes;
 
 auto TestPath(std::string_view name) -> std::filesystem::path {
-  return std::filesystem::temp_directory_path() /
-         ("tinydb_committed_cache_" + std::string(name) + ".db");
+  return std::filesystem::temp_directory_path() / ("tinydb_committed_cache_" + std::string(name) + ".db");
 }
 
-auto EncodedPage(tinydb::page_id_t page_id, std::uint64_t lsn,
-                 tinydb::page_id_t marker) -> std::unique_ptr<PageBytes> {
-  auto encoded = tinydb::storage::EncodeAllocatorPage(page_id, lsn, marker);
+auto EncodedPage(tinydb::page_id_t page_id, std::uint64_t lsn, tinydb::page_id_t marker) -> std::unique_ptr<PageBytes> {
+  const auto payload =
+      std::array<std::byte, sizeof(tinydb::page_id_t)>{std::byte{static_cast<unsigned char>(marker & 0xffU)}};
+  auto encoded = tinydb::storage::EncodeOverflowPage(page_id, lsn, payload.size(), tinydb::HEADER_PAGE_ID, payload);
   EXPECT_TRUE(encoded.has_value());
   return std::make_unique<PageBytes>(std::move(*encoded));
 }
 
 auto Marker(const tinydb::cache::PageGuard &page) -> tinydb::page_id_t {
-  const auto decoded = tinydb::storage::DecodeAllocatorPage(
-      std::as_bytes(page.Data()), page.Id());
+  const auto decoded = tinydb::storage::DecodeOverflowPage(std::as_bytes(page.Data()), page.Id());
   EXPECT_TRUE(decoded.has_value());
-  return decoded->next_free;
+  return std::to_integer<tinydb::page_id_t>(decoded->payload.front());
 }
 
 struct CacheFixture {
   explicit CacheFixture(std::string_view name) : path(TestPath(name)) {
     std::filesystem::remove(path);
-    disk = std::make_unique<tinydb::DiskManager>(
-        tinydb::DiskManager::Open(path).value());
+    disk = std::make_unique<tinydb::DiskManager>(tinydb::DiskManager::Open(path).value());
   }
 
   ~CacheFixture() {
@@ -52,9 +50,11 @@ struct CacheFixture {
     std::filesystem::remove(path);
   }
 
-  auto AddDiskPage(tinydb::page_id_t marker, std::uint64_t lsn = 0)
-      -> tinydb::page_id_t {
-    const auto page_id = disk->AllocatePage().value();
+  auto AddDiskPage(tinydb::page_id_t marker, std::uint64_t lsn = 0) -> tinydb::page_id_t {
+    const auto page_id = disk->HighWaterPageId();
+    disk->AdoptState(disk->GetRootPageId(), disk->GetAllocatorRootPageId(), page_id + 1, disk->TransactionId(),
+                     disk->CheckpointLsn());
+    EXPECT_TRUE(disk->EnsurePageCount(page_id + 1).Ok());
     const auto page = EncodedPage(page_id, lsn, marker);
     EXPECT_TRUE(disk->WritePage(page_id, page->data()).Ok());
     return page_id;
@@ -138,12 +138,14 @@ TEST(CommittedPageCacheTest, UncheckpointedPagesAreNotEvicted) {
   const auto other_id = fixture.AddDiskPage(dirty_id);
   auto cache = CommittedPageCache(fixture.disk.get(), tinydb::PAGE_SIZE, 0);
 
-  ASSERT_TRUE(cache.Install(CommittedPageImage{
-      .page_id = dirty_id,
-      .page_lsn = 5,
-      .transaction_id = 1,
-      .bytes = EncodedPage(dirty_id, 5, other_id),
-  }).Ok());
+  ASSERT_TRUE(cache
+                  .Install(CommittedPageImage{
+                      .page_id = dirty_id,
+                      .page_lsn = 5,
+                      .transaction_id = 1,
+                      .bytes = EncodedPage(dirty_id, 5, other_id),
+                  })
+                  .Ok());
   EXPECT_EQ(cache.DirtyPageIds(), std::vector<tinydb::page_id_t>{dirty_id});
 
   const auto blocked = cache.Read(other_id);
@@ -162,12 +164,14 @@ TEST(CommittedPageCacheTest, ReplacingAPageDoesNotMutateAnExistingGuard) {
   auto cache = CommittedPageCache(fixture.disk.get(), 2 * tinydb::PAGE_SIZE, 0);
   auto old = cache.Read(page_id).value();
 
-  ASSERT_TRUE(cache.Install(CommittedPageImage{
-      .page_id = page_id,
-      .page_lsn = 9,
-      .transaction_id = 3,
-      .bytes = EncodedPage(page_id, 9, page_id),
-  }).Ok());
+  ASSERT_TRUE(cache
+                  .Install(CommittedPageImage{
+                      .page_id = page_id,
+                      .page_lsn = 9,
+                      .transaction_id = 3,
+                      .bytes = EncodedPage(page_id, 9, page_id),
+                  })
+                  .Ok());
   auto latest = cache.Read(page_id).value();
 
   EXPECT_EQ(Marker(old), tinydb::HEADER_PAGE_ID);
@@ -182,12 +186,14 @@ TEST(CommittedPageCacheTest, RejectsInvalidOrRegressingCommittedImages) {
   const auto page_id = fixture.AddDiskPage(tinydb::HEADER_PAGE_ID);
   auto cache = CommittedPageCache(fixture.disk.get(), 2 * tinydb::PAGE_SIZE, 0);
 
-  ASSERT_TRUE(cache.Install(CommittedPageImage{
-      .page_id = page_id,
-      .page_lsn = 10,
-      .transaction_id = 2,
-      .bytes = EncodedPage(page_id, 10, tinydb::HEADER_PAGE_ID),
-  }).Ok());
+  ASSERT_TRUE(cache
+                  .Install(CommittedPageImage{
+                      .page_id = page_id,
+                      .page_lsn = 10,
+                      .transaction_id = 2,
+                      .bytes = EncodedPage(page_id, 10, tinydb::HEADER_PAGE_ID),
+                  })
+                  .Ok());
   const auto regressing = cache.Install(CommittedPageImage{
       .page_id = page_id,
       .page_lsn = 8,

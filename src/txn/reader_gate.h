@@ -51,6 +51,7 @@ class ReaderGate final {
 
   auto BeginRead() -> SnapshotToken;
   auto BeginPublication() -> PublicationGuard;
+  auto CurrentState() const -> std::shared_ptr<const DatabaseState>;
   auto Stats() const -> ReaderGateStats;
 
  private:

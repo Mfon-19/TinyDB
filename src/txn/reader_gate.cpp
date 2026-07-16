@@ -81,8 +81,11 @@ auto ReaderGate::BeginRead() -> SnapshotToken {
   return SnapshotToken(std::move(lease));
 }
 
-auto ReaderGate::BeginPublication() -> PublicationGuard {
-  return PublicationGuard(control_);
+auto ReaderGate::BeginPublication() -> PublicationGuard { return PublicationGuard(control_); }
+
+auto ReaderGate::CurrentState() const -> std::shared_ptr<const DatabaseState> {
+  auto lock = std::lock_guard(control_->mutex);
+  return control_->state;
 }
 
 auto ReaderGate::Stats() const -> ReaderGateStats {
@@ -98,8 +101,7 @@ auto ReaderGate::Stats() const -> ReaderGateStats {
   return result;
 }
 
-PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control)
-    : control_(std::move(control)) {
+PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) : control_(std::move(control)) {
   auto lock = std::unique_lock(control_->mutex);
 
   // Serializing publishers here makes the gate robust independently of the
@@ -110,8 +112,7 @@ PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control)
   control_->changed.wait(lock, [this] { return control_->active_readers == 0; });
 }
 
-PublicationGuard::PublicationGuard(PublicationGuard &&other) noexcept
-    : control_(std::move(other.control_)) {}
+PublicationGuard::PublicationGuard(PublicationGuard &&other) noexcept : control_(std::move(other.control_)) {}
 
 auto PublicationGuard::operator=(PublicationGuard &&other) noexcept -> PublicationGuard & {
   if (this != &other) {

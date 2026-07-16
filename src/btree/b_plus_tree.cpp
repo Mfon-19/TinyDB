@@ -49,8 +49,7 @@ struct PathStep {
   std::size_t child_index;
 };
 
-auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key)
-    -> Result<std::vector<PathStep>> {
+auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key) -> Result<std::vector<PathStep>> {
   // Retain page ids, not page handles: each level is released before the next
   // read. The visited set turns a corrupt child cycle into a finite error.
   auto path = std::vector<PathStep>{{root_page_id, 0}};
@@ -546,10 +545,16 @@ auto BPlusTree::Scan(std::string_view start,
 }
 
 auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<page_id_t> &free_pages) -> Status {
-  if (root_page_id_ == HEADER_PAGE_ID || root_page_id_ >= next_page_id) {
+  return CheckIntegrity(pages_, root_page_id_, next_page_id, free_pages, {});
+}
+
+auto BPlusTree::CheckIntegrity(PageReader *pages, page_id_t root_page_id, page_id_t next_page_id,
+                               const std::unordered_set<page_id_t> &free_pages,
+                               const std::unordered_set<page_id_t> &allocator_pages) -> Status {
+  if (root_page_id == HEADER_PAGE_ID || root_page_id >= next_page_id) {
     return Status::Corruption("root page is outside the allocation frontier");
   }
-  if (free_pages.contains(root_page_id_)) {
+  if (free_pages.contains(root_page_id) || allocator_pages.contains(root_page_id)) {
     return Status::Corruption("root page is on the free list");
   }
 
@@ -575,7 +580,7 @@ auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<
       return std::unexpected(Status::Corruption("tree contains a duplicate page reference or cycle"));
     }
 
-    auto page = pages_->Read(page_id);
+    auto page = pages->Read(page_id);
     if (!page) {
       return std::unexpected(std::move(page).error());
     }
@@ -627,7 +632,7 @@ auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<
     return result;
   };
 
-  auto root = visit(root_page_id_, Bound{}, Bound{});
+  auto root = visit(root_page_id, Bound{}, Bound{});
   if (!root) {
     return std::move(root).error();
   }
@@ -644,8 +649,14 @@ auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<
       return Status::Corruption("free-list page is outside the allocation frontier");
     }
   }
+  for (const auto page_id : allocator_pages) {
+    if (page_id < FIRST_DATA_PAGE_ID || page_id >= next_page_id || free_pages.contains(page_id) ||
+        visited.contains(page_id)) {
+      return Status::Corruption("allocator page has invalid ownership");
+    }
+  }
   const auto allocated_pages = next_page_id - FIRST_DATA_PAGE_ID;
-  if (visited.size() + free_pages.size() != allocated_pages) {
+  if (visited.size() + free_pages.size() + allocator_pages.size() != allocated_pages) {
     return Status::Corruption("allocated page is neither reachable nor free");
   }
   return {};

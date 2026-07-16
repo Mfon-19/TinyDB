@@ -195,189 +195,108 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
   disk.checkpoint_lsn_ = selected->value.checkpoint_lsn;
   disk.transaction_id_ = selected->value.transaction_id;
   disk.root_page_id_ = selected->value.root_page_id;
-  disk.next_page_id_ = selected->value.high_water_page_id;
-  disk.free_list_head_ = selected->value.allocator_root_page_id;
+  disk.high_water_page_id_ = selected->value.high_water_page_id;
+  disk.allocator_root_page_id_ = selected->value.allocator_root_page_id;
   disk.active_superblock_page_id_ =
       selected->slot == storage::SuperblockSlot::A ? SUPERBLOCK_A_PAGE_ID : SUPERBLOCK_B_PAGE_ID;
 
   // The superblock may not claim pages beyond the physical file. It may claim
   // fewer pages because a failed checkpoint can leave harmless trailing data.
   const auto file_pages = static_cast<std::uint64_t>(file_stat.st_size) / PAGE_SIZE;
-  if (disk.next_page_id_ < FIRST_DATA_PAGE_ID || disk.next_page_id_ > file_pages) {
+  if (disk.high_water_page_id_ < FIRST_DATA_PAGE_ID || disk.high_water_page_id_ > file_pages) {
     return std::unexpected(Status::Corruption("superblock allocation frontier lies outside the database file"));
-  }
-
-  // Reconstruct the in-memory membership set by walking the persistent LIFO
-  // chain. Bounds plus duplicate detection catch invalid links and cycles
-  // before the allocator is allowed to reuse any page.
-  auto free_page_id = disk.free_list_head_;
-  while (free_page_id != HEADER_PAGE_ID) {
-    if (free_page_id < FIRST_DATA_PAGE_ID || free_page_id >= disk.next_page_id_ ||
-        disk.free_pages_.contains(free_page_id)) {
-      return std::unexpected(Status::Corruption("corrupt allocator free list"));
-    }
-    const auto page = ReadWholePage(disk.fd_.Get(), free_page_id);
-    if (!page) {
-      return std::unexpected(page.error());
-    }
-    const auto decoded = storage::DecodeAllocatorPage(ToBytes(*page), free_page_id);
-    if (!decoded) {
-      return std::unexpected(decoded.error());
-    }
-    disk.free_pages_.insert(free_page_id);
-    free_page_id = decoded->next_free;
   }
   return disk;
 }
 
-auto DiskManager::AllocatePage() -> Result<page_id_t> {
-  TINYDB_CHECK(fd_.Valid(), "allocating a page on a closed disk manager");
-
-  if (free_list_head_ != HEADER_PAGE_ID) {
-    // Prefer reuse over file growth. The link can be private in
-    // pending_free_links_ (freed since the last checkpoint) or already encoded
-    // in the database file.
-    const auto page_id = free_list_head_;
-    auto next_free = HEADER_PAGE_ID;
-    if (const auto pending = pending_free_links_.find(page_id); pending != pending_free_links_.end()) {
-      // Free then allocate within one operation cancels the pending allocator
-      // page image: the page returns directly to live use.
-      next_free = pending->second;
-      pending_free_links_.erase(pending);
-      std::erase(op_freed_pages_, page_id);
-    } else {
-      const auto page = ReadWholePage(fd_.Get(), page_id);
-      if (!page) {
-        return std::unexpected(page.error());
-      }
-      const auto decoded = storage::DecodeAllocatorPage(ToBytes(*page), page_id);
-      if (!decoded) {
-        return std::unexpected(decoded.error());
-      }
-      next_free = decoded->next_free;
-    }
-    free_list_head_ = next_free;
-    free_pages_.erase(page_id);
-    header_changed_ = true;
-    return page_id;
-  }
-
-  // Extending the file reserves addressable zero-filled space, but does not by
-  // itself commit allocation. The new high-water frontier is carried by the
-  // next logged superblock image.
-  const auto page_id = next_page_id_;
-  if (io::Ftruncate(fd_.Get(), (page_id + 1) * PAGE_SIZE) < 0) {
-    return std::unexpected(ErrnoStatus("ftruncate"));
-  }
-  ++next_page_id_;
-  header_changed_ = true;
-  return page_id;
-}
-
-void DiskManager::FreePage(page_id_t page_id) {
-  TINYDB_CHECK(fd_.Valid(), "freeing a page on a closed disk manager");
-  TINYDB_CHECK(page_id >= FIRST_DATA_PAGE_ID && page_id < next_page_id_, "freeing a page that was never allocated");
-  TINYDB_CHECK(!free_pages_.contains(page_id), "double free of a page");
-
-  // Build the new list head privately. Writing the allocator page here would
-  // violate no-steal: a crash could make an uncommitted free visible.
-  pending_free_links_[page_id] = free_list_head_;
-  op_freed_pages_.push_back(page_id);
-  free_pages_.insert(page_id);
-  free_list_head_ = page_id;
-  header_changed_ = true;
-}
-
 auto DiskManager::GetRootPageId() const -> page_id_t { return root_page_id_; }
-auto DiskManager::NextPageId() const -> page_id_t { return next_page_id_; }
-auto DiskManager::FreePages() const -> const std::unordered_set<page_id_t> & { return free_pages_; }
+auto DiskManager::GetAllocatorRootPageId() const -> page_id_t { return allocator_root_page_id_; }
+auto DiskManager::HighWaterPageId() const -> page_id_t { return high_water_page_id_; }
+auto DiskManager::TransactionId() const -> std::uint64_t { return transaction_id_; }
+auto DiskManager::CheckpointLsn() const -> std::uint64_t { return checkpoint_lsn_; }
 auto DiskManager::Uuid() const -> const DatabaseUuid & { return database_uuid_; }
 
-void DiskManager::SetRootPageId(page_id_t root_page_id) {
-  TINYDB_CHECK(root_page_id == HEADER_PAGE_ID || (root_page_id >= FIRST_DATA_PAGE_ID && root_page_id < next_page_id_),
-               "root page is outside the allocation frontier");
-  root_page_id_ = root_page_id;
-  header_changed_ = true;
-}
-
-auto DiskManager::EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE> {
-  // This is the single conversion from live allocator/tree metadata to its
-  // physical redo image. Recovery can write the result verbatim.
+auto DiskManager::EncodeSuperblock(page_id_t root_page_id, page_id_t allocator_root_page_id,
+                                   page_id_t high_water_page_id, std::uint64_t transaction_id,
+                                   std::uint64_t checkpoint_lsn,
+                                   std::uint64_t generation) const -> Result<std::array<char, PAGE_SIZE>> {
   const auto encoded = storage::EncodeSuperblock(storage::Superblock{
       .database_uuid = database_uuid_,
-      .generation = generation_,
-      .checkpoint_lsn = checkpoint_lsn_,
-      .transaction_id = transaction_id_,
-      .root_page_id = root_page_id_,
-      .allocator_root_page_id = free_list_head_,
-      .high_water_page_id = next_page_id_,
+      .generation = generation,
+      .checkpoint_lsn = checkpoint_lsn,
+      .transaction_id = transaction_id,
+      .root_page_id = root_page_id,
+      .allocator_root_page_id = allocator_root_page_id,
+      .high_water_page_id = high_water_page_id,
   });
-  TINYDB_CHECK(encoded.has_value(), "invalid in-memory superblock state");
+  if (!encoded) {
+    return std::unexpected(encoded.error());
+  }
   auto output = std::array<char, PAGE_SIZE>{};
   std::memcpy(output.data(), encoded->data(), encoded->size());
   return output;
 }
 
-auto DiskManager::AdvanceSuperblock() -> page_id_t {
-  // Never overwrite the currently selected slot for an operation update. If
-  // the new image tears, the previous generation remains independently valid.
-  ++generation_;
-  ++transaction_id_;
-  active_superblock_page_id_ =
-      active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
-  return active_superblock_page_id_;
+auto DiskManager::EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE> {
+  const auto encoded = EncodeSuperblock(root_page_id_, allocator_root_page_id_, high_water_page_id_, transaction_id_,
+                                        checkpoint_lsn_, generation_);
+  TINYDB_CHECK(encoded.has_value(), "invalid published superblock state");
+  return *encoded;
 }
 
-auto DiskManager::TakeOpImages() -> std::vector<PageImage> {
-  // Metadata participates in the same atomic WAL run as tree pages. Drain the
-  // superblock first so the run contains the resulting roots/frontier, then
-  // include every newly freed page's final allocator link.
-  auto images = std::vector<PageImage>{};
-  if (header_changed_) {
-    const auto page_id = AdvanceSuperblock();
-    images.push_back(PageImage{.page_id = page_id, .data = EncodeCurrentSuperblock()});
-    header_changed_ = false;
+auto DiskManager::PrepareStateImage(page_id_t root_page_id, page_id_t allocator_root_page_id,
+                                    page_id_t high_water_page_id, std::uint64_t transaction_id,
+                                    std::uint64_t checkpoint_lsn) const -> Result<PageImage> {
+  const auto page_id = active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
+  const auto encoded = EncodeSuperblock(root_page_id, allocator_root_page_id, high_water_page_id, transaction_id,
+                                        checkpoint_lsn, generation_ + 1);
+  if (!encoded) {
+    return std::unexpected(encoded.error());
   }
+  return PageImage{.page_id = page_id, .data = *encoded};
+}
 
-  for (const auto page_id : op_freed_pages_) {
-    const auto link = pending_free_links_.find(page_id);
-    TINYDB_CHECK(link != pending_free_links_.end(), "freed page has no pending allocator link");
-    // transaction_id_ doubles as the current page LSN until the later commit
-    // coordinator assigns a true global LSN to each final page image.
-    const auto encoded = storage::EncodeAllocatorPage(page_id, transaction_id_, link->second);
-    TINYDB_CHECK(encoded.has_value(), "invalid in-memory allocator page");
-    images.push_back(PageImage{.page_id = page_id, .data = *encoded});
+void DiskManager::AdoptState(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
+                             std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) {
+  TINYDB_CHECK(high_water_page_id >= FIRST_DATA_PAGE_ID, "adopting an invalid allocation frontier");
+  TINYDB_CHECK(
+      root_page_id == HEADER_PAGE_ID || (root_page_id >= FIRST_DATA_PAGE_ID && root_page_id < high_water_page_id),
+      "adopting an invalid tree root");
+  TINYDB_CHECK(allocator_root_page_id == HEADER_PAGE_ID ||
+                   (allocator_root_page_id >= FIRST_DATA_PAGE_ID && allocator_root_page_id < high_water_page_id),
+               "adopting an invalid allocator root");
+  ++generation_;
+  active_superblock_page_id_ =
+      active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
+  root_page_id_ = root_page_id;
+  allocator_root_page_id_ = allocator_root_page_id;
+  high_water_page_id_ = high_water_page_id;
+  transaction_id_ = transaction_id;
+  checkpoint_lsn_ = checkpoint_lsn;
+}
+
+void DiskManager::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
+  TINYDB_CHECK(checkpoint_lsn >= checkpoint_lsn_ && checkpoint_lsn <= transaction_id_,
+               "checkpoint frontier is outside published history");
+  ++generation_;
+  active_superblock_page_id_ =
+      active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
+  checkpoint_lsn_ = checkpoint_lsn;
+}
+
+auto DiskManager::EnsurePageCount(page_id_t high_water_page_id) -> Status {
+  TINYDB_CHECK(fd_.Valid(), "extending a closed disk manager");
+  if (high_water_page_id < FIRST_DATA_PAGE_ID) {
+    return Status::InvalidArgument("allocation frontier overlaps superblocks");
   }
-  op_freed_pages_.clear();
-  return images;
+  if (io::Ftruncate(fd_.Get(), high_water_page_id * PAGE_SIZE) < 0) {
+    return ErrnoStatus("ftruncate");
+  }
+  return {};
 }
 
 auto DiskManager::Checkpoint() -> Status {
   TINYDB_CHECK(fd_.Valid(), "checkpointing a closed disk manager");
-  // A checkpoint runs only after all operation images are committed. The
-  // operation-specific drain list is no longer needed, but pending links stay
-  // until each database-page write succeeds.
-  op_freed_pages_.clear();
-
-  for (auto link = pending_free_links_.begin(); link != pending_free_links_.end();) {
-    const auto encoded = storage::EncodeAllocatorPage(link->first, transaction_id_, link->second);
-    if (!encoded) {
-      return encoded.error();
-    }
-    if (auto status = WriteWholePage(fd_.Get(), link->first, *encoded); !status.Ok()) {
-      return status;
-    }
-    // Erase only after the write completes. A returned I/O error leaves the
-    // remaining map entries available for a retry while WAL stays intact.
-    link = pending_free_links_.erase(link);
-  }
-
-  if (header_changed_) {
-    // Changes made since the last logged metadata image still need a fresh
-    // generation before the checkpoint publishes them.
-    AdvanceSuperblock();
-    header_changed_ = false;
-  }
   return WriteCurrentSuperblock();
 }
 
@@ -385,7 +304,7 @@ auto DiskManager::WriteCurrentSuperblock() const -> Status {
   // Current checkpointing writes data pages in place. Once the WAL is reset,
   // either surviving superblock must describe those same checkpointed bytes;
   // falling back to an older generation could pair new pages with stale roots
-  // or free-list state. Therefore checkpoint mirrors one identical final
+  // or allocator-root state. Therefore checkpoint mirrors one identical final
   // generation to both slots before StorageEngine fsyncs and resets the WAL.
   const auto encoded = EncodeCurrentSuperblock();
   if (auto status = WriteWholePage(fd_.Get(), active_superblock_page_id_, encoded); !status.Ok()) {
@@ -405,8 +324,7 @@ auto DiskManager::Sync() const -> Status {
 
 auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> Status {
   TINYDB_CHECK(fd_.Valid(), "reading from a closed disk manager");
-  TINYDB_CHECK(!free_pages_.contains(page_id), "reading a freed page");
-  if (page_id < FIRST_DATA_PAGE_ID || page_id >= next_page_id_) {
+  if (page_id < FIRST_DATA_PAGE_ID || page_id >= high_water_page_id_) {
     // Invalid requests are programming/API errors; short or malformed bytes
     // inside an allocated page are persistent corruption.
     return Status::InvalidArgument("reading a page that was never allocated");
@@ -423,8 +341,7 @@ auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> Status {
 
 auto DiskManager::WritePage(page_id_t page_id, const char *data) const -> Status {
   TINYDB_CHECK(fd_.Valid(), "writing to a closed disk manager");
-  TINYDB_CHECK(!free_pages_.contains(page_id), "writing to a freed page");
-  if (page_id < FIRST_DATA_PAGE_ID || page_id >= next_page_id_) {
+  if (page_id < FIRST_DATA_PAGE_ID || page_id >= high_water_page_id_) {
     return Status::InvalidArgument("writing a page that was never allocated");
   }
   const auto bytes_written = io::Pwrite(fd_.Get(), data, PAGE_SIZE, page_id * PAGE_SIZE);

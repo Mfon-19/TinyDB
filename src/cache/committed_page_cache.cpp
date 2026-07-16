@@ -221,6 +221,21 @@ auto CommittedPageCache::Install(CommittedPageImage image) -> Status {
   return {};
 }
 
+void CommittedPageCache::Retire(std::span<const page_id_t> page_ids) {
+  auto lock = std::lock_guard(impl_->mutex);
+  for (const auto page_id : page_ids) {
+    const auto page = impl_->pages.find(page_id);
+    if (page == impl_->pages.end()) {
+      continue;
+    }
+    TINYDB_CHECK(page->second.frame->pin_count.load(std::memory_order_acquire) == 0,
+                 "retiring a pinned committed page");
+    impl_->dirty_pages.erase(page_id);
+    impl_->lru.erase(page->second.lru_position);
+    impl_->pages.erase(page);
+  }
+}
+
 void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
   auto lock = std::lock_guard(impl_->mutex);
   TINYDB_CHECK(checkpoint_lsn >= impl_->checkpoint_lsn, "committed cache checkpoint frontier moved backward");
@@ -251,6 +266,23 @@ auto CommittedPageCache::DirtyPageIds() const -> std::vector<page_id_t> {
     result.push_back(page_id);
   }
   std::ranges::sort(result);
+  return result;
+}
+
+auto CommittedPageCache::DirtyPages() -> std::vector<PageGuard> {
+  auto lock = std::lock_guard(impl_->mutex);
+  auto ids = std::vector<page_id_t>{};
+  ids.reserve(impl_->dirty_pages.size());
+  for (const auto &[page_id, frame] : impl_->dirty_pages) {
+    (void)frame;
+    ids.push_back(page_id);
+  }
+  std::ranges::sort(ids);
+  auto result = std::vector<PageGuard>{};
+  result.reserve(ids.size());
+  for (const auto page_id : ids) {
+    result.push_back(PageGuard(impl_->dirty_pages.at(page_id)));
+  }
   return result;
 }
 
