@@ -89,6 +89,7 @@ add_library(
   src/engine/storage_engine.cpp
   src/io/syscalls.h
   src/storage/disk_manager.cpp
+  src/txn/state.h
   src/util/checksums.h
   src/wal/wal.cpp)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
@@ -155,6 +156,15 @@ if(BUILD_TESTING)
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_storage_engine_test)
     gtest_discover_tests(TinyDB_storage_engine_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/contract_test.cpp")
+    add_executable(TinyDB_contract_test tests/contract_test.cpp)
+    target_link_libraries(TinyDB_contract_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_contract_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_contract_test)
+    gtest_discover_tests(TinyDB_contract_test)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/wal_test.cpp")
