@@ -55,6 +55,8 @@ namespace {
 */
 
 constexpr std::size_t MAX_RECORD_BYTES = wal_format::RECORD_HEADER_BYTES + wal_format::PAGE_IMAGE_PAYLOAD_BYTES;
+constexpr page_id_t MAX_FILE_PAGES =
+    static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) / static_cast<std::uint64_t>(PAGE_SIZE);
 
 struct SegmentFile {
   std::filesystem::path path;
@@ -164,6 +166,9 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
       return std::unexpected(Status::Corruption("WAL segment has a negative size"));
     }
     const auto size = static_cast<std::uint64_t>(file_stat.st_size);
+    if (size > std::numeric_limits<std::size_t>::max()) {
+      return std::unexpected(Status::ResourceExhausted("WAL segment is too large to validate"));
+    }
     auto bytes = std::vector<char>(size);
     const auto read = io::FullPread(fd.Get(), bytes.data(), bytes.size(), 0);
     if (!read) {
@@ -211,24 +216,25 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
   for (std::size_t index = 0; index < log.segments.size(); ++index) {
     const auto &segment = log.segments[index];
     if (segment.header.database_uuid != log.database_uuid ||
-        (index != 0 && segment.header.segment_id != log.segments[index - 1].header.segment_id + 1U)) {
-      return std::unexpected(Status::Corruption("WAL segment identity sequence is missing or duplicated"));
+        (index != 0 && segment.header.segment_id <= log.segments[index - 1].header.segment_id)) {
+      return std::unexpected(Status::Corruption("WAL segment identity sequence is duplicated or reordered"));
     }
     if (segment.file.active && index + 1 != log.segments.size()) {
       return std::unexpected(Status::Corruption("active WAL segment is not the newest segment"));
     }
   }
 
-  auto expected_lsn = log.segments.front().header.starting_lsn;
-  auto expected_sequence = std::uint32_t{0};
   log.cleanup_needed = log.active_partial || log.segments.size() > 1;
   for (std::size_t segment_index = 0; segment_index < log.segments.size(); ++segment_index) {
-    const auto &segment = log.segments[segment_index];
+    auto &segment = log.segments[segment_index];
     log.active_present = log.active_present || segment.file.active;
-    if (segment.header.starting_lsn != expected_lsn) {
-      return std::unexpected(Status::Corruption("WAL segment starting LSN breaks the durable sequence"));
-    }
 
+    // Transactions never cross a segment, so record identity restarts at the
+    // authenticated segment header.  BuildPlan later decides whether a gap
+    // between two independently valid segments is covered by the checkpoint
+    // or corrupts the still-live suffix.
+    auto expected_lsn = segment.header.starting_lsn;
+    auto expected_sequence = std::uint32_t{0};
     auto offset = std::size_t{wal_format::HEADER_BYTES};
     auto last_type = std::optional<wal_format::RecordType>{};
     while (offset < segment.bytes.size()) {
@@ -264,10 +270,14 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
       log.encoded_records.insert(log.encoded_records.end(), segment.bytes.begin() + static_cast<std::ptrdiff_t>(offset),
                                  segment.bytes.begin() + static_cast<std::ptrdiff_t>(offset + *total));
       ++expected_lsn;
-      ++expected_sequence;
       last_type = record->type;
       if (record->type == wal_format::RecordType::Commit) {
         expected_sequence = 0;
+      } else {
+        if (expected_sequence == std::numeric_limits<std::uint32_t>::max()) {
+          return std::unexpected(Status::Corruption("WAL transaction record sequence overflows"));
+        }
+        ++expected_sequence;
       }
       offset += *total;
     }
@@ -307,6 +317,9 @@ auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optio
   if (file_stat.st_size < static_cast<off_t>(FIRST_DATA_PAGE_ID * PAGE_SIZE)) {
     return std::unexpected(Status::UnsupportedFormat("database does not contain TinyDB dual superblocks"));
   }
+  if (file_stat.st_size % static_cast<off_t>(PAGE_SIZE) != 0) {
+    return std::unexpected(Status::Corruption("database file ends in a partial page"));
+  }
 
   auto prefix = std::array<char, FIRST_DATA_PAGE_ID * PAGE_SIZE>{};
   const auto read = io::FullPread(fd.Get(), prefix.data(), prefix.size(), 0);
@@ -328,6 +341,9 @@ auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optio
   if (selected->value.high_water_page_id >
       static_cast<std::uint64_t>(file_stat.st_size) / static_cast<std::uint64_t>(PAGE_SIZE)) {
     return std::unexpected(Status::Corruption("superblock allocation frontier exceeds the database file"));
+  }
+  if (selected->value.high_water_page_id > MAX_FILE_PAGES) {
+    return std::unexpected(Status::Corruption("superblock allocation frontier exceeds the platform file limit"));
   }
   return std::optional{DatabaseBase{.selected = *selected}};
 }
@@ -390,8 +406,13 @@ auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> 
   const auto checkpoint_lsn = base.selected.value.checkpoint_lsn;
   auto run = std::vector<char>{};
   auto run_first_lsn = log.segments.front().header.starting_lsn;
-  auto last_transaction_id = std::optional<std::uint64_t>{};
+  auto previous_transaction_id = std::optional<std::uint64_t>{};
+  auto previous_next_lsn = std::optional<std::uint64_t>{};
   auto saw_uncheckpointed_transaction = false;
+  auto expected_live_lsn = checkpoint_lsn + 1U;
+  auto expected_live_transaction_id = base.selected.value.transaction_id == std::numeric_limits<std::uint64_t>::max()
+                                          ? 0
+                                          : base.selected.value.transaction_id + 1U;
   auto previous_high_water = base.selected.value.high_water_page_id;
   auto offset = std::size_t{0};
   while (offset < log.encoded_records.size()) {
@@ -418,26 +439,41 @@ auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> 
     if (!transaction) {
       return std::unexpected(transaction.error());
     }
-    if (last_transaction_id && transaction->transaction_id != *last_transaction_id + 1U) {
-      return std::unexpected(Status::Corruption("WAL transaction ID sequence is missing or duplicated"));
+    if (previous_next_lsn && transaction->first_lsn != *previous_next_lsn) {
+      // Cleanup may have removed any subset of segments whose records are
+      // already represented by the selected superblock.  Such a gap is safe
+      // only while both sides remain at or behind checkpoint_lsn.  The first
+      // live record and everything after it must be exactly contiguous.
+      if (transaction->first_lsn < *previous_next_lsn || *previous_next_lsn > checkpoint_lsn + 1U ||
+          transaction->first_lsn > checkpoint_lsn + 1U) {
+        return std::unexpected(Status::Corruption("WAL transaction LSN sequence is missing or reordered"));
+      }
     }
-    last_transaction_id = transaction->transaction_id;
-    plan.durable_next_lsn = transaction->next_lsn;
+    if (previous_transaction_id && transaction->transaction_id <= *previous_transaction_id) {
+      return std::unexpected(Status::Corruption("WAL transaction ID sequence is duplicated or reordered"));
+    }
+    previous_transaction_id = transaction->transaction_id;
+    previous_next_lsn = transaction->next_lsn;
+    plan.durable_next_lsn = std::max(plan.durable_next_lsn, transaction->next_lsn);
 
     if (transaction->commit_lsn > checkpoint_lsn) {
       if (transaction->first_lsn <= checkpoint_lsn) {
         return std::unexpected(Status::Corruption("database checkpoint cuts through a WAL transaction"));
       }
-      if (!saw_uncheckpointed_transaction) {
-        if (base.selected.value.transaction_id == std::numeric_limits<std::uint64_t>::max() ||
-            transaction->first_lsn != checkpoint_lsn + 1U ||
-            transaction->transaction_id != base.selected.value.transaction_id + 1U) {
-          return std::unexpected(Status::Corruption("WAL is missing the first transaction after the checkpoint"));
-        }
-        saw_uncheckpointed_transaction = true;
+      if (expected_live_transaction_id == 0 || transaction->first_lsn != expected_live_lsn ||
+          transaction->transaction_id != expected_live_transaction_id) {
+        return std::unexpected(Status::Corruption("WAL live transaction suffix is missing or reordered"));
+      }
+      saw_uncheckpointed_transaction = true;
+      expected_live_lsn = transaction->next_lsn;
+      if (expected_live_transaction_id == std::numeric_limits<std::uint64_t>::max()) {
+        expected_live_transaction_id = 0;
+      } else {
+        ++expected_live_transaction_id;
       }
       if (transaction->state.checkpoint_lsn != checkpoint_lsn ||
-          transaction->state.high_water_page_id < previous_high_water) {
+          transaction->state.high_water_page_id < previous_high_water ||
+          transaction->state.high_water_page_id > MAX_FILE_PAGES) {
         return std::unexpected(Status::Corruption("WAL database-state frontier is inconsistent with its base"));
       }
       for (const auto &page : transaction->pages) {
@@ -447,6 +483,8 @@ auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> 
       }
       previous_high_water = transaction->state.high_water_page_id;
       plan.transactions.push_back(std::move(*transaction));
+    } else if (transaction->transaction_id > base.selected.value.transaction_id) {
+      return std::unexpected(Status::Corruption("covered WAL transaction is newer than the selected superblock"));
     }
     run.clear();
   }
@@ -456,6 +494,10 @@ auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> 
   }
   if (!saw_uncheckpointed_transaction && log.segments.front().header.starting_lsn > checkpoint_lsn + 1U) {
     return std::unexpected(Status::Corruption("WAL segment sequence begins after the checkpoint frontier"));
+  }
+  if (!saw_uncheckpointed_transaction && log.active_present &&
+      log.segments.back().header.starting_lsn > checkpoint_lsn + 1U) {
+    return std::unexpected(Status::Corruption("active WAL begins after the checkpoint frontier"));
   }
 
   if (!plan.transactions.empty()) {
