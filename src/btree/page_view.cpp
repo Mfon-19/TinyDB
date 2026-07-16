@@ -1,6 +1,6 @@
 #include "btree/page_view.h"
 
-#include <tinydb/check.h>
+#include "util/check.h"
 
 #include "btree/page_format.h"
 #include "storage/encoding.h"
@@ -16,7 +16,7 @@ namespace tinydb {
 namespace {
 
 // Fixed-width fields use byte spans; record access returns char-based views.
-auto Bytes(const char *page) -> std::span<const std::byte> { return std::as_bytes(std::span{page, PAGE_SIZE}); }
+auto PageSpan(const char *page) -> std::span<const std::byte> { return std::as_bytes(std::span{page, PAGE_SIZE}); }
 
 }  // namespace
 
@@ -30,7 +30,7 @@ auto LeafPageView::Open(const char *page, page_id_t expected_page_id) -> Result<
     return std::unexpected(Status::Corruption("page is not a leaf node"));
   }
 
-  const auto bytes = Bytes(page);
+  const auto bytes = PageSpan(page);
   const auto cell_count = storage::GetLittleEndian<std::uint16_t>(bytes, node_page_offset::CELL_COUNT);
   const auto next_leaf = storage::GetLittleEndian<page_id_t>(bytes, node_page_offset::LINK);
   // Missing fields now imply the supposedly immutable page changed after validation.
@@ -40,19 +40,20 @@ auto LeafPageView::Open(const char *page, page_id_t expected_page_id) -> Result<
 
 auto LeafPageView::CellOffset(std::size_t index) const -> std::size_t {
   TINYDB_CHECK(index < cell_count_, "leaf record index out of range");
-  return *storage::GetLittleEndian<slot_t>(Bytes(page_), LEAF_HEADER_SIZE + index * SLOT_SIZE);
+  return *storage::GetLittleEndian<slot_t>(PageSpan(page_), LEAF_HEADER_SIZE + index * SLOT_SIZE);
 }
 
 auto LeafPageView::KeyAt(std::size_t index) const -> std::string_view {
   const auto offset = CellOffset(index);
-  const auto key_bytes = *storage::GetLittleEndian<std::uint16_t>(Bytes(page_), offset + leaf_cell_offset::KEY_BYTES);
+  const auto key_bytes =
+      *storage::GetLittleEndian<std::uint16_t>(PageSpan(page_), offset + leaf_cell_offset::KEY_BYTES);
   // The owning PageHandle bounds the returned slice's lifetime.
   return {page_ + offset + LEAF_CELL_HEADER_SIZE, key_bytes};
 }
 
 auto LeafPageView::ValueAt(std::size_t index) const -> LeafValueView {
   const auto offset = CellOffset(index);
-  const auto bytes = Bytes(page_);
+  const auto bytes = PageSpan(page_);
   const auto key_bytes = *storage::GetLittleEndian<std::uint16_t>(bytes, offset + leaf_cell_offset::KEY_BYTES);
   const auto value_bytes = *storage::GetLittleEndian<std::uint16_t>(bytes, offset + leaf_cell_offset::VALUE_BYTES);
   const auto value_offset = offset + LEAF_CELL_HEADER_SIZE + key_bytes;
@@ -61,12 +62,12 @@ auto LeafPageView::ValueAt(std::size_t index) const -> LeafValueView {
     return LeafValueView::Inline(std::string_view{page_ + value_offset, value_bytes});
   }
 
-  const auto total = *storage::GetLittleEndian<std::uint64_t>(
-      bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES);
+  const auto total =
+      *storage::GetLittleEndian<std::uint64_t>(bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES);
   const auto first =
       *storage::GetLittleEndian<page_id_t>(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID);
-  const auto checksum = *storage::GetLittleEndian<std::uint32_t>(
-      bytes, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM);
+  const auto checksum =
+      *storage::GetLittleEndian<std::uint32_t>(bytes, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM);
   return LeafValueView::Overflow(OverflowValueDescriptor{
       .total_value_bytes = total,
       .first_page_id = first,
@@ -107,7 +108,7 @@ auto InternalPageView::Open(const char *page, page_id_t expected_page_id) -> Res
     return std::unexpected(Status::Corruption("page is not an internal node"));
   }
 
-  const auto bytes = Bytes(page);
+  const auto bytes = PageSpan(page);
   const auto separator_count = storage::GetLittleEndian<std::uint16_t>(bytes, node_page_offset::CELL_COUNT);
   const auto first_child = storage::GetLittleEndian<page_id_t>(bytes, node_page_offset::LINK);
   TINYDB_CHECK(separator_count.has_value() && first_child.has_value(), "validated internal header became unreadable");
@@ -116,19 +117,19 @@ auto InternalPageView::Open(const char *page, page_id_t expected_page_id) -> Res
 
 auto InternalPageView::CellOffset(std::size_t index) const -> std::size_t {
   TINYDB_CHECK(index < separator_count_, "internal separator index out of range");
-  return *storage::GetLittleEndian<slot_t>(Bytes(page_), INTERNAL_HEADER_SIZE + index * SLOT_SIZE);
+  return *storage::GetLittleEndian<slot_t>(PageSpan(page_), INTERNAL_HEADER_SIZE + index * SLOT_SIZE);
 }
 
 auto InternalPageView::KeyAt(std::size_t index) const -> std::string_view {
   const auto offset = CellOffset(index);
   const auto key_bytes =
-      *storage::GetLittleEndian<std::uint16_t>(Bytes(page_), offset + internal_cell_offset::KEY_BYTES);
+      *storage::GetLittleEndian<std::uint16_t>(PageSpan(page_), offset + internal_cell_offset::KEY_BYTES);
   return {page_ + offset + INTERNAL_CELL_HEADER_SIZE, key_bytes};
 }
 
 auto InternalPageView::RightChildAt(std::size_t index) const -> page_id_t {
   const auto offset = CellOffset(index);
-  return *storage::GetLittleEndian<page_id_t>(Bytes(page_), offset + internal_cell_offset::RIGHT_CHILD);
+  return *storage::GetLittleEndian<page_id_t>(PageSpan(page_), offset + internal_cell_offset::RIGHT_CHILD);
 }
 
 auto InternalPageView::ChildAt(std::size_t child_index) const -> page_id_t {

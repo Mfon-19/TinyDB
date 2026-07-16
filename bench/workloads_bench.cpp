@@ -11,8 +11,7 @@
 // anything — on a tmpfs /tmp the "device" is RAM and eviction is a no-op.
 
 #include <benchmark/benchmark.h>
-#include <tinydb/check.h>
-#include <tinydb/storage_engine.h>
+#include <tinydb/database.h>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -21,6 +20,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <numeric>
@@ -30,6 +30,13 @@
 #include <vector>
 
 namespace {
+
+void BenchCheck(bool condition, const char *message) {
+  if (!condition) {
+    std::fprintf(stderr, "TinyDB benchmark setup failed: %s\n", message);
+    std::abort();
+  }
+}
 
 // Fixed payload size. With 12-byte keys an entry costs ~120 bytes on a page,
 // so a fully packed leaf holds around 33 rows.
@@ -105,11 +112,11 @@ class PrebuiltDatabase {
  public:
   explicit PrebuiltDatabase(std::int64_t rows) : path_(BenchPath("prebuilt_" + std::to_string(rows))) {
     std::filesystem::remove(path_);
-    auto engine = tinydb::StorageEngine::Open(path_).value();
+    auto engine = tinydb::Database::Open(path_).value();
     for (std::int64_t row = 0; row < rows; ++row) {
-      TINYDB_CHECK(engine.Put(RowKey(row), RowValue(row)).Ok(), "prebuild Put failed");
+      BenchCheck(engine.Put(RowKey(row), RowValue(row)).Ok(), "prebuild Put failed");
     }
-    TINYDB_CHECK(engine.Close().Ok(), "prebuild Close failed");
+    BenchCheck(engine.Close().Ok(), "prebuild Close failed");
   }
 
   PrebuiltDatabase(const PrebuiltDatabase &) = delete;
@@ -141,7 +148,7 @@ auto PrebuiltDb(std::int64_t rows) -> const std::filesystem::path & {
 class PageCacheEvictor {
  public:
   explicit PageCacheEvictor(const std::filesystem::path &path) : fd_(::open(path.c_str(), O_RDONLY)) {
-    TINYDB_CHECK(fd_ >= 0, "opening the database for cache eviction failed");
+    BenchCheck(fd_ >= 0, "opening the database for cache eviction failed");
   }
 
   PageCacheEvictor(const PageCacheEvictor &) = delete;
@@ -152,7 +159,7 @@ class PageCacheEvictor {
   ~PageCacheEvictor() { ::close(fd_); }
 
   auto Evict() const -> void {
-    TINYDB_CHECK(::posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED) == 0, "posix_fadvise failed");
+    BenchCheck(::posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED) == 0, "posix_fadvise failed");
   }
 
  private:
@@ -166,7 +173,7 @@ void InsertWorkload(benchmark::State &state, const std::vector<Row> &rows, const
   const auto path = BenchPath(label);
   while (state.KeepRunning()) {
     std::filesystem::remove(path);
-    auto engine = tinydb::StorageEngine::Open(path).value();
+    auto engine = tinydb::Database::Open(path).value();
 
     const auto start = std::chrono::steady_clock::now();
     for (const auto &row : rows) {
@@ -175,7 +182,7 @@ void InsertWorkload(benchmark::State &state, const std::vector<Row> &rows, const
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start);
     state.SetIterationTime(seconds.count());
 
-    TINYDB_CHECK(engine.Close().Ok(), "Close failed");
+    BenchCheck(engine.Close().Ok(), "Close failed");
   }
 
   state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(rows.size()));
@@ -203,7 +210,7 @@ void PointReadHot(benchmark::State &state) {
   // At 1,000 rows the whole tree is ~35 pages, comfortably inside the
   // 64-frame buffer pool: after warmup every Get is served from memory.
   const auto keys = ShuffledKeys(state.range(0));
-  auto engine = tinydb::StorageEngine::Open(PrebuiltDb(state.range(0))).value();
+  auto engine = tinydb::Database::Open(PrebuiltDb(state.range(0))).value();
 
   for (const auto &key : keys) {  // warm the pool
     auto value = engine.Get(key);
@@ -226,7 +233,7 @@ void PointReadCold(benchmark::State &state) {
   // reads a page. Per the header caveat, the OS page cache absorbs the
   // pread: this measures the pool-miss path, not disk latency.
   const auto keys = ShuffledKeys(state.range(0));
-  auto engine = tinydb::StorageEngine::Open(PrebuiltDb(state.range(0))).value();
+  auto engine = tinydb::Database::Open(PrebuiltDb(state.range(0))).value();
 
   std::size_t next = 0;
   while (state.KeepRunning()) {
@@ -245,7 +252,7 @@ void PointReadColdDisk(benchmark::State &state) {
   // already-warmed leaf ~2% of the time), and eviction runs off the clock.
   const auto keys = ShuffledKeys(state.range(0));
   const auto &path = PrebuiltDb(state.range(0));
-  auto engine = tinydb::StorageEngine::Open(path).value();
+  auto engine = tinydb::Database::Open(path).value();
   const auto evictor = PageCacheEvictor{path};
 
   std::size_t next = 0;
@@ -269,7 +276,7 @@ void RangeScan(benchmark::State &state) {
   // key and copied-value payload returned. The cursor retains one leaf rather
   // than allocating storage proportional to the full result set.
   const auto rows = static_cast<std::int64_t>(state.range(0));
-  auto engine = tinydb::StorageEngine::Open(PrebuiltDb(rows)).value();
+  auto engine = tinydb::Database::Open(PrebuiltDb(rows)).value();
 
   std::int64_t payload_bytes = 0;
   auto sample_rows = std::int64_t{0};
@@ -280,10 +287,10 @@ void RangeScan(benchmark::State &state) {
       const auto value = cursor.CopyValue().value();
       payload_bytes += std::ssize(cursor.Key()) + std::ssize(value);
       ++sample_rows;
-      TINYDB_CHECK(cursor.Next().Ok(), "sample cursor failed");
+      BenchCheck(cursor.Next().Ok(), "sample cursor failed");
     }
   }
-  TINYDB_CHECK(sample_rows == rows, "prebuilt database is missing rows");
+  BenchCheck(sample_rows == rows, "prebuilt database is missing rows");
 
   while (state.KeepRunning()) {
     auto transaction = engine.BeginRead().value();
@@ -291,7 +298,7 @@ void RangeScan(benchmark::State &state) {
     while (cursor.Valid()) {
       auto value = cursor.CopyValue();
       benchmark::DoNotOptimize(value);
-      TINYDB_CHECK(cursor.Next().Ok(), "range cursor failed");
+      BenchCheck(cursor.Next().Ok(), "range cursor failed");
     }
   }
 
@@ -308,19 +315,19 @@ void Churn(benchmark::State &state) {
   const auto rows = SequentialRowSet(state.range(0));
   const auto path = BenchPath("churn");
   std::filesystem::remove(path);
-  auto engine = tinydb::StorageEngine::Open(path).value();
+  auto engine = tinydb::Database::Open(path).value();
 
   while (state.KeepRunning()) {
     for (const auto &row : rows) {
       benchmark::DoNotOptimize(engine.Put(row.key, row.value));
     }
     for (const auto &row : rows) {
-      benchmark::DoNotOptimize(engine.Remove(row.key));
+      benchmark::DoNotOptimize(engine.Delete(row.key));
     }
   }
 
   state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(rows.size()) * 2);
-  TINYDB_CHECK(engine.Close().Ok(), "Close failed");
+  BenchCheck(engine.Close().Ok(), "Close failed");
   state.counters["db_KiB"] = static_cast<double>(std::filesystem::file_size(path)) / 1024.0;
   std::filesystem::remove(path);
 }

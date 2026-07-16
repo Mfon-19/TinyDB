@@ -3,8 +3,8 @@
 #include "btree/navigation.h"
 #include "txn/contract.h"
 
-#include <tinydb/check.h>
-#include <tinydb/page.h>
+#include "util/check.h"
+#include "storage/page.h"
 
 #include <expected>
 #include <utility>

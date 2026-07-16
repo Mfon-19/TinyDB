@@ -1,7 +1,7 @@
 #include "txn/commit_coordinator.h"
 
-#include <tinydb/check.h>
-#include <tinydb/wal.h>
+#include "util/check.h"
+#include "wal/wal.h"
 
 #include "btree/b_plus_tree.h"
 #include "cache/committed_page_cache.h"
@@ -17,7 +17,7 @@
 namespace tinydb::txn {
 
 auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
-                               TransactionState &transaction_state) -> Result<TransactionCommitInfo> {
+                               TransactionState &transaction_state) -> Result<CommitInfo> {
   transaction.SetRootPageId(tree.RootPageId());
   if (auto status = transaction.Freeze(); !status.Ok()) {
     transaction.Abort();
@@ -28,7 +28,7 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
   if (!transaction.HasChanges()) {
     const auto &state = transaction.ResultingState();
     transaction_state = TransactionState::Published;
-    return TransactionCommitInfo{.transaction_id = state.transaction_id, .commit_lsn = state.visible_lsn};
+    return CommitInfo{.transaction_id = state.transaction_id, .commit_lsn = state.visible_lsn};
   }
 
   const auto commit_lsn = wal_->NextCommitLsn(transaction.FinalPageCount());
@@ -107,7 +107,7 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
     publication.Publish(std::move(published_state));
   }
   transaction_state = TransactionState::Published;
-  return TransactionCommitInfo{.transaction_id = durable->transaction_id, .commit_lsn = durable->commit_lsn};
+  return CommitInfo{.transaction_id = durable->transaction_id, .commit_lsn = durable->commit_lsn};
 }
 
 }  // namespace tinydb::txn

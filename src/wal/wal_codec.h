@@ -1,7 +1,7 @@
 #pragma once
 
-#include <tinydb/database_uuid.h>
-#include <tinydb/page.h>
+#include "storage/database_uuid.h"
+#include "storage/page.h"
 #include <tinydb/status.h>
 
 #include "txn/database_state.h"

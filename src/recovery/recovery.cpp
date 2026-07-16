@@ -1,9 +1,9 @@
 #include "recovery/recovery.h"
 
-#include <tinydb/check.h>
-#include <tinydb/database_uuid.h>
-#include <tinydb/page.h>
-#include <tinydb/unique_fd.h>
+#include "util/check.h"
+#include "storage/database_uuid.h"
+#include "storage/page.h"
+#include "io/unique_fd.h"
 
 #include "io/file_io.h"
 #include "io/syscalls.h"

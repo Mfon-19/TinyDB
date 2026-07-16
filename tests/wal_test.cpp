@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
-#include <tinydb/database_uuid.h>
-#include <tinydb/page.h>
+#include "storage/database_uuid.h"
+#include "storage/page.h"
 #include <tinydb/status.h>
-#include <tinydb/wal.h>
+#include "wal/wal.h"
 
 #include "io/syscalls.h"
 #include "recovery/recovery.h"

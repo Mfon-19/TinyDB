@@ -1,7 +1,7 @@
 #include "cache/committed_page_cache.h"
 
-#include <tinydb/check.h>
-#include <tinydb/disk_manager.h>
+#include "util/check.h"
+#include "storage/disk_manager.h"
 
 #include "btree/page_source.h"
 #include "storage/page_codec.h"

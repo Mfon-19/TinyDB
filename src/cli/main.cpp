@@ -1,5 +1,4 @@
-#include <tinydb/status.h>
-#include <tinydb/storage_engine.h>
+#include <tinydb/database.h>
 
 #include <exception>
 #include <filesystem>
@@ -8,17 +7,13 @@
 #include <string_view>
 #include <vector>
 
-/**
-  Minimal command-line front end. Every invocation opens the database, runs
-  one command, and closes it, so persistence is exercised on every call.
-
-    TinyDB <db-file> put <key> <value>
-    TinyDB <db-file> get <key>
-    TinyDB <db-file> del <key>
-    TinyDB <db-file> scan [<start> <end>]
-
-  Exit codes: 0 on success, 1 on failure (missing key, oversized entry,
-  I/O error), 2 on usage errors.
+/*
+** ONE-SHOT COMMAND-LINE FRONT END
+**
+** Each invocation opens one database, performs one public API operation, and
+** closes it. The CLI owns parsing and presentation only; transaction,
+** durability, and scan semantics remain those of Database. Exit status is 0
+** on success, 1 for a database error or missing key, and 2 for invalid syntax.
 */
 
 namespace {
@@ -38,8 +33,7 @@ auto ReportError(const tinydb::Status &status) -> int {
   return 1;
 }
 
-auto RunCommand(tinydb::StorageEngine &engine, std::string_view program,
-                const std::vector<std::string_view> &args) -> int {
+auto RunCommand(tinydb::Database &engine, std::string_view program, const std::vector<std::string_view> &args) -> int {
   const auto command = args[1];
 
   if (command == "put" && args.size() == 4) {
@@ -64,7 +58,7 @@ auto RunCommand(tinydb::StorageEngine &engine, std::string_view program,
   }
 
   if (command == "del" && args.size() == 3) {
-    if (const auto status = engine.Remove(args[2]); !status.Ok()) {
+    if (const auto status = engine.Delete(args[2]); !status.Ok()) {
       return ReportError(status);
     }
     return 0;
@@ -112,14 +106,14 @@ auto main(int argc, char **argv) -> int {
       return 2;
     }
 
-    auto engine = tinydb::StorageEngine::Open(std::filesystem::path{args[0]});
+    auto engine = tinydb::Database::Open(std::filesystem::path{args[0]});
     if (!engine) {
       return ReportError(engine.error());
     }
     const int code = RunCommand(*engine, program, args);
 
-    // Close explicitly: a put that cannot reach the device must fail loudly,
-    // not vanish into the destructor's stderr log.
+    // Commits are already durable. Explicit Close makes a final checkpoint
+    // failure visible instead of relegating it to destructor diagnostics.
     if (const auto status = engine->Close(); !status.Ok()) {
       return ReportError(status);
     }

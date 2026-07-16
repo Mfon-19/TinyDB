@@ -1,6 +1,6 @@
 #include "btree/page_source.h"
 
-#include <tinydb/check.h>
+#include "util/check.h"
 
 #include <utility>
 

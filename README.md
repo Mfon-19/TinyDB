@@ -1,123 +1,159 @@
 # TinyDB
 
-A disk-backed, ordered **key-value storage engine** in C++23. A page-based
-file format, a buffer pool, and a B+-tree index behind a small embedded API.
-
-It is the persistence core that sits *underneath* a database, not a full
-RDBMS: no SQL, planner, or server, just storage, indexing, caching, and
-durability.
+TinyDB is a single-process, ordered, transactional key-value database embedded
+directly in a C++23 application. It stores byte-string keys and values in a
+checksummed B+ tree, commits through a physical write-ahead log, and recovers
+automatically when the database is reopened after a crash.
 
 ```cpp
-auto db = tinydb::StorageEngine::Open("data.db").value();
+#include <tinydb/database.h>
 
-db.Put("user:1", "Mfon");     // -> tinydb::Status
-db.Get("user:1");             // -> Result<std::optional<std::string>>
-db.Remove("user:1");
+auto database = tinydb::Database::Open("notes.db").value();
 
-for (const auto &[key, value] : db.Scan("user:", "user;").value())  // [start, end)
-  std::cout << key << " = " << value << "\n";
+auto write = database.BeginWrite().value();
+if (!write.Put("doc/1", "contents").Ok() ||
+    !write.Put("tag/database/doc/1", "").Ok()) {
+  write.Abort();
+  return;
+}
+auto committed = std::move(write).Commit();
+if (!committed) {
+  return;
+}
+
+auto read = database.BeginRead().value();
+auto cursor = read.Scan(tinydb::KeyRange::Prefix("tag/database/")).value();
+while (cursor.Valid()) {
+  Use(cursor.Key(), cursor.CopyValue().value());
+  if (!cursor.Next().Ok()) {
+    break;
+  }
+}
 ```
 
-## Architecture
+## Contract
 
-Four layers — here drawn as the structures they are. One key's journey,
-top to bottom:
+- Keys are unique byte strings ordered by unsigned lexicographic order.
+- `Put` inserts or replaces, and `Delete` is idempotent.
+- A write transaction publishes all of its mutations or none of them.
+- A successful commit is durable without `Close` or an explicit checkpoint.
+- An indeterminate durability failure moves the handle to `NeedsRecovery`; the
+  application must reopen before determining the transaction outcome.
+- Read transactions and their cursors retain one stable committed snapshot.
+- Many readers may coexist. One write transaction may prepare at a time.
+- One process owns a database file at a time through an exclusive file lock.
+- Keys are limited to 1 KiB and values to 4 MiB. Large values use checksummed
+  overflow pages and are copied by `Get` and `Cursor::CopyValue`.
+- Detected malformed persistent state is returned as `Corruption` or
+  `UnsupportedFormat`; it is not treated as an internal assertion failure.
+
+TinyDB does not provide SQL, schemas, networking, replication, multi-process
+readers, or concurrent write transactions.
+
+## Storage model
 
 ```text
-                   Put · Get · Remove · Scan
-                               │
-                     ╔═════════▼═════════╗
-                     ║   StorageEngine   ║      src/engine — the one door
-                     ╚═════════╤═════════╝      in; every failure walks
-                               │                back out of it as a
-                               │                Status / Result<T>
-                          [ B+ tree ]           src/btree
-                            ┌─────┐
-                            │ k37 │             internal nodes route
-                            └┬───┬┘             the key down
-                       ┌─────┘   └─────┐
-                   ┌───▼───┐       ┌───▼───┐
-              ┄┄──▶│ k1 k9 │──────▶│k37 k80│──▶┄┄
-                   └───────┘       └───────┘    leaves hold the rows,
-                               │                chained for Scan
-                               │  every node is one 4 KiB page,
-                               ▼  fetched and pinned via PageRef
-                        [ Buffer pool ]         src/buffer
-                ┌────┬────┬────┬────┬────┬────┬────┐
-                │ p3*│p17 │ p9*│ …  │p41 │p88*│ p5 │  64 fixed frames
-                └────┴────┴────┴────┴────┴────┴────┘  * = dirty
-                 pins hold pages in; a clock hand
-                 sweeps for the eviction victim
-                               │
-                        [ DiskManager ]         src/storage
-                               │
-                               │  pread · pwrite · fsync
-                               ▼
-             ┌────────┬────────┬────────┬────────┬┄┄
-             │ header │ btree  │  free  │ btree  │┄┄  data.db
-             └───┬────┴────────┴───▲────┴────────┴┄┄
-                 └─ free-list head ┘
-                 freed pages are reused before the file grows
+application
+    │
+    ├── ReadTransaction ── immutable committed snapshot ──┐
+    │                                                     │
+    └── WriteTransaction ── private mutable page overlay  │
+                              │                           │
+                              ├── fsynced physical WAL    │
+                              └── atomic publication ─────┘
+                                           │
+                                  committed page cache
+                                           │ checkpoint
+                                  checksummed page file
 ```
 
-Each layer only talks to the one directly below it: the tree never sees the
-file, the pool never parses a node. The write-ahead log (next up) will slot
-in beside the buffer pool, getting its records to disk before the pages
-they describe.
+Before WAL synchronization, write pages are private and discardable. The
+commit path prepares every allocation required for visibility, appends final
+page images and resulting roots, synchronizes the WAL, drains older readers,
+and publishes without further allocation or I/O. Checkpointing later writes
+those immutable committed versions to the database file and removes covered
+WAL segments. It is not a commit boundary.
 
-## What's inside
+The database file uses explicit little-endian encodings, per-page checksums,
+and alternating checksummed superblocks. The WAL is segmented, checksummed,
+bound to the database UUID, and replays only complete self-binding
+transactions.
 
-- **4 KiB slotted pages** over plain `pread`/`pwrite`, with an intrusive
-  LIFO free list so deleted pages are reused instead of growing the file.
-- **Buffer pool** — fixed-frame page cache with pin counts, dirty tracking,
-  and clock eviction.
-- **B+ tree** — variable-length keys and values, splits (tail-heavy for
-  ascending inserts), merges, and leaf-chained range scans.
-- **Durability at close** — `Close()` flushes and fsyncs.
-- **Status-based errors** — I/O failures travel as `Status` / `Result<T>`
-  (`std::expected`) values, LevelDB-style; nothing throws.
-- Invariant checks (`TINYDB_CHECK`) stay on in release builds: corruption
-  aborts loudly rather than propagating.
-
-## Build, test, benchmark
+## Build and test
 
 ```sh
-cmake -B build && cmake --build build      # library
-ctest --test-dir build                     # unit tests
-
-cmake -B cmake-build-release -DCMAKE_BUILD_TYPE=Release -DTINYDB_BUILD_BENCHMARKS=ON
-cmake --build cmake-build-release --target TinyDB_workloads_bench
-./cmake-build-release/TinyDB_workloads_bench
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
 ```
 
-Sample numbers (NVMe SSD, 112-byte entries): ~420k sequential inserts/s,
-~264k random inserts/s, point reads at 1.9 µs from the buffer pool, 4.1 µs
-from the OS page cache, and 110 µs from the device; range scans at
-~690 MiB/s. See `bench/workloads_bench.cpp` for methodology and caveats.
+Sanitizer and clang-tidy presets are defined in `CMakePresets.json`. Benchmarks
+are optional:
 
-## Layout
+```sh
+cmake -S . -B build/bench -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF -DTINYDB_BUILD_BENCHMARKS=ON
+cmake --build build/bench --target TinyDB_workloads_bench
+```
 
-| Path | What's there |
-|------|--------------|
-| `include/tinydb` | Public headers (the embed surface) |
-| `src/storage` | DiskManager: page file, header, free list |
-| `src/buffer`  | Buffer pool / page cache |
-| `src/btree`   | B+ tree and the on-disk node formats |
-| `src/engine`  | StorageEngine API and lifecycle |
-| `src/cli`     | Interactive REPL |
-| `tests`       | GoogleTest suites for every layer |
-| `bench`       | Google Benchmark workload suite |
+No historical performance figures are claimed here; storage, filesystem, and
+durability settings materially change the result.
 
-## What's next
+## Install and consume
 
-- **Write-ahead log** — per-operation durability instead of
-  durability-at-close, into `src/wal`.
-- **Crash recovery** — replay the log on `Open()` after an unclean shutdown,
-  into `src/recovery`; then checkpointing to bound replay time.
-- **Recovery and commit-latency benchmarks** — fsync cost per commit, time to
-  recover after a crash.
-- **Engine metrics** — buffer-pool hit rate, write amplification, leaf fill
-  factor, and latency percentiles in the benchmark suite.
-- **Open-ended scans** — `Scan(start)` to the end of the keyspace, without a
-  sentinel end key.
-- **And a few more...**
+```sh
+cmake --install build/release --prefix /your/prefix
+```
+
+A downstream CMake project can then use only the installed public boundary:
+
+```cmake
+find_package(TinyDB CONFIG REQUIRED)
+target_link_libraries(my_application PRIVATE TinyDB::TinyDB)
+```
+
+The installed headers are:
+
+```text
+tinydb/bytes.h
+tinydb/cursor.h
+tinydb/database.h
+tinydb/options.h
+tinydb/stats.h
+tinydb/status.h
+tinydb/transaction.h
+```
+
+Page formats, the cache, WAL, allocator, recovery, and B+ tree types are
+private implementation details under `src/`.
+
+## Command line
+
+The `tinydb` executable performs one operation per invocation:
+
+```text
+tinydb <database> put <key> <value>
+tinydb <database> get <key>
+tinydb <database> del <key>
+tinydb <database> scan
+tinydb <database> scan <lower> <upper>
+```
+
+The CLI is a thin demonstration of the public API. It is not a server or an
+interactive shell.
+
+## Repository layout
+
+| Path | Responsibility |
+|---|---|
+| `include/tinydb` | Installed application API |
+| `src/api` | Handle, transaction, lifecycle, and publication coordination |
+| `src/btree` | Ordered index, cursors, and overflow values |
+| `src/cache` | Immutable committed page versions |
+| `src/txn` | Reader gate, private overlay, allocator, and commit protocol |
+| `src/wal` | Segmented WAL and physical transaction codec |
+| `src/recovery` | WAL validation and idempotent redo |
+| `src/checkpoint` | Immutable checkpoint capture and cleanup |
+| `src/storage` | Database file, superblocks, and page codecs |
+| `src/io` | POSIX I/O boundary and fault-injection hooks |
+| `tests` | Contract, model, corruption, durability, and crash tests |

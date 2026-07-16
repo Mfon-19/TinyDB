@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include <tinydb/disk_manager.h>
-#include <tinydb/wal.h>
+#include "storage/disk_manager.h"
+#include "wal/wal.h"
 
 #include "cache/committed_page_cache.h"
 #include "checkpoint/checkpoint_manager.h"

@@ -186,13 +186,13 @@ TEST(TransactionContractTest, OnlyOneWriterMayExist) {
 
 TEST(DataModelContractTest, EmptyAndMaximumSizedKeysAreValid) {
   EXPECT_EQ(tinydb::txn::ValidateKeySize(0), StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::ValidateKeySize(tinydb::txn::MAX_KEY_BYTES), StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::ValidateKeySize(tinydb::txn::MAX_KEY_BYTES + 1), StatusCode::InvalidArgument);
+  EXPECT_EQ(tinydb::txn::ValidateKeySize(tinydb::MAX_KEY_BYTES), StatusCode::Ok);
+  EXPECT_EQ(tinydb::txn::ValidateKeySize(tinydb::MAX_KEY_BYTES + 1), StatusCode::InvalidArgument);
 
   auto model = TransactionModel{};
   auto transaction = model.BeginWrite();
   ASSERT_TRUE(transaction.has_value());
-  const auto maximum_key = std::string(tinydb::txn::MAX_KEY_BYTES, 'k');
+  const auto maximum_key = std::string(tinydb::MAX_KEY_BYTES, 'k');
   ASSERT_EQ(transaction->Put("", ""), StatusCode::Ok);
   ASSERT_EQ(transaction->Put(maximum_key, "maximum"), StatusCode::Ok);
   ASSERT_TRUE(transaction->Commit());
@@ -205,7 +205,7 @@ TEST(DataModelContractTest, InvalidMutationDoesNotAbortTheTransaction) {
   auto transaction = model.BeginWrite();
   ASSERT_TRUE(transaction.has_value());
 
-  const auto oversized_key = std::string(tinydb::txn::MAX_KEY_BYTES + 1, 'x');
+  const auto oversized_key = std::string(tinydb::MAX_KEY_BYTES + 1, 'x');
   EXPECT_EQ(transaction->Put(oversized_key, "value"), StatusCode::InvalidArgument);
   EXPECT_EQ(transaction->Delete(oversized_key), StatusCode::InvalidArgument);
   EXPECT_EQ(transaction->Put("valid", "value"), StatusCode::Ok);

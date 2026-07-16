@@ -16,7 +16,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(CTest)
+include(CMakePackageConfigHelpers)
 include(FetchContent)
+include(GNUInstallDirs)
 
 add_library(TinyDB_warnings INTERFACE)
 target_compile_options(
@@ -59,7 +61,10 @@ if(TINYDB_ENABLE_CLANG_TIDY)
 endif()
 
 function(TinyDB_apply_local_tooling target_name)
-  target_link_libraries(${target_name} PRIVATE TinyDB_warnings TinyDB_sanitizers)
+  # These are repository build policies, not transitive package dependencies.
+  target_link_libraries(
+    ${target_name} PRIVATE $<BUILD_INTERFACE:TinyDB_warnings>
+                           $<BUILD_INTERFACE:TinyDB_sanitizers>)
   if(TINYDB_CLANG_TIDY_COMMAND)
     set_target_properties(${target_name} PROPERTIES CXX_CLANG_TIDY
                                                     "${TINYDB_CLANG_TIDY_COMMAND}")
@@ -68,15 +73,6 @@ endfunction()
 
 add_library(
   TinyDB
-  include/tinydb/check.h
-  include/tinydb/database_uuid.h
-  include/tinydb/disk_manager.h
-  include/tinydb/limits.h
-  include/tinydb/page.h
-  include/tinydb/status.h
-  include/tinydb/storage_engine.h
-  include/tinydb/unique_fd.h
-  include/tinydb/wal.h
   src/btree/b_plus_tree.cpp
   src/btree/b_plus_tree.h
   src/btree/internal_page_builder.cpp
@@ -102,14 +98,18 @@ add_library(
   src/cache/committed_page_source.h
   src/checkpoint/checkpoint_manager.cpp
   src/checkpoint/checkpoint_manager.h
-  src/engine/storage_engine.cpp
+  src/api/database.cpp
   src/io/file_io.cpp
   src/io/file_io.h
   src/io/syscalls.h
+  src/io/unique_fd.h
   src/recovery/recovery.cpp
   src/recovery/recovery.h
   src/storage/disk_manager.cpp
+  src/storage/disk_manager.h
+  src/storage/database_uuid.h
   src/storage/encoding.h
+  src/storage/page.h
   src/storage/page_codec.cpp
   src/storage/page_codec.h
   src/storage/superblock.cpp
@@ -125,11 +125,29 @@ add_library(
   src/txn/state.h
   src/txn/transaction_pages.cpp
   src/txn/transaction_pages.h
+  src/util/check.h
   src/util/crc32.h
   src/wal/wal.cpp
+  src/wal/wal.h
   src/wal/wal_codec.cpp
   src/wal/wal_codec.h)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
+target_sources(
+  TinyDB
+  PUBLIC FILE_SET
+         public_headers
+         TYPE
+         HEADERS
+         BASE_DIRS
+         ${CMAKE_CURRENT_SOURCE_DIR}/include
+         FILES
+         include/tinydb/bytes.h
+         include/tinydb/cursor.h
+         include/tinydb/database.h
+         include/tinydb/options.h
+         include/tinydb/stats.h
+         include/tinydb/status.h
+         include/tinydb/transaction.h)
 target_compile_features(TinyDB PUBLIC cxx_std_23)
 target_include_directories(
   TinyDB
@@ -137,163 +155,39 @@ target_include_directories(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 TinyDB_apply_local_tooling(TinyDB)
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/cli/main.cpp")
-  add_executable(TinyDB_cli src/cli/main.cpp)
-  set_target_properties(TinyDB_cli PROPERTIES OUTPUT_NAME TinyDB)
-  target_link_libraries(TinyDB_cli PRIVATE TinyDB::TinyDB)
-  TinyDB_apply_local_tooling(TinyDB_cli)
-endif()
+add_executable(TinyDB_cli src/cli/main.cpp)
+set_target_properties(TinyDB_cli PROPERTIES OUTPUT_NAME tinydb)
+target_link_libraries(TinyDB_cli PRIVATE TinyDB::TinyDB)
+TinyDB_apply_local_tooling(TinyDB_cli)
+
+set(TINYDB_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/TinyDB)
+configure_package_config_file(
+  cmake/TinyDBConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/TinyDBConfig.cmake
+  INSTALL_DESTINATION ${TINYDB_INSTALL_CMAKEDIR})
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/TinyDBConfigVersion.cmake
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion)
+
+install(
+  TARGETS TinyDB TinyDB_cli
+  EXPORT TinyDBTargets
+  FILE_SET public_headers
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(
+  EXPORT TinyDBTargets
+  FILE TinyDBTargets.cmake
+  NAMESPACE TinyDB::
+  DESTINATION ${TINYDB_INSTALL_CMAKEDIR})
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/TinyDBConfig.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/TinyDBConfigVersion.cmake
+        DESTINATION ${TINYDB_INSTALL_CMAKEDIR})
 
 if(BUILD_TESTING)
-  FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.14.0
-    GIT_SHALLOW TRUE)
-  set(gtest_force_shared_crt
-      ON
-      CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(googletest)
-
-  include(GoogleTest)
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/disk_manager_test.cpp")
-    add_executable(TinyDB_disk_manager_test tests/disk_manager_test.cpp)
-    target_link_libraries(TinyDB_disk_manager_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    # White-box tests: the suite uses the private syscall hook and header
-    # checksum helpers under src/.
-    target_include_directories(TinyDB_disk_manager_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_disk_manager_test)
-    gtest_discover_tests(TinyDB_disk_manager_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/storage_engine_test.cpp")
-    add_executable(TinyDB_storage_engine_test tests/storage_engine_test.cpp)
-    target_link_libraries(TinyDB_storage_engine_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_storage_engine_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_storage_engine_test)
-    gtest_discover_tests(TinyDB_storage_engine_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/storage_codec_test.cpp")
-    add_executable(TinyDB_storage_codec_test tests/storage_codec_test.cpp)
-    target_link_libraries(TinyDB_storage_codec_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_storage_codec_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_storage_codec_test)
-    gtest_discover_tests(TinyDB_storage_codec_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/page_view_test.cpp")
-    add_executable(TinyDB_page_view_test tests/page_view_test.cpp)
-    target_link_libraries(TinyDB_page_view_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_page_view_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_page_view_test)
-    gtest_discover_tests(TinyDB_page_view_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/tree_page_source_test.cpp")
-    add_executable(TinyDB_tree_page_source_test tests/tree_page_source_test.cpp)
-    target_link_libraries(TinyDB_tree_page_source_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_tree_page_source_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_tree_page_source_test)
-    gtest_discover_tests(TinyDB_tree_page_source_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/contract_test.cpp")
-    add_executable(TinyDB_contract_test tests/contract_test.cpp)
-    target_link_libraries(TinyDB_contract_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_contract_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_contract_test)
-    gtest_discover_tests(TinyDB_contract_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/reader_gate_test.cpp")
-    add_executable(TinyDB_reader_gate_test tests/reader_gate_test.cpp)
-    target_link_libraries(TinyDB_reader_gate_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_reader_gate_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_reader_gate_test)
-    gtest_discover_tests(TinyDB_reader_gate_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/committed_page_cache_test.cpp")
-    add_executable(TinyDB_committed_page_cache_test tests/committed_page_cache_test.cpp)
-    target_link_libraries(TinyDB_committed_page_cache_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_committed_page_cache_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_committed_page_cache_test)
-    gtest_discover_tests(TinyDB_committed_page_cache_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/checkpoint_manager_test.cpp")
-    add_executable(TinyDB_checkpoint_manager_test tests/checkpoint_manager_test.cpp)
-    target_link_libraries(TinyDB_checkpoint_manager_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_checkpoint_manager_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_checkpoint_manager_test)
-    gtest_discover_tests(TinyDB_checkpoint_manager_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cursor_test.cpp")
-    add_executable(TinyDB_cursor_test tests/cursor_test.cpp)
-    target_link_libraries(TinyDB_cursor_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_cursor_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_cursor_test)
-    gtest_discover_tests(TinyDB_cursor_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/overflow_value_test.cpp")
-    add_executable(TinyDB_overflow_value_test tests/overflow_value_test.cpp)
-    target_link_libraries(TinyDB_overflow_value_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_overflow_value_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_overflow_value_test)
-    gtest_discover_tests(TinyDB_overflow_value_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/read_snapshot_test.cpp")
-    add_executable(TinyDB_read_snapshot_test tests/read_snapshot_test.cpp)
-    target_link_libraries(TinyDB_read_snapshot_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_read_snapshot_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_read_snapshot_test)
-    gtest_discover_tests(TinyDB_read_snapshot_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/transaction_pages_test.cpp")
-    add_executable(TinyDB_transaction_pages_test tests/transaction_pages_test.cpp)
-    target_link_libraries(TinyDB_transaction_pages_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_transaction_pages_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_transaction_pages_test)
-    gtest_discover_tests(TinyDB_transaction_pages_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/wal_test.cpp")
-    add_executable(TinyDB_wal_test tests/wal_test.cpp)
-    target_link_libraries(TinyDB_wal_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_wal_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_wal_test)
-    gtest_discover_tests(TinyDB_wal_test)
-  endif()
-
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/recovery_test.cpp")
-    add_executable(TinyDB_recovery_test tests/recovery_test.cpp)
-    target_link_libraries(TinyDB_recovery_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
-    target_include_directories(TinyDB_recovery_test
-                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    TinyDB_apply_local_tooling(TinyDB_recovery_test)
-    gtest_discover_tests(TinyDB_recovery_test)
-  endif()
-
+  include(cmake/TinyDBTesting.cmake)
 endif()
 
 if(TINYDB_BUILD_BENCHMARKS)

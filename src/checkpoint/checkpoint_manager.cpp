@@ -1,9 +1,9 @@
 #include "checkpoint/checkpoint_manager.h"
 
-#include <tinydb/check.h>
-#include <tinydb/disk_manager.h>
-#include <tinydb/page.h>
-#include <tinydb/wal.h>
+#include "storage/disk_manager.h"
+#include "storage/page.h"
+#include "util/check.h"
+#include "wal/wal.h"
 
 #include "cache/committed_page_cache.h"
 #include "txn/database_state.h"
@@ -141,12 +141,16 @@ auto Manager::WriteAdmissionStatus() const -> Status {
 
 auto Manager::GetStats() const -> Stats {
   const auto state = readers_->CurrentState();
+  const auto cache = cache_->Stats();
+  const auto wal_bytes = wal_->SizeBytes();
   auto lock = std::lock_guard(state_mutex_);
+  const auto age_expired =
+      cache.dirty_pages != 0 && std::chrono::steady_clock::now() - last_success_ >= policy_.maximum_age;
   return Stats{
       .consecutive_failures = consecutive_failures_,
       .checkpoint_lsn = state->checkpoint_lsn,
-      .checkpoint_requested = consecutive_failures_ != 0 || wal_->SizeBytes() >= policy_.wal_trigger_bytes ||
-                              DirtyBytes(cache_->Stats()) >= policy_.dirty_trigger_bytes,
+      .checkpoint_requested = consecutive_failures_ != 0 || wal_bytes >= policy_.wal_trigger_bytes ||
+                              DirtyBytes(cache) >= policy_.dirty_trigger_bytes || age_expired,
   };
 }
 

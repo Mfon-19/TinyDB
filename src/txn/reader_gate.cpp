@@ -1,6 +1,6 @@
 #include "txn/reader_gate.h"
 
-#include <tinydb/check.h>
+#include "util/check.h"
 
 #include <condition_variable>
 #include <mutex>

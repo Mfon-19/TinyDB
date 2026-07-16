@@ -1,7 +1,7 @@
 #pragma once
 
 #include <tinydb/status.h>
-#include <tinydb/storage_engine.h>
+#include <tinydb/transaction.h>
 
 #include "txn/state.h"
 
@@ -42,7 +42,7 @@ class CommitCoordinator final {
       : wal_(wal), cache_(cache), readers_(readers) {}
 
   auto Commit(TransactionPages &transaction, BPlusTree &tree,
-              TransactionState &transaction_state) -> Result<TransactionCommitInfo>;
+              TransactionState &transaction_state) -> Result<CommitInfo>;
 
  private:
   Wal *wal_;

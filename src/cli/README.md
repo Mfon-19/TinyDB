@@ -1,31 +1,23 @@
-# src/cli — Interactive shell (REPL)
+# TinyDB command-line interface
 
-The thin command-line front-end people actually run: open a database file and
-drive the storage engine's key-value API from a prompt. All real work happens
-below it in `src/engine`; this layer is just I/O and formatting, and exists mostly
-to demo and poke at the engine by hand.
+The CLI is a thin one-command-per-process client of the installed TinyDB API.
+It opens the database, performs one operation, reports any `Status`, and closes
+the handle before exiting. It contains no storage logic and is not an
+interactive shell.
 
-## Commands (v1)
-```
-put <key> <value>      insert or overwrite
-get <key>              print the value (or "not found")
-del <key>              delete
-scan <lo> <hi>         print ordered key/value pairs in range
-.stats                 buffer-pool hit rate, page count, WAL size
-.exit
+```text
+tinydb <database> put <key> <value>
+tinydb <database> get <key>
+tinydb <database> del <key>
+tinydb <database> scan
+tinydb <database> scan <lower> <upper>
 ```
 
-## Responsibilities
-- Parse arguments (database file path, optional script to run).
-- Read commands, call the matching `StorageEngine` method, print the result.
-- Surface engine `Status` errors as friendly messages (exceptions, if any, are
-  caught here at the edge — internal layers return status, per `docs/STYLE.md`).
+`scan` streams rows from a `ReadTransaction` cursor. Two bounds describe the
+half-open range `[lower, upper)`; no bounds scan the complete keyspace. Keys
+and values are written separated by a tab.
 
-## Planned files
-- `main.cpp` — argument parsing, open the engine, start the loop.
-- `repl.h` / `repl.cpp` — the read-eval-print loop and command dispatch.
-
-## Key decisions
-- Depends only on the public API in `include/TinyDB`, not internal headers.
-- No storage logic here — purely a driver for the engine.
-- The `.stats` command surfaces the metrics that matter for `bench/`.
+Exit status is 0 on success, 1 for a database error or missing key, and 2 for
+invalid command syntax. Because commits are durable before they return, the
+explicit `Close` is resource cleanup and an opportunity to report checkpoint
+failure rather than the mutation durability boundary.

@@ -1,7 +1,7 @@
 #pragma once
 
+#include <tinydb/bytes.h>
 #include <tinydb/status.h>
-#include <tinydb/limits.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -17,10 +17,8 @@ namespace tinydb::txn {
 ** identically after reopening on every supported build. Empty keys are valid;
 ** the upper size bound limits separators copied into internal pages.
 */
-inline constexpr std::size_t MAX_KEY_BYTES = 1024;
-
 constexpr auto ValidateKeySize(std::size_t size) noexcept -> StatusCode {
-  return size <= MAX_KEY_BYTES ? StatusCode::Ok : StatusCode::InvalidArgument;
+  return size <= tinydb::MAX_KEY_BYTES ? StatusCode::Ok : StatusCode::InvalidArgument;
 }
 
 constexpr auto ValidateValueSize(std::size_t size) noexcept -> StatusCode {

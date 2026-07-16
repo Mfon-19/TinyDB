@@ -1,9 +1,9 @@
 #pragma once
 
-#include <tinydb/database_uuid.h>
-#include <tinydb/page.h>
 #include <tinydb/status.h>
-#include <tinydb/unique_fd.h>
+#include "io/unique_fd.h"
+#include "storage/database_uuid.h"
+#include "storage/page.h"
 
 #include <array>
 #include <cstddef>
@@ -60,7 +60,7 @@ class Wal {
   auto operator=(const Wal &) -> Wal & = delete;
 
   Wal(Wal &&) noexcept = default;
-  auto operator=(Wal &&) noexcept -> Wal & = default;
+  auto operator=(Wal &&) -> Wal & = delete;
   ~Wal() = default;
 
   void AppendPageImage(page_id_t page_id, const char *data);

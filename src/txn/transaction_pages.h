@@ -43,7 +43,7 @@ class TransactionPages final : public PageSource {
   TransactionPages(const TransactionPages &) = delete;
   auto operator=(const TransactionPages &) -> TransactionPages & = delete;
   TransactionPages(TransactionPages &&) noexcept = default;
-  auto operator=(TransactionPages &&) noexcept -> TransactionPages & = default;
+  auto operator=(TransactionPages &&) -> TransactionPages & = delete;
   ~TransactionPages();
 
   auto Read(page_id_t page_id) -> Result<PageHandle> override;

@@ -5,7 +5,7 @@
 #include "storage/page_codec.h"
 #include "util/crc32.h"
 
-#include <tinydb/limits.h>
+#include <tinydb/bytes.h>
 
 #include <algorithm>
 #include <cstddef>

@@ -1,5 +1,5 @@
-#include <tinydb/check.h>
-#include <tinydb/disk_manager.h>
+#include "util/check.h"
+#include "storage/disk_manager.h"
 
 #include "io/file_io.h"
 #include "io/syscalls.h"

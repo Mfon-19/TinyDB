@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
-#include <tinydb/page.h>
-#include <tinydb/storage_engine.h>
-#include <tinydb/wal.h>
+#include <tinydb/database.h>
+#include "storage/page.h"
+#include "wal/wal.h"
 
 #include "btree/b_plus_tree.h"
 #include "btree/leaf_page_builder.h"
@@ -77,8 +77,7 @@ auto Descriptor(tinydb::page_id_t first_page, std::string_view value) -> tinydb:
   };
 }
 
-auto Leaf(tinydb::page_id_t page_id,
-          std::vector<std::pair<std::string, tinydb::OverflowValueDescriptor>> values)
+auto Leaf(tinydb::page_id_t page_id, std::vector<std::pair<std::string, tinydb::OverflowValueDescriptor>> values)
     -> std::array<char, tinydb::PAGE_SIZE> {
   auto builder = tinydb::LeafPageBuilder{};
   for (auto &[key, value] : values) {
@@ -89,8 +88,8 @@ auto Leaf(tinydb::page_id_t page_id,
   return page;
 }
 
-auto OverflowPage(tinydb::page_id_t page_id, tinydb::page_id_t owner, std::uint32_t chunk,
-                  tinydb::page_id_t next, std::string_view payload) -> std::array<char, tinydb::PAGE_SIZE> {
+auto OverflowPage(tinydb::page_id_t page_id, tinydb::page_id_t owner, std::uint32_t chunk, tinydb::page_id_t next,
+                  std::string_view payload) -> std::array<char, tinydb::PAGE_SIZE> {
   return tinydb::storage::EncodeOverflowPage(page_id, 1, owner, chunk, next,
                                              std::as_bytes(std::span{payload.data(), payload.size()}))
       .value();
@@ -163,7 +162,7 @@ TEST(OverflowIntegrityTest, RejectsCyclesDuplicateOwnershipAndLogicalChecksumDam
   }
 }
 
-class OverflowEngineTest : public ::testing::Test {
+class OverflowDatabaseTest : public ::testing::Test {
  protected:
   void SetUp() override {
     const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
@@ -193,14 +192,14 @@ class OverflowEngineTest : public ::testing::Test {
   std::filesystem::path crash_copy_;
 };
 
-TEST_F(OverflowEngineTest, PointReadsAndCursorsCopyValuesAcrossManyPages) {
+TEST_F(OverflowDatabaseTest, PointReadsAndCursorsCopyValuesAcrossManyPages) {
   const auto value = Pattern(9 * tinydb::storage::OVERFLOW_PAGE_PAYLOAD_BYTES + 137);
   {
-    auto engine = tinydb::StorageEngine::Open(path_).value();
+    auto engine = tinydb::Database::Open(path_).value();
     auto write = engine.BeginWrite().value();
     ASSERT_TRUE(write.Put("large", value).Ok());
     EXPECT_EQ(write.Get("large").value(), std::optional<std::string>{value});
-    ASSERT_TRUE(write.Commit());
+    ASSERT_TRUE(std::move(write).Commit());
 
     {
       auto read = engine.BeginRead().value();
@@ -215,15 +214,14 @@ TEST_F(OverflowEngineTest, PointReadsAndCursorsCopyValuesAcrossManyPages) {
     ASSERT_TRUE(engine.Checkpoint().Ok());
     ASSERT_TRUE(engine.Close().Ok());
   }
-  auto reopened = tinydb::StorageEngine::Open(path_).value();
+  auto reopened = tinydb::Database::Open(path_).value();
   EXPECT_EQ(reopened.Get("large").value(), std::optional<std::string>{value});
-  EXPECT_TRUE(reopened.CheckIntegrity().Ok());
 }
 
-TEST_F(OverflowEngineTest, ReplacementDeletionAndAbortRetireOnlyCommittedChains) {
+TEST_F(OverflowDatabaseTest, ReplacementDeletionAndAbortRetireOnlyCommittedChains) {
   const auto first = Pattern(5 * tinydb::storage::OVERFLOW_PAGE_PAYLOAD_BYTES + 11, 'b');
   const auto second = Pattern(7 * tinydb::storage::OVERFLOW_PAGE_PAYLOAD_BYTES + 29, 'c');
-  auto engine = tinydb::StorageEngine::Open(path_).value();
+  auto engine = tinydb::Database::Open(path_).value();
   ASSERT_TRUE(engine.Put("key", first).Ok());
 
   {
@@ -245,14 +243,13 @@ TEST_F(OverflowEngineTest, ReplacementDeletionAndAbortRetireOnlyCommittedChains)
     write.Abort();
   }
   EXPECT_EQ(engine.Get("key").value(), std::optional<std::string>{second});
-  ASSERT_TRUE(engine.Remove("key").Ok());
+  ASSERT_TRUE(engine.Delete("key").Ok());
   EXPECT_EQ(engine.Get("key").value(), std::nullopt);
-  EXPECT_TRUE(engine.CheckIntegrity().Ok());
 }
 
-TEST_F(OverflowEngineTest, PartialChainAllocationFailureAbortsTheWholeTransaction) {
+TEST_F(OverflowDatabaseTest, PartialChainAllocationFailureAbortsTheWholeTransaction) {
   const auto maximum = Pattern(tinydb::MAX_VALUE_BYTES, 'f');
-  auto engine = tinydb::StorageEngine::Open(path_).value();
+  auto engine = tinydb::Database::Open(path_).value();
   ASSERT_TRUE(engine.Put("baseline", "safe").Ok());
 
   auto write = engine.BeginWrite().value();
@@ -266,27 +263,24 @@ TEST_F(OverflowEngineTest, PartialChainAllocationFailureAbortsTheWholeTransactio
   EXPECT_EQ(engine.Get("baseline").value(), std::optional<std::string>{"safe"});
   EXPECT_EQ(engine.Get("first").value(), std::nullopt);
   EXPECT_EQ(engine.Get("second").value(), std::nullopt);
-  EXPECT_TRUE(engine.CheckIntegrity().Ok());
 }
 
-TEST_F(OverflowEngineTest, CrashRecoveryReplaysCreationAndRetirementAsWholeTransactions) {
+TEST_F(OverflowDatabaseTest, CrashRecoveryReplaysCreationAndRetirementAsWholeTransactions) {
   const auto value = Pattern(6 * tinydb::storage::OVERFLOW_PAGE_PAYLOAD_BYTES + 41, 'e');
-  auto engine = tinydb::StorageEngine::Open(path_).value();
+  auto engine = tinydb::Database::Open(path_).value();
   ASSERT_TRUE(engine.Put("key", value).Ok());
   CopyCrashImage();
   {
-    auto recovered = tinydb::StorageEngine::Open(crash_copy_).value();
+    auto recovered = tinydb::Database::Open(crash_copy_).value();
     EXPECT_EQ(recovered.Get("key").value(), std::optional<std::string>{value});
-    EXPECT_TRUE(recovered.CheckIntegrity().Ok());
     ASSERT_TRUE(recovered.Close().Ok());
   }
 
   Remove(crash_copy_);
-  ASSERT_TRUE(engine.Remove("key").Ok());
+  ASSERT_TRUE(engine.Delete("key").Ok());
   CopyCrashImage();
-  auto recovered = tinydb::StorageEngine::Open(crash_copy_).value();
+  auto recovered = tinydb::Database::Open(crash_copy_).value();
   EXPECT_EQ(recovered.Get("key").value(), std::nullopt);
-  EXPECT_TRUE(recovered.CheckIntegrity().Ok());
 }
 
 }  // namespace

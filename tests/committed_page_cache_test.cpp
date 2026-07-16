@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <tinydb/disk_manager.h>
+#include "storage/disk_manager.h"
 
 #include "cache/committed_page_cache.h"
 #include "storage/page_codec.h"

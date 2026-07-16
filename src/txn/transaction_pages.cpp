@@ -1,6 +1,6 @@
 #include "txn/transaction_pages.h"
 
-#include <tinydb/check.h>
+#include "util/check.h"
 
 #include <algorithm>
 #include <cstring>

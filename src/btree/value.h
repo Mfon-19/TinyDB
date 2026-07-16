@@ -1,7 +1,7 @@
 #pragma once
 
-#include <tinydb/check.h>
-#include <tinydb/page.h>
+#include "util/check.h"
+#include "storage/page.h"
 
 #include <cstddef>
 #include <cstdint>

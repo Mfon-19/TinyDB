@@ -17,7 +17,7 @@ namespace {
 ** Once this routine succeeds, page views rely on its proof and use internal
 ** checks only to detect an impossible mutation of supposedly immutable bytes.
 */
-auto Bytes(const char *page) -> std::span<const std::byte> { return std::as_bytes(std::span{page, PAGE_SIZE}); }
+auto PageSpan(const char *page) -> std::span<const std::byte> { return std::as_bytes(std::span{page, PAGE_SIZE}); }
 
 /*
 ** Validate the complete slot/cell region for one node. In addition to local
@@ -66,12 +66,12 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
           return Status::Corruption("overflow leaf cell has an invalid descriptor length");
         }
         const auto descriptor_offset = key_offset + key_bytes;
-        const auto total =
-            storage::GetLittleEndian<std::uint64_t>(page, descriptor_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES);
+        const auto total = storage::GetLittleEndian<std::uint64_t>(
+            page, descriptor_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES);
         const auto first_page =
             storage::GetLittleEndian<page_id_t>(page, descriptor_offset + overflow_descriptor_offset::FIRST_PAGE_ID);
-        const auto checksum =
-            storage::GetLittleEndian<std::uint32_t>(page, descriptor_offset + overflow_descriptor_offset::VALUE_CHECKSUM);
+        const auto checksum = storage::GetLittleEndian<std::uint32_t>(
+            page, descriptor_offset + overflow_descriptor_offset::VALUE_CHECKSUM);
         const auto reserved =
             storage::GetLittleEndian<std::uint32_t>(page, descriptor_offset + overflow_descriptor_offset::RESERVED);
         if (!total || !first_page || !checksum || !reserved || *total == 0 || *total > MAX_VALUE_BYTES ||
@@ -108,12 +108,12 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
 
 auto RawNodeType(const char *page) -> std::uint16_t {
   // Zero is reserved for fresh-root detection and is never a valid page type.
-  return storage::GetLittleEndian<std::uint16_t>(Bytes(page), storage::data_page_offset::TYPE).value_or(0);
+  return storage::GetLittleEndian<std::uint16_t>(PageSpan(page), storage::data_page_offset::TYPE).value_or(0);
 }
 
 auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status {
   // Common framing and checksum validation always precede tree-local offsets.
-  const auto bytes = Bytes(page);
+  const auto bytes = PageSpan(page);
   const auto common = storage::DecodeDataPageHeader(bytes, expected_page_id);
   if (!common) {
     return common.error();

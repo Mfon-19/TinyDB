@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include <tinydb/database_uuid.h>
-#include <tinydb/page.h>
-#include <tinydb/wal.h>
+#include "storage/database_uuid.h"
+#include "storage/page.h"
+#include "wal/wal.h"
 
 #include "io/syscalls.h"
 #include "recovery/recovery.h"
@@ -34,7 +34,7 @@ namespace {
 /*
 ** RECOVERY PROTOCOL TESTS
 **
-** These tests operate below StorageEngine so they can isolate the recovery
+** These tests operate below Database so they can isolate the recovery
 ** state machine.  A fixture contains a checkpointed database plus the exact
 ** WAL suffix to recover.  Each crash iteration copies that same fixture,
 ** terminates a child immediately before one hooked filesystem call, and then

@@ -10,7 +10,7 @@ namespace tinydb::test_support {
 
 // These scenarios use only the semantic adapter surface shared by the
 // reference model and the TinyDB test adapter. They intentionally do
-// not know about pages, the cache, WAL records, or the current StorageEngine.
+// not know about pages, the cache, WAL records, or the current Database.
 
 template <typename Database>
 void CommitPublishesAtomically(Database &database) {

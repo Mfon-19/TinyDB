@@ -32,7 +32,7 @@ class SnapshotCursor final {
   SnapshotCursor(const SnapshotCursor &) = delete;
   auto operator=(const SnapshotCursor &) -> SnapshotCursor & = delete;
   SnapshotCursor(SnapshotCursor &&) noexcept = default;
-  auto operator=(SnapshotCursor &&) noexcept -> SnapshotCursor & = default;
+  auto operator=(SnapshotCursor &&) -> SnapshotCursor & = delete;
 
   auto Valid() const -> bool { return cursor_.Valid(); }
   auto Key() const -> std::string_view { return cursor_.Key(); }
@@ -69,7 +69,7 @@ class ReadSnapshot final {
   ReadSnapshot(const ReadSnapshot &) = delete;
   auto operator=(const ReadSnapshot &) -> ReadSnapshot & = delete;
   ReadSnapshot(ReadSnapshot &&) noexcept = default;
-  auto operator=(ReadSnapshot &&) noexcept -> ReadSnapshot & = default;
+  auto operator=(ReadSnapshot &&) -> ReadSnapshot & = delete;
 
   auto State() const -> const DatabaseState & { return snapshot_.State(); }
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;

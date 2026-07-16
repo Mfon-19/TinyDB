@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include <tinydb/storage_engine.h>
-#include <tinydb/wal.h>
+#include <tinydb/database.h>
+#include "wal/wal.h"
 
 #include <unistd.h>
 
@@ -70,7 +70,7 @@ auto ReadRows(tinydb::Cursor &cursor) -> Rows {
 struct Fixture final {
   explicit Fixture(std::string_view name) : path(TestPath(name)) {
     RemoveDatabase(path);
-    database.emplace(tinydb::StorageEngine::Open(path).value());
+    database.emplace(tinydb::Database::Open(path).value());
   }
 
   ~Fixture() {
@@ -86,7 +86,7 @@ struct Fixture final {
   }
 
   std::filesystem::path path;
-  std::optional<tinydb::StorageEngine> database;
+  std::optional<tinydb::Database> database;
 };
 
 }  // namespace
@@ -166,10 +166,10 @@ TEST(CursorTest, CursorOutlivesTransactionAndDelaysWriterPublication) {
   const auto wal_size_before = std::filesystem::file_size(wal_path);
   auto entered_commit = std::atomic<bool>{false};
   auto commit_finished = std::atomic<bool>{false};
-  auto committed = std::optional<tinydb::Result<tinydb::TransactionCommitInfo>>{};
+  auto committed = std::optional<tinydb::Result<tinydb::CommitInfo>>{};
   auto thread = std::thread([&] {
     entered_commit.store(true, std::memory_order_release);
-    committed.emplace(writer.Commit());
+    committed.emplace(std::move(writer).Commit());
     commit_finished.store(true, std::memory_order_release);
   });
   while (!entered_commit.load(std::memory_order_acquire)) {

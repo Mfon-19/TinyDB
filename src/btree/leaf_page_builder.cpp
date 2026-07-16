@@ -1,5 +1,5 @@
-#include <tinydb/check.h>
-#include <tinydb/page.h>
+#include "util/check.h"
+#include "storage/page.h"
 
 #include <algorithm>
 #include <cstddef>

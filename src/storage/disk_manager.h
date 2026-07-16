@@ -1,9 +1,9 @@
 #pragma once
 
-#include <tinydb/database_uuid.h>
-#include <tinydb/page.h>
 #include <tinydb/status.h>
-#include <tinydb/unique_fd.h>
+#include "io/unique_fd.h"
+#include "storage/database_uuid.h"
+#include "storage/page.h"
 
 #include <array>
 #include <cstdint>
@@ -36,7 +36,7 @@ class DiskManager {
   DiskManager(const DiskManager &) = delete;
   auto operator=(const DiskManager &) -> DiskManager & = delete;
   DiskManager(DiskManager &&) noexcept = default;
-  auto operator=(DiskManager &&) noexcept -> DiskManager & = default;
+  auto operator=(DiskManager &&) -> DiskManager & = delete;
   ~DiskManager() = default;
 
   auto GetRootPageId() const -> page_id_t;

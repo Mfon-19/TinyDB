@@ -1,7 +1,7 @@
 #pragma once
 
-#include <tinydb/page.h>
 #include <tinydb/status.h>
+#include "storage/page.h"
 
 #include <array>
 #include <cstddef>
@@ -84,7 +84,7 @@ class PublicationPlan final {
   PublicationPlan(const PublicationPlan &) = delete;
   auto operator=(const PublicationPlan &) -> PublicationPlan & = delete;
   PublicationPlan(PublicationPlan &&) noexcept = default;
-  auto operator=(PublicationPlan &&) noexcept -> PublicationPlan & = default;
+  auto operator=(PublicationPlan &&) -> PublicationPlan & = delete;
 
  private:
   PublicationPlan(std::vector<std::shared_ptr<CommittedFrame>> frames, std::vector<page_id_t> retired,

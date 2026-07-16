@@ -1,5 +1,5 @@
 #include "btree/b_plus_tree.h"
-#include <tinydb/check.h>
+#include "util/check.h"
 
 #include <algorithm>
 #include <cstddef>

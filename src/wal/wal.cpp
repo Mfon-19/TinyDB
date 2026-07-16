@@ -1,5 +1,5 @@
-#include <tinydb/check.h>
-#include <tinydb/wal.h>
+#include "util/check.h"
+#include "wal/wal.h"
 
 #include "io/file_io.h"
 #include "io/syscalls.h"
@@ -30,7 +30,7 @@ namespace {
 **
 ** The writer collects final data pages in memory, adds the resulting logical
 ** database state, and appends the complete run with its binding Commit record
-** before calling fsync. That fsync is the durability point. StorageEngine may
+** before calling fsync. That fsync is the durability point. Database may
 ** publish only after it succeeds. A failed append that can be truncated back
 ** to the known-good tail is a definite abort. Failed repair or ambiguous sync
 ** prevents more work until recovery establishes the durable tail.
@@ -264,7 +264,7 @@ auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
   ** DURABILITY POINT
   **
   ** One contiguous append preserves record order. The subsequent fsync is the
-  ** exact point after which StorageEngine may acknowledge durability. Nothing
+  ** exact point after which Database may acknowledge durability. Nothing
   ** below advances the known-good tail until that synchronization succeeds.
   */
   if (auto status = FullPwrite(fd_.Get(), transaction->bytes.data(), transaction->bytes.size(), size_bytes_);

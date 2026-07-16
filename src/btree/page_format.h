@@ -1,10 +1,10 @@
 #pragma once
 
-#include <tinydb/limits.h>
+#include <tinydb/bytes.h>
 #include <tinydb/status.h>
 
-#include "storage/page_codec.h"
 #include "btree/value.h"
+#include "storage/page_codec.h"
 #include "txn/contract.h"
 
 #include <cstddef>
@@ -100,9 +100,8 @@ constexpr auto AlignDown(std::size_t value, std::size_t alignment) -> std::size_
 // overflowing builder has a legal split boundary. Overflow descriptors keep a
 // maximum-sized key below this bound regardless of logical value size.
 inline constexpr std::size_t MAX_LEAF_RECORD_BYTES = (PAGE_SIZE - LEAF_HEADER_SIZE) / 2;
-static_assert(SLOT_SIZE + LEAF_CELL_HEADER_SIZE + txn::MAX_KEY_BYTES + OVERFLOW_VALUE_DESCRIPTOR_BYTES <=
+static_assert(SLOT_SIZE + LEAF_CELL_HEADER_SIZE + MAX_KEY_BYTES + OVERFLOW_VALUE_DESCRIPTOR_BYTES <=
               MAX_LEAF_RECORD_BYTES);
-static_assert(SLOT_SIZE + INTERNAL_CELL_HEADER_SIZE + txn::MAX_KEY_BYTES <=
-              (PAGE_SIZE - INTERNAL_HEADER_SIZE) / 2);
+static_assert(SLOT_SIZE + INTERNAL_CELL_HEADER_SIZE + MAX_KEY_BYTES <= (PAGE_SIZE - INTERNAL_HEADER_SIZE) / 2);
 
 }  // namespace tinydb

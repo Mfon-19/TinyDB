@@ -87,7 +87,7 @@ class CheckpointCaptureGuard final {
   CheckpointCaptureGuard(const CheckpointCaptureGuard &) = delete;
   auto operator=(const CheckpointCaptureGuard &) -> CheckpointCaptureGuard & = delete;
   CheckpointCaptureGuard(CheckpointCaptureGuard &&) noexcept = default;
-  auto operator=(CheckpointCaptureGuard &&) noexcept -> CheckpointCaptureGuard & = default;
+  auto operator=(CheckpointCaptureGuard &&) -> CheckpointCaptureGuard & = delete;
 
   auto CurrentState() const -> std::shared_ptr<const DatabaseState>;
 
