@@ -2,6 +2,8 @@
 
 #include <tinydb/file_header.h>
 
+#include "util/crc32.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -12,30 +14,6 @@
 // public API.
 
 namespace tinydb {
-
-// CRC-32 (the reflected IEEE polynomial — the same function as zlib's
-// crc32), table-driven, with the table built at compile time.
-constexpr auto MakeCrc32Table() -> std::array<std::uint32_t, 256> {
-  std::array<std::uint32_t, 256> table{};
-  for (std::uint32_t byte = 0; byte < table.size(); ++byte) {
-    std::uint32_t remainder = byte;
-    for (int bit = 0; bit < 8; ++bit) {
-      remainder = (remainder & 1U) != 0 ? 0xEDB88320U ^ (remainder >> 1U) : remainder >> 1U;
-    }
-    table[byte] = remainder;
-  }
-  return table;
-}
-inline constexpr auto CRC32_TABLE = MakeCrc32Table();
-
-inline auto Crc32(const char *data, std::size_t size) -> std::uint32_t {
-  std::uint32_t crc = 0xFFFFFFFFU;
-  for (std::size_t i = 0; i < size; ++i) {
-    const auto byte = static_cast<unsigned char>(data[i]);
-    crc = CRC32_TABLE[(crc ^ byte) & 0xFFU] ^ (crc >> 8U);
-  }
-  return crc ^ 0xFFFFFFFFU;
-}
 
 // The header's checksum covers every field before it in the struct; the
 // field itself (and the struct's tail padding) is excluded.
