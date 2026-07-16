@@ -9,7 +9,7 @@
 namespace tinydb::test_support {
 
 // These scenarios use only the semantic adapter surface shared by the
-// reference model and the eventual TinyDB test adapter. They intentionally do
+// reference model and the TinyDB test adapter. They intentionally do
 // not know about pages, the cache, WAL records, or the current StorageEngine.
 
 template <typename Database>

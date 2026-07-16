@@ -105,6 +105,8 @@ add_library(
   src/storage/page_codec.h
   src/storage/superblock.cpp
   src/storage/superblock.h
+  src/txn/commit_coordinator.cpp
+  src/txn/commit_coordinator.h
   src/txn/contract.h
   src/txn/database_state.h
   src/txn/reader_gate.cpp

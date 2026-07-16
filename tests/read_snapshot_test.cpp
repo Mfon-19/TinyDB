@@ -18,6 +18,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 /*
 ** These integration tests join ReaderGate, committed cache, PageReader, and
@@ -125,16 +126,17 @@ TEST(ReadSnapshotTest, PublicationWaitsUntilCursorReleasesOldPageVersion) {
 
   auto published = std::atomic<bool>{false};
   auto publisher = std::thread([&] {
-    auto publication = fixture.gate->BeginPublication();
     auto replacement = Leaf(fixture.root, {{"alpha", "new"}, {"charlie", "three"}});
-    ASSERT_TRUE(fixture.cache
-                    ->Install(tinydb::cache::CommittedPageImage{
-                        .page_id = fixture.root,
-                        .page_lsn = 0,
-                        .transaction_id = 2,
-                        .bytes = std::move(replacement),
-                    })
-                    .Ok());
+    auto images = std::vector<tinydb::cache::CommittedPageImage>{};
+    images.push_back(tinydb::cache::CommittedPageImage{
+        .page_id = fixture.root,
+        .page_lsn = 0,
+        .transaction_id = 2,
+        .bytes = std::move(replacement),
+    });
+    auto plan = fixture.cache->PreparePublication(std::move(images), {}, fixture.root + 1).value();
+    auto publication = fixture.gate->BeginPublication();
+    fixture.cache->Publish(std::move(plan));
     publication.Publish(State(2, fixture.root));
     published.store(true, std::memory_order_release);
   });

@@ -184,7 +184,8 @@ TEST(TransactionPagesTest, FreeIndexGrowthUsesOnlyTheHighWaterFrontier) {
   auto transaction = tinydb::txn::TransactionPages::Begin(&committed, state, 8 * tinydb::PAGE_SIZE).value();
 
   ASSERT_TRUE(transaction.Free(400).Ok());
-  ASSERT_TRUE(transaction.Freeze(2).Ok());
+  ASSERT_TRUE(transaction.Freeze().Ok());
+  ASSERT_TRUE(transaction.Seal(2).Ok());
   EXPECT_EQ(transaction.ResultingState().high_water_page_id, 501U);
   EXPECT_EQ(transaction.AllocatorPageIds(), (std::vector<tinydb::page_id_t>{3, 500}));
   const auto images = transaction.PageImages();
@@ -225,7 +226,8 @@ TEST(TransactionPagesTest, AllocationAndAbortMatchAReferenceFrontierModel) {
       transaction.Abort();
       continue;
     }
-    ASSERT_TRUE(transaction.Freeze(state.visible_lsn + 1).Ok());
+    ASSERT_TRUE(transaction.Freeze().Ok());
+    ASSERT_TRUE(transaction.Seal(state.visible_lsn + 1).Ok());
     const auto next_state = transaction.ResultingState();
     const auto retired_ids =
         std::vector<tinydb::page_id_t>(transaction.RetiredPageIds().begin(), transaction.RetiredPageIds().end());
@@ -311,7 +313,8 @@ TEST(TransactionPagesTest, RootChangesAllocateOneUniqueReachablePageSet) {
   }
   ASSERT_NE(tree.RootPageId(), state.root_page_id);
   transaction.SetRootPageId(tree.RootPageId());
-  ASSERT_TRUE(transaction.Freeze(2).Ok());
+  ASSERT_TRUE(transaction.Freeze().Ok());
+  ASSERT_TRUE(transaction.Seal(2).Ok());
   EXPECT_TRUE(tinydb::BPlusTree::CheckIntegrity(&transaction, transaction.ResultingState().root_page_id,
                                                 transaction.ResultingState().high_water_page_id, {}, {})
                   .Ok());

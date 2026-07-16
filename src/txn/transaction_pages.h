@@ -28,8 +28,8 @@ namespace tinydb::txn {
 **
 ** Nothing owned here is reachable through the committed cache. Therefore
 ** abort requires no undo: dropping the overlay restores the base state. Freeze
-** serializes allocator metadata, assigns final page LSNs, and makes the page
-** set immutable for WAL construction and publication.
+** finishes structural work and fixes the final page count. Seal then assigns
+** the commit coordinator's exact LSN without changing that count.
 **
 ** Memory accounting covers private pages and retained value bytes. All page
 ** handles must be released before Freeze, Abort, ownership transfer, or
@@ -54,10 +54,11 @@ class TransactionPages final : public PageSource {
   void SetRootPageId(page_id_t root_page_id);
   auto ChargeValueBytes(std::size_t bytes) -> Status;
 
-  // Finalizes retirements and the persistent free-extent index. retire_lsn is
-  // assigned by the caller's current commit path; Milestone 6 will replace it
-  // with the commit coordinator's global LSN.
-  auto Freeze(std::uint64_t retire_lsn) -> Status;
+  // Freeze may allocate allocator pages; Seal may only rewrite existing private
+  // bytes. This split lets the coordinator derive COMMIT's LSN from the final
+  // page count before checksums and retirement metadata are sealed.
+  auto Freeze() -> Status;
+  auto Seal(std::uint64_t commit_lsn) -> Status;
   void Abort() noexcept;
 
   auto ResultingState() const -> const DatabaseState &;
@@ -65,6 +66,7 @@ class TransactionPages final : public PageSource {
   auto MemoryLimitBytes() const -> std::size_t { return memory_limit_bytes_; }
   auto PrivatePageCount() const -> std::size_t { return pages_.size(); }
   auto HasChanges() const -> bool;
+  auto FinalPageCount() const -> std::size_t;
   auto RetiredPageIds() const -> const std::unordered_set<page_id_t> & { return retired_page_ids_; }
   auto FreeExtents() const -> const std::vector<storage::FreeExtent> & { return free_extents_; }
   auto AllocatorPageIds() const -> const std::vector<page_id_t> & { return allocator_page_ids_; }
@@ -104,7 +106,8 @@ class TransactionPages final : public PageSource {
   DatabaseState resulting_state_;   // private roots/frontiers
   std::size_t memory_limit_bytes_;  // pages plus retained values
   std::size_t memory_used_bytes_{0};
-  bool frozen_{false};           // no further mutation permitted
+  bool frozen_{false};           // structural page set is final
+  bool sealed_{false};           // exact commit LSN is encoded
   bool aborted_{false};          // private state was discarded
   bool allocator_dirty_{false};  // extent index needs rewriting
 

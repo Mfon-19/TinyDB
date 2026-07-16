@@ -94,7 +94,7 @@ auto ReaderGate::BeginRead() -> SnapshotToken {
   return SnapshotToken(std::move(lease));
 }
 
-auto ReaderGate::BeginPublication() -> PublicationGuard { return PublicationGuard(control_); }
+auto ReaderGate::BeginPublication() noexcept -> PublicationGuard { return PublicationGuard(control_); }
 
 auto ReaderGate::CurrentState() const -> std::shared_ptr<const DatabaseState> {
   auto lock = std::lock_guard(control_->mutex);
@@ -114,7 +114,7 @@ auto ReaderGate::Stats() const -> ReaderGateStats {
   return result;
 }
 
-PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) : control_(std::move(control)) {
+PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) noexcept : control_(std::move(control)) {
   auto lock = std::unique_lock(control_->mutex);
 
   // Serializing publishers here makes the gate robust independently of the
@@ -145,7 +145,7 @@ auto PublicationGuard::CurrentState() const -> std::shared_ptr<const DatabaseSta
   return control_->state;
 }
 
-void PublicationGuard::Publish(std::shared_ptr<const DatabaseState> state) {
+void PublicationGuard::Publish(std::shared_ptr<const DatabaseState> state) noexcept {
   TINYDB_CHECK(control_ != nullptr, "publishing through an empty publication guard");
   TINYDB_CHECK(state != nullptr, "publishing a null database state");
   auto lock = std::lock_guard(control_->mutex);

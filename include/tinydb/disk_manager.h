@@ -45,7 +45,7 @@ class DiskManager {
   auto Uuid() const -> const DatabaseUuid &;
 
   void AdoptState(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
-                  std::uint64_t transaction_id, std::uint64_t checkpoint_lsn);
+                  std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) noexcept;
   void AdvanceCheckpoint(std::uint64_t checkpoint_lsn);
 
   // Checkpoint data-page writes may need to extend the file to the published

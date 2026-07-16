@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -112,6 +113,47 @@ auto FullPread(int fd, void *data, std::size_t size, std::uint64_t offset) -> Re
 
 auto Bytes(const std::vector<char> &value) -> std::span<const std::byte> { return std::as_bytes(std::span{value}); }
 
+struct SegmentFile {
+  std::filesystem::path path;
+  std::uint64_t segment_id{0};
+  bool active{false};
+};
+
+auto DiscoverSegmentFiles(const std::filesystem::path &wal_path) -> Result<std::vector<SegmentFile>> {
+  auto parent = wal_path.parent_path();
+  if (parent.empty()) {
+    parent = ".";
+  }
+  const auto active_name = wal_path.filename().string();
+  const auto archive_prefix = active_name + ".";
+  constexpr auto archive_suffix = std::string_view{".segment"};
+  auto files = std::vector<SegmentFile>{};
+  auto error = std::error_code{};
+  auto iterator = std::filesystem::directory_iterator(parent, error);
+  if (error) {
+    return std::unexpected(Status::IoError("enumerate WAL segments: " + error.message()));
+  }
+  for (const auto &entry : iterator) {
+    const auto name = entry.path().filename().string();
+    if (name == active_name) {
+      files.push_back(SegmentFile{.path = entry.path(), .active = true});
+      continue;
+    }
+    if (!name.starts_with(archive_prefix) || !name.ends_with(archive_suffix)) {
+      continue;
+    }
+    const auto digits = std::string_view{name}.substr(archive_prefix.size(),
+                                                      name.size() - archive_prefix.size() - archive_suffix.size());
+    auto segment_id = std::uint64_t{0};
+    const auto [end, parse_error] = std::from_chars(digits.data(), digits.data() + digits.size(), segment_id);
+    if (parse_error != std::errc{} || end != digits.data() + digits.size() || segment_id == 0) {
+      continue;
+    }
+    files.push_back(SegmentFile{.path = entry.path(), .segment_id = segment_id, .active = false});
+  }
+  return files;
+}
+
 auto ReadDatabaseStateForRecovery(const std::filesystem::path &db_path) -> Result<std::optional<storage::Superblock>> {
   // Recovery must establish database/WAL identity before replay, but the
   // database may be missing or both superblocks may be damaged.
@@ -194,141 +236,223 @@ auto Wal::PathFor(const std::filesystem::path &db_path) -> std::filesystem::path
   return wal_path;
 }
 
+auto Wal::SegmentPathFor(const std::filesystem::path &wal_path, std::uint64_t segment_id) -> std::filesystem::path {
+  auto path = wal_path;
+  path += "." + std::to_string(segment_id) + ".segment";
+  return path;
+}
+
 auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::path &wal_path) -> Status {
-  // Recovery is physical and idempotent: applying the same final page images
-  // repeatedly produces the same database bytes. No B+ tree object or logical
-  // mutation code participates here.
-  auto wal_fd = UniqueFd(io::Open(wal_path, O_RDWR | O_CLOEXEC));
-  if (!wal_fd.Valid()) {
-    return errno == ENOENT ? Status{} : ErrnoStatus("open");
+  /*
+  ** SEGMENT DISCOVERY
+  **
+  ** Archived siblings are immutable. wal_path is the sole active segment and
+  ** may contain a torn tail. Headers, IDs, UUIDs, starting LSNs, and record
+  ** framing are validated in segment order before any transaction is replayed.
+  */
+  auto discovered = DiscoverSegmentFiles(wal_path);
+  if (!discovered) {
+    return discovered.error();
   }
-  struct stat wal_stat {};
-  if (io::Fstat(wal_fd.Get(), &wal_stat) < 0) {
-    return ErrnoStatus("fstat");
-  }
-  const auto wal_size = static_cast<std::uint64_t>(wal_stat.st_size);
-  if (wal_size == 0) {
+  if (discovered->empty()) {
     return {};
   }
 
-  if (wal_size < wal_format::HEADER_BYTES) {
-    // A crash during first-time header creation can leave a prefix of the
-    // current magic or a zero-filled file. Neither could contain a committed
-    // record, so it is safe to clear. Arbitrary foreign bytes are preserved and
-    // rejected instead of being silently destroyed.
-    auto partial = std::vector<char>(wal_size);
-    const auto read = FullPread(wal_fd.Get(), partial.data(), partial.size(), 0);
+  struct LoadedSegment {
+    SegmentFile file;
+    wal_format::Header header;
+    std::vector<char> bytes;
+  };
+  auto loaded = std::vector<LoadedSegment>{};
+  auto active_partial = false;
+  for (auto file : *discovered) {
+    auto fd = UniqueFd(io::Open(file.path, O_RDWR | O_CLOEXEC));
+    if (!fd.Valid()) {
+      return ErrnoStatus("open WAL segment");
+    }
+    struct stat file_stat {};
+    if (io::Fstat(fd.Get(), &file_stat) < 0) {
+      return ErrnoStatus("fstat WAL segment");
+    }
+    const auto size = static_cast<std::uint64_t>(file_stat.st_size);
+    auto bytes = std::vector<char>(size);
+    const auto read = FullPread(fd.Get(), bytes.data(), bytes.size(), 0);
     if (!read) {
       return read.error();
     }
-    const auto bytes = std::as_bytes(std::span{partial});
-    const auto prefix_bytes = std::min(bytes.size(), wal_format::MAGIC.size());
-    const bool magic_prefix =
-        std::ranges::equal(bytes.first(prefix_bytes), std::span{wal_format::MAGIC}.first(prefix_bytes));
-    const bool zero = std::ranges::all_of(bytes, [](std::byte byte) { return byte == std::byte{0}; });
-    if (!magic_prefix && !zero) {
-      return Status::UnsupportedFormat("unrecognized TinyDB WAL prefix");
+    if (*read != bytes.size()) {
+      return Status::IoError("short read while loading WAL segment");
     }
-    if (io::Ftruncate(wal_fd.Get(), 0) < 0) {
-      return ErrnoStatus("ftruncate");
+    if (size < wal_format::HEADER_BYTES) {
+      if (!file.active) {
+        return Status::Corruption("archived WAL segment has a torn header");
+      }
+      const auto encoded = std::as_bytes(std::span{bytes});
+      const auto prefix_bytes = std::min(encoded.size(), wal_format::MAGIC.size());
+      const auto magic_prefix =
+          std::ranges::equal(encoded.first(prefix_bytes), std::span{wal_format::MAGIC}.first(prefix_bytes));
+      const auto zero = std::ranges::all_of(encoded, [](std::byte byte) { return byte == std::byte{0}; });
+      if (!magic_prefix && !zero) {
+        return Status::UnsupportedFormat("unrecognized TinyDB WAL prefix");
+      }
+      active_partial = true;
+      continue;
+    }
+    const auto header = wal_format::DecodeHeader(std::as_bytes(std::span{bytes}).first(wal_format::HEADER_BYTES));
+    if (!header) {
+      return header.error();
+    }
+    if (!file.active && file.segment_id != header->segment_id) {
+      return Status::Corruption("WAL archive name disagrees with its segment header");
+    }
+    file.segment_id = header->segment_id;
+    loaded.push_back(LoadedSegment{.file = std::move(file), .header = *header, .bytes = std::move(bytes)});
+  }
+  if (loaded.empty()) {
+    // Only an incomplete active header exists; no transaction could be durable.
+    auto fd = UniqueFd(io::Open(wal_path, O_RDWR | O_CLOEXEC));
+    if (!fd.Valid() || io::Ftruncate(fd.Get(), 0) < 0) {
+      return ErrnoStatus("clear incomplete WAL header");
     }
     return {};
   }
 
-  auto encoded_header = std::vector<char>(wal_format::HEADER_BYTES);
-  const auto header_read = FullPread(wal_fd.Get(), encoded_header.data(), encoded_header.size(), 0);
-  if (!header_read) {
-    return header_read.error();
-  }
-  const auto header = wal_format::DecodeHeader(Bytes(encoded_header));
-  if (!header) {
-    return header.error();
+  std::ranges::sort(loaded, {}, [](const LoadedSegment &segment) { return segment.header.segment_id; });
+  const auto database_uuid = loaded.front().header.database_uuid;
+  for (std::size_t index = 0; index < loaded.size(); ++index) {
+    const auto &segment = loaded[index];
+    if (segment.header.database_uuid != database_uuid ||
+        (index != 0 && segment.header.segment_id != loaded[index - 1].header.segment_id + 1U)) {
+      return Status::Corruption("WAL segment identity sequence is missing or duplicated");
+    }
+    if (segment.file.active && index + 1 != loaded.size()) {
+      return Status::Corruption("active WAL segment is not the newest segment");
+    }
   }
 
-  const auto database_state = ReadDatabaseStateForRecovery(db_path);
+  auto database_state = ReadDatabaseStateForRecovery(db_path);
   if (!database_state) {
     return database_state.error();
   }
-  if (database_state->has_value() && database_state->value().database_uuid != header->database_uuid) {
-    // Refuse before opening the database writable or applying a single page.
+  if (database_state->has_value() && database_state->value().database_uuid != database_uuid) {
     return Status::InvalidArgument("write-ahead log does not belong to this database: " + wal_path.string());
   }
 
-  // run_bytes retains exactly one transaction. Nothing is written until its
-  // final COMMIT validates record order, page count, state, and both digests.
-  auto db_fd = UniqueFd{};
-  auto run_bytes = std::vector<char>{};
-  auto run_first_lsn = header->starting_lsn;
-  auto run_sequence = std::uint32_t{0};
-  auto expected_lsn = header->starting_lsn;
-  auto durable_next_lsn = header->starting_lsn;
-  auto last_transaction = std::optional<wal_format::DecodedTransaction>{};
-  auto committed_transactions = std::uint64_t{0};
-  auto applied = false;
-  auto created_db_file = false;
-  auto offset = static_cast<std::uint64_t>(wal_format::HEADER_BYTES);
-
-  /*
-  ** PASS THROUGH THE LOG
-  **
-  ** The current implementation validates and replays each committed run in a
-  ** single pass. Milestone 7 will separate validation from replay, but the
-  ** committed-run and torn-tail rules here remain the protocol foundation.
-  */
-  while (offset < wal_size) {
-    // Read only the total-length prefix first. This bounds allocation before a
-    // corrupt record can make recovery allocate an arbitrary amount of memory.
-    auto total_prefix = std::array<std::byte, sizeof(std::uint32_t)>{};
-    const auto prefix_read = FullPread(wal_fd.Get(), total_prefix.data(), total_prefix.size(), offset);
-    if (!prefix_read) {
-      return prefix_read.error();
+  auto encoded_records = std::vector<char>{};
+  auto expected_lsn = loaded.front().header.starting_lsn;
+  auto expected_sequence = std::uint32_t{0};
+  auto active_present = false;
+  auto cleanup_needed = active_partial || loaded.size() > 1;
+  for (std::size_t segment_index = 0; segment_index < loaded.size(); ++segment_index) {
+    const auto &segment = loaded[segment_index];
+    active_present = active_present || segment.file.active;
+    if (segment.header.starting_lsn != expected_lsn) {
+      return Status::Corruption("WAL segment starting LSN breaks the durable sequence");
     }
-    const auto total = storage::GetLittleEndian<std::uint32_t>(total_prefix, 0);
-    if (*prefix_read != total_prefix.size() || !total || *total < wal_format::RECORD_HEADER_BYTES ||
-        *total > MAX_RECORD_BYTES || offset + *total > wal_size) {
-      // An incomplete/invalid frame at the physical tail is an uncommitted torn
-      // suffix. Since no COMMIT has accepted it, the committed prefix is enough.
-      break;
-    }
-
-    auto encoded_record = std::vector<char>(*total);
-    const auto record_read = FullPread(wal_fd.Get(), encoded_record.data(), encoded_record.size(), offset);
-    if (!record_read) {
-      return record_read.error();
-    }
-    if (*record_read != encoded_record.size()) {
-      break;
-    }
-    const auto record = wal_format::DecodeRecord(Bytes(encoded_record));
-    if (!record) {
-      // A checksum mismatch is tolerable only when this record reaches exact
-      // EOF: that is the shape of a torn final write. The same mismatch in the
-      // durable middle would hide later records and is reported as corruption.
-      const bool checksum_torn_at_tail =
-          record.error().Message() == "WAL record checksum mismatch" && offset + encoded_record.size() == wal_size;
-      if (checksum_torn_at_tail) {
+    auto offset = std::size_t{wal_format::HEADER_BYTES};
+    auto last_type = std::optional<wal_format::RecordType>{};
+    while (offset < segment.bytes.size()) {
+      const auto remaining = std::as_bytes(std::span{segment.bytes}).subspan(offset);
+      const auto total = storage::GetLittleEndian<std::uint32_t>(remaining, 0);
+      if (!total || *total < wal_format::RECORD_HEADER_BYTES || *total > MAX_RECORD_BYTES ||
+          *total > remaining.size()) {
+        if (!segment.file.active || segment_index + 1 != loaded.size()) {
+          return Status::Corruption("archived WAL segment has a torn record");
+        }
+        cleanup_needed = true;
         break;
       }
-      return record.error();
+      const auto encoded_record = remaining.first(*total);
+      const auto record = wal_format::DecodeRecord(encoded_record);
+      if (!record) {
+        const auto torn_checksum = record.error().Message() == "WAL record checksum mismatch" && segment.file.active &&
+                                   segment_index + 1 == loaded.size() && offset + *total == segment.bytes.size();
+        if (torn_checksum) {
+          cleanup_needed = true;
+          break;
+        }
+        return record.error();
+      }
+      if (record->lsn != expected_lsn || record->record_sequence != expected_sequence) {
+        return Status::Corruption("WAL record sequence is missing, duplicated, or reordered");
+      }
+      encoded_records.insert(encoded_records.end(), segment.bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                             segment.bytes.begin() + static_cast<std::ptrdiff_t>(offset + *total));
+      ++expected_lsn;
+      ++expected_sequence;
+      last_type = record->type;
+      if (record->type == wal_format::RecordType::Commit) {
+        expected_sequence = 0;
+      }
+      offset += *total;
     }
-    if (record->lsn != expected_lsn || record->record_sequence != run_sequence) {
-      return Status::Corruption("WAL record sequence is missing, duplicated, or reordered");
+    if (segment.bytes.size() != wal_format::HEADER_BYTES) {
+      cleanup_needed = true;
     }
-    if (run_bytes.empty()) {
+    const auto has_following_segment = segment_index + 1 != loaded.size() || active_partial;
+    if (has_following_segment && last_type != wal_format::RecordType::Commit) {
+      return Status::Corruption("a WAL transaction crosses a segment boundary");
+    }
+  }
+  cleanup_needed = cleanup_needed || !active_present;
+
+  /*
+  ** VALIDATE AND REDO COMPLETE TRANSACTIONS
+  **
+  ** Recovery is intentionally still one pass here. Transactions covered by
+  ** the selected superblock are validated but not replayed; this is what makes
+  ** crashes during archive cleanup idempotent. The recovery subsystem later
+  ** separates complete validation from physical replay.
+  */
+  const auto checkpoint_lsn = database_state->has_value() ? database_state->value().checkpoint_lsn : 0;
+  auto db_fd = UniqueFd{};
+  auto created_db_file = false;
+  auto run = std::vector<char>{};
+  auto run_first_lsn = loaded.front().header.starting_lsn;
+  auto durable_next_lsn = std::max(loaded.front().header.starting_lsn, checkpoint_lsn + 1U);
+  auto last_transaction = std::optional<wal_format::DecodedTransaction>{};
+  auto applied_transactions = std::uint64_t{0};
+  auto last_transaction_id = std::optional<std::uint64_t>{};
+  auto saw_uncheckpointed_transaction = false;
+  auto offset = std::size_t{0};
+  while (offset < encoded_records.size()) {
+    const auto bytes = std::as_bytes(std::span{encoded_records}).subspan(offset);
+    const auto total = storage::GetLittleEndian<std::uint32_t>(bytes, 0);
+    TINYDB_CHECK(total && *total <= bytes.size(), "validated WAL record geometry changed during recovery");
+    const auto record_bytes = bytes.first(*total);
+    const auto record = wal_format::DecodeRecord(record_bytes);
+    TINYDB_CHECK(record.has_value(), "validated WAL record failed a second decode");
+    if (run.empty()) {
       run_first_lsn = record->lsn;
     }
-    run_bytes.insert(run_bytes.end(), encoded_record.begin(), encoded_record.end());
-    ++expected_lsn;
-    ++run_sequence;
+    run.insert(run.end(), encoded_records.begin() + static_cast<std::ptrdiff_t>(offset),
+               encoded_records.begin() + static_cast<std::ptrdiff_t>(offset + *total));
+    offset += *total;
+    if (record->type != wal_format::RecordType::Commit) {
+      continue;
+    }
 
-    if (record->type == wal_format::RecordType::Commit) {
-      const auto transaction = wal_format::DecodeTransaction(std::as_bytes(std::span{run_bytes}), run_first_lsn);
-      if (!transaction) {
-        return transaction.error();
+    auto transaction = wal_format::DecodeTransaction(std::as_bytes(std::span{run}), run_first_lsn);
+    if (!transaction) {
+      return transaction.error();
+    }
+    if (last_transaction_id && transaction->transaction_id != *last_transaction_id + 1U) {
+      return Status::Corruption("WAL transaction ID sequence is missing or duplicated");
+    }
+    last_transaction_id = transaction->transaction_id;
+    durable_next_lsn = transaction->next_lsn;
+    if (transaction->commit_lsn > checkpoint_lsn) {
+      if (transaction->first_lsn <= checkpoint_lsn) {
+        return Status::Corruption("database checkpoint cuts through a WAL transaction");
       }
-      // Delay opening/creating the database until a complete transaction is
-      // proven committed. A WAL containing only a torn run must not create or
-      // mutate the database file.
+      if (!saw_uncheckpointed_transaction) {
+        if (transaction->first_lsn != checkpoint_lsn + 1U ||
+            (database_state->has_value() &&
+             transaction->transaction_id != database_state->value().transaction_id + 1U)) {
+          return Status::Corruption("WAL sequence is missing the first transaction after the checkpoint");
+        }
+        saw_uncheckpointed_transaction = true;
+      }
       if (!db_fd.Valid()) {
         db_fd = UniqueFd(io::Open(db_path, O_RDWR | O_CLOEXEC));
         if (!db_fd.Valid() && errno == ENOENT) {
@@ -336,86 +460,103 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
           created_db_file = db_fd.Valid();
         }
         if (!db_fd.Valid()) {
-          return ErrnoStatus("open");
+          return ErrnoStatus("open database for recovery");
         }
       }
       if (io::Ftruncate(db_fd.Get(), transaction->state.high_water_page_id * PAGE_SIZE) < 0) {
-        return ErrnoStatus("ftruncate");
+        return ErrnoStatus("extend database during recovery");
       }
       for (const auto &page : transaction->pages) {
-        // Full physical redo may extend the file. Reapplying after a recovery
-        // crash simply overwrites the same offsets with the same bytes.
         if (auto status = FullPwrite(db_fd.Get(), page.bytes.data(), page.bytes.size(), page.page_id * PAGE_SIZE);
             !status.Ok()) {
           return status;
         }
       }
-      durable_next_lsn = transaction->next_lsn;
       last_transaction = std::move(*transaction);
       last_transaction->pages.clear();
-      ++committed_transactions;
-      run_bytes.clear();
-      run_sequence = 0;
-      applied = true;
+      ++applied_transactions;
     }
-    offset += encoded_record.size();
+    run.clear();
+  }
+  if (!run.empty() && !active_present && !active_partial) {
+    return Status::Corruption("archived WAL ends with an incomplete transaction");
+  }
+  if (!saw_uncheckpointed_transaction && loaded.front().header.starting_lsn > checkpoint_lsn + 1U) {
+    return Status::Corruption("WAL segment sequence begins after the checkpoint frontier");
   }
 
-  if (applied) {
-    TINYDB_CHECK(last_transaction.has_value(), "recovery applied pages without committed database state");
+  if (last_transaction) {
     const auto base_generation = database_state->has_value() ? database_state->value().generation : 0;
     const auto superblock =
-        EncodeRecoverySuperblock(*last_transaction, header->database_uuid, base_generation + committed_transactions);
+        EncodeRecoverySuperblock(*last_transaction, database_uuid, base_generation + applied_transactions);
     if (!superblock) {
       return superblock.error();
     }
-    if (auto status = FullPwrite(db_fd.Get(), superblock->data(), superblock->size(), SUPERBLOCK_A_PAGE_ID * PAGE_SIZE);
-        !status.Ok()) {
-      return status;
-    }
-    if (auto status = FullPwrite(db_fd.Get(), superblock->data(), superblock->size(), SUPERBLOCK_B_PAGE_ID * PAGE_SIZE);
-        !status.Ok()) {
-      return status;
+    for (const auto page_id : {SUPERBLOCK_A_PAGE_ID, SUPERBLOCK_B_PAGE_ID}) {
+      if (auto status = FullPwrite(db_fd.Get(), superblock->data(), superblock->size(), page_id * PAGE_SIZE);
+          !status.Ok()) {
+        return status;
+      }
     }
     if (io::Fsync(db_fd.Get()) < 0) {
-      // The WAL remains untouched on failure, so reopening retries all commits.
-      return ErrnoStatus("fsync");
+      return ErrnoStatus("fsync recovered database");
+    }
+    if (created_db_file) {
+      if (auto status = SyncParentDirectory(db_path); !status.Ok()) {
+        return status;
+      }
     }
   }
-  if (applied && created_db_file) {
-    // Only recovery that created the path must make its directory entry durable.
-    if (auto status = SyncParentDirectory(db_path); !status.Ok()) {
-      return status;
-    }
+
+  if (!cleanup_needed) {
+    return {};
   }
-  if (wal_size > wal_format::HEADER_BYTES) {
-    // Replacement is last: committed redo may be forgotten only after the
-    // database and any newly created directory entry are durable. The new
-    // header carries the first LSN not covered by the recovered checkpoint.
-    if (io::Ftruncate(wal_fd.Get(), 0) < 0) {
-      return ErrnoStatus("ftruncate");
+
+  // Install a clean active header before deleting covered archives. A crash at
+  // any cleanup boundary therefore leaves either the old complete sequence or
+  // a clean active segment plus harmless checkpoint-covered archives.
+  auto active_fd = UniqueFd(io::Open(wal_path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+  if (!active_fd.Valid() || io::Ftruncate(active_fd.Get(), 0) < 0) {
+    return ErrnoStatus("replace active WAL segment");
+  }
+  const auto active_segment_id = loaded.back().header.segment_id + (active_present ? 0U : 1U);
+  const auto clean_header = wal_format::EncodeHeader(wal_format::Header{
+      .database_uuid = database_uuid,
+      .segment_id = active_segment_id,
+      .starting_lsn = durable_next_lsn,
+  });
+  if (!clean_header) {
+    return clean_header.error();
+  }
+  if (auto status = FullPwrite(active_fd.Get(), clean_header->data(), clean_header->size(), 0); !status.Ok()) {
+    return status;
+  }
+  if (io::Fsync(active_fd.Get()) < 0) {
+    return ErrnoStatus("fsync clean WAL segment");
+  }
+
+  auto removed_archive = false;
+  for (const auto &segment : loaded) {
+    if (segment.file.active) {
+      continue;
     }
-    const auto clean_header = wal_format::EncodeHeader(wal_format::Header{
-        .database_uuid = header->database_uuid,
-        .segment_id = header->segment_id,
-        .starting_lsn = durable_next_lsn,
-    });
-    if (!clean_header) {
-      return clean_header.error();
+    if (io::Unlink(segment.file.path) < 0 && errno != ENOENT) {
+      return ErrnoStatus("remove checkpointed WAL segment");
     }
-    if (auto status = FullPwrite(wal_fd.Get(), clean_header->data(), clean_header->size(), 0); !status.Ok()) {
+    removed_archive = true;
+  }
+  if (removed_archive || !active_present) {
+    if (auto status = SyncParentDirectory(wal_path); !status.Ok()) {
       return status;
-    }
-    if (io::Fsync(wal_fd.Get()) < 0) {
-      return ErrnoStatus("fsync");
     }
   }
   return {};
 }
 
 auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &database_uuid,
-               std::uint64_t next_transaction_id, std::uint64_t starting_lsn) -> Result<Wal> {
-  if (next_transaction_id == 0) {
+               std::uint64_t next_transaction_id, std::uint64_t starting_lsn,
+               std::uint64_t max_segment_bytes) -> Result<Wal> {
+  if (next_transaction_id == 0 || max_segment_bytes <= wal_format::HEADER_BYTES) {
     return std::unexpected(Status::InvalidArgument("invalid WAL transaction frontier"));
   }
   const auto requested_starting_lsn = starting_lsn;
@@ -430,8 +571,8 @@ auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &databa
   if (io::Fstat(fd.Get(), &file_stat) < 0) {
     return std::unexpected(ErrnoStatus("fstat"));
   }
-  Wal wal(std::move(fd), database_uuid, static_cast<std::uint64_t>(file_stat.st_size), next_transaction_id,
-          starting_lsn);
+  Wal wal(std::move(fd), wal_path, database_uuid, 1, static_cast<std::uint64_t>(file_stat.st_size), next_transaction_id,
+          starting_lsn, max_segment_bytes);
 
   if (file_stat.st_size == 0) {
     // Fresh WAL durability ordering is contents -> file fsync -> directory
@@ -485,8 +626,68 @@ auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &databa
   if (requested_starting_lsn != 0 && header->starting_lsn != requested_starting_lsn) {
     return std::unexpected(Status::Corruption("WAL starting LSN disagrees with the database checkpoint"));
   }
+  wal.segment_id_ = header->segment_id;
   wal.next_lsn_ = header->starting_lsn;
   return wal;
+}
+
+auto Wal::RotateSegment() -> Status {
+  TINYDB_CHECK(size_bytes_ > wal_format::HEADER_BYTES, "rotating an empty WAL segment");
+  const auto archive_path = SegmentPathFor(wal_path_, segment_id_);
+  auto exists_error = std::error_code{};
+  if (std::filesystem::exists(archive_path, exists_error) || exists_error) {
+    needs_recovery_ = true;
+    return Status::NeedsRecovery("next WAL archive path is not safely available");
+  }
+  if (io::Rename(wal_path_, archive_path) < 0) {
+    return ErrnoStatus("archive WAL segment");
+  }
+  // A failed directory sync makes the active/archive name transition
+  // indeterminate across power loss. The old fd remains valid, but appending
+  // through it would no longer have one discoverable active identity.
+  if (auto status = SyncParentDirectory(wal_path_); !status.Ok()) {
+    needs_recovery_ = true;
+    return Status::NeedsRecovery("WAL segment archive synchronization failed");
+  }
+
+  auto next_fd = UniqueFd(io::Open(wal_path_, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
+  if (!next_fd.Valid()) {
+    needs_recovery_ = true;
+    return Status::NeedsRecovery("could not create the next WAL segment");
+  }
+  const auto next_segment_id = segment_id_ + 1U;
+  if (next_segment_id == 0) {
+    needs_recovery_ = true;
+    return Status::NeedsRecovery("WAL segment ID space exhausted after archive");
+  }
+  const auto header = wal_format::EncodeHeader(wal_format::Header{
+      .database_uuid = database_uuid_,
+      .segment_id = next_segment_id,
+      .starting_lsn = next_lsn_,
+  });
+  if (!header) {
+    needs_recovery_ = true;
+    return Status::NeedsRecovery(header.error().Message());
+  }
+  if (auto status = FullPwrite(next_fd.Get(), header->data(), header->size(), 0); !status.Ok()) {
+    needs_recovery_ = true;
+    return Status::NeedsRecovery("could not write the next WAL segment header");
+  }
+  if (io::Fsync(next_fd.Get()) < 0) {
+    needs_recovery_ = true;
+    return Status::NeedsRecovery("could not synchronize the next WAL segment header");
+  }
+  if (auto status = SyncParentDirectory(wal_path_); !status.Ok()) {
+    needs_recovery_ = true;
+    return Status::NeedsRecovery("next WAL segment directory entry is indeterminate");
+  }
+
+  retained_size_bytes_ += size_bytes_;
+  archived_segments_.push_back(archive_path);
+  fd_ = std::move(next_fd);
+  segment_id_ = next_segment_id;
+  size_bytes_ = wal_format::HEADER_BYTES;
+  return {};
 }
 
 void Wal::AppendPageImage(page_id_t page_id, const char *data) {
@@ -502,9 +703,21 @@ void Wal::DiscardPending() {
   pending_.clear();
 }
 
+auto Wal::NextCommitLsn(std::size_t page_count) const -> Result<std::uint64_t> {
+  if (page_count == 0 || page_count > std::numeric_limits<std::uint32_t>::max() - 2U ||
+      next_lsn_ >= std::numeric_limits<std::uint64_t>::max() ||
+      page_count > std::numeric_limits<std::uint64_t>::max() - next_lsn_ - 1U) {
+    return std::unexpected(Status::ResourceExhausted("WAL LSN space exhausted"));
+  }
+  return next_lsn_ + page_count + 1U;
+}
+
 auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
   TINYDB_CHECK(fd_.Valid(), "committing on a moved-from log");
   TINYDB_CHECK(!pending_.empty(), "committing an operation that logged no page images");
+  if (needs_recovery_) {
+    return std::unexpected(Status::NeedsRecovery("WAL tail is not trustworthy; reopen the database"));
+  }
   // A zero transaction ID asks the WAL to assign its current frontier. A
   // nonzero ID was assigned by a higher-level coordinator and must agree
   // before the first byte is appended; discovering disagreement after fsync
@@ -523,6 +736,15 @@ auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
     return std::unexpected(transaction.error());
   }
 
+  // Rotation is soft: a transaction larger than the configured target owns an
+  // oversized empty segment rather than being split across files.
+  if (size_bytes_ > wal_format::HEADER_BYTES && size_bytes_ + transaction->bytes.size() > max_segment_bytes_) {
+    if (auto status = RotateSegment(); !status.Ok()) {
+      pending_.clear();
+      return std::unexpected(std::move(status));
+    }
+  }
+
   /*
   ** DURABILITY POINT
   **
@@ -532,12 +754,28 @@ auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
   */
   if (auto status = FullPwrite(fd_.Get(), transaction->bytes.data(), transaction->bytes.size(), size_bytes_);
       !status.Ok()) {
+    /*
+    ** A failed append cannot contain the complete final COMMIT record: the
+    ** write loop stops at the first failed/short syscall and COMMIT is last.
+    ** Truncating to known_good_size therefore converts the result into a
+    ** definite abort. If that repair fails, live appends are forbidden because
+    ** their offset could splice into an unknown tail.
+    */
+    if (io::Ftruncate(fd_.Get(), size_bytes_) < 0) {
+      needs_recovery_ = true;
+      pending_.clear();
+      return std::unexpected(Status::NeedsRecovery("WAL append and known-good tail repair both failed"));
+    }
+    pending_.clear();
     return std::unexpected(std::move(status));
   }
   if (io::Fsync(fd_.Get()) < 0) {
-    // Do not advance size_bytes_ or clear pending_: the outcome is not treated
-    // as acknowledged, and the owning engine poisons itself before more work.
-    return std::unexpected(ErrnoStatus("fsync"));
+    // The kernel may have persisted the COMMIT despite reporting failure. No
+    // live repair can turn that into a definite outcome without another
+    // ambiguous durability boundary, so recovery must decide on reopen.
+    needs_recovery_ = true;
+    pending_.clear();
+    return std::unexpected(Status::IndeterminateCommit(ErrnoStatus("fsync").Message()));
   }
   size_bytes_ += transaction->bytes.size();
   next_lsn_ = transaction->next_lsn;
@@ -547,7 +785,7 @@ auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
   return result;
 }
 
-auto Wal::SizeBytes() const -> std::uint64_t { return size_bytes_; }
+auto Wal::SizeBytes() const -> std::uint64_t { return retained_size_bytes_ + size_bytes_; }
 
 auto Wal::Reset() -> Status {
   TINYDB_CHECK(fd_.Valid(), "resetting a moved-from log");
@@ -557,18 +795,39 @@ auto Wal::Reset() -> Status {
   if (io::Ftruncate(fd_.Get(), 0) < 0) {
     return ErrnoStatus("ftruncate");
   }
-  const auto header =
-      wal_format::EncodeHeader(wal_format::Header{.database_uuid = database_uuid_, .starting_lsn = next_lsn_});
+  const auto header = wal_format::EncodeHeader(wal_format::Header{
+      .database_uuid = database_uuid_,
+      .segment_id = segment_id_,
+      .starting_lsn = next_lsn_,
+  });
   if (!header) {
     return header.error();
   }
   if (auto status = FullPwrite(fd_.Get(), header->data(), header->size(), 0); !status.Ok()) {
-    return status;
+    needs_recovery_ = true;
+    return Status::NeedsRecovery("checkpoint reset could not restore the WAL header: " + status.Message());
   }
   if (io::Fsync(fd_.Get()) < 0) {
-    return ErrnoStatus("fsync");
+    needs_recovery_ = true;
+    return Status::NeedsRecovery("checkpoint WAL reset synchronization failed");
+  }
+  auto removed_archive = false;
+  for (const auto &archive : archived_segments_) {
+    if (io::Unlink(archive) < 0 && errno != ENOENT) {
+      needs_recovery_ = true;
+      return Status::NeedsRecovery("checkpoint could not remove a covered WAL segment");
+    }
+    removed_archive = true;
+  }
+  if (removed_archive) {
+    if (auto status = SyncParentDirectory(wal_path_); !status.Ok()) {
+      needs_recovery_ = true;
+      return Status::NeedsRecovery("checkpointed WAL segment deletion is not durable");
+    }
   }
   size_bytes_ = wal_format::HEADER_BYTES;
+  retained_size_bytes_ = 0;
+  archived_segments_.clear();
   return {};
 }
 

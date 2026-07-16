@@ -261,7 +261,7 @@ auto DiskManager::EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE>
 }
 
 void DiskManager::AdoptState(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
-                             std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) {
+                             std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) noexcept {
   TINYDB_CHECK(high_water_page_id >= FIRST_DATA_PAGE_ID, "adopting an invalid allocation frontier");
   TINYDB_CHECK(
       root_page_id == HEADER_PAGE_ID || (root_page_id >= FIRST_DATA_PAGE_ID && root_page_id < high_water_page_id),

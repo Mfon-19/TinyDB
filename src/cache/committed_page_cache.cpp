@@ -9,9 +9,9 @@
 #include <algorithm>
 #include <atomic>
 #include <expected>
-#include <list>
+#include <limits>
 #include <mutex>
-#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace tinydb::cache {
@@ -40,6 +40,7 @@ struct CommittedFrame final {
   // encoded bytes remain const after this object is constructed.
   mutable std::atomic<std::size_t> pin_count{0};
   std::atomic<bool> checkpointed{false};
+  std::uint64_t last_access{0};  // protected by the cache mutex
 };
 
 PageGuard::PageGuard(std::shared_ptr<const CommittedFrame> frame) : frame_(std::move(frame)) {
@@ -106,56 +107,57 @@ auto PageGuard::IntoPageHandle() && -> PageHandle {
 }
 
 struct CommittedPageCache::Impl final {
-  struct ResidentPage {
-    std::shared_ptr<CommittedFrame> frame;
-    std::list<page_id_t>::iterator lru_position;
-  };
-
   DiskManager *disk;  // backing checkpointed database file
   const std::size_t target_bytes;
   mutable std::mutex mutex;  // protects every field below
-  std::unordered_map<page_id_t, ResidentPage> pages;
-  std::unordered_map<page_id_t, std::shared_ptr<CommittedFrame>> dirty_pages;
-  std::list<page_id_t> lru;      // most-recently-used page at the front
+  std::vector<std::shared_ptr<CommittedFrame>> pages;
+  std::size_t resident_pages{0};
+  std::uint64_t access_clock{0};
   std::uint64_t checkpoint_lsn;  // eviction-safe durability frontier
 
   Impl(DiskManager *database_file, std::size_t byte_target, std::uint64_t initial_checkpoint_lsn)
       : disk(database_file), target_bytes(byte_target), checkpoint_lsn(initial_checkpoint_lsn) {}
 
-  void Touch(ResidentPage &page) {
-    // Splice preserves the list node and iterator while moving this page to
-    // the most-recently-used end of the policy.
-    lru.splice(lru.begin(), lru, page.lru_position);
+  void Touch(const std::shared_ptr<CommittedFrame> &page) {
+    ++access_clock;
+    page->last_access = access_clock;
   }
 
   auto TryEvictOne() -> bool {
-    // Search from least-recently-used toward most-recently-used. A pinned or
-    // WAL-only frame is skipped rather than allowing policy to violate safety.
-    for (auto candidate = lru.rbegin(); candidate != lru.rend(); ++candidate) {
-      auto page = pages.find(*candidate);
-      TINYDB_CHECK(page != pages.end(), "cache LRU references a missing page");
-      const auto &frame = page->second.frame;
+    // A dense page table removes node allocation from publication. Eviction
+    // scans for the oldest eligible frame; cache capacity is intentionally a
+    // memory budget, not an asymptotic complexity promise.
+    auto victim = pages.size();
+    auto oldest = std::numeric_limits<std::uint64_t>::max();
+    for (std::size_t index = 0; index < pages.size(); ++index) {
+      const auto &frame = pages[index];
+      if (frame == nullptr) {
+        continue;
+      }
       if (frame->pin_count.load(std::memory_order_acquire) != 0 ||
           !frame->checkpointed.load(std::memory_order_acquire)) {
         continue;
       }
-
-      const auto position = page->second.lru_position;
-      dirty_pages.erase(page->first);
-      pages.erase(page);
-      lru.erase(position);
-      return true;
+      if (frame->last_access < oldest) {
+        oldest = frame->last_access;
+        victim = index;
+      }
     }
-    return false;
+    if (victim == pages.size()) {
+      return false;
+    }
+    pages[victim].reset();
+    --resident_pages;
+    return true;
   }
 
   void TrimToTarget() {
-    while (pages.size() * PAGE_SIZE > target_bytes && TryEvictOne()) {
+    while (resident_pages * PAGE_SIZE > target_bytes && TryEvictOne()) {
     }
   }
 
   void MakeRoomForRead() {
-    while ((pages.size() + 1) * PAGE_SIZE > target_bytes && TryEvictOne()) {
+    while ((resident_pages + 1) * PAGE_SIZE > target_bytes && TryEvictOne()) {
     }
   }
 };
@@ -170,16 +172,16 @@ CommittedPageCache::~CommittedPageCache() = default;
 
 auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageGuard> {
   auto lock = std::lock_guard(impl_->mutex);
-  if (auto existing = impl_->pages.find(page_id); existing != impl_->pages.end()) {
-    impl_->Touch(existing->second);
-    return PageGuard(existing->second.frame);
+  if (page_id < impl_->pages.size() && impl_->pages[page_id] != nullptr) {
+    impl_->Touch(impl_->pages[page_id]);
+    return PageGuard(impl_->pages[page_id]);
   }
 
   // Disk reads obey the hard target. Unlike publication, a cache miss has no
   // already-approved transaction overage and may fail if every frame is pinned
   // or waiting for checkpoint.
   impl_->MakeRoomForRead();
-  if ((impl_->pages.size() + 1) * PAGE_SIZE > impl_->target_bytes) {
+  if ((impl_->resident_pages + 1) * PAGE_SIZE > impl_->target_bytes) {
     return std::unexpected(Status::ResourceExhausted("committed cache is full of pinned or uncheckpointed pages"));
   }
 
@@ -195,63 +197,90 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageGuard> {
   }
 
   auto frame = std::make_shared<CommittedFrame>(page_id, header->page_lsn, 0, std::move(bytes), true);
-  impl_->lru.push_front(page_id);
-  const auto [inserted, unique] =
-      impl_->pages.emplace(page_id, Impl::ResidentPage{.frame = frame, .lru_position = impl_->lru.begin()});
-  TINYDB_CHECK(unique, "cache miss raced with an existing page under its mutex");
-  (void)inserted;
+  if (page_id >= impl_->pages.size()) {
+    impl_->pages.resize(page_id + 1);
+  }
+  TINYDB_CHECK(impl_->pages[page_id] == nullptr, "cache miss raced with an existing page under its mutex");
+  impl_->pages[page_id] = frame;
+  ++impl_->resident_pages;
+  impl_->Touch(frame);
   return PageGuard(std::move(frame));
 }
 
-auto CommittedPageCache::Install(CommittedPageImage image) -> Status {
-  if (image.bytes == nullptr) {
-    return Status::InvalidArgument("committed page image has no bytes");
-  }
-  const auto header =
-      storage::DecodeDataPageHeader(std::as_bytes(std::span<const char, PAGE_SIZE>(*image.bytes)), image.page_id);
-  if (!header) {
-    return header.error();
-  }
-  if (header->page_lsn != image.page_lsn) {
-    return Status::InvalidArgument("committed page metadata disagrees with encoded LSN");
+auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> images, std::vector<page_id_t> retired,
+                                            page_id_t high_water_page_id) -> Result<PublicationPlan> {
+  if (high_water_page_id < FIRST_DATA_PAGE_ID) {
+    return std::unexpected(Status::InvalidArgument("publication has an invalid high-water page ID"));
   }
 
+  auto seen = std::unordered_set<page_id_t>{};
+  seen.reserve(images.size());
+  auto frames = std::vector<std::shared_ptr<CommittedFrame>>{};
+  frames.reserve(images.size());
+
+  /*
+  ** PREPARE CACHE OWNERSHIP
+  **
+  ** Grow the dense table and allocate every shared control block here. The
+  ** writer has not appended WAL yet, so any validation or allocation failure
+  ** remains a definite abort.
+  */
   auto lock = std::lock_guard(impl_->mutex);
-  // Replacement changes only the latest-version table. Guards retain shared
-  // ownership of the previous immutable frame until old snapshots drain.
-  auto frame = std::make_shared<CommittedFrame>(image.page_id, image.page_lsn, image.transaction_id,
-                                                std::move(image.bytes), image.page_lsn <= impl_->checkpoint_lsn);
-  if (const auto existing = impl_->pages.find(image.page_id); existing != impl_->pages.end()) {
-    if (existing->second.frame->page_lsn > image.page_lsn) {
-      return Status::InvalidArgument("committed page version moves backward");
+  if (impl_->pages.size() < high_water_page_id) {
+    impl_->pages.resize(high_water_page_id);
+  }
+  for (auto &image : images) {
+    if (image.bytes == nullptr || image.page_id < FIRST_DATA_PAGE_ID || image.page_id >= high_water_page_id ||
+        !seen.insert(image.page_id).second) {
+      return std::unexpected(Status::InvalidArgument("publication contains an invalid or duplicate page image"));
     }
-    impl_->dirty_pages.erase(image.page_id);
-    impl_->lru.erase(existing->second.lru_position);
-    impl_->pages.erase(existing);
+    const auto header =
+        storage::DecodeDataPageHeader(std::as_bytes(std::span<const char, PAGE_SIZE>(*image.bytes)), image.page_id);
+    if (!header) {
+      return std::unexpected(header.error());
+    }
+    if (header->page_lsn != image.page_lsn) {
+      return std::unexpected(Status::InvalidArgument("committed page metadata disagrees with encoded LSN"));
+    }
+    const auto &existing = impl_->pages[image.page_id];
+    if (existing != nullptr && existing->page_lsn > image.page_lsn) {
+      return std::unexpected(Status::InvalidArgument("committed page version moves backward"));
+    }
+    frames.push_back(std::make_shared<CommittedFrame>(image.page_id, image.page_lsn, image.transaction_id,
+                                                      std::move(image.bytes), image.page_lsn <= impl_->checkpoint_lsn));
   }
-
-  impl_->lru.push_front(image.page_id);
-  impl_->pages.emplace(image.page_id, Impl::ResidentPage{.frame = frame, .lru_position = impl_->lru.begin()});
-  if (!frame->checkpointed.load(std::memory_order_relaxed)) {
-    impl_->dirty_pages.emplace(image.page_id, frame);
+  for (const auto page_id : retired) {
+    if (page_id < FIRST_DATA_PAGE_ID || page_id >= high_water_page_id || seen.contains(page_id)) {
+      return std::unexpected(Status::InvalidArgument("publication contains an invalid retired page"));
+    }
   }
-  impl_->TrimToTarget();
-  return {};
+  return PublicationPlan(std::move(frames), std::move(retired), high_water_page_id);
 }
 
-void CommittedPageCache::Retire(std::span<const page_id_t> page_ids) {
+void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
   auto lock = std::lock_guard(impl_->mutex);
-  for (const auto page_id : page_ids) {
-    const auto page = impl_->pages.find(page_id);
-    if (page == impl_->pages.end()) {
+  TINYDB_CHECK(plan.high_water_page_id_ <= impl_->pages.size(), "publication page table was not preallocated");
+
+  for (const auto page_id : plan.retired_) {
+    if (impl_->pages[page_id] == nullptr) {
       continue;
     }
-    TINYDB_CHECK(page->second.frame->pin_count.load(std::memory_order_acquire) == 0,
+    TINYDB_CHECK(impl_->pages[page_id]->pin_count.load(std::memory_order_acquire) == 0,
                  "retiring a pinned committed page");
-    impl_->dirty_pages.erase(page_id);
-    impl_->lru.erase(page->second.lru_position);
-    impl_->pages.erase(page);
+    impl_->pages[page_id].reset();
+    --impl_->resident_pages;
   }
+  for (auto &frame : plan.frames_) {
+    auto &current = impl_->pages[frame->page_id];
+    TINYDB_CHECK(current == nullptr || current->page_lsn <= frame->page_lsn,
+                 "prepared publication regressed a page version");
+    if (current == nullptr) {
+      ++impl_->resident_pages;
+    }
+    current = std::move(frame);
+    impl_->Touch(current);
+  }
+  impl_->TrimToTarget();
 }
 
 void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
@@ -261,12 +290,9 @@ void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
 
   // Only versions at or below the new frontier are now reproducible from the
   // database file. Later committed versions remain WAL-backed and non-evictable.
-  for (auto page = impl_->dirty_pages.begin(); page != impl_->dirty_pages.end();) {
-    if (page->second->page_lsn <= checkpoint_lsn) {
-      page->second->checkpointed.store(true, std::memory_order_release);
-      page = impl_->dirty_pages.erase(page);
-    } else {
-      ++page;
+  for (const auto &page : impl_->pages) {
+    if (page != nullptr && page->page_lsn <= checkpoint_lsn) {
+      page->checkpointed.store(true, std::memory_order_release);
     }
   }
   impl_->TrimToTarget();
@@ -280,30 +306,24 @@ void CommittedPageCache::Trim() {
 auto CommittedPageCache::DirtyPageIds() const -> std::vector<page_id_t> {
   auto lock = std::lock_guard(impl_->mutex);
   auto result = std::vector<page_id_t>{};
-  result.reserve(impl_->dirty_pages.size());
-  for (const auto &[page_id, frame] : impl_->dirty_pages) {
-    (void)frame;
-    result.push_back(page_id);
+  for (page_id_t page_id = 0; page_id < impl_->pages.size(); ++page_id) {
+    const auto &page = impl_->pages[page_id];
+    if (page != nullptr && !page->checkpointed.load(std::memory_order_acquire)) {
+      result.push_back(page_id);
+    }
   }
-  std::ranges::sort(result);
   return result;
 }
 
 auto CommittedPageCache::DirtyPages() -> std::vector<PageGuard> {
   auto lock = std::lock_guard(impl_->mutex);
-  auto ids = std::vector<page_id_t>{};
-  ids.reserve(impl_->dirty_pages.size());
-  for (const auto &[page_id, frame] : impl_->dirty_pages) {
-    (void)frame;
-    ids.push_back(page_id);
-  }
-  std::ranges::sort(ids);
   // Return guards in page-ID order. Checkpointing receives a stable version of
   // every frame even if a later publication replaces the page-table entry.
   auto result = std::vector<PageGuard>{};
-  result.reserve(ids.size());
-  for (const auto page_id : ids) {
-    result.push_back(PageGuard(impl_->dirty_pages.at(page_id)));
+  for (const auto &page : impl_->pages) {
+    if (page != nullptr && !page->checkpointed.load(std::memory_order_acquire)) {
+      result.push_back(PageGuard(page));
+    }
   }
   return result;
 }
@@ -311,16 +331,20 @@ auto CommittedPageCache::DirtyPages() -> std::vector<PageGuard> {
 auto CommittedPageCache::Stats() const -> CommittedCacheStats {
   auto lock = std::lock_guard(impl_->mutex);
   auto pinned_pages = std::size_t{0};
-  for (const auto &[page_id, page] : impl_->pages) {
-    (void)page_id;
-    pinned_pages += page.frame->pin_count.load(std::memory_order_acquire) != 0 ? 1U : 0U;
+  auto dirty_pages = std::size_t{0};
+  for (const auto &page : impl_->pages) {
+    if (page == nullptr) {
+      continue;
+    }
+    pinned_pages += page->pin_count.load(std::memory_order_acquire) != 0 ? 1U : 0U;
+    dirty_pages += !page->checkpointed.load(std::memory_order_acquire) ? 1U : 0U;
   }
   return CommittedCacheStats{
       .target_bytes = impl_->target_bytes,
-      .resident_bytes = impl_->pages.size() * PAGE_SIZE,
-      .resident_pages = impl_->pages.size(),
+      .resident_bytes = impl_->resident_pages * PAGE_SIZE,
+      .resident_pages = impl_->resident_pages,
       .pinned_pages = pinned_pages,
-      .dirty_pages = impl_->dirty_pages.size(),
+      .dirty_pages = dirty_pages,
       .checkpoint_lsn = impl_->checkpoint_lsn,
   };
 }

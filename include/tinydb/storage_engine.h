@@ -1,14 +1,11 @@
 #pragma once
 
-#include <tinydb/disk_manager.h>
 #include <tinydb/limits.h>
 #include <tinydb/status.h>
-#include <tinydb/unique_fd.h>
-#include <tinydb/wal.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -17,36 +14,86 @@
 
 namespace tinydb {
 
-namespace cache {
-class CommittedPageCache;
-class CommittedPageSource;
-}  // namespace cache
-namespace txn {
-class ReaderGate;
-}  // namespace txn
+namespace detail {
+class DatabaseCore;
+}
+
+struct TransactionCommitInfo {
+  std::uint64_t transaction_id{0};
+  std::uint64_t commit_lsn{0};
+};
 
 /*
-** Compatibility facade for the current single-operation API.
+** PUBLIC TRANSACTION HANDLES
 **
-** Reads capture immutable committed snapshots. Each mutation acquires the
-** sole writer permit, prepares B+ tree and allocator changes privately, makes
-** their final physical images durable in WAL, drains readers of the old state,
-** and publishes all new pages and roots together.
+** ReadTransaction owns one reader admission and therefore one immutable root
+** snapshot. WriteTransaction owns the process-local writer permit and a private
+** page overlay. Both keep DatabaseCore alive across StorageEngine moves.
 **
-** Put and Remove are currently one-operation transactions. Milestone 6 exposes
-** the same machinery as a multi-key WriteTransaction and replaces the
-** temporary WAL/publication bridge with a prebuilt infallible commit plan.
+** Destruction aborts an active writer. Commit success means the complete
+** transaction is both WAL-durable and visible. IndeterminateCommit means the
+** caller must reopen the database and inspect application state before it can
+** know whether the transaction committed.
 */
-class StorageEngine {
+class ReadTransaction final {
+ public:
+  ReadTransaction(const ReadTransaction &) = delete;
+  auto operator=(const ReadTransaction &) -> ReadTransaction & = delete;
+  ReadTransaction(ReadTransaction &&) noexcept;
+  auto operator=(ReadTransaction &&) noexcept -> ReadTransaction &;
+  ~ReadTransaction();
+
+  auto Get(std::string_view key) -> Result<std::optional<std::string>>;
+
+ private:
+  struct Impl;
+  explicit ReadTransaction(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+
+  friend class StorageEngine;
+  friend class detail::DatabaseCore;
+};
+
+class WriteTransaction final {
+ public:
+  WriteTransaction(const WriteTransaction &) = delete;
+  auto operator=(const WriteTransaction &) -> WriteTransaction & = delete;
+  WriteTransaction(WriteTransaction &&) noexcept;
+  auto operator=(WriteTransaction &&) noexcept -> WriteTransaction &;
+  ~WriteTransaction();
+
+  auto Get(std::string_view key) -> Result<std::optional<std::string>>;
+  auto Put(std::string_view key, std::string_view value) -> Status;
+  auto Delete(std::string_view key) -> Status;
+  auto Commit() -> Result<TransactionCommitInfo>;
+  void Abort() noexcept;
+
+ private:
+  struct Impl;
+  explicit WriteTransaction(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+
+  friend class StorageEngine;
+  friend class detail::DatabaseCore;
+};
+
+/*
+** StorageEngine is the owning database handle. Convenience reads and writes
+** create the same public transaction objects applications use directly; there
+** is no second single-operation commit path.
+*/
+class StorageEngine final {
  public:
   StorageEngine(const StorageEngine &) = delete;
   auto operator=(const StorageEngine &) -> StorageEngine & = delete;
-
-  StorageEngine(StorageEngine &&other) noexcept;
-  auto operator=(StorageEngine &&other) noexcept -> StorageEngine &;
+  StorageEngine(StorageEngine &&) noexcept = default;
+  auto operator=(StorageEngine &&) noexcept -> StorageEngine & = default;
   ~StorageEngine();
 
   static auto Open(const std::filesystem::path &path) -> Result<StorageEngine>;
+
+  auto BeginRead() -> Result<ReadTransaction>;
+  auto BeginWrite() -> Result<WriteTransaction>;
 
   auto Put(std::string_view key, std::string_view value) -> Status;
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
@@ -56,35 +103,10 @@ class StorageEngine {
   auto Close() -> Status;
 
  private:
-  enum class Mutation { Bootstrap, Put, Remove };
-
-  StorageEngine(std::filesystem::path path, UniqueFd lock_fd, std::unique_ptr<DiskManager> disk,
-                std::unique_ptr<cache::CommittedPageCache> cache, std::unique_ptr<cache::CommittedPageSource> pages,
-                std::unique_ptr<txn::ReaderGate> readers, std::unique_ptr<Wal> wal);
-
+  explicit StorageEngine(std::shared_ptr<detail::DatabaseCore> core) : core_(std::move(core)) {}
   void CloseBestEffort() noexcept;
-  auto Mutate(Mutation mutation, std::string_view key = {}, std::string_view value = {}) -> Status;
-  auto Checkpoint() -> Status;
-  void Poison();
 
-  std::filesystem::path path_;
-  bool closed_{false};
-  bool poisoned_{false};
-
-  /*
-  ** Members are declared in ownership order. The process lock is acquired
-  ** before recovery and released last. Page sources borrow the cache, the
-  ** cache borrows DiskManager, and snapshots borrow the page source during an
-  ** admitted operation. Milestone 6 will expose those admissions publicly and
-  ** make Close report Busy while one remains live.
-  */
-  UniqueFd lock_fd_;
-  std::unique_ptr<DiskManager> disk_;
-  std::unique_ptr<cache::CommittedPageCache> cache_;
-  std::unique_ptr<cache::CommittedPageSource> pages_;
-  std::unique_ptr<txn::ReaderGate> readers_;
-  std::unique_ptr<Wal> wal_;
-  std::unique_ptr<std::mutex> writer_mutex_;
+  std::shared_ptr<detail::DatabaseCore> core_;
 };
 
 }  // namespace tinydb

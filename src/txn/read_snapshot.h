@@ -50,11 +50,10 @@ class SnapshotCursor final {
 };
 
 /*
-** Internal read-transaction core. PageReader is owned by the database. The
-** current compatibility facade completes snapshots inside one API call; the
-** public transaction layer will count the admission when deciding whether
-** Close is Busy. Returned point values are owning copies; cursor keys and
-** values remain borrowed from its current page.
+** Internal read-transaction core. PageReader is owned by DatabaseCore. Public
+** ReadTransaction holds this object for its full lifetime, and convenience
+** reads construct the same transaction temporarily. Returned point values are
+** owning copies; cursor keys and values remain borrowed from its current page.
 */
 class ReadSnapshot final {
  public:

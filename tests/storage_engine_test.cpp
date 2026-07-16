@@ -8,6 +8,7 @@
 #include "storage/page_codec.h"
 #include "storage/superblock.h"
 #include "support/transaction_model.h"
+#include "support/transaction_scenarios.h"
 #include "txn/database_state.h"
 #include "wal/wal_codec.h"
 
@@ -96,7 +97,19 @@ class StorageEngineTest : public ::testing::Test {
   // A database on disk is the file plus its write-ahead log.
   static void RemoveDatabase(const std::filesystem::path &path) {
     std::filesystem::remove(path);
-    std::filesystem::remove(tinydb::Wal::PathFor(path));
+    const auto wal_path = tinydb::Wal::PathFor(path);
+    std::filesystem::remove(wal_path);
+    auto parent = wal_path.parent_path();
+    if (parent.empty()) {
+      parent = ".";
+    }
+    const auto prefix = wal_path.filename().string() + ".";
+    for (const auto &entry : std::filesystem::directory_iterator(parent)) {
+      const auto name = entry.path().filename().string();
+      if (name.starts_with(prefix) && name.ends_with(".segment")) {
+        std::filesystem::remove(entry.path());
+      }
+    }
   }
 
   // Copies the database and its log as they sit on disk right now — the
@@ -105,12 +118,271 @@ class StorageEngineTest : public ::testing::Test {
   // original stays live.
   void SnapshotDatabase() const {
     std::filesystem::copy_file(db_path_, second_db_path_);
-    std::filesystem::copy_file(tinydb::Wal::PathFor(db_path_), tinydb::Wal::PathFor(second_db_path_));
+    const auto source_wal = tinydb::Wal::PathFor(db_path_);
+    const auto destination_wal = tinydb::Wal::PathFor(second_db_path_);
+    std::filesystem::copy_file(source_wal, destination_wal);
+    auto parent = source_wal.parent_path();
+    if (parent.empty()) {
+      parent = ".";
+    }
+    const auto prefix = source_wal.filename().string() + ".";
+    for (const auto &entry : std::filesystem::directory_iterator(parent)) {
+      const auto name = entry.path().filename().string();
+      if (!name.starts_with(prefix) || !name.ends_with(".segment")) {
+        continue;
+      }
+      const auto suffix = name.substr(source_wal.filename().string().size());
+      auto destination = destination_wal;
+      destination += suffix;
+      std::filesystem::copy_file(entry.path(), destination);
+    }
   }
 
   std::filesystem::path db_path_;
   std::filesystem::path second_db_path_;
 };
+
+/*
+** The reusable contract scenarios intentionally speak a tiny model-shaped
+** vocabulary. This adapter removes Result/Status wrappers only after asserting
+** that TinyDB returned a value, leaving the scenarios themselves independent
+** of storage implementation types.
+*/
+class TinyDbContractAdapter final {
+ public:
+  using Row = std::pair<std::string, std::string>;
+  using Rows = std::vector<Row>;
+
+  explicit TinyDbContractAdapter(tinydb::StorageEngine *engine) : engine_(engine) {}
+
+  class Write final {
+   public:
+    explicit Write(tinydb::WriteTransaction transaction) : transaction_(std::move(transaction)) {}
+
+    auto Put(std::string_view key, std::string_view value) -> tinydb::StatusCode {
+      return transaction_.Put(key, value).Code();
+    }
+    auto Delete(std::string_view key) -> tinydb::StatusCode { return transaction_.Delete(key).Code(); }
+    auto Get(std::string_view key) -> std::optional<std::string> { return transaction_.Get(key).value(); }
+    auto Commit() -> bool { return transaction_.Commit().has_value(); }
+    void Abort() noexcept { transaction_.Abort(); }
+
+   private:
+    tinydb::WriteTransaction transaction_;
+  };
+
+  auto BeginWrite() -> std::optional<Write> {
+    auto transaction = engine_->BeginWrite();
+    if (!transaction) {
+      return std::nullopt;
+    }
+    return Write(std::move(*transaction));
+  }
+
+  auto Get(std::string_view key) -> std::optional<std::string> { return engine_->Get(key).value(); }
+
+  auto Scan(std::optional<std::string_view> start = std::nullopt,
+            std::optional<std::string_view> end = std::nullopt) -> Rows {
+    const auto upper = std::string(tinydb::txn::MAX_KEY_BYTES + 1, static_cast<char>(0xFF));
+    return engine_->Scan(start.value_or(""), end.value_or(upper)).value();
+  }
+
+ private:
+  tinydb::StorageEngine *engine_;
+};
+
+TEST_F(StorageEngineTest, PublicTransactionCommitPublishesAtomically) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto adapter = TinyDbContractAdapter(&engine);
+  tinydb::test_support::CommitPublishesAtomically(adapter);
+}
+
+TEST_F(StorageEngineTest, PublicTransactionAbortDiscardsAllChanges) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto adapter = TinyDbContractAdapter(&engine);
+  tinydb::test_support::AbortDiscardsAllChanges(adapter);
+}
+
+TEST_F(StorageEngineTest, PublicTransactionDestructionAbortsAndReleasesWriter) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto adapter = TinyDbContractAdapter(&engine);
+  tinydb::test_support::DestructionAborts(adapter);
+}
+
+TEST_F(StorageEngineTest, PublicTransactionReadsOwnWritesAndDeletes) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto adapter = TinyDbContractAdapter(&engine);
+  tinydb::test_support::OverwriteDeleteAndReadOwnWrites(adapter);
+}
+
+TEST_F(StorageEngineTest, PublicTransactionScansUseHalfOpenOptionalBounds) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto adapter = TinyDbContractAdapter(&engine);
+  tinydb::test_support::ScanUsesHalfOpenOptionalBounds(adapter);
+}
+
+TEST_F(StorageEngineTest, PublicTransactionKeysUseUnsignedByteOrder) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto adapter = TinyDbContractAdapter(&engine);
+  tinydb::test_support::KeysUseUnsignedByteOrder(adapter);
+}
+
+TEST_F(StorageEngineTest, PublicTransactionAllowsOnlyOneWriter) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto adapter = TinyDbContractAdapter(&engine);
+  tinydb::test_support::OnlyOneWriterIsAdmitted(adapter);
+}
+
+TEST_F(StorageEngineTest, InvalidMutationLeavesTheWriteTransactionActive) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto transaction = engine.BeginWrite().value();
+  const auto oversized_key = std::string(tinydb::txn::MAX_KEY_BYTES + 1, 'x');
+  EXPECT_EQ(transaction.Put(oversized_key, "value").Code(), tinydb::StatusCode::InvalidArgument);
+  EXPECT_EQ(transaction.Delete(oversized_key).Code(), tinydb::StatusCode::InvalidArgument);
+  ASSERT_TRUE(transaction.Put("valid", "value").Ok());
+  ASSERT_TRUE(transaction.Commit().has_value());
+  EXPECT_EQ(engine.Get("valid").value(), std::optional<std::string>{"value"});
+}
+
+TEST_F(StorageEngineTest, PublicTransactionCloseIsBusyWithoutInvalidatingTransactions) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  {
+    auto read = engine.BeginRead().value();
+    EXPECT_EQ(engine.Close().Code(), tinydb::StatusCode::Busy);
+    EXPECT_EQ(read.Get("missing").value(), std::nullopt);
+  }
+  {
+    auto write = engine.BeginWrite().value();
+    EXPECT_EQ(engine.Close().Code(), tinydb::StatusCode::Busy);
+    ASSERT_TRUE(write.Put("key", "value").Ok());
+    ASSERT_TRUE(write.Commit().has_value());
+  }
+  EXPECT_TRUE(engine.Close().Ok());
+}
+
+TEST_F(StorageEngineTest, PublicReadTransactionKeepsOneSnapshotUntilWriterPublishes) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(engine.Put("key", "before").Ok());
+  auto reader = std::optional<tinydb::ReadTransaction>{engine.BeginRead().value()};
+
+  auto started = std::atomic<bool>{false};
+  auto finished = std::atomic<bool>{false};
+  auto writer = std::thread([&] {
+    auto transaction = engine.BeginWrite().value();
+    ASSERT_TRUE(transaction.Put("key", "after").Ok());
+    started.store(true, std::memory_order_release);
+    const auto committed = transaction.Commit();
+    EXPECT_TRUE(committed.has_value());
+    finished.store(true, std::memory_order_release);
+  });
+  while (!started.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(reader->Get("key").value(), std::optional<std::string>{"before"});
+  EXPECT_FALSE(finished.load(std::memory_order_acquire));
+  reader.reset();
+  writer.join();
+  EXPECT_EQ(engine.Get("key").value(), std::optional<std::string>{"after"});
+}
+
+TEST_F(StorageEngineTest, MultiPageTransactionSurvivesCrashAsOneCommittedUnit) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto transaction = engine.BeginWrite().value();
+  for (int row = 0; row < 80; ++row) {
+    ASSERT_TRUE(transaction.Put(RowKey(row), RowValue(row, 256)).Ok());
+  }
+  const auto committed = transaction.Commit();
+  ASSERT_TRUE(committed.has_value());
+  EXPECT_GT(committed->transaction_id, 0U);
+  EXPECT_GT(committed->commit_lsn, 0U);
+
+  SnapshotDatabase();
+  auto recovered = tinydb::StorageEngine::Open(second_db_path_).value();
+  for (int row = 0; row < 80; ++row) {
+    EXPECT_EQ(recovered.Get(RowKey(row)).value(), std::optional<std::string>{RowValue(row, 256)});
+  }
+}
+
+TEST_F(StorageEngineTest, CrashAfterWalDurabilityBeforePublicationRecoversTransaction) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  auto reader = std::optional<tinydb::ReadTransaction>{engine.BeginRead().value()};
+  auto wal_synced = std::atomic<bool>{false};
+  auto writer_done = std::atomic<bool>{false};
+
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      if (call.syscall == tinydb::io::Syscall::Fsync && call.path == tinydb::Wal::PathFor(db_path_)) {
+        wal_synced.store(true, std::memory_order_release);
+      }
+      return std::nullopt;
+    }};
+    auto writer = std::thread([&] {
+      auto transaction = engine.BeginWrite().value();
+      ASSERT_TRUE(transaction.Put("doc/1", "contents").Ok());
+      ASSERT_TRUE(transaction.Put("tag/database/doc/1", "").Ok());
+      EXPECT_TRUE(transaction.Commit().has_value());
+      writer_done.store(true, std::memory_order_release);
+    });
+
+    while (!wal_synced.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    EXPECT_FALSE(writer_done.load(std::memory_order_acquire));
+    EXPECT_EQ(reader->Get("doc/1").value(), std::nullopt);
+
+    // This copy is the exact durable-but-not-yet-visible crash state. Recovery
+    // must publish both keys from physical WAL without relying on the blocked
+    // writer's in-memory publication plan.
+    SnapshotDatabase();
+    auto recovered = tinydb::StorageEngine::Open(second_db_path_).value();
+    EXPECT_EQ(recovered.Get("doc/1").value(), std::optional<std::string>{"contents"});
+    EXPECT_EQ(recovered.Get("tag/database/doc/1").value(), std::optional<std::string>{""});
+
+    reader.reset();
+    writer.join();
+  }
+  EXPECT_TRUE(writer_done.load(std::memory_order_acquire));
+}
+
+TEST_F(StorageEngineTest, RepairedWalAppendFailureIsADefiniteAbort) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  const auto wal_path = tinydb::Wal::PathFor(db_path_);
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      if (call.syscall == tinydb::io::Syscall::Pwrite && call.path == wal_path) {
+        return tinydb::io::Fault{.error = EIO};
+      }
+      return std::nullopt;
+    }};
+    EXPECT_EQ(engine.Put("aborted", "value").Code(), tinydb::StatusCode::IoError);
+  }
+
+  EXPECT_EQ(engine.Get("aborted").value(), std::nullopt);
+  EXPECT_TRUE(engine.Put("committed", "value").Ok());
+  EXPECT_EQ(engine.Get("committed").value(), std::optional<std::string>{"value"});
+}
+
+TEST_F(StorageEngineTest, WalSyncFailureMakesCommitIndeterminateAndRequiresReopen) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  const auto wal_path = tinydb::Wal::PathFor(db_path_);
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      if (call.syscall == tinydb::io::Syscall::Fsync && call.path == wal_path) {
+        return tinydb::io::Fault{.error = EIO};
+      }
+      return std::nullopt;
+    }};
+    EXPECT_EQ(engine.Put("limbo", "value").Code(), tinydb::StatusCode::IndeterminateCommit);
+  }
+
+  EXPECT_EQ(engine.Get("limbo").error().Code(), tinydb::StatusCode::NeedsRecovery);
+  EXPECT_EQ(engine.Put("later", "value").Code(), tinydb::StatusCode::NeedsRecovery);
+  EXPECT_TRUE(engine.Close().Ok());
+
+  auto recovered = tinydb::StorageEngine::Open(db_path_).value();
+  const auto value = recovered.Get("limbo").value();
+  EXPECT_TRUE(value == std::nullopt || value == std::optional<std::string>{"value"});
+}
 
 TEST_F(StorageEngineTest, OpenCreatesEmptyDatabase) {
   auto engine = tinydb::StorageEngine::Open(db_path_).value();

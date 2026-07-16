@@ -38,6 +38,8 @@ static constexpr std::uint64_t DATABASE_STATE_RECORD_BYTES =
     tinydb::wal_format::RECORD_HEADER_BYTES + tinydb::wal_format::DATABASE_STATE_PAYLOAD_BYTES;
 static constexpr std::uint64_t COMMIT_RECORD_BYTES =
     tinydb::wal_format::RECORD_HEADER_BYTES + tinydb::wal_format::COMMIT_PAYLOAD_BYTES;
+static constexpr std::uint64_t ONE_PAGE_TRANSACTION_BYTES =
+    PAGE_IMAGE_RECORD_BYTES + DATABASE_STATE_RECORD_BYTES + COMMIT_RECORD_BYTES;
 
 // Keep expected record geometry derived from public format constants, but not
 // from Wal::SizeBytes itself. These assertions catch accidental framing growth
@@ -267,6 +269,179 @@ TEST(WalTest, CommitGrowsTheLogAndResetEmptiesIt) {
   std::filesystem::remove(path);
 }
 
+TEST(WalTest, RotationKeepsEachTransactionInsideOneOrderedSegment) {
+  const auto path = TestPath("wal_segment_rotation");
+  const auto archive = tinydb::Wal::SegmentPathFor(path, 1);
+  std::filesystem::remove(path);
+  std::filesystem::remove(archive);
+  auto wal = tinydb::Wal::Open(path, TEST_UUID, 1, 0, WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES).value();
+
+  const auto first = DataPage(2, 'a');
+  wal.AppendPageImage(2, first.data());
+  ASSERT_TRUE(Commit(wal).has_value());
+  EXPECT_FALSE(std::filesystem::exists(archive));
+
+  const auto second = DataPage(3, 'b');
+  wal.AppendPageImage(3, second.data());
+  const auto committed = Commit(wal);
+  ASSERT_TRUE(committed.has_value());
+  EXPECT_TRUE(std::filesystem::exists(archive));
+  EXPECT_EQ(std::filesystem::file_size(archive), WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES);
+  EXPECT_EQ(std::filesystem::file_size(path), WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES);
+  EXPECT_EQ(wal.SizeBytes(), 2 * (WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES));
+
+  const auto archived = ReadWholeFile(archive);
+  const auto active = ReadWholeFile(path);
+  const auto archived_header =
+      tinydb::wal_format::DecodeHeader(std::as_bytes(std::span{archived.data(), tinydb::wal_format::HEADER_BYTES}));
+  const auto active_header =
+      tinydb::wal_format::DecodeHeader(std::as_bytes(std::span{active.data(), tinydb::wal_format::HEADER_BYTES}));
+  ASSERT_TRUE(archived_header.has_value());
+  ASSERT_TRUE(active_header.has_value());
+  EXPECT_EQ(archived_header->segment_id, 1U);
+  EXPECT_EQ(active_header->segment_id, 2U);
+  EXPECT_EQ(active_header->starting_lsn, committed->commit_lsn - 2U);
+
+  ASSERT_TRUE(wal.Reset().Ok());
+  EXPECT_FALSE(std::filesystem::exists(archive));
+  EXPECT_EQ(wal.SizeBytes(), WAL_HEADER_BYTES);
+  std::filesystem::remove(path);
+}
+
+TEST(WalTest, RecoveryReplaysAndRemovesAnOrderedSegmentSequence) {
+  const auto db_path = TestPath("recover_segments");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  const auto archive = tinydb::Wal::SegmentPathFor(wal_path, 1);
+  std::filesystem::remove(wal_path);
+  std::filesystem::remove(archive);
+  MakeDbFile(db_path, 4);
+  const auto first = DataPage(2, 'a');
+  const auto second = DataPage(3, 'b');
+  {
+    auto wal = tinydb::Wal::Open(wal_path, TEST_UUID, 1, 0, WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES).value();
+    wal.AppendPageImage(2, first.data());
+    ASSERT_TRUE(Commit(wal).has_value());
+    wal.AppendPageImage(3, second.data());
+    ASSERT_TRUE(Commit(wal).has_value());
+  }
+  ASSERT_TRUE(std::filesystem::exists(archive));
+
+  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  const auto database = ReadWholeFile(db_path);
+  EXPECT_EQ(database.substr(2 * tinydb::PAGE_SIZE, tinydb::PAGE_SIZE), std::string(first.data(), first.size()));
+  EXPECT_EQ(database.substr(3 * tinydb::PAGE_SIZE, tinydb::PAGE_SIZE), std::string(second.data(), second.size()));
+  EXPECT_FALSE(std::filesystem::exists(archive));
+  EXPECT_EQ(std::filesystem::file_size(wal_path), WAL_HEADER_BYTES);
+
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+}
+
+TEST(WalTest, RecoveryRejectsAMissingSegmentAfterTheCheckpoint) {
+  const auto db_path = TestPath("recover_missing_segment");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  const auto first_archive = tinydb::Wal::SegmentPathFor(wal_path, 1);
+  const auto second_archive = tinydb::Wal::SegmentPathFor(wal_path, 2);
+  std::filesystem::remove(wal_path);
+  std::filesystem::remove(first_archive);
+  std::filesystem::remove(second_archive);
+  MakeDbFile(db_path, 5);
+  {
+    auto wal = tinydb::Wal::Open(wal_path, TEST_UUID, 1, 0, WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES).value();
+    for (tinydb::page_id_t page_id = 2; page_id < 5; ++page_id) {
+      const auto page = DataPage(page_id, static_cast<char>('a' + page_id));
+      wal.AppendPageImage(page_id, page.data());
+      ASSERT_TRUE(Commit(wal, 5).has_value());
+    }
+  }
+  ASSERT_TRUE(std::filesystem::exists(first_archive));
+  ASSERT_TRUE(std::filesystem::exists(second_archive));
+  std::filesystem::remove(first_archive);
+
+  const auto status = tinydb::Wal::Recover(db_path, wal_path);
+  EXPECT_EQ(status.Code(), tinydb::StatusCode::Corruption);
+
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+  std::filesystem::remove(second_archive);
+}
+
+TEST(WalDurabilityTest, RotationSynchronizesArchiveAndNewActiveDirectoryEntriesBeforeAppend) {
+  const auto path = TestPath("wal_segment_rotation_order");
+  const auto archive = tinydb::Wal::SegmentPathFor(path, 1);
+  std::filesystem::remove(path);
+  std::filesystem::remove(archive);
+  auto wal = tinydb::Wal::Open(path, TEST_UUID, 1, 0, WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES).value();
+  const auto page = DataPage(2, 'a');
+  wal.AppendPageImage(2, page.data());
+  ASSERT_TRUE(Commit(wal).has_value());
+
+  auto calls = std::vector<tinydb::io::Call>{};
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      calls.push_back(call);
+      return std::nullopt;
+    }};
+    wal.AppendPageImage(3, DataPage(3, 'b').data());
+    ASSERT_TRUE(Commit(wal).has_value());
+  }
+
+  const auto renamed = FindCall(calls, tinydb::io::Syscall::Rename, path);
+  const auto archive_dir_sync = FindCall(calls, tinydb::io::Syscall::Fsync, ParentPath(path), renamed + 1);
+  const auto create_active = FindCall(calls, tinydb::io::Syscall::Open, path, archive_dir_sync + 1);
+  const auto header_write = FindCall(calls, tinydb::io::Syscall::Pwrite, path, create_active + 1);
+  const auto header_sync = FindCall(calls, tinydb::io::Syscall::Fsync, path, header_write + 1);
+  const auto active_dir_sync = FindCall(calls, tinydb::io::Syscall::Fsync, ParentPath(path), header_sync + 1);
+  const auto transaction_write = FindCall(calls, tinydb::io::Syscall::Pwrite, path, active_dir_sync + 1);
+  EXPECT_LT(renamed, archive_dir_sync);
+  EXPECT_LT(archive_dir_sync, create_active);
+  EXPECT_LT(create_active, header_write);
+  EXPECT_LT(header_write, header_sync);
+  EXPECT_LT(header_sync, active_dir_sync);
+  EXPECT_LT(active_dir_sync, transaction_write);
+
+  ASSERT_TRUE(wal.Reset().Ok());
+  std::filesystem::remove(path);
+}
+
+TEST(WalDurabilityTest, IndeterminateRotationDirectorySyncRequiresRecovery) {
+  const auto path = TestPath("wal_segment_rotation_sync_fails");
+  const auto archive = tinydb::Wal::SegmentPathFor(path, 1);
+  std::filesystem::remove(path);
+  std::filesystem::remove(archive);
+  auto wal = tinydb::Wal::Open(path, TEST_UUID, 1, 0, WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES).value();
+  const auto first = DataPage(2, 'a');
+  wal.AppendPageImage(2, first.data());
+  ASSERT_TRUE(Commit(wal).has_value());
+
+  auto renamed = false;
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      if (call.syscall == tinydb::io::Syscall::Rename && call.path == path) {
+        renamed = true;
+      } else if (renamed && call.syscall == tinydb::io::Syscall::Fsync && call.path == ParentPath(path)) {
+        return tinydb::io::Fault{.error = EIO};
+      }
+      return std::nullopt;
+    }};
+    const auto second = DataPage(3, 'b');
+    wal.AppendPageImage(3, second.data());
+    const auto failed = Commit(wal);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().Code(), tinydb::StatusCode::NeedsRecovery);
+  }
+  EXPECT_TRUE(renamed);
+
+  const auto second = DataPage(3, 'b');
+  wal.AppendPageImage(3, second.data());
+  const auto refused = Commit(wal);
+  ASSERT_FALSE(refused.has_value());
+  EXPECT_EQ(refused.error().Code(), tinydb::StatusCode::NeedsRecovery);
+
+  std::filesystem::remove(path);
+  std::filesystem::remove(archive);
+}
+
 TEST(WalTest, DiscardPendingDropsTheBufferedImages) {
   const auto path = TestPath("wal_discard");
   std::filesystem::remove(path);
@@ -324,7 +499,7 @@ TEST(WalDurabilityTest, CommitDoesNotAdvanceTailWhenWalFsyncFails) {
 
   const auto status = Commit(wal);
   ASSERT_FALSE(status.has_value());
-  EXPECT_EQ(status.error().Code(), tinydb::StatusCode::IoError);
+  EXPECT_EQ(status.error().Code(), tinydb::StatusCode::IndeterminateCommit);
   EXPECT_EQ(wal.SizeBytes(), WAL_HEADER_BYTES);
 
   const auto append = FindCall(calls, tinydb::io::Syscall::Pwrite, path);
@@ -332,6 +507,65 @@ TEST(WalDurabilityTest, CommitDoesNotAdvanceTailWhenWalFsyncFails) {
   ASSERT_NE(append, std::numeric_limits<std::size_t>::max());
   ASSERT_NE(sync, std::numeric_limits<std::size_t>::max());
 
+  tinydb::io::ClearTestHook();
+  wal.AppendPageImage(2, image.data());
+  const auto refused = Commit(wal);
+  ASSERT_FALSE(refused.has_value());
+  EXPECT_EQ(refused.error().Code(), tinydb::StatusCode::NeedsRecovery);
+
+  std::filesystem::remove(path);
+}
+
+TEST(WalDurabilityTest, AppendFailureRepairsTheKnownGoodTailAndPermitsAnotherCommit) {
+  const auto path = TestPath("wal_append_repair");
+  std::filesystem::remove(path);
+  auto wal = tinydb::Wal::Open(path, TEST_UUID).value();
+  const auto image = DataPage(2, 'x');
+  wal.AppendPageImage(2, image.data());
+
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      if (call.syscall == tinydb::io::Syscall::Pwrite && call.path == path) {
+        return tinydb::io::Fault{.error = EIO};
+      }
+      return std::nullopt;
+    }};
+    const auto failed = Commit(wal);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().Code(), tinydb::StatusCode::IoError);
+  }
+  EXPECT_EQ(std::filesystem::file_size(path), WAL_HEADER_BYTES);
+
+  wal.AppendPageImage(2, image.data());
+  EXPECT_TRUE(Commit(wal).has_value());
+  EXPECT_GT(wal.SizeBytes(), WAL_HEADER_BYTES);
+  std::filesystem::remove(path);
+}
+
+TEST(WalDurabilityTest, FailedTailRepairRequiresRecovery) {
+  const auto path = TestPath("wal_append_repair_fails");
+  std::filesystem::remove(path);
+  auto wal = tinydb::Wal::Open(path, TEST_UUID).value();
+  const auto image = DataPage(2, 'x');
+  wal.AppendPageImage(2, image.data());
+
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      if ((call.syscall == tinydb::io::Syscall::Pwrite || call.syscall == tinydb::io::Syscall::Ftruncate) &&
+          call.path == path) {
+        return tinydb::io::Fault{.error = EIO};
+      }
+      return std::nullopt;
+    }};
+    const auto failed = Commit(wal);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().Code(), tinydb::StatusCode::NeedsRecovery);
+  }
+
+  wal.AppendPageImage(2, image.data());
+  const auto refused = Commit(wal);
+  ASSERT_FALSE(refused.has_value());
+  EXPECT_EQ(refused.error().Code(), tinydb::StatusCode::NeedsRecovery);
   std::filesystem::remove(path);
 }
 

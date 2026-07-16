@@ -65,7 +65,7 @@ class ReaderGate final {
   auto operator=(const ReaderGate &) -> ReaderGate & = delete;
 
   auto BeginRead() -> SnapshotToken;
-  auto BeginPublication() -> PublicationGuard;
+  auto BeginPublication() noexcept -> PublicationGuard;
   auto CurrentState() const -> std::shared_ptr<const DatabaseState>;
   auto Stats() const -> ReaderGateStats;
 
@@ -89,10 +89,10 @@ class PublicationGuard final {
   ~PublicationGuard();
 
   auto CurrentState() const -> std::shared_ptr<const DatabaseState>;
-  void Publish(std::shared_ptr<const DatabaseState> state);
+  void Publish(std::shared_ptr<const DatabaseState> state) noexcept;
 
  private:
-  explicit PublicationGuard(std::shared_ptr<ReaderGateControl> control);
+  explicit PublicationGuard(std::shared_ptr<ReaderGateControl> control) noexcept;
   void Reopen() noexcept;
 
   std::shared_ptr<ReaderGateControl> control_;

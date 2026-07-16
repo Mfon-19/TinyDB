@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace tinydb {
@@ -73,6 +74,30 @@ struct CommittedPageImage {
   std::unique_ptr<PageBytes> bytes;
 };
 
+/*
+** A publication plan owns every allocation needed to install one transaction.
+** PreparePublication constructs frames and grows the dense page table before
+** WAL append. Publish consumes only already-owned objects and is noexcept.
+*/
+class PublicationPlan final {
+ public:
+  PublicationPlan(const PublicationPlan &) = delete;
+  auto operator=(const PublicationPlan &) -> PublicationPlan & = delete;
+  PublicationPlan(PublicationPlan &&) noexcept = default;
+  auto operator=(PublicationPlan &&) noexcept -> PublicationPlan & = default;
+
+ private:
+  PublicationPlan(std::vector<std::shared_ptr<CommittedFrame>> frames, std::vector<page_id_t> retired,
+                  page_id_t high_water_page_id)
+      : frames_(std::move(frames)), retired_(std::move(retired)), high_water_page_id_(high_water_page_id) {}
+
+  std::vector<std::shared_ptr<CommittedFrame>> frames_;
+  std::vector<page_id_t> retired_;
+  page_id_t high_water_page_id_{FIRST_DATA_PAGE_ID};
+
+  friend class CommittedPageCache;
+};
+
 struct CommittedCacheStats {
   std::size_t target_bytes{0};
   std::size_t resident_bytes{0};
@@ -84,7 +109,7 @@ struct CommittedCacheStats {
 
 /*
 ** Thread-safe cache for latest committed versions. Its mutex protects the
-** page table, LRU policy, and dirty index. Pin and checkpoint flags are atomic
+** dense page table and recency clock. Pin and checkpoint flags are atomic
 ** because guards release outside that mutex.
 */
 class CommittedPageCache final {
@@ -97,10 +122,9 @@ class CommittedPageCache final {
   // A miss validates the complete common page header before caching bytes.
   auto Read(page_id_t page_id) -> Result<PageGuard>;
 
-  // Installs the latest committed version. The cache may exceed its soft target
-  // while uncheckpointed pages are not eligible for eviction.
-  auto Install(CommittedPageImage image) -> Status;
-  void Retire(std::span<const page_id_t> page_ids);
+  auto PreparePublication(std::vector<CommittedPageImage> images, std::vector<page_id_t> retired,
+                          page_id_t high_water_page_id) -> Result<PublicationPlan>;
+  void Publish(PublicationPlan plan) noexcept;
 
   // The caller invokes this only after the database file and superblock make
   // every page through checkpoint_lsn durable.

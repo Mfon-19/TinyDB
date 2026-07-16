@@ -1,15 +1,20 @@
 #include <tinydb/check.h>
+#include <tinydb/disk_manager.h>
+#include <tinydb/limits.h>
 #include <tinydb/storage_engine.h>
 #include <tinydb/unique_fd.h>
+#include <tinydb/wal.h>
 
 #include "btree/b_plus_tree.h"
 #include "cache/committed_page_cache.h"
 #include "cache/committed_page_source.h"
 #include "io/syscalls.h"
+#include "txn/commit_coordinator.h"
 #include "txn/contract.h"
 #include "txn/database_state.h"
 #include "txn/read_snapshot.h"
 #include "txn/reader_gate.h"
+#include "txn/state.h"
 #include "txn/transaction_pages.h"
 
 #include <fcntl.h>
@@ -23,6 +28,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -37,29 +43,23 @@ namespace {
 /*
 ** STORAGE ENGINE COORDINATION
 **
-** The engine joins four state domains:
+** DatabaseCore owns every address borrowed by a transaction and therefore
+** survives StorageEngine moves. The four storage domains are:
 **
-**   TransactionPages       private, mutable, and discardable
-**   WAL                    durable state newer than the checkpoint
-**   CommittedPageCache     currently visible immutable page versions
+**   TransactionPages       private, mutable, discardable
+**   WAL                    committed state newer than the checkpoint
+**   CommittedPageCache     visible immutable page versions
 **   DiskManager            checkpointed file and published metadata
 **
-** A mutation follows this order:
+** Commit order is fixed:
 **
-**   acquire writer -> prepare private tree/allocator changes -> freeze
-**   -> encode final state -> append and fsync WAL -> drain old readers
-**   -> install pages and roots -> reopen reader admission -> optionally ckpt
+**   freeze structure -> assign exact commit LSN -> seal page bytes
+**   -> encode WAL transaction -> prepare cache/state ownership
+**   -> append and fsync WAL -> drain old readers -> publish noexcept
 **
-** Before WAL synchronization, every failure is a definite abort because no
-** shared state has changed. After synchronization the transaction is durable
-** and publication must complete. The current bridge still performs cache
-** installation after that point; Milestone 6 replaces it with a fully prepared
-** noexcept publication plan.
-**
-** Checkpoint writes visible dirty pages and matching superblocks to the
-** database file, fsyncs that file, and only then resets WAL. Close is resource
-** release plus a final checkpoint; successful mutations do not depend on it
-** for durability.
+** Every validation and allocation happens before WAL append. Once fsync proves
+** the COMMIT record durable, publication only transfers existing ownership and
+** replaces the one visible DatabaseState pointer.
 */
 constexpr std::size_t CACHE_TARGET_BYTES = 64 * PAGE_SIZE;
 constexpr std::size_t WRITE_TRANSACTION_LIMIT_BYTES = 16U << 20U;
@@ -84,9 +84,8 @@ auto SyncParentDirectory(const std::filesystem::path &path) -> Status {
   return {};
 }
 
-// Ownership is acquired before recovery because replay and WAL truncation are
-// writes. flock also rejects a second open file description in this process.
 auto AcquireDatabaseLock(const std::filesystem::path &path) -> Result<UniqueFd> {
+  // Ownership precedes recovery because replay and segment cleanup are writes.
   auto fd = UniqueFd(io::Open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
   if (!fd.Valid()) {
     return std::unexpected(ErrnoStatus("open"));
@@ -116,57 +115,344 @@ auto InitialState(const DiskManager &disk) -> std::shared_ptr<const txn::Databas
       .allocator_root_page_id = disk.GetAllocatorRootPageId(),
       .high_water_page_id = disk.HighWaterPageId(),
       .transaction_id = disk.TransactionId(),
-      // Open runs recovery first, so the database-file checkpoint is also the
-      // newest visible frontier when the in-memory reader gate is constructed.
       .visible_lsn = disk.CheckpointLsn(),
       .checkpoint_lsn = disk.CheckpointLsn(),
   });
 }
 
+auto LifecycleError(txn::DatabaseLifecycle lifecycle, txn::DatabaseOperation operation,
+                    std::size_t active_transactions = 0) -> Status {
+  const auto code = txn::StateStatus(lifecycle, operation, active_transactions);
+  switch (code) {
+    case StatusCode::Ok:
+      return {};
+    case StatusCode::Busy:
+      return Status::Busy("database has active transactions");
+    case StatusCode::NeedsRecovery:
+      return Status::NeedsRecovery("database must be reopened before further access");
+    case StatusCode::Corruption:
+      return Status::Corruption("database handle is in the corruption state");
+    case StatusCode::Closed:
+      return Status::Closed("operation on a closed database handle");
+    case StatusCode::IoError:
+    case StatusCode::UnsupportedFormat:
+    case StatusCode::InvalidArgument:
+    case StatusCode::ResourceExhausted:
+    case StatusCode::IndeterminateCommit:
+      TINYDB_CHECK(false, "database lifecycle produced a non-admission status");
+  }
+  TINYDB_CHECK(false, "unknown database lifecycle status");
+}
+
 }  // namespace
+
+namespace detail {
+
+class DatabaseCore final {
+ public:
+  DatabaseCore(std::filesystem::path database_path, UniqueFd database_lock, std::unique_ptr<DiskManager> database_file,
+               std::unique_ptr<cache::CommittedPageCache> page_cache,
+               std::unique_ptr<cache::CommittedPageSource> page_source, std::unique_ptr<txn::ReaderGate> reader_gate,
+               std::unique_ptr<Wal> write_ahead_log)
+      : path(std::move(database_path)),
+        lock_fd(std::move(database_lock)),
+        disk(std::move(database_file)),
+        cache(std::move(page_cache)),
+        pages(std::move(page_source)),
+        readers(std::move(reader_gate)),
+        wal(std::move(write_ahead_log)) {}
+
+  DatabaseCore(const DatabaseCore &) = delete;
+  auto operator=(const DatabaseCore &) -> DatabaseCore & = delete;
+
+  ~DatabaseCore() { ReleaseResources(); }
+
+  void ReleaseTransaction() noexcept {
+    auto lock = std::lock_guard(lifecycle_mutex);
+    TINYDB_CHECK(active_transactions != 0, "database transaction count underflow");
+    --active_transactions;
+  }
+
+  void NeedsRecovery() noexcept {
+    auto lock = std::lock_guard(lifecycle_mutex);
+    if (lifecycle == txn::DatabaseLifecycle::Open || lifecycle == txn::DatabaseLifecycle::CheckpointDegraded) {
+      lifecycle = txn::DatabaseLifecycle::NeedsRecovery;
+    }
+  }
+
+  auto Commit(txn::TransactionPages &transaction, BPlusTree &tree,
+              txn::TransactionState &transaction_state) -> Result<TransactionCommitInfo> {
+    auto coordinator = txn::CommitCoordinator(wal.get(), cache.get(), disk.get(), readers.get());
+    auto result = coordinator.Commit(transaction, tree, transaction_state);
+    if (!result && (result.error().Code() == StatusCode::IndeterminateCommit ||
+                    result.error().Code() == StatusCode::NeedsRecovery)) {
+      NeedsRecovery();
+    }
+    return result;
+  }
+
+  auto CheckpointLocked() -> Status {
+    /*
+    ** CHECKPOINT ORDER
+    **
+    **   extend file -> write captured dirty pages -> write superblocks
+    **   -> fsync database -> reset WAL -> mark frames checkpointed
+    **   -> publish advanced checkpoint frontier
+    **
+    ** Commit success never depends on this maintenance path. A failure leaves
+    ** WAL authoritative and moves the live handle to CheckpointDegraded.
+    */
+    const auto state = readers->CurrentState();
+    auto next = *state;
+    next.checkpoint_lsn = state->visible_lsn;
+    auto checkpointed_state = std::make_shared<const txn::DatabaseState>(std::move(next));
+    if (auto status = disk->EnsurePageCount(state->high_water_page_id); !status.Ok()) {
+      return status;
+    }
+    auto dirty = cache->DirtyPages();
+    for (const auto &page : dirty) {
+      if (auto status = disk->WritePage(page.Id(), page.Data().data()); !status.Ok()) {
+        return status;
+      }
+    }
+    disk->AdvanceCheckpoint(state->visible_lsn);
+    if (auto status = disk->Checkpoint(); !status.Ok()) {
+      return status;
+    }
+    if (auto status = disk->Sync(); !status.Ok()) {
+      return status;
+    }
+    if (auto status = wal->Reset(); !status.Ok()) {
+      return status;
+    }
+    cache->MarkCheckpointed(state->visible_lsn);
+    auto publication = readers->BeginPublication();
+    publication.Publish(std::move(checkpointed_state));
+    return {};
+  }
+
+  auto Close() -> Status {
+    auto lifecycle_lock = std::unique_lock(lifecycle_mutex);
+    if (lifecycle == txn::DatabaseLifecycle::Closed) {
+      return {};
+    }
+    if (active_transactions != 0) {
+      return Status::Busy("database has active transactions");
+    }
+
+    // Holding the lifecycle mutex prevents new admission while the writer
+    // permit and final checkpoint are acquired.
+    auto writer = std::unique_lock(writer_mutex);
+    if (lifecycle == txn::DatabaseLifecycle::Open || lifecycle == txn::DatabaseLifecycle::CheckpointDegraded) {
+      if (auto status = CheckpointLocked(); !status.Ok()) {
+        lifecycle = txn::DatabaseLifecycle::CheckpointDegraded;
+        return status;
+      }
+    }
+    lifecycle = txn::DatabaseLifecycle::Closed;
+    ReleaseResources();
+    return {};
+  }
+
+  void ReleaseResources() noexcept {
+    readers.reset();
+    pages.reset();
+    cache.reset();
+    disk.reset();
+    wal.reset();
+    lock_fd = UniqueFd{};
+  }
+
+  std::filesystem::path path;
+  mutable std::mutex lifecycle_mutex;
+  txn::DatabaseLifecycle lifecycle{txn::DatabaseLifecycle::Open};
+  std::size_t active_transactions{0};
+  std::mutex writer_mutex;
+
+  UniqueFd lock_fd;
+  std::unique_ptr<DiskManager> disk;
+  std::unique_ptr<cache::CommittedPageCache> cache;
+  std::unique_ptr<cache::CommittedPageSource> pages;
+  std::unique_ptr<txn::ReaderGate> readers;
+  std::unique_ptr<Wal> wal;
+};
+
+}  // namespace detail
+
+struct ReadTransaction::Impl final {
+  Impl(std::shared_ptr<detail::DatabaseCore> database, txn::ReadSnapshot read_snapshot)
+      : core(std::move(database)), snapshot(std::move(read_snapshot)) {}
+
+  ~Impl() { Release(); }
+
+  void Release() noexcept {
+    if (!active) {
+      return;
+    }
+    // Reader admission must be released before taking lifecycle_mutex. A new
+    // BeginRead may hold that mutex while waiting behind a pending publisher;
+    // reversing these two releases would make the publisher wait on us while
+    // we wait on the new reader.
+    snapshot.reset();
+    active = false;
+    core->ReleaseTransaction();
+  }
+
+  std::shared_ptr<detail::DatabaseCore> core;
+  std::optional<txn::ReadSnapshot> snapshot;
+  bool active{true};
+};
+
+struct WriteTransaction::Impl final {
+  Impl(std::shared_ptr<detail::DatabaseCore> database, std::unique_lock<std::mutex> writer_permit,
+       std::unique_ptr<txn::TransactionPages> private_pages, std::unique_ptr<BPlusTree> private_tree)
+      : core(std::move(database)),
+        writer(std::move(writer_permit)),
+        transaction(std::move(private_pages)),
+        tree(std::move(private_tree)) {}
+
+  ~Impl() { Abort(); }
+
+  void Release() noexcept {
+    if (!active) {
+      return;
+    }
+    active = false;
+    core->ReleaseTransaction();
+    if (writer.owns_lock()) {
+      writer.unlock();
+    }
+  }
+
+  void Abort() noexcept {
+    if (!active) {
+      return;
+    }
+    transaction->Abort();
+    state = txn::TransactionState::Aborted;
+    Release();
+  }
+
+  std::shared_ptr<detail::DatabaseCore> core;
+  std::unique_lock<std::mutex> writer;
+  std::unique_ptr<txn::TransactionPages> transaction;
+  std::unique_ptr<BPlusTree> tree;
+  txn::TransactionState state{txn::TransactionState::Active};
+  bool active{true};
+};
+
+ReadTransaction::ReadTransaction(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+ReadTransaction::ReadTransaction(ReadTransaction &&) noexcept = default;
+auto ReadTransaction::operator=(ReadTransaction &&) noexcept -> ReadTransaction & = default;
+ReadTransaction::~ReadTransaction() = default;
+
+auto ReadTransaction::Get(std::string_view key) -> Result<std::optional<std::string>> {
+  if (impl_ == nullptr || !impl_->active) {
+    return std::unexpected(Status::Closed("Get on an inactive read transaction"));
+  }
+  return impl_->snapshot->Get(key);
+}
+
+WriteTransaction::WriteTransaction(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+WriteTransaction::WriteTransaction(WriteTransaction &&) noexcept = default;
+auto WriteTransaction::operator=(WriteTransaction &&) noexcept -> WriteTransaction & = default;
+WriteTransaction::~WriteTransaction() = default;
+
+auto WriteTransaction::Get(std::string_view key) -> Result<std::optional<std::string>> {
+  if (impl_ == nullptr || !impl_->active) {
+    return std::unexpected(Status::Closed("Get on an inactive write transaction"));
+  }
+  return impl_->tree->Get(key);
+}
+
+auto WriteTransaction::Put(std::string_view key, std::string_view value) -> Status {
+  if (impl_ == nullptr || !impl_->active) {
+    return Status::Closed("Put on an inactive write transaction");
+  }
+  if (txn::ValidateKeySize(key.size()) != StatusCode::Ok || key.size() + value.size() > MAX_ENTRY_BYTES) {
+    return Status::InvalidArgument("key or value exceeds the current encoded entry limit");
+  }
+  auto status = impl_->transaction->ChargeValueBytes(value.size());
+  if (status.Ok()) {
+    status = impl_->tree->Put(key, value);
+  }
+  if (!status.Ok() && status.Code() != StatusCode::InvalidArgument) {
+    impl_->Abort();
+  }
+  return status;
+}
+
+auto WriteTransaction::Delete(std::string_view key) -> Status {
+  if (impl_ == nullptr || !impl_->active) {
+    return Status::Closed("Delete on an inactive write transaction");
+  }
+  if (txn::ValidateKeySize(key.size()) != StatusCode::Ok) {
+    return Status::InvalidArgument("key exceeds the maximum key size");
+  }
+  auto status = impl_->tree->Remove(key);
+  if (!status.Ok() && status.Code() != StatusCode::InvalidArgument) {
+    impl_->Abort();
+  }
+  return status;
+}
+
+auto WriteTransaction::Commit() -> Result<TransactionCommitInfo> {
+  if (impl_ == nullptr || !impl_->active) {
+    return std::unexpected(Status::Closed("Commit on an inactive write transaction"));
+  }
+  auto result = impl_->core->Commit(*impl_->transaction, *impl_->tree, impl_->state);
+  impl_->Release();
+  return result;
+}
+
+void WriteTransaction::Abort() noexcept {
+  if (impl_ != nullptr) {
+    impl_->Abort();
+  }
+}
 
 auto StorageEngine::Open(const std::filesystem::path &path) -> Result<StorageEngine> {
   /*
   ** OPEN ORDER
   **
-  ** Process ownership comes first because recovery mutates both database and
-  ** WAL. Recovery completes before DiskManager selects superblocks and before
-  ** any cache can retain page bytes. Only after all layers agree on one state
-  ** is the handle exposed to the caller.
+  ** Process ownership comes first. Recovery completes before DiskManager
+  ** selects superblocks and before any cache can retain page bytes.
   */
   auto lock = AcquireDatabaseLock(path);
   if (!lock) {
-    return std::unexpected(std::move(lock).error());
+    return std::unexpected(lock.error());
   }
-
-  // Recovery precedes normal decoders and cache construction because replay
-  // may replace either superblock and any data page.
   const auto wal_path = Wal::PathFor(path);
   if (auto status = Wal::Recover(path, wal_path); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   auto disk_result = DiskManager::Open(path);
   if (!disk_result) {
-    return std::unexpected(std::move(disk_result).error());
+    return std::unexpected(disk_result.error());
   }
   auto disk = std::make_unique<DiskManager>(*std::move(disk_result));
   auto cache = std::make_unique<cache::CommittedPageCache>(disk.get(), CACHE_TARGET_BYTES, disk->CheckpointLsn());
   auto pages = std::make_unique<cache::CommittedPageSource>(cache.get());
   auto readers = std::make_unique<txn::ReaderGate>(InitialState(*disk));
-
   auto wal_result = Wal::Open(wal_path, disk->Uuid(), disk->TransactionId() + 1, disk->CheckpointLsn() + 1);
   if (!wal_result) {
-    return std::unexpected(std::move(wal_result).error());
+    return std::unexpected(wal_result.error());
   }
   auto wal = std::make_unique<Wal>(*std::move(wal_result));
+  auto core = std::make_shared<detail::DatabaseCore>(path, std::move(*lock), std::move(disk), std::move(cache),
+                                                     std::move(pages), std::move(readers), std::move(wal));
+  auto engine = StorageEngine(std::move(core));
 
-  auto engine = StorageEngine(path, std::move(*lock), std::move(disk), std::move(cache), std::move(pages),
-                              std::move(readers), std::move(wal));
-  // A fresh empty root is published through the same private-page and WAL
-  // path as every later mutation; no unlogged bootstrap state is exposed.
-  if (engine.disk_->GetRootPageId() == HEADER_PAGE_ID) {
-    if (auto status = engine.Mutate(Mutation::Bootstrap); !status.Ok()) {
-      return std::unexpected(std::move(status));
+  // Bootstrap allocates the first root through the same public write path as
+  // every application transaction.
+  if (engine.core_->disk->GetRootPageId() == HEADER_PAGE_ID) {
+    auto transaction = engine.BeginWrite();
+    if (!transaction) {
+      return std::unexpected(transaction.error());
+    }
+    const auto committed = transaction->Commit();
+    if (!committed) {
+      return std::unexpected(committed.error());
     }
   }
   if (auto status = engine.CheckIntegrity(); !status.Ok()) {
@@ -175,117 +461,130 @@ auto StorageEngine::Open(const std::filesystem::path &path) -> Result<StorageEng
   return engine;
 }
 
-StorageEngine::StorageEngine(std::filesystem::path path, UniqueFd lock_fd, std::unique_ptr<DiskManager> disk,
-                             std::unique_ptr<cache::CommittedPageCache> cache,
-                             std::unique_ptr<cache::CommittedPageSource> pages,
-                             std::unique_ptr<txn::ReaderGate> readers, std::unique_ptr<Wal> wal)
-    : path_(std::move(path)),
-      lock_fd_(std::move(lock_fd)),
-      disk_(std::move(disk)),
-      cache_(std::move(cache)),
-      pages_(std::move(pages)),
-      readers_(std::move(readers)),
-      wal_(std::move(wal)),
-      writer_mutex_(std::make_unique<std::mutex>()) {}
-
-StorageEngine::StorageEngine(StorageEngine &&other) noexcept
-    : path_(std::move(other.path_)),
-      closed_(other.closed_),
-      poisoned_(other.poisoned_),
-      lock_fd_(std::move(other.lock_fd_)),
-      disk_(std::move(other.disk_)),
-      cache_(std::move(other.cache_)),
-      pages_(std::move(other.pages_)),
-      readers_(std::move(other.readers_)),
-      wal_(std::move(other.wal_)),
-      writer_mutex_(std::move(other.writer_mutex_)) {
-  other.closed_ = true;
-}
-
 StorageEngine::~StorageEngine() { CloseBestEffort(); }
 
 void StorageEngine::CloseBestEffort() noexcept {
-  if (const auto status = Close(); !status.Ok()) {
-    std::fprintf(stderr, "tinydb: failed to close %s: %s\n", path_.c_str(), status.ToString().c_str());
+  if (core_ == nullptr) {
+    return;
+  }
+  if (const auto status = Close(); !status.Ok() && status.Code() != StatusCode::Busy) {
+    std::fprintf(stderr, "tinydb: failed to close %s: %s\n", core_->path.c_str(), status.ToString().c_str());
   }
 }
 
-auto StorageEngine::operator=(StorageEngine &&other) noexcept -> StorageEngine & {
-  if (this == &other) {
-    return *this;
+auto StorageEngine::BeginRead() -> Result<ReadTransaction> {
+  if (core_ == nullptr) {
+    return std::unexpected(Status::Closed("BeginRead on a moved-from database"));
   }
-  CloseBestEffort();
-  readers_.reset();
-  pages_.reset();
-  cache_.reset();
-  disk_.reset();
-  wal_.reset();
+  auto lock = std::lock_guard(core_->lifecycle_mutex);
+  if (auto status = LifecycleError(core_->lifecycle, txn::DatabaseOperation::Read); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
+  auto snapshot = txn::ReadSnapshot::Begin(core_->readers.get(), core_->pages.get());
+  auto impl = std::make_unique<ReadTransaction::Impl>(core_, std::move(snapshot));
+  ++core_->active_transactions;
+  return ReadTransaction(std::move(impl));
+}
 
-  path_ = std::move(other.path_);
-  closed_ = other.closed_;
-  poisoned_ = other.poisoned_;
-  lock_fd_ = std::move(other.lock_fd_);
-  disk_ = std::move(other.disk_);
-  cache_ = std::move(other.cache_);
-  pages_ = std::move(other.pages_);
-  readers_ = std::move(other.readers_);
-  wal_ = std::move(other.wal_);
-  writer_mutex_ = std::move(other.writer_mutex_);
-  other.closed_ = true;
-  return *this;
+auto StorageEngine::BeginWrite() -> Result<WriteTransaction> {
+  if (core_ == nullptr) {
+    return std::unexpected(Status::Closed("BeginWrite on a moved-from database"));
+  }
+  auto lifecycle_lock = std::lock_guard(core_->lifecycle_mutex);
+  if (auto status = LifecycleError(core_->lifecycle, txn::DatabaseOperation::Write); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
+  auto writer = std::unique_lock(core_->writer_mutex, std::try_to_lock);
+  if (!writer.owns_lock()) {
+    return std::unexpected(Status::Busy("another write transaction is active"));
+  }
+
+  /*
+  ** CHECKPOINT BEFORE THE NEXT WRITE
+  **
+  ** Maintenance never runs between WAL durability and returning CommitInfo.
+  ** If the retained log crossed its target, the next writer attempts a
+  ** checkpoint while it is still in a definite pre-transaction region.
+  */
+  if (core_->wal->SizeBytes() > CHECKPOINT_THRESHOLD_BYTES) {
+    const auto checkpoint = core_->CheckpointLocked();
+    if (checkpoint.Code() == StatusCode::NeedsRecovery || checkpoint.Code() == StatusCode::IndeterminateCommit) {
+      core_->lifecycle = txn::DatabaseLifecycle::NeedsRecovery;
+      return std::unexpected(checkpoint);
+    }
+    core_->lifecycle = checkpoint.Ok() ? txn::DatabaseLifecycle::Open : txn::DatabaseLifecycle::CheckpointDegraded;
+  }
+
+  const auto base = core_->readers->CurrentState();
+  auto transaction = txn::TransactionPages::Begin(core_->pages.get(), *base, WRITE_TRANSACTION_LIMIT_BYTES);
+  if (!transaction) {
+    return std::unexpected(transaction.error());
+  }
+  auto private_pages = std::make_unique<txn::TransactionPages>(std::move(*transaction));
+  auto root_page_id = base->root_page_id;
+  if (root_page_id == HEADER_PAGE_ID) {
+    auto root = private_pages->Allocate();
+    if (!root) {
+      private_pages->Abort();
+      return std::unexpected(root.error());
+    }
+    root_page_id = root->Id();
+    root = PageHandle{};
+  }
+  auto tree = BPlusTree::Open(private_pages.get(), root_page_id);
+  if (!tree) {
+    private_pages->Abort();
+    return std::unexpected(tree.error());
+  }
+  auto private_tree = std::make_unique<BPlusTree>(std::move(*tree));
+  auto impl = std::make_unique<WriteTransaction::Impl>(core_, std::move(writer), std::move(private_pages),
+                                                       std::move(private_tree));
+  ++core_->active_transactions;
+  return WriteTransaction(std::move(impl));
 }
 
 auto StorageEngine::Put(std::string_view key, std::string_view value) -> Status {
-  if (closed_) {
-    return Status::Closed("Put on a closed handle");
+  auto transaction = BeginWrite();
+  if (!transaction) {
+    return transaction.error();
   }
-  if (poisoned_) {
-    return Status::Closed("Put on a poisoned handle; reopen to recover");
+  if (auto status = transaction->Put(key, value); !status.Ok()) {
+    return status;
   }
-  if (key.size() + value.size() > MAX_ENTRY_BYTES) {
-    return Status::InvalidArgument("key + value exceeds MAX_ENTRY_BYTES");
-  }
-  return Mutate(Mutation::Put, key, value);
+  const auto committed = transaction->Commit();
+  return committed ? Status{} : committed.error();
 }
 
 auto StorageEngine::Get(std::string_view key) -> Result<std::optional<std::string>> {
-  if (closed_) {
-    return std::unexpected(Status::Closed("Get on a closed handle"));
+  auto transaction = BeginRead();
+  if (!transaction) {
+    return std::unexpected(transaction.error());
   }
-  if (poisoned_) {
-    return std::unexpected(Status::Closed("Get on a poisoned handle; reopen to recover"));
-  }
-  // Admission captures root and visibility frontier before tree descent.
-  auto snapshot = txn::ReadSnapshot::Begin(readers_.get(), pages_.get());
-  return snapshot.Get(key);
+  return transaction->Get(key);
 }
 
 auto StorageEngine::Remove(std::string_view key) -> Status {
-  if (closed_) {
-    return Status::Closed("Remove on a closed handle");
+  auto transaction = BeginWrite();
+  if (!transaction) {
+    return transaction.error();
   }
-  if (poisoned_) {
-    return Status::Closed("Remove on a poisoned handle; reopen to recover");
+  if (auto status = transaction->Delete(key); !status.Ok()) {
+    return status;
   }
-  return Mutate(Mutation::Remove, key);
+  const auto committed = transaction->Commit();
+  return committed ? Status{} : committed.error();
 }
 
 auto StorageEngine::Scan(std::string_view start,
                          std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>> {
-  if (closed_) {
-    return std::unexpected(Status::Closed("Scan on a closed handle"));
+  auto transaction = BeginRead();
+  if (!transaction) {
+    return std::unexpected(transaction.error());
   }
-  if (poisoned_) {
-    return std::unexpected(Status::Closed("Scan on a poisoned handle; reopen to recover"));
-  }
-
-  auto snapshot = txn::ReadSnapshot::Begin(readers_.get(), pages_.get());
-  auto cursor = snapshot.Seek(start);
+  auto cursor = transaction->impl_->snapshot->Seek(start);
   if (!cursor) {
-    return std::unexpected(std::move(cursor).error());
+    return std::unexpected(cursor.error());
   }
-  // The public compatibility API materializes rows, but traversal itself is a
-  // streaming snapshot cursor and retains only one leaf page at a time.
   auto rows = std::vector<std::pair<std::string, std::string>>{};
   const auto less = txn::BytewiseLess{};
   while (cursor->Valid() && less(cursor->Key(), end)) {
@@ -298,19 +597,14 @@ auto StorageEngine::Scan(std::string_view start,
 }
 
 auto StorageEngine::CheckIntegrity() -> Status {
-  if (closed_) {
-    return Status::Closed("CheckIntegrity on a closed handle");
+  auto read = BeginRead();
+  if (!read) {
+    return read.error();
   }
-  if (poisoned_) {
-    return Status::Closed("CheckIntegrity on a poisoned handle; reopen to recover");
-  }
-
-  // Decode the allocator through TransactionPages so verification and normal
-  // allocation share one interpretation of free extents and metadata pages.
-  const auto state = readers_->CurrentState();
-  auto transaction = txn::TransactionPages::Begin(pages_.get(), *state, WRITE_TRANSACTION_LIMIT_BYTES);
+  const auto &state = read->impl_->snapshot->State();
+  auto transaction = txn::TransactionPages::Begin(core_->pages.get(), state, WRITE_TRANSACTION_LIMIT_BYTES);
   if (!transaction) {
-    return std::move(transaction).error();
+    return transaction.error();
   }
   auto free_pages = std::unordered_set<page_id_t>{};
   for (const auto &extent : transaction->FreeExtents()) {
@@ -320,203 +614,15 @@ auto StorageEngine::CheckIntegrity() -> Status {
   }
   const auto allocator_pages =
       std::unordered_set<page_id_t>(transaction->AllocatorPageIds().begin(), transaction->AllocatorPageIds().end());
-  return BPlusTree::CheckIntegrity(pages_.get(), state->root_page_id, state->high_water_page_id, free_pages,
+  return BPlusTree::CheckIntegrity(core_->pages.get(), state.root_page_id, state.high_water_page_id, free_pages,
                                    allocator_pages);
 }
 
-auto StorageEngine::Mutate(Mutation mutation, std::string_view key, std::string_view value) -> Status {
-  /*
-  ** PREPARE PRIVATE STATE
-  **
-  ** writer_mutex_ admits one mutable overlay. Readers remain admitted and see
-  ** base while all tree splits, merges, root changes, and allocator updates are
-  ** confined to TransactionPages.
-  */
-  auto writer = std::lock_guard(*writer_mutex_);
-  // Readers remain admitted during preparation and continue seeing base while
-  // every B+ tree and allocator change lives in the private overlay.
-  const auto base = readers_->CurrentState();
-  auto transaction = txn::TransactionPages::Begin(pages_.get(), *base, WRITE_TRANSACTION_LIMIT_BYTES);
-  if (!transaction) {
-    return std::move(transaction).error();
-  }
-
-  auto root_page_id = base->root_page_id;
-  if (root_page_id == HEADER_PAGE_ID) {
-    // Fresh database bootstrap is an ordinary private allocation. Releasing
-    // the handle before BPlusTree::Open satisfies its edit-lease discipline.
-    auto root = transaction->Allocate();
-    if (!root) {
-      transaction->Abort();
-      return std::move(root).error();
-    }
-    root_page_id = root->Id();
-    root = PageHandle{};
-  }
-  auto tree = BPlusTree::Open(&*transaction, root_page_id);
-  if (!tree) {
-    transaction->Abort();
-    return std::move(tree).error();
-  }
-
-  auto status = Status{};
-  if (mutation == Mutation::Put) {
-    status = transaction->ChargeValueBytes(value.size());
-    if (status.Ok()) {
-      status = tree->Put(key, value);
-    }
-  } else if (mutation == Mutation::Remove) {
-    status = tree->Remove(key);
-  }
-  if (!status.Ok()) {
-    transaction->Abort();
-    return status;
-  }
-  transaction->SetRootPageId(tree->RootPageId());
-  if (status = transaction->Freeze(base->visible_lsn + 1); !status.Ok()) {
-    transaction->Abort();
-    return status;
-  }
-  if (!transaction->HasChanges()) {
-    // Removing a missing key produces no WAL traffic or visibility event.
-    return {};
-  }
-
-  /*
-  ** BUILD FINAL IMAGES
-  **
-  ** Everything through Freeze is a definite-abort region. No shared page,
-  ** root, frontier, or free extent has changed if one of those steps fails.
-  ** The resulting logical DatabaseState is logged beside the final data pages;
-  ** transaction commit never manufactures a checkpoint superblock.
-  */
-  auto state = transaction->ResultingState();
-  auto retired = std::vector<page_id_t>(transaction->RetiredPageIds().begin(), transaction->RetiredPageIds().end());
-  auto committed_pages = transaction->TakePages(state.transaction_id);
-  if (!committed_pages) {
-    return std::move(committed_pages).error();
-  }
-
-  /*
-  ** MAKE DURABLE
-  **
-  ** PAGE_IMAGE records contain only final data pages. DATABASE_STATE carries
-  ** the roots and allocation frontier, and COMMIT binds both into one ordered
-  ** transaction. None of those bytes can become visible before WAL sync.
-  */
-  for (const auto &page : *committed_pages) {
-    wal_->AppendPageImage(page.page_id, page.bytes->data());
-  }
-  const auto commit = wal_->Commit(state);
-  if (!commit) {
-    Poison();
-    return commit.error();
-  }
-  TINYDB_CHECK(commit->transaction_id == state.transaction_id, "WAL assigned an unexpected transaction ID");
-  state.visible_lsn = commit->commit_lsn;
-  auto published_state = std::make_shared<const txn::DatabaseState>(state);
-
-  {
-    /*
-    ** PUBLISH
-    **
-    ** Closing admission drains every reader of base. Cache replacement,
-    ** retirement, DiskManager metadata adoption, and root replacement then
-    ** occur while no reader can begin or remain active. Publish performs the
-    ** one DatabaseState pointer replacement that makes the transaction visible.
-    */
-    auto publication = readers_->BeginPublication();
-    for (auto &page : *committed_pages) {
-      const auto installed = cache_->Install(std::move(page));
-      TINYDB_CHECK(installed.Ok(), "durable page failed committed-cache installation");
-    }
-    cache_->Retire(retired);
-    disk_->AdoptState(state.root_page_id, state.allocator_root_page_id, state.high_water_page_id, state.transaction_id,
-                      state.checkpoint_lsn);
-    publication.Publish(std::move(published_state));
-  }
-
-  if (wal_->SizeBytes() > CHECKPOINT_THRESHOLD_BYTES) {
-    if (auto checkpoint = Checkpoint(); !checkpoint.Ok()) {
-      Poison();
-      return checkpoint;
-    }
-  }
-  return {};
-}
-
-auto StorageEngine::Checkpoint() -> Status {
-  /*
-  ** CHECKPOINT ORDER
-  **
-  **   extend file -> write dirty committed pages -> write both superblocks
-  **   -> fsync database -> reset and fsync WAL -> mark frames checkpointed
-  **   -> publish the advanced checkpoint frontier
-  **
-  ** Any failure before WAL reset leaves the WAL authoritative and retryable.
-  ** Resetting it before database synchronization would lose the only durable
-  ** copy of newer page versions after a crash.
-  */
-  const auto state = readers_->CurrentState();
-  auto next = *state;
-  next.checkpoint_lsn = state->visible_lsn;
-  auto checkpointed_state = std::make_shared<const txn::DatabaseState>(std::move(next));
-  // Materialize pages before either mirrored superblock advertises the new
-  // checkpoint. The WAL remains authoritative until the final file sync.
-  if (auto status = disk_->EnsurePageCount(state->high_water_page_id); !status.Ok()) {
-    return status;
-  }
-  auto pages = cache_->DirtyPages();
-  for (const auto &page : pages) {
-    if (auto status = disk_->WritePage(page.Id(), page.Data().data()); !status.Ok()) {
-      return status;
-    }
-  }
-  disk_->AdvanceCheckpoint(state->visible_lsn);
-  if (auto status = disk_->Checkpoint(); !status.Ok()) {
-    return status;
-  }
-  if (auto status = disk_->Sync(); !status.Ok()) {
-    return status;
-  }
-  if (auto status = wal_->Reset(); !status.Ok()) {
-    return status;
-  }
-  cache_->MarkCheckpointed(state->visible_lsn);
-  auto publication = readers_->BeginPublication();
-  publication.Publish(std::move(checkpointed_state));
-  return {};
-}
-
-void StorageEngine::Poison() {
-  // The temporary single-operation path cannot classify or repair every
-  // post-append failure. Refuse further work so reopen can recover durable WAL.
-  poisoned_ = true;
-  wal_->DiscardPending();
-}
-
 auto StorageEngine::Close() -> Status {
-  if (!disk_) {
+  if (core_ == nullptr) {
     return {};
   }
-  // Serialize with mutation so destruction cannot tear down borrowed layers
-  // while a private transaction is preparing or publishing.
-  auto writer = std::lock_guard(*writer_mutex_);
-  closed_ = true;
-
-  if (!poisoned_) {
-    if (auto status = Checkpoint(); !status.Ok()) {
-      return status;
-    }
-  }
-  // Release borrowers before owners, then drop the process lock last.
-  readers_.reset();
-  pages_.reset();
-  cache_.reset();
-  disk_.reset();
-  wal_.reset();
-  lock_fd_ = UniqueFd{};
-  return {};
+  return core_->Close();
 }
 
 }  // namespace tinydb

@@ -12,6 +12,14 @@
 
 namespace tinydb::txn {
 
+namespace {
+
+// The provisional value sorts after every real LSN, so coalescing a newly
+// retired page with an older extent cannot accidentally make it reusable.
+constexpr auto PENDING_COMMIT_LSN = std::numeric_limits<std::uint64_t>::max();
+
+}  // namespace
+
 /*
 ** Open a write overlay on one immutable base state. The allocator index is
 ** decoded eagerly so corruption is reported before callers begin modifying
@@ -342,14 +350,14 @@ auto TransactionPages::StoreFreeExtentIndex(std::uint64_t page_lsn) -> Status {
   return {};
 }
 
-auto TransactionPages::Freeze(std::uint64_t retire_lsn) -> Status {
+auto TransactionPages::Freeze() -> Status {
   RequireActive();
   RequireUnpinned();
   // Allocator serialization comes first because it can add metadata pages and
   // advance the resulting high-water frontier.
   if (allocator_dirty_) {
-    AddRetiredExtents(retire_lsn);
-    if (auto status = StoreFreeExtentIndex(retire_lsn); !status.Ok()) {
+    AddRetiredExtents(PENDING_COMMIT_LSN);
+    if (auto status = StoreFreeExtentIndex(PENDING_COMMIT_LSN); !status.Ok()) {
       return status;
     }
   }
@@ -362,22 +370,48 @@ auto TransactionPages::Freeze(std::uint64_t retire_lsn) -> Status {
                        !retired_page_ids_.empty();
   if (changed) {
     resulting_state_.transaction_id = base_state_.transaction_id + 1;
-    resulting_state_.visible_lsn = retire_lsn;
   }
-  // Sealing the LSN changes checksummed bytes, so every final dirty image is
-  // finalized again after its commit frontier is known.
+  frozen_ = true;
+  return {};
+}
+
+auto TransactionPages::Seal(std::uint64_t commit_lsn) -> Status {
+  TINYDB_CHECK(frozen_ && !sealed_ && !aborted_, "sealing a transaction outside its frozen state");
+  TINYDB_CHECK(commit_lsn != 0 && commit_lsn != PENDING_COMMIT_LSN, "sealing an invalid commit LSN");
+  RequireUnpinned();
+
+  const auto page_count = pages_.size();
+  const auto high_water = resulting_state_.high_water_page_id;
+  if (allocator_dirty_) {
+    for (auto &extent : free_extents_) {
+      if (extent.retire_lsn == PENDING_COMMIT_LSN) {
+        extent.retire_lsn = commit_lsn;
+      }
+    }
+    if (auto status = StoreFreeExtentIndex(commit_lsn); !status.Ok()) {
+      return status;
+    }
+    // Freeze already allocated every allocator frame. A change here would make
+    // the previously computed commit LSN circular and is an internal bug.
+    TINYDB_CHECK(pages_.size() == page_count && resulting_state_.high_water_page_id == high_water,
+                 "sealing changed the frozen transaction page set");
+  }
+
+  // Page LSNs and their checksums are the final bytes consumed by both WAL and
+  // the prepared cache frames.
   for (auto &[page_id, page] : pages_) {
     if (!page->dirty || retired_page_ids_.contains(page_id)) {
       continue;
     }
     if (auto status = storage::RewriteDataPageLsn(std::as_writable_bytes(std::span<char, PAGE_SIZE>(*page->bytes)),
-                                                  page_id, retire_lsn);
+                                                  page_id, commit_lsn);
         !status.Ok()) {
       return status;
     }
   }
+  resulting_state_.visible_lsn = commit_lsn;
   RequireUnpinned();
-  frozen_ = true;
+  sealed_ = true;
   return {};
 }
 
@@ -398,13 +432,19 @@ auto TransactionPages::HasChanges() const -> bool {
   return resulting_state_ != base_state_;
 }
 
+auto TransactionPages::FinalPageCount() const -> std::size_t {
+  TINYDB_CHECK(frozen_, "counting transaction pages before freeze");
+  return std::ranges::count_if(
+      pages_, [this](const auto &entry) { return entry.second->dirty && !retired_page_ids_.contains(entry.first); });
+}
+
 auto TransactionPages::ResultingState() const -> const DatabaseState & {
   TINYDB_CHECK(frozen_, "reading transaction state before freeze");
   return resulting_state_;
 }
 
 auto TransactionPages::PageImages() const -> std::vector<std::pair<page_id_t, const char *>> {
-  TINYDB_CHECK(frozen_, "reading transaction pages before freeze");
+  TINYDB_CHECK(sealed_, "reading transaction pages before seal");
   // Stable ordering makes WAL construction deterministic and lets a commit
   // digest bind one unambiguous physical transaction representation.
   auto result = std::vector<std::pair<page_id_t, const char *>>{};
@@ -419,7 +459,7 @@ auto TransactionPages::PageImages() const -> std::vector<std::pair<page_id_t, co
 }
 
 auto TransactionPages::TakePages(std::uint64_t transaction_id) -> Result<std::vector<cache::CommittedPageImage>> {
-  TINYDB_CHECK(frozen_, "taking transaction pages before freeze");
+  TINYDB_CHECK(sealed_, "taking transaction pages before seal");
   RequireUnpinned();
   auto result = std::vector<cache::CommittedPageImage>{};
   result.reserve(pages_.size());
