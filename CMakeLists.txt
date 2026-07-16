@@ -98,7 +98,11 @@ add_library(
   src/cache/committed_page_source.cpp
   src/cache/committed_page_source.h
   src/engine/storage_engine.cpp
+  src/io/file_io.cpp
+  src/io/file_io.h
   src/io/syscalls.h
+  src/recovery/recovery.cpp
+  src/recovery/recovery.h
   src/storage/disk_manager.cpp
   src/storage/encoding.h
   src/storage/page_codec.cpp

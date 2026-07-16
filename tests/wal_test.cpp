@@ -5,6 +5,7 @@
 #include <tinydb/wal.h>
 
 #include "io/syscalls.h"
+#include "recovery/recovery.h"
 #include "storage/page_codec.h"
 #include "storage/superblock.h"
 #include "txn/database_state.h"
@@ -21,6 +22,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -147,6 +149,32 @@ static void FlipByteAt(const std::filesystem::path &path, std::uint64_t offset) 
   file.get(byte);
   file.seekp(static_cast<std::streamoff>(offset));
   file.put(static_cast<char>(byte ^ 0x1));
+}
+
+static void BreakTransactionDigestButKeepRecordChecksum(const std::filesystem::path &path,
+                                                        std::uint64_t commit_offset) {
+  /*
+  ** A raw bit flip is rejected while segment framing is scanned.  Re-encoding
+  ** the changed COMMIT record preserves its record checksum while breaking
+  ** the digest over preceding transaction records.  Recovery can discover
+  ** this defect only when it authenticates the complete transaction, which
+  ** makes it the regression case for the write-free first pass.
+  */
+  auto file_bytes = ReadWholeFile(path);
+  auto record = tinydb::wal_format::DecodeRecord(
+      std::as_bytes(std::span{file_bytes}).subspan(commit_offset, COMMIT_RECORD_BYTES));
+  ASSERT_TRUE(record.has_value());
+  ASSERT_EQ(record->type, tinydb::wal_format::RecordType::Commit);
+  record->payload[tinydb::wal_format::COMMIT_TRANSACTION_DIGEST_OFFSET] ^= std::byte{1};
+  auto encoded = tinydb::wal_format::EncodeRecord(record->type, record->transaction_id, record->lsn,
+                                                  record->record_sequence, record->payload);
+  ASSERT_TRUE(encoded.has_value());
+  ASSERT_EQ(encoded->size(), COMMIT_RECORD_BYTES);
+
+  std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+  file.seekp(static_cast<std::streamoff>(commit_offset));
+  file.write(encoded->data(), static_cast<std::streamsize>(encoded->size()));
+  ASSERT_TRUE(file.good());
 }
 
 TEST(WalTest, PathForAppendsWalSuffix) {
@@ -326,7 +354,7 @@ TEST(WalTest, RecoveryReplaysAndRemovesAnOrderedSegmentSequence) {
   }
   ASSERT_TRUE(std::filesystem::exists(archive));
 
-  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  ASSERT_TRUE(tinydb::recovery::Recover(db_path, wal_path).Ok());
   const auto database = ReadWholeFile(db_path);
   EXPECT_EQ(database.substr(2 * tinydb::PAGE_SIZE, tinydb::PAGE_SIZE), std::string(first.data(), first.size()));
   EXPECT_EQ(database.substr(3 * tinydb::PAGE_SIZE, tinydb::PAGE_SIZE), std::string(second.data(), second.size()));
@@ -358,7 +386,7 @@ TEST(WalTest, RecoveryRejectsAMissingSegmentAfterTheCheckpoint) {
   ASSERT_TRUE(std::filesystem::exists(second_archive));
   std::filesystem::remove(first_archive);
 
-  const auto status = tinydb::Wal::Recover(db_path, wal_path);
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
   EXPECT_EQ(status.Code(), tinydb::StatusCode::Corruption);
 
   std::filesystem::remove(db_path);
@@ -574,7 +602,7 @@ TEST(WalTest, RecoverIsANoOpWithoutALog) {
   const auto wal_path = tinydb::Wal::PathFor(db_path);
   std::filesystem::remove(wal_path);
 
-  EXPECT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  EXPECT_TRUE(tinydb::recovery::Recover(db_path, wal_path).Ok());
   EXPECT_FALSE(std::filesystem::exists(wal_path));
 }
 
@@ -596,16 +624,27 @@ TEST(WalTest, RecoverAppliesCommittedRuns) {
     ASSERT_TRUE(Commit(wal).has_value());
   }
 
-  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  ASSERT_TRUE(tinydb::recovery::Recover(db_path, wal_path).Ok());
 
   const auto db = ReadWholeFile(db_path);
   ASSERT_EQ(db.size(), 4 * tinydb::PAGE_SIZE);
-  const auto recovered_state =
-      tinydb::storage::DecodeSuperblock(std::as_bytes(std::span{db.data(), tinydb::PAGE_SIZE}));
+  const auto page_a = std::as_bytes(std::span{db.data(), tinydb::PAGE_SIZE});
+  const auto page_b = std::as_bytes(std::span{db.data() + tinydb::PAGE_SIZE, tinydb::PAGE_SIZE});
+  const auto recovered_state = tinydb::storage::SelectSuperblock(page_a, page_b);
   ASSERT_TRUE(recovered_state.has_value());
-  EXPECT_EQ(recovered_state->database_uuid, TEST_UUID);
-  EXPECT_EQ(recovered_state->transaction_id, 2U);
-  EXPECT_EQ(recovered_state->checkpoint_lsn, 7U);
+  EXPECT_EQ(recovered_state->slot, tinydb::storage::SuperblockSlot::B);
+  EXPECT_EQ(recovered_state->value.database_uuid, TEST_UUID);
+  EXPECT_EQ(recovered_state->value.generation, 2U);
+  EXPECT_EQ(recovered_state->value.transaction_id, 2U);
+  EXPECT_EQ(recovered_state->value.checkpoint_lsn, 7U);
+
+  // Recovery advances only the inactive slot.  Until B is durable, A remains
+  // the complete previous recovery basis; rewriting both would destroy that
+  // atomic generation switch.
+  const auto previous_state = tinydb::storage::DecodeSuperblock(page_a);
+  ASSERT_TRUE(previous_state.has_value());
+  EXPECT_EQ(previous_state->generation, 1U);
+  EXPECT_EQ(previous_state->checkpoint_lsn, 0U);
   EXPECT_EQ(db.substr(2 * tinydb::PAGE_SIZE, tinydb::PAGE_SIZE),
             std::string(expected_second.data(), expected_second.size()));
   EXPECT_EQ(db.substr(3 * tinydb::PAGE_SIZE, tinydb::PAGE_SIZE),
@@ -615,7 +654,7 @@ TEST(WalTest, RecoverAppliesCommittedRuns) {
   EXPECT_EQ(std::filesystem::file_size(wal_path), WAL_HEADER_BYTES);
 
   // Idempotent: a second pass has nothing to do and changes nothing.
-  EXPECT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  EXPECT_TRUE(tinydb::recovery::Recover(db_path, wal_path).Ok());
   EXPECT_EQ(ReadWholeFile(db_path), db);
 
   std::filesystem::remove(db_path);
@@ -641,7 +680,7 @@ TEST(WalDurabilityTest, RecoverSyncsDatabaseBeforeTruncatingWal) {
       calls.push_back(call);
       return std::nullopt;
     }};
-    ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+    ASSERT_TRUE(tinydb::recovery::Recover(db_path, wal_path).Ok());
   }
 
   const auto db_write = FindCall(calls, tinydb::io::Syscall::Pwrite, db_path);
@@ -682,7 +721,7 @@ TEST(WalDurabilityTest, RecoverLeavesWalIntactWhenDatabaseFsyncFails) {
     return std::nullopt;
   }};
 
-  const auto status = tinydb::Wal::Recover(db_path, wal_path);
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
   EXPECT_EQ(status.Code(), tinydb::StatusCode::IoError);
   EXPECT_EQ(std::filesystem::file_size(wal_path), wal_size_before);
 
@@ -690,7 +729,7 @@ TEST(WalDurabilityTest, RecoverLeavesWalIntactWhenDatabaseFsyncFails) {
   std::filesystem::remove(wal_path);
 }
 
-TEST(WalTest, RecoverCanRebuildMissingDatabaseFromCommittedImages) {
+TEST(WalTest, RecoverRefusesToTreatWalAsABackupForAMissingDatabase) {
   const auto db_path = TestPath("recover_missing_db");
   const auto wal_path = tinydb::Wal::PathFor(db_path);
   std::filesystem::remove(db_path);
@@ -704,30 +743,21 @@ TEST(WalTest, RecoverCanRebuildMissingDatabaseFromCommittedImages) {
     ASSERT_TRUE(Commit(wal, 3).has_value());
   }
 
-  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
-
-  const auto db = ReadWholeFile(db_path);
-  ASSERT_EQ(db.size(), 3 * tinydb::PAGE_SIZE);
-  const auto superblock_a = tinydb::storage::DecodeSuperblock(std::as_bytes(std::span{db.data(), tinydb::PAGE_SIZE}));
-  const auto superblock_b =
-      tinydb::storage::DecodeSuperblock(std::as_bytes(std::span{db.data() + tinydb::PAGE_SIZE, tinydb::PAGE_SIZE}));
-  ASSERT_TRUE(superblock_a.has_value());
-  ASSERT_TRUE(superblock_b.has_value());
-  EXPECT_EQ(*superblock_a, *superblock_b);
-  EXPECT_EQ(superblock_a->database_uuid, TEST_UUID);
-  EXPECT_EQ(superblock_a->high_water_page_id, 3U);
-  EXPECT_EQ(db.substr(2 * tinydb::PAGE_SIZE, tinydb::PAGE_SIZE), std::string(leaf_page.data(), leaf_page.size()));
-  EXPECT_EQ(std::filesystem::file_size(wal_path), WAL_HEADER_BYTES);
+  const auto wal_before = ReadWholeFile(wal_path);
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
+  EXPECT_EQ(status.Code(), tinydb::StatusCode::Corruption);
+  EXPECT_FALSE(std::filesystem::exists(db_path));
+  EXPECT_EQ(ReadWholeFile(wal_path), wal_before);
 
   std::filesystem::remove(db_path);
   std::filesystem::remove(wal_path);
 }
 
-TEST(WalDurabilityTest, RecoverSyncsCreatedDatabaseDirectoryBeforeTruncatingWal) {
-  const auto db_path = TestPath("recover_created_db_order");
+TEST(WalDurabilityTest, RecoverSyncsPagesAndAlternateSuperblockBeforeCleaningWal) {
+  const auto db_path = TestPath("recover_two_database_syncs");
   const auto wal_path = tinydb::Wal::PathFor(db_path);
-  std::filesystem::remove(db_path);
   std::filesystem::remove(wal_path);
+  MakeDbFile(db_path, 3);
 
   const auto leaf_page = DataPage(2, 'l');
 
@@ -743,23 +773,26 @@ TEST(WalDurabilityTest, RecoverSyncsCreatedDatabaseDirectoryBeforeTruncatingWal)
       calls.push_back(call);
       return std::nullopt;
     }};
-    ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+    ASSERT_TRUE(tinydb::recovery::Recover(db_path, wal_path).Ok());
   }
 
-  const auto db_write = FindCall(calls, tinydb::io::Syscall::Pwrite, db_path);
-  const auto db_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path, db_write + 1);
-  const auto db_parent_sync = FindCall(calls, tinydb::io::Syscall::Fsync, ParentPath(db_path), db_sync + 1);
-  const auto wal_truncate = FindCall(calls, tinydb::io::Syscall::Ftruncate, wal_path, db_parent_sync + 1);
+  const auto page_write = FindCall(calls, tinydb::io::Syscall::Pwrite, db_path);
+  const auto page_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path, page_write + 1);
+  const auto superblock_write = FindCall(calls, tinydb::io::Syscall::Pwrite, db_path, page_sync + 1);
+  const auto superblock_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path, superblock_write + 1);
+  const auto wal_truncate = FindCall(calls, tinydb::io::Syscall::Ftruncate, wal_path, superblock_sync + 1);
   const auto wal_sync = FindCall(calls, tinydb::io::Syscall::Fsync, wal_path, wal_truncate + 1);
 
-  ASSERT_NE(db_write, std::numeric_limits<std::size_t>::max());
-  ASSERT_NE(db_sync, std::numeric_limits<std::size_t>::max());
-  ASSERT_NE(db_parent_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(page_write, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(page_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(superblock_write, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(superblock_sync, std::numeric_limits<std::size_t>::max());
   ASSERT_NE(wal_truncate, std::numeric_limits<std::size_t>::max());
   ASSERT_NE(wal_sync, std::numeric_limits<std::size_t>::max());
-  EXPECT_LT(db_write, db_sync);
-  EXPECT_LT(db_sync, db_parent_sync);
-  EXPECT_LT(db_parent_sync, wal_truncate);
+  EXPECT_LT(page_write, page_sync);
+  EXPECT_LT(page_sync, superblock_write);
+  EXPECT_LT(superblock_write, superblock_sync);
+  EXPECT_LT(superblock_sync, wal_truncate);
   EXPECT_LT(wal_truncate, wal_sync);
 
   std::filesystem::remove(db_path);
@@ -790,7 +823,7 @@ TEST(WalTest, RecoverDiscardsATornTail) {
   const auto full_size = std::filesystem::file_size(wal_path);
   std::filesystem::resize_file(wal_path, full_size - (COMMIT_RECORD_BYTES - 4));
 
-  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  ASSERT_TRUE(tinydb::recovery::Recover(db_path, wal_path).Ok());
 
   const auto db = ReadWholeFile(db_path);
   EXPECT_EQ(db.substr(2 * tinydb::PAGE_SIZE, tinydb::PAGE_SIZE),
@@ -826,9 +859,51 @@ TEST(WalTest, RecoverRejectsCorruptionInTheDurableMiddle) {
   FlipByteAt(wal_path, second_run_start + 100);
 
   const auto wal_size = std::filesystem::file_size(wal_path);
-  const auto status = tinydb::Wal::Recover(db_path, wal_path);
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
   EXPECT_EQ(status.Code(), tinydb::StatusCode::Corruption);
   EXPECT_EQ(std::filesystem::file_size(wal_path), wal_size);
+
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(wal_path);
+}
+
+TEST(WalTest, TransactionValidationFinishesBeforeTheFirstDatabaseWrite) {
+  const auto db_path = TestPath("recover_validate_before_redo");
+  const auto wal_path = tinydb::Wal::PathFor(db_path);
+  std::filesystem::remove(wal_path);
+  MakeDbFile(db_path, 4);
+
+  {
+    auto wal = tinydb::Wal::Open(wal_path, TEST_UUID).value();
+    const auto first = DataPage(2, 'a');
+    const auto second = DataPage(3, 'b');
+    wal.AppendPageImage(2, first.data());
+    ASSERT_TRUE(Commit(wal).has_value());
+    wal.AppendPageImage(3, second.data());
+    ASSERT_TRUE(Commit(wal).has_value());
+  }
+
+  // The second COMMIT remains a well-framed, checksummed record, but no
+  // longer authenticates its preceding PAGE_IMAGE and DATABASE_STATE.
+  const auto second_transaction = WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES;
+  const auto second_commit = second_transaction + PAGE_IMAGE_RECORD_BYTES + DATABASE_STATE_RECORD_BYTES;
+  BreakTransactionDigestButKeepRecordChecksum(wal_path, second_commit);
+  const auto database_before = ReadWholeFile(db_path);
+  const auto wal_before = ReadWholeFile(wal_path);
+
+  auto database_writes = std::size_t{0};
+  auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+    if (call.syscall == tinydb::io::Syscall::Pwrite && call.path == db_path) {
+      ++database_writes;
+    }
+    return std::nullopt;
+  }};
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
+
+  EXPECT_EQ(status.Code(), tinydb::StatusCode::Corruption);
+  EXPECT_EQ(database_writes, 0U);
+  EXPECT_EQ(ReadWholeFile(db_path), database_before);
+  EXPECT_EQ(ReadWholeFile(wal_path), wal_before);
 
   std::filesystem::remove(db_path);
   std::filesystem::remove(wal_path);
@@ -844,7 +919,7 @@ TEST(WalTest, RecoverClearsATornHeader) {
     file << "TI";
   }
 
-  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  ASSERT_TRUE(tinydb::recovery::Recover(db_path, wal_path).Ok());
   EXPECT_EQ(std::filesystem::file_size(wal_path), 0U);
   EXPECT_TRUE(tinydb::Wal::Open(wal_path, TEST_UUID).has_value());
 
@@ -861,7 +936,7 @@ TEST(WalTest, RecoverClearsAnIncompleteHeader) {
   { ASSERT_TRUE(tinydb::Wal::Open(wal_path, TEST_UUID).has_value()); }
   std::filesystem::resize_file(wal_path, 6);
 
-  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
+  ASSERT_TRUE(tinydb::recovery::Recover(db_path, wal_path).Ok());
   EXPECT_EQ(std::filesystem::file_size(wal_path), 0U);
   EXPECT_TRUE(tinydb::Wal::Open(wal_path, TEST_UUID).has_value());
 
@@ -876,7 +951,7 @@ TEST(WalTest, RecoverRejectsAForeignFile) {
     file << "definitely not a wal";
   }
 
-  const auto status = tinydb::Wal::Recover(db_path, wal_path);
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
   EXPECT_EQ(status.Code(), tinydb::StatusCode::UnsupportedFormat);
   // The file it refused to trust is left exactly as it was.
   EXPECT_EQ(ReadWholeFile(wal_path), "definitely not a wal");
@@ -902,7 +977,7 @@ TEST(WalTest, RecoverRejectsAForeignDatabaseBeforeReplay) {
   }
   const auto wal_size_before = std::filesystem::file_size(wal_path);
 
-  const auto status = tinydb::Wal::Recover(db_path, wal_path);
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
   EXPECT_EQ(status.Code(), tinydb::StatusCode::UnsupportedFormat);
   EXPECT_EQ(ReadWholeFile(db_path), db_before);
   EXPECT_EQ(std::filesystem::file_size(wal_path), wal_size_before);
@@ -929,7 +1004,7 @@ TEST(WalTest, RecoverRefusesAWalFromAnotherDatabase) {
 
   // The database's superblock is intact and vouches for its UUID, so the
   // mismatched log is refused before a single image is replayed.
-  const auto status = tinydb::Wal::Recover(db_path, wal_path);
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
   EXPECT_EQ(status.Code(), tinydb::StatusCode::InvalidArgument);
   EXPECT_EQ(ReadWholeFile(db_path), db_before);
   EXPECT_EQ(std::filesystem::file_size(wal_path), wal_size_before);
@@ -938,7 +1013,7 @@ TEST(WalTest, RecoverRefusesAWalFromAnotherDatabase) {
   std::filesystem::remove(wal_path);
 }
 
-TEST(WalTest, RecoverRepairsATornDatabaseHeader) {
+TEST(WalTest, RecoverRefusesToGuessABaseWhenBothSuperblocksAreDamaged) {
   const auto db_path = TestPath("recover_torn_db_header");
   const auto wal_path = tinydb::Wal::PathFor(db_path);
   std::filesystem::remove(wal_path);
@@ -957,21 +1032,19 @@ TEST(WalTest, RecoverRepairsATornDatabaseHeader) {
   // checksum no longer holds.
   FlipByteAt(db_path, tinydb::storage::superblock_offset::ROOT_PAGE_ID);
   FlipByteAt(db_path, tinydb::PAGE_SIZE + tinydb::storage::superblock_offset::ROOT_PAGE_ID);
+  const auto database_before = ReadWholeFile(db_path);
+  const auto wal_before = ReadWholeFile(wal_path);
 
-  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
-
-  const auto db = ReadWholeFile(db_path);
-  const auto recovered = tinydb::storage::DecodeSuperblock(std::as_bytes(std::span{db.data(), tinydb::PAGE_SIZE}));
-  ASSERT_TRUE(recovered.has_value());
-  EXPECT_EQ(recovered->database_uuid, TEST_UUID);
-  EXPECT_EQ(recovered->high_water_page_id, 3U);
-  EXPECT_EQ(std::filesystem::file_size(wal_path), WAL_HEADER_BYTES);
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
+  EXPECT_EQ(status.Code(), tinydb::StatusCode::Corruption);
+  EXPECT_EQ(ReadWholeFile(db_path), database_before);
+  EXPECT_EQ(ReadWholeFile(wal_path), wal_before);
 
   std::filesystem::remove(db_path);
   std::filesystem::remove(wal_path);
 }
 
-TEST(WalTest, RecoverRepairsAZeroedHeaderFromACrashedCreation) {
+TEST(WalTest, RecoverRefusesAZeroedBaseEvenWhenWalContainsPageImages) {
   const auto db_path = TestPath("recover_zeroed_header");
   const auto wal_path = tinydb::Wal::PathFor(db_path);
   std::filesystem::remove(wal_path);
@@ -990,16 +1063,13 @@ TEST(WalTest, RecoverRepairsAZeroedHeaderFromACrashedCreation) {
     wal.AppendPageImage(2, leaf_page.data());
     ASSERT_TRUE(Commit(wal, 3).has_value());
   }
+  const auto database_before = ReadWholeFile(db_path);
+  const auto wal_before = ReadWholeFile(wal_path);
 
-  ASSERT_TRUE(tinydb::Wal::Recover(db_path, wal_path).Ok());
-
-  const auto db = ReadWholeFile(db_path);
-  ASSERT_EQ(db.size(), 3 * tinydb::PAGE_SIZE);
-  const auto recovered = tinydb::storage::DecodeSuperblock(std::as_bytes(std::span{db.data(), tinydb::PAGE_SIZE}));
-  ASSERT_TRUE(recovered.has_value());
-  EXPECT_EQ(recovered->database_uuid, TEST_UUID);
-  EXPECT_EQ(recovered->high_water_page_id, 3U);
-  EXPECT_EQ(db.substr(2 * tinydb::PAGE_SIZE, tinydb::PAGE_SIZE), std::string(leaf_page.data(), leaf_page.size()));
+  const auto status = tinydb::recovery::Recover(db_path, wal_path);
+  EXPECT_EQ(status.Code(), tinydb::StatusCode::Corruption);
+  EXPECT_EQ(ReadWholeFile(db_path), database_before);
+  EXPECT_EQ(ReadWholeFile(wal_path), wal_before);
 
   std::filesystem::remove(db_path);
   std::filesystem::remove(wal_path);

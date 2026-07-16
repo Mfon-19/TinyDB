@@ -30,9 +30,9 @@ struct DatabaseState;
 **
 ** PathFor names the active segment. Immutable archives are sibling files named
 ** by SegmentPathFor. Reset may delete them only after the caller has written
-** and synchronized the same state into the database file. Recover is the only
-** path that interprets a non-empty segment sequence; normal Open accepts the
-** clean active header left behind by recovery or checkpoint.
+** and synchronized the same state into the database file. The recovery
+** subsystem is the only reader of non-empty segment sequences; normal Open
+** accepts the clean active header it leaves behind.
 */
 class Wal {
  public:
@@ -47,11 +47,6 @@ class Wal {
   // database file is parsed or a normal Wal object exists.
   static auto PathFor(const std::filesystem::path &db_path) -> std::filesystem::path;
   static auto SegmentPathFor(const std::filesystem::path &wal_path, std::uint64_t segment_id) -> std::filesystem::path;
-
-  // Replays complete committed runs and ignores only an incomplete trailing
-  // run. Successful recovery leaves the database durable before truncating
-  // the WAL back to its header.
-  static auto Recover(const std::filesystem::path &db_path, const std::filesystem::path &wal_path) -> Status;
 
   // Creates or validates a clean header-only WAL bound to database_uuid.
   static auto Open(const std::filesystem::path &wal_path, const DatabaseUuid &database_uuid,

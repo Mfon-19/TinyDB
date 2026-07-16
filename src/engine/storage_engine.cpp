@@ -8,7 +8,9 @@
 #include "btree/b_plus_tree.h"
 #include "cache/committed_page_cache.h"
 #include "cache/committed_page_source.h"
+#include "io/file_io.h"
 #include "io/syscalls.h"
+#include "recovery/recovery.h"
 #include "txn/commit_coordinator.h"
 #include "txn/contract.h"
 #include "txn/database_state.h"
@@ -65,24 +67,8 @@ constexpr std::size_t CACHE_TARGET_BYTES = 64 * PAGE_SIZE;
 constexpr std::size_t WRITE_TRANSACTION_LIMIT_BYTES = 16U << 20U;
 constexpr std::uint64_t CHECKPOINT_THRESHOLD_BYTES = 1U << 20U;
 
-auto ErrnoStatus(std::string_view operation) -> Status {
-  return Status::IoError(std::string(operation) + ": " + std::generic_category().message(errno));
-}
-
-auto SyncParentDirectory(const std::filesystem::path &path) -> Status {
-  auto parent = path.parent_path();
-  if (parent.empty()) {
-    parent = ".";
-  }
-  auto directory = UniqueFd(io::Open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-  if (!directory.Valid()) {
-    return ErrnoStatus("open directory");
-  }
-  if (io::Fsync(directory.Get()) < 0) {
-    return ErrnoStatus("fsync directory");
-  }
-  return {};
-}
+using io::ErrnoStatus;
+using io::SyncParentDirectory;
 
 auto AcquireDatabaseLock(const std::filesystem::path &path) -> Result<UniqueFd> {
   // Ownership precedes recovery because replay and segment cleanup are writes.
@@ -423,7 +409,7 @@ auto StorageEngine::Open(const std::filesystem::path &path) -> Result<StorageEng
     return std::unexpected(lock.error());
   }
   const auto wal_path = Wal::PathFor(path);
-  if (auto status = Wal::Recover(path, wal_path); !status.Ok()) {
+  if (auto status = recovery::Recover(path, wal_path); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   auto disk_result = DiskManager::Open(path);
