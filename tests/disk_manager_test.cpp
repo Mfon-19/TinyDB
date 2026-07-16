@@ -13,16 +13,15 @@
 #include <fstream>
 #include <limits>
 #include <optional>
-#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 /*
 ** DiskManager tests exercise the physical-file boundary independently of tree
-** allocation. They verify prepared-versus-adopted metadata, dual-superblock
-** selection, creation synchronization order, short-file rejection, and the
-** distinction between logical high-water state and physical file extension.
+** allocation. They verify adopted metadata, dual-superblock selection,
+** creation synchronization order, short-file rejection, and the distinction
+** between logical high-water state and physical file extension.
 */
 namespace {
 
@@ -69,24 +68,6 @@ void AdoptOnePage(tinydb::DiskManager &disk, tinydb::page_id_t root, std::uint64
 }
 
 }  // namespace
-
-TEST(DiskManagerTest, PreparedStateDoesNotMutatePublishedMetadata) {
-  const auto path = TestPath("prepare_state");
-  std::filesystem::remove(path);
-  auto disk = tinydb::DiskManager::Open(path).value();
-
-  const auto image = disk.PrepareStateImage(tinydb::FIRST_DATA_PAGE_ID, 0, tinydb::FIRST_DATA_PAGE_ID + 1, 1, 0);
-  ASSERT_TRUE(image.has_value());
-  EXPECT_EQ(disk.GetRootPageId(), tinydb::HEADER_PAGE_ID);
-  EXPECT_EQ(disk.HighWaterPageId(), tinydb::FIRST_DATA_PAGE_ID);
-
-  const auto state = tinydb::storage::DecodeSuperblock(std::as_bytes(std::span{image->data}));
-  ASSERT_TRUE(state.has_value());
-  EXPECT_EQ(state->root_page_id, tinydb::FIRST_DATA_PAGE_ID);
-  EXPECT_EQ(state->high_water_page_id, tinydb::FIRST_DATA_PAGE_ID + 1);
-  EXPECT_EQ(state->transaction_id, 1U);
-  std::filesystem::remove(path);
-}
 
 TEST(DiskManagerTest, AdoptCheckpointAndReopenPage) {
   const auto path = TestPath("write_read_reopen");

@@ -20,21 +20,12 @@ namespace tinydb {
 ** durable superblock selection; it does not allocate, retire, or reuse logical
 ** page IDs. Those operations belong to TransactionPages.
 **
-** Logical publication and checkpointing are separate. PrepareStateImage
-** creates a redo-ready alternate superblock without changing this object's
-** published fields. AdoptState changes those fields only after WAL durability
-** and cache publication. Checkpoint writes the current state to the database
-** file so that older WAL can eventually be discarded.
+** Logical publication and checkpointing are separate. AdoptState changes the
+** published fields only after WAL durability and cache publication. Checkpoint
+** encodes that logical state into the inactive superblock so that older WAL
+** can eventually be discarded. Superblocks are checkpoint artifacts; they are
+** never transaction page images.
 */
-
-/*
-** A physical image suitable for redo. The bytes already contain their final
-** identity and checksum, so recovery does not invoke tree or allocator logic.
-*/
-struct PageImage {
-  page_id_t page_id;
-  std::array<char, PAGE_SIZE> data;
-};
 
 class DiskManager {
  public:
@@ -53,11 +44,6 @@ class DiskManager {
   auto CheckpointLsn() const -> std::uint64_t;
   auto Uuid() const -> const DatabaseUuid &;
 
-  // Produces the alternate superblock image for a prepared transaction without
-  // changing visible in-memory state. AdoptState is called only after that
-  // image and the transaction's data pages become durable.
-  auto PrepareStateImage(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
-                         std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) const -> Result<PageImage>;
   void AdoptState(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
                   std::uint64_t transaction_id, std::uint64_t checkpoint_lsn);
   void AdvanceCheckpoint(std::uint64_t checkpoint_lsn);

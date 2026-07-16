@@ -116,7 +116,9 @@ auto InitialState(const DiskManager &disk) -> std::shared_ptr<const txn::Databas
       .allocator_root_page_id = disk.GetAllocatorRootPageId(),
       .high_water_page_id = disk.HighWaterPageId(),
       .transaction_id = disk.TransactionId(),
-      .visible_lsn = disk.TransactionId(),
+      // Open runs recovery first, so the database-file checkpoint is also the
+      // newest visible frontier when the in-memory reader gate is constructed.
+      .visible_lsn = disk.CheckpointLsn(),
       .checkpoint_lsn = disk.CheckpointLsn(),
   });
 }
@@ -152,7 +154,7 @@ auto StorageEngine::Open(const std::filesystem::path &path) -> Result<StorageEng
   auto pages = std::make_unique<cache::CommittedPageSource>(cache.get());
   auto readers = std::make_unique<txn::ReaderGate>(InitialState(*disk));
 
-  auto wal_result = Wal::Open(wal_path, disk->Uuid());
+  auto wal_result = Wal::Open(wal_path, disk->Uuid(), disk->TransactionId() + 1, disk->CheckpointLsn() + 1);
   if (!wal_result) {
     return std::unexpected(std::move(wal_result).error());
   }
@@ -385,36 +387,34 @@ auto StorageEngine::Mutate(Mutation mutation, std::string_view key, std::string_
   **
   ** Everything through Freeze is a definite-abort region. No shared page,
   ** root, frontier, or free extent has changed if one of those steps fails.
-  ** PrepareStateImage likewise changes no DiskManager field.
+  ** The resulting logical DatabaseState is logged beside the final data pages;
+  ** transaction commit never manufactures a checkpoint superblock.
   */
-  const auto state = transaction->ResultingState();
-  auto state_image = disk_->PrepareStateImage(state.root_page_id, state.allocator_root_page_id,
-                                              state.high_water_page_id, state.transaction_id, state.checkpoint_lsn);
-  if (!state_image) {
-    return std::move(state_image).error();
-  }
+  auto state = transaction->ResultingState();
   auto retired = std::vector<page_id_t>(transaction->RetiredPageIds().begin(), transaction->RetiredPageIds().end());
   auto committed_pages = transaction->TakePages(state.transaction_id);
   if (!committed_pages) {
     return std::move(committed_pages).error();
   }
-  auto published_state = std::make_shared<const txn::DatabaseState>(state);
 
   /*
   ** MAKE DURABLE
   **
-  ** The current WAL is a temporary bridge until Milestone 6, but the permanent
-  ** ownership direction is already established: final private page and state
-  ** images are logged before any of them can become visible.
+  ** PAGE_IMAGE records contain only final data pages. DATABASE_STATE carries
+  ** the roots and allocation frontier, and COMMIT binds both into one ordered
+  ** transaction. None of those bytes can become visible before WAL sync.
   */
   for (const auto &page : *committed_pages) {
     wal_->AppendPageImage(page.page_id, page.bytes->data());
   }
-  wal_->AppendPageImage(state_image->page_id, state_image->data.data());
-  if (auto commit = wal_->Commit(); !commit.Ok()) {
+  const auto commit = wal_->Commit(state);
+  if (!commit) {
     Poison();
-    return commit;
+    return commit.error();
   }
+  TINYDB_CHECK(commit->transaction_id == state.transaction_id, "WAL assigned an unexpected transaction ID");
+  state.visible_lsn = commit->commit_lsn;
+  auto published_state = std::make_shared<const txn::DatabaseState>(state);
 
   {
     /*

@@ -5,7 +5,7 @@
 #include "storage/encoding.h"
 #include "storage/page_codec.h"
 #include "storage/superblock.h"
-#include "util/crc32.h"
+#include "txn/database_state.h"
 #include "wal/wal_codec.h"
 
 #include <fcntl.h>
@@ -33,11 +33,11 @@ namespace {
 /*
 ** CURRENT WAL PROTOCOL
 **
-** The current compatibility writer collects final page images in memory,
-** appends the complete run and its binding Commit record, then calls fsync.
-** That fsync is the durability point. StorageEngine may publish only after it
-** succeeds. On append or sync failure the durable tail is not advanced in
-** memory and the engine stops accepting work until reopen.
+** The writer collects final data pages in memory, adds the resulting logical
+** database state, and appends the complete run with its binding Commit record
+** before calling fsync. That fsync is the durability point. StorageEngine may
+** publish only after it succeeds. On append or sync failure the durable tail
+** is not advanced in memory and the engine stops accepting work until reopen.
 **
 ** Recovery scans complete records from the header. It retains one transaction
 ** run in memory and writes no database page until the Commit record validates
@@ -47,25 +47,7 @@ namespace {
 ** header. Repeating recovery after a crash is therefore idempotent.
 */
 
-/*
-** PAGE_IMAGE payload: [page ID u64][exact 4096-byte encoded page]. The page
-** retains its own checksum and identity in addition to the WAL record CRC.
-*/
-constexpr std::size_t PAGE_IMAGE_PAGE_ID_OFFSET = 0;
-constexpr std::size_t PAGE_IMAGE_DATA_OFFSET = sizeof(page_id_t);
-constexpr std::size_t PAGE_IMAGE_PAYLOAD_BYTES = PAGE_IMAGE_DATA_OFFSET + PAGE_SIZE;
-/*
-** COMMIT payload: [image count u32][CRC of encoded image records u32]
-**                 [commit-record LSN u64].
-**
-** These redundant bindings prevent a valid-looking commit record from
-** accepting a run with a missing, duplicated, or reordered middle image.
-*/
-constexpr std::size_t COMMIT_IMAGE_COUNT_OFFSET = 0;
-constexpr std::size_t COMMIT_DIGEST_OFFSET = 4;
-constexpr std::size_t COMMIT_LSN_OFFSET = 8;
-constexpr std::size_t COMMIT_PAYLOAD_BYTES = 16;
-constexpr std::size_t MAX_RECORD_BYTES = wal_format::RECORD_HEADER_BYTES + PAGE_IMAGE_PAYLOAD_BYTES;
+constexpr std::size_t MAX_RECORD_BYTES = wal_format::RECORD_HEADER_BYTES + wal_format::PAGE_IMAGE_PAYLOAD_BYTES;
 
 auto ErrnoStatus(std::string_view operation) -> Status {
   return Status::IoError(std::string(operation) + ": " + std::generic_category().message(errno));
@@ -130,14 +112,14 @@ auto FullPread(int fd, void *data, std::size_t size, std::uint64_t offset) -> Re
 
 auto Bytes(const std::vector<char> &value) -> std::span<const std::byte> { return std::as_bytes(std::span{value}); }
 
-auto ReadDatabaseUuidForRecovery(const std::filesystem::path &db_path) -> Result<std::optional<DatabaseUuid>> {
+auto ReadDatabaseStateForRecovery(const std::filesystem::path &db_path) -> Result<std::optional<storage::Superblock>> {
   // Recovery must establish database/WAL identity before replay, but the
-  // database may be missing or its superblocks may be exactly the pages the
-  // WAL needs to restore. optional<UUID> represents that recoverable absence.
+  // database may be missing or both superblocks may be damaged.
+  // optional<Superblock> represents that recoverable absence.
   auto fd = UniqueFd(io::Open(db_path, O_RDONLY | O_CLOEXEC));
   if (!fd.Valid()) {
     if (errno == ENOENT) {
-      return std::optional<DatabaseUuid>{};
+      return std::optional<storage::Superblock>{};
     }
     return std::unexpected(ErrnoStatus("open"));
   }
@@ -146,7 +128,7 @@ auto ReadDatabaseUuidForRecovery(const std::filesystem::path &db_path) -> Result
     return std::unexpected(ErrnoStatus("fstat"));
   }
   if (file_stat.st_size == 0) {
-    return std::optional<DatabaseUuid>{};
+    return std::optional<storage::Superblock>{};
   }
 
   auto prefix = std::vector<char>(
@@ -157,7 +139,7 @@ auto ReadDatabaseUuidForRecovery(const std::filesystem::path &db_path) -> Result
   }
   if (std::ranges::all_of(prefix, [](char byte) { return byte == 0; })) {
     // Creation may have reserved zero pages before a superblock became durable.
-    return std::optional<DatabaseUuid>{};
+    return std::optional<storage::Superblock>{};
   }
   if (prefix.size() < FIRST_DATA_PAGE_ID * PAGE_SIZE) {
     return std::unexpected(Status::UnsupportedFormat("database does not contain TinyDB dual superblocks"));
@@ -168,7 +150,7 @@ auto ReadDatabaseUuidForRecovery(const std::filesystem::path &db_path) -> Result
   const auto page_b = all.subspan(PAGE_SIZE, PAGE_SIZE);
   const auto selected = storage::SelectSuperblock(page_a, page_b);
   if (selected) {
-    return std::optional{selected->value.database_uuid};
+    return std::optional{selected->value};
   }
 
   const auto recognized = [&](std::span<const std::byte> page) {
@@ -177,20 +159,31 @@ auto ReadDatabaseUuidForRecovery(const std::filesystem::path &db_path) -> Result
   if (recognized(page_a) || recognized(page_b)) {
     // A recognized but damaged superblock can be repaired from a committed WAL
     // image. Its UUID cannot be trusted yet, so defer identity to that WAL.
-    return std::optional<DatabaseUuid>{};
+    return std::optional<storage::Superblock>{};
   }
   return std::unexpected(selected.error());
 }
 
-auto ValidatePageImage(page_id_t page_id, std::span<const std::byte> page) -> Status {
-  // WAL CRC proves the record arrived intact; page validation additionally
-  // proves the payload is a semantically valid page for the target file offset.
-  if (page_id == SUPERBLOCK_A_PAGE_ID || page_id == SUPERBLOCK_B_PAGE_ID) {
-    const auto decoded = storage::DecodeSuperblock(page);
-    return decoded ? Status{} : decoded.error();
+auto EncodeRecoverySuperblock(const wal_format::DecodedTransaction &transaction, const DatabaseUuid &database_uuid,
+                              std::uint64_t generation) -> Result<std::array<char, PAGE_SIZE>> {
+  const auto &state = transaction.state;
+  const auto encoded = storage::EncodeSuperblock(storage::Superblock{
+      .database_uuid = database_uuid,
+      .generation = generation,
+      // Recovery has materialized and will fsync every committed data page, so
+      // the recovered visible frontier also becomes the checkpoint frontier.
+      .checkpoint_lsn = state.visible_lsn,
+      .transaction_id = state.transaction_id,
+      .root_page_id = state.root_page_id,
+      .allocator_root_page_id = state.allocator_root_page_id,
+      .high_water_page_id = state.high_water_page_id,
+  });
+  if (!encoded) {
+    return std::unexpected(encoded.error());
   }
-  const auto decoded = storage::DecodeDataPageHeader(page, page_id);
-  return decoded ? Status{} : decoded.error();
+  auto page = std::array<char, PAGE_SIZE>{};
+  std::memcpy(page.data(), encoded->data(), encoded->size());
+  return page;
 }
 
 }  // namespace
@@ -252,21 +245,25 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
     return header.error();
   }
 
-  const auto database_uuid = ReadDatabaseUuidForRecovery(db_path);
-  if (!database_uuid) {
-    return database_uuid.error();
+  const auto database_state = ReadDatabaseStateForRecovery(db_path);
+  if (!database_state) {
+    return database_state.error();
   }
-  if (database_uuid->has_value() && **database_uuid != header->database_uuid) {
+  if (database_state->has_value() && database_state->value().database_uuid != header->database_uuid) {
     // Refuse before opening the database writable or applying a single page.
     return Status::InvalidArgument("write-ahead log does not belong to this database: " + wal_path.string());
   }
 
-  // `run` contains decoded page images for the transaction currently being
-  // scanned. Nothing is written until its COMMIT record validates all of them.
+  // run_bytes retains exactly one transaction. Nothing is written until its
+  // final COMMIT validates record order, page count, state, and both digests.
   auto db_fd = UniqueFd{};
-  auto run = std::vector<std::pair<page_id_t, std::array<char, PAGE_SIZE>>>{};
   auto run_bytes = std::vector<char>{};
-  auto current_transaction = std::uint64_t{0};
+  auto run_first_lsn = header->starting_lsn;
+  auto run_sequence = std::uint32_t{0};
+  auto expected_lsn = header->starting_lsn;
+  auto durable_next_lsn = header->starting_lsn;
+  auto last_transaction = std::optional<wal_format::DecodedTransaction>{};
+  auto committed_transactions = std::uint64_t{0};
   auto applied = false;
   auto created_db_file = false;
   auto offset = static_cast<std::uint64_t>(wal_format::HEADER_BYTES);
@@ -314,50 +311,21 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
       }
       return record.error();
     }
-    if (record->lsn != offset) {
-      // LSN-to-position binding detects spliced/reordered records even if each
-      // individual record carries a valid checksum.
-      return Status::Corruption("WAL record LSN does not match its position");
+    if (record->lsn != expected_lsn || record->record_sequence != run_sequence) {
+      return Status::Corruption("WAL record sequence is missing, duplicated, or reordered");
     }
+    if (run_bytes.empty()) {
+      run_first_lsn = record->lsn;
+    }
+    run_bytes.insert(run_bytes.end(), encoded_record.begin(), encoded_record.end());
+    ++expected_lsn;
+    ++run_sequence;
 
-    if (record->type == wal_format::RecordType::PageImage) {
-      if (record->payload.size() != PAGE_IMAGE_PAYLOAD_BYTES) {
-        return Status::Corruption("malformed WAL page-image payload");
+    if (record->type == wal_format::RecordType::Commit) {
+      const auto transaction = wal_format::DecodeTransaction(std::as_bytes(std::span{run_bytes}), run_first_lsn);
+      if (!transaction) {
+        return transaction.error();
       }
-      if (current_transaction == 0) {
-        // The first image opens a run; subsequent images and the commit must
-        // carry the same transaction ID. Interleaving is not supported.
-        current_transaction = record->transaction_id;
-      }
-      if (record->transaction_id != current_transaction) {
-        return Status::Corruption("interleaved WAL transactions");
-      }
-      const auto page_id = storage::GetLittleEndian<page_id_t>(record->payload, PAGE_IMAGE_PAGE_ID_OFFSET);
-      if (!page_id) {
-        return Status::Corruption("truncated WAL page ID");
-      }
-      auto image = std::array<char, PAGE_SIZE>{};
-      std::memcpy(image.data(), record->payload.data() + PAGE_IMAGE_DATA_OFFSET, PAGE_SIZE);
-      if (auto status = ValidatePageImage(*page_id, std::as_bytes(std::span{image})); !status.Ok()) {
-        return status;
-      }
-      run.emplace_back(*page_id, image);
-      // Digest the exact encoded records, not merely decoded page bytes. The
-      // commit therefore binds framing metadata as well as image contents.
-      run_bytes.insert(run_bytes.end(), encoded_record.begin(), encoded_record.end());
-    } else {
-      if (record->payload.size() != COMMIT_PAYLOAD_BYTES || run.empty() ||
-          record->transaction_id != current_transaction) {
-        return Status::Corruption("malformed WAL commit record");
-      }
-      const auto image_count = storage::GetLittleEndian<std::uint32_t>(record->payload, COMMIT_IMAGE_COUNT_OFFSET);
-      const auto digest = storage::GetLittleEndian<std::uint32_t>(record->payload, COMMIT_DIGEST_OFFSET);
-      const auto commit_lsn = storage::GetLittleEndian<std::uint64_t>(record->payload, COMMIT_LSN_OFFSET);
-      if (!image_count || !digest || !commit_lsn || *image_count != run.size() ||
-          *digest != Crc32(std::as_bytes(std::span{run_bytes})) || *commit_lsn != offset) {
-        return Status::Corruption("WAL commit does not bind its page images");
-      }
-
       // Delay opening/creating the database until a complete transaction is
       // proven committed. A WAL containing only a torn run must not create or
       // mutate the database file.
@@ -371,24 +339,48 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
           return ErrnoStatus("open");
         }
       }
-      for (const auto &[page_id, image] : run) {
+      if (io::Ftruncate(db_fd.Get(), transaction->state.high_water_page_id * PAGE_SIZE) < 0) {
+        return ErrnoStatus("ftruncate");
+      }
+      for (const auto &page : transaction->pages) {
         // Full physical redo may extend the file. Reapplying after a recovery
         // crash simply overwrites the same offsets with the same bytes.
-        if (auto status = FullPwrite(db_fd.Get(), image.data(), image.size(), page_id * PAGE_SIZE); !status.Ok()) {
+        if (auto status = FullPwrite(db_fd.Get(), page.bytes.data(), page.bytes.size(), page.page_id * PAGE_SIZE);
+            !status.Ok()) {
           return status;
         }
       }
-      run.clear();
+      durable_next_lsn = transaction->next_lsn;
+      last_transaction = std::move(*transaction);
+      last_transaction->pages.clear();
+      ++committed_transactions;
       run_bytes.clear();
-      current_transaction = 0;
+      run_sequence = 0;
       applied = true;
     }
     offset += encoded_record.size();
   }
 
-  if (applied && io::Fsync(db_fd.Get()) < 0) {
-    // The WAL remains untouched on failure, so reopening retries all commits.
-    return ErrnoStatus("fsync");
+  if (applied) {
+    TINYDB_CHECK(last_transaction.has_value(), "recovery applied pages without committed database state");
+    const auto base_generation = database_state->has_value() ? database_state->value().generation : 0;
+    const auto superblock =
+        EncodeRecoverySuperblock(*last_transaction, header->database_uuid, base_generation + committed_transactions);
+    if (!superblock) {
+      return superblock.error();
+    }
+    if (auto status = FullPwrite(db_fd.Get(), superblock->data(), superblock->size(), SUPERBLOCK_A_PAGE_ID * PAGE_SIZE);
+        !status.Ok()) {
+      return status;
+    }
+    if (auto status = FullPwrite(db_fd.Get(), superblock->data(), superblock->size(), SUPERBLOCK_B_PAGE_ID * PAGE_SIZE);
+        !status.Ok()) {
+      return status;
+    }
+    if (io::Fsync(db_fd.Get()) < 0) {
+      // The WAL remains untouched on failure, so reopening retries all commits.
+      return ErrnoStatus("fsync");
+    }
   }
   if (applied && created_db_file) {
     // Only recovery that created the path must make its directory entry durable.
@@ -397,10 +389,22 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
     }
   }
   if (wal_size > wal_format::HEADER_BYTES) {
-    // Truncation is last: committed redo may be forgotten only after database
-    // pages (and a newly created directory entry) are durable.
-    if (io::Ftruncate(wal_fd.Get(), wal_format::HEADER_BYTES) < 0) {
+    // Replacement is last: committed redo may be forgotten only after the
+    // database and any newly created directory entry are durable. The new
+    // header carries the first LSN not covered by the recovered checkpoint.
+    if (io::Ftruncate(wal_fd.Get(), 0) < 0) {
       return ErrnoStatus("ftruncate");
+    }
+    const auto clean_header = wal_format::EncodeHeader(wal_format::Header{
+        .database_uuid = header->database_uuid,
+        .segment_id = header->segment_id,
+        .starting_lsn = durable_next_lsn,
+    });
+    if (!clean_header) {
+      return clean_header.error();
+    }
+    if (auto status = FullPwrite(wal_fd.Get(), clean_header->data(), clean_header->size(), 0); !status.Ok()) {
+      return status;
     }
     if (io::Fsync(wal_fd.Get()) < 0) {
       return ErrnoStatus("fsync");
@@ -409,7 +413,15 @@ auto Wal::Recover(const std::filesystem::path &db_path, const std::filesystem::p
   return {};
 }
 
-auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &database_uuid) -> Result<Wal> {
+auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &database_uuid,
+               std::uint64_t next_transaction_id, std::uint64_t starting_lsn) -> Result<Wal> {
+  if (next_transaction_id == 0) {
+    return std::unexpected(Status::InvalidArgument("invalid WAL transaction frontier"));
+  }
+  const auto requested_starting_lsn = starting_lsn;
+  if (starting_lsn == 0) {
+    starting_lsn = 1;
+  }
   auto fd = UniqueFd(io::Open(wal_path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
   if (!fd.Valid()) {
     return std::unexpected(ErrnoStatus("open"));
@@ -418,13 +430,15 @@ auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &databa
   if (io::Fstat(fd.Get(), &file_stat) < 0) {
     return std::unexpected(ErrnoStatus("fstat"));
   }
-  Wal wal(std::move(fd), static_cast<std::uint64_t>(file_stat.st_size));
+  Wal wal(std::move(fd), database_uuid, static_cast<std::uint64_t>(file_stat.st_size), next_transaction_id,
+          starting_lsn);
 
   if (file_stat.st_size == 0) {
     // Fresh WAL durability ordering is contents -> file fsync -> directory
     // fsync. A crash before completion leaves the short-header case Recover
     // handles without pretending any transaction committed.
-    const auto encoded = wal_format::EncodeHeader(wal_format::Header{.database_uuid = database_uuid});
+    const auto encoded =
+        wal_format::EncodeHeader(wal_format::Header{.database_uuid = database_uuid, .starting_lsn = starting_lsn});
     if (!encoded) {
       return std::unexpected(encoded.error());
     }
@@ -468,48 +482,46 @@ auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &databa
     return std::unexpected(
         Status::InvalidArgument("write-ahead log does not belong to this database: " + wal_path.string()));
   }
+  if (requested_starting_lsn != 0 && header->starting_lsn != requested_starting_lsn) {
+    return std::unexpected(Status::Corruption("WAL starting LSN disagrees with the database checkpoint"));
+  }
+  wal.next_lsn_ = header->starting_lsn;
   return wal;
 }
 
 void Wal::AppendPageImage(page_id_t page_id, const char *data) {
-  // This path cannot fail for valid engine-owned page bytes: buffer sizing and
-  // field offsets are fixed. A failure indicates an internal invariant bug,
-  // hence TINYDB_CHECK rather than an environmental Status.
-  auto payload = std::vector<std::byte>(PAGE_IMAGE_PAYLOAD_BYTES);
-  TINYDB_CHECK(storage::PutLittleEndian(payload, PAGE_IMAGE_PAGE_ID_OFFSET, page_id) &&
-                   storage::PutBytes(payload, PAGE_IMAGE_DATA_OFFSET, std::as_bytes(std::span{data, PAGE_SIZE})),
-               "failed to encode WAL page image");
-  const auto record = wal_format::EncodeRecord(wal_format::RecordType::PageImage, next_transaction_id_,
-                                               size_bytes_ + pending_.size(), payload);
-  TINYDB_CHECK(record.has_value(), "failed to encode WAL page-image record");
-  pending_.insert(pending_.end(), record->begin(), record->end());
-  ++pending_image_count_;
+  TINYDB_CHECK(page_id >= FIRST_DATA_PAGE_ID, "logging a superblock as a WAL page image");
+  auto image = PendingPageImage{.page_id = page_id, .bytes = {}};
+  std::memcpy(image.bytes.data(), data, PAGE_SIZE);
+  pending_.push_back(std::move(image));
 }
 
 void Wal::DiscardPending() {
   // Durable size and transaction ID do not advance. A retry/reopen therefore
   // cannot mistake abandoned memory records for a committed transaction.
   pending_.clear();
-  pending_image_count_ = 0;
 }
 
-auto Wal::Commit() -> Status {
+auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
   TINYDB_CHECK(fd_.Valid(), "committing on a moved-from log");
-  TINYDB_CHECK(!pending_.empty() && pending_image_count_ > 0, "committing an operation that logged no page images");
+  TINYDB_CHECK(!pending_.empty(), "committing an operation that logged no page images");
+  // A zero transaction ID asks the WAL to assign its current frontier. A
+  // nonzero ID was assigned by a higher-level coordinator and must agree
+  // before the first byte is appended; discovering disagreement after fsync
+  // would turn a programmer error into a durable, unpublished transaction.
+  if (state.transaction_id != 0 && state.transaction_id != next_transaction_id_) {
+    return std::unexpected(Status::InvalidArgument("database state has the wrong WAL transaction ID"));
+  }
 
-  // The commit's LSN is known before encoding because it begins immediately
-  // after the already encoded page-image run.
-  const auto commit_lsn = size_bytes_ + pending_.size();
-  auto payload = std::array<std::byte, COMMIT_PAYLOAD_BYTES>{};
-  TINYDB_CHECK(
-      storage::PutLittleEndian(payload, COMMIT_IMAGE_COUNT_OFFSET, static_cast<std::uint32_t>(pending_image_count_)) &&
-          storage::PutLittleEndian(payload, COMMIT_DIGEST_OFFSET, Crc32(std::as_bytes(std::span{pending_}))) &&
-          storage::PutLittleEndian(payload, COMMIT_LSN_OFFSET, commit_lsn),
-      "failed to encode WAL commit payload");
-  const auto commit =
-      wal_format::EncodeRecord(wal_format::RecordType::Commit, next_transaction_id_, commit_lsn, payload);
-  TINYDB_CHECK(commit.has_value(), "failed to encode WAL commit record");
-  pending_.insert(pending_.end(), commit->begin(), commit->end());
+  auto views = std::vector<wal_format::PageImageView>{};
+  views.reserve(pending_.size());
+  for (const auto &page : pending_) {
+    views.push_back(wal_format::PageImageView{.page_id = page.page_id, .bytes = page.bytes});
+  }
+  auto transaction = wal_format::EncodeTransaction(next_transaction_id_, next_lsn_, views, state);
+  if (!transaction) {
+    return std::unexpected(transaction.error());
+  }
 
   /*
   ** DURABILITY POINT
@@ -518,19 +530,21 @@ auto Wal::Commit() -> Status {
   ** exact point after which StorageEngine may acknowledge durability. Nothing
   ** below advances the known-good tail until that synchronization succeeds.
   */
-  if (auto status = FullPwrite(fd_.Get(), pending_.data(), pending_.size(), size_bytes_); !status.Ok()) {
-    return status;
+  if (auto status = FullPwrite(fd_.Get(), transaction->bytes.data(), transaction->bytes.size(), size_bytes_);
+      !status.Ok()) {
+    return std::unexpected(std::move(status));
   }
   if (io::Fsync(fd_.Get()) < 0) {
     // Do not advance size_bytes_ or clear pending_: the outcome is not treated
     // as acknowledged, and the owning engine poisons itself before more work.
-    return ErrnoStatus("fsync");
+    return std::unexpected(ErrnoStatus("fsync"));
   }
-  size_bytes_ += pending_.size();
+  size_bytes_ += transaction->bytes.size();
+  next_lsn_ = transaction->next_lsn;
   pending_.clear();
-  pending_image_count_ = 0;
+  const auto result = CommitInfo{.transaction_id = next_transaction_id_, .commit_lsn = transaction->commit_lsn};
   ++next_transaction_id_;
-  return {};
+  return result;
 }
 
 auto Wal::SizeBytes() const -> std::uint64_t { return size_bytes_; }
@@ -538,10 +552,18 @@ auto Wal::SizeBytes() const -> std::uint64_t { return size_bytes_; }
 auto Wal::Reset() -> Status {
   TINYDB_CHECK(fd_.Valid(), "resetting a moved-from log");
   TINYDB_CHECK(pending_.empty(), "resetting the log mid-operation");
-  // Preserve the UUID/version header so subsequent commits can append without
-  // recreating the file or its directory entry.
-  if (io::Ftruncate(fd_.Get(), wal_format::HEADER_BYTES) < 0) {
+  // Replace the header so its starting LSN continues after the checkpointed
+  // transaction even though the physical byte offset returns to HEADER_BYTES.
+  if (io::Ftruncate(fd_.Get(), 0) < 0) {
     return ErrnoStatus("ftruncate");
+  }
+  const auto header =
+      wal_format::EncodeHeader(wal_format::Header{.database_uuid = database_uuid_, .starting_lsn = next_lsn_});
+  if (!header) {
+    return header.error();
+  }
+  if (auto status = FullPwrite(fd_.Get(), header->data(), header->size(), 0); !status.Ok()) {
+    return status;
   }
   if (io::Fsync(fd_.Get()) < 0) {
     return ErrnoStatus("fsync");

@@ -260,20 +260,6 @@ auto DiskManager::EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE>
   return *encoded;
 }
 
-auto DiskManager::PrepareStateImage(page_id_t root_page_id, page_id_t allocator_root_page_id,
-                                    page_id_t high_water_page_id, std::uint64_t transaction_id,
-                                    std::uint64_t checkpoint_lsn) const -> Result<PageImage> {
-  // Preparing uses the inactive slot and next generation but deliberately
-  // leaves every in-memory published field unchanged.
-  const auto page_id = active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
-  const auto encoded = EncodeSuperblock(root_page_id, allocator_root_page_id, high_water_page_id, transaction_id,
-                                        checkpoint_lsn, generation_ + 1);
-  if (!encoded) {
-    return std::unexpected(encoded.error());
-  }
-  return PageImage{.page_id = page_id, .data = *encoded};
-}
-
 void DiskManager::AdoptState(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
                              std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) {
   TINYDB_CHECK(high_water_page_id >= FIRST_DATA_PAGE_ID, "adopting an invalid allocation frontier");
@@ -297,8 +283,9 @@ void DiskManager::AdoptState(page_id_t root_page_id, page_id_t allocator_root_pa
 }
 
 void DiskManager::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
-  TINYDB_CHECK(checkpoint_lsn >= checkpoint_lsn_ && checkpoint_lsn <= transaction_id_,
-               "checkpoint frontier is outside published history");
+  // LSNs count WAL records and are deliberately independent of logical
+  // transaction IDs. The caller supplies the current visible upper bound.
+  TINYDB_CHECK(checkpoint_lsn >= checkpoint_lsn_, "checkpoint frontier moved backward");
   ++generation_;
   active_superblock_page_id_ =
       active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;

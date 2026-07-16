@@ -14,6 +14,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -347,7 +348,7 @@ TEST(WalCodecTest, HeaderMatchesGoldenBytesAndRoundTrips) {
   ASSERT_TRUE(encoded.has_value());
   constexpr auto golden = std::array<std::byte, 80>{
       std::byte{0x54}, std::byte{0x49}, std::byte{0x4E}, std::byte{0x59}, std::byte{0x57}, std::byte{0x4C},
-      std::byte{0x30}, std::byte{0x34}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+      std::byte{0x30}, std::byte{0x35}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
       std::byte{0x50}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
       std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
       std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
@@ -355,9 +356,9 @@ TEST(WalCodecTest, HeaderMatchesGoldenBytesAndRoundTrips) {
       std::byte{0x04}, std::byte{0x05}, std::byte{0x06}, std::byte{0x07}, std::byte{0x08}, std::byte{0x09},
       std::byte{0x0A}, std::byte{0x0B}, std::byte{0x0C}, std::byte{0x0D}, std::byte{0x0E}, std::byte{0x0F},
       std::byte{0x08}, std::byte{0x07}, std::byte{0x06}, std::byte{0x05}, std::byte{0x04}, std::byte{0x03},
-      std::byte{0x02}, std::byte{0x01}, std::byte{0x50}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x78}, std::byte{0xFD},
-      std::byte{0x15}, std::byte{0x77}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+      std::byte{0x02}, std::byte{0x01}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0xD9}, std::byte{0x41},
+      std::byte{0x4B}, std::byte{0x58}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
       std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
       std::byte{0x00}, std::byte{0x00},
   };
@@ -368,16 +369,18 @@ TEST(WalCodecTest, HeaderMatchesGoldenBytesAndRoundTrips) {
 
 TEST(WalCodecTest, RecordMatchesGoldenBytesAndDetectsCorruption) {
   constexpr auto payload = std::array{std::byte{0xAA}, std::byte{0xBB}, std::byte{0xCC}};
-  const auto encoded =
-      tinydb::wal_format::EncodeRecord(tinydb::wal_format::RecordType::PageImage, 0x0102030405060708ULL, 80, payload);
+  const auto encoded = tinydb::wal_format::EncodeRecord(tinydb::wal_format::RecordType::PageImage,
+                                                        0x0102030405060708ULL, 80, 0x0A0B0C0DU, payload);
   ASSERT_TRUE(encoded.has_value());
-  constexpr auto golden = std::array<std::byte, 35>{
-      std::byte{0x23}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01}, std::byte{0x00},
+  constexpr auto golden = std::array<std::byte, 43>{
+      std::byte{0x2B}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01}, std::byte{0x00},
       std::byte{0x00}, std::byte{0x00}, std::byte{0x08}, std::byte{0x07}, std::byte{0x06}, std::byte{0x05},
       std::byte{0x04}, std::byte{0x03}, std::byte{0x02}, std::byte{0x01}, std::byte{0x50}, std::byte{0x00},
       std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x8F}, std::byte{0xF3}, std::byte{0x40}, std::byte{0x2D}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0xAA}, std::byte{0xBB}, std::byte{0xCC},
+      std::byte{0x0D}, std::byte{0x0C}, std::byte{0x0B}, std::byte{0x0A}, std::byte{0x9A}, std::byte{0x30},
+      std::byte{0x7A}, std::byte{0xC9}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0xAA}, std::byte{0xBB},
+      std::byte{0xCC},
   };
   const auto bytes = std::as_bytes(std::span{*encoded});
   EXPECT_TRUE(std::ranges::equal(golden, bytes));
@@ -386,16 +389,110 @@ TEST(WalCodecTest, RecordMatchesGoldenBytesAndDetectsCorruption) {
   EXPECT_EQ(decoded->type, tinydb::wal_format::RecordType::PageImage);
   EXPECT_EQ(decoded->transaction_id, 0x0102030405060708ULL);
   EXPECT_EQ(decoded->lsn, 80U);
+  EXPECT_EQ(decoded->record_sequence, 0x0A0B0C0DU);
   EXPECT_EQ(decoded->payload, std::vector<std::byte>(payload.begin(), payload.end()));
 
   for (const auto offset : {std::size_t{0}, std::size_t{4}, std::size_t{8}, std::size_t{16}, std::size_t{24},
-                            std::size_t{28}, std::size_t{34}}) {
+                            std::size_t{28}, std::size_t{32}, std::size_t{42}}) {
     auto corrupted = *encoded;
     corrupted[offset] ^= 0x01;
     EXPECT_EQ(tinydb::wal_format::DecodeRecord(std::as_bytes(std::span{corrupted})).error().Code(),
               StatusCode::Corruption)
         << "offset=" << offset;
   }
+}
+
+TEST(WalCodecTest, TransactionBindsPagesStateOrderAndLsnRange) {
+  const auto first =
+      tinydb::storage::EncodeOverflowPage(2, 100, 1, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
+  const auto second =
+      tinydb::storage::EncodeOverflowPage(3, 100, 1, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
+  const auto pages = std::array{
+      tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
+      tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},
+  };
+  const auto encoded = tinydb::wal_format::EncodeTransaction(9, 100, pages,
+                                                             tinydb::txn::DatabaseState{
+                                                                 .root_page_id = 2,
+                                                                 .allocator_root_page_id = tinydb::HEADER_PAGE_ID,
+                                                                 .high_water_page_id = 4,
+                                                                 .transaction_id = 8,
+                                                                 .visible_lsn = 99,
+                                                                 .checkpoint_lsn = 90,
+                                                             });
+  ASSERT_TRUE(encoded.has_value()) << encoded.error().ToString();
+  EXPECT_EQ(encoded->commit_lsn, 103U);
+  EXPECT_EQ(encoded->next_lsn, 104U);
+  EXPECT_EQ(encoded->state.transaction_id, 9U);
+  EXPECT_EQ(encoded->state.visible_lsn, 103U);
+
+  const auto decoded = tinydb::wal_format::DecodeTransaction(std::as_bytes(std::span{encoded->bytes}), 100);
+  ASSERT_TRUE(decoded.has_value()) << decoded.error().ToString();
+  EXPECT_EQ(decoded->transaction_id, 9U);
+  EXPECT_EQ(decoded->commit_lsn, 103U);
+  EXPECT_EQ(decoded->next_lsn, 104U);
+  EXPECT_EQ(decoded->state, encoded->state);
+  ASSERT_EQ(decoded->pages.size(), 2U);
+  EXPECT_EQ(decoded->pages[0].page_id, 2U);
+  EXPECT_EQ(decoded->pages[0].bytes, first);
+  EXPECT_EQ(decoded->pages[1].page_id, 3U);
+  EXPECT_EQ(decoded->pages[1].bytes, second);
+
+  const auto exhausted = tinydb::wal_format::EncodeTransaction(
+      10, std::numeric_limits<std::uint64_t>::max() - 2, std::span{pages}.first<1>(), tinydb::txn::DatabaseState{});
+  ASSERT_FALSE(exhausted.has_value());
+  EXPECT_EQ(exhausted.error().Code(), StatusCode::ResourceExhausted);
+}
+
+TEST(WalCodecTest, TransactionRejectsMissingDuplicatedReorderedAndCorruptRecords) {
+  const auto first =
+      tinydb::storage::EncodeOverflowPage(2, 50, 1, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
+  const auto second =
+      tinydb::storage::EncodeOverflowPage(3, 50, 1, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
+  const auto pages = std::array{
+      tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
+      tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},
+  };
+  const auto encoded = tinydb::wal_format::EncodeTransaction(4, 50, pages,
+                                                             tinydb::txn::DatabaseState{
+                                                                 .root_page_id = 2,
+                                                                 .high_water_page_id = 4,
+                                                             })
+                           .value();
+  constexpr auto page_record_bytes =
+      tinydb::wal_format::RECORD_HEADER_BYTES + tinydb::wal_format::PAGE_IMAGE_PAYLOAD_BYTES;
+  constexpr auto state_record_bytes =
+      tinydb::wal_format::RECORD_HEADER_BYTES + tinydb::wal_format::DATABASE_STATE_PAYLOAD_BYTES;
+
+  auto missing = encoded.bytes;
+  missing.erase(missing.begin() + static_cast<std::ptrdiff_t>(page_record_bytes),
+                missing.begin() + static_cast<std::ptrdiff_t>(2 * page_record_bytes));
+  EXPECT_EQ(tinydb::wal_format::DecodeTransaction(std::as_bytes(std::span{missing}), 50).error().Code(),
+            StatusCode::Corruption);
+
+  auto duplicated = encoded.bytes;
+  duplicated.insert(duplicated.begin() + static_cast<std::ptrdiff_t>(page_record_bytes), encoded.bytes.begin(),
+                    encoded.bytes.begin() + static_cast<std::ptrdiff_t>(page_record_bytes));
+  EXPECT_EQ(tinydb::wal_format::DecodeTransaction(std::as_bytes(std::span{duplicated}), 50).error().Code(),
+            StatusCode::Corruption);
+
+  auto reordered = encoded.bytes;
+  std::rotate(reordered.begin(), reordered.begin() + static_cast<std::ptrdiff_t>(page_record_bytes),
+              reordered.begin() + static_cast<std::ptrdiff_t>(2 * page_record_bytes));
+  EXPECT_EQ(tinydb::wal_format::DecodeTransaction(std::as_bytes(std::span{reordered}), 50).error().Code(),
+            StatusCode::Corruption);
+
+  auto corrupt_state = encoded.bytes;
+  const auto state_payload = 2 * page_record_bytes + tinydb::wal_format::RECORD_HEADER_BYTES;
+  corrupt_state[state_payload + tinydb::wal_format::DATABASE_STATE_ROOT_OFFSET] ^= 0x01;
+  EXPECT_EQ(tinydb::wal_format::DecodeTransaction(std::as_bytes(std::span{corrupt_state}), 50).error().Code(),
+            StatusCode::Corruption);
+
+  auto missing_state = encoded.bytes;
+  missing_state.erase(missing_state.begin() + static_cast<std::ptrdiff_t>(2 * page_record_bytes),
+                      missing_state.begin() + static_cast<std::ptrdiff_t>(2 * page_record_bytes + state_record_bytes));
+  EXPECT_EQ(tinydb::wal_format::DecodeTransaction(std::as_bytes(std::span{missing_state}), 50).error().Code(),
+            StatusCode::Corruption);
 }
 
 TEST(WalCodecTest, RejectsUnsupportedVersionsFeaturesAndOppositeEndianHeader) {

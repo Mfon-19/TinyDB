@@ -5,12 +5,15 @@
 #include <tinydb/wal.h>
 
 #include "io/syscalls.h"
+#include "storage/page_codec.h"
 #include "storage/superblock.h"
 #include "support/transaction_model.h"
+#include "txn/database_state.h"
 #include "wal/wal_codec.h"
 
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <filesystem>
@@ -421,10 +424,16 @@ TEST_F(StorageEngineTest, OpenRejectsForeignFilesBeforeWalReplay) {
   {
     const auto uuid = TestUuid();
     auto wal = tinydb::Wal::Open(tinydb::Wal::PathFor(db_path_), uuid).value();
-    const auto image = tinydb::storage::EncodeSuperblock(tinydb::storage::Superblock{.database_uuid = uuid});
+    const auto payload = std::array{std::byte{'x'}};
+    const auto image = tinydb::storage::EncodeOverflowPage(2, 1, 1, tinydb::HEADER_PAGE_ID, payload);
     ASSERT_TRUE(image.has_value());
-    wal.AppendPageImage(0, reinterpret_cast<const char *>(image->data()));
-    ASSERT_TRUE(wal.Commit().Ok());
+    wal.AppendPageImage(2, image->data());
+    const auto committed = wal.Commit(tinydb::txn::DatabaseState{
+        .root_page_id = tinydb::HEADER_PAGE_ID,
+        .allocator_root_page_id = tinydb::HEADER_PAGE_ID,
+        .high_water_page_id = 3,
+    });
+    ASSERT_TRUE(committed.has_value());
   }
   const auto wal_size_before = std::filesystem::file_size(tinydb::Wal::PathFor(db_path_));
 
