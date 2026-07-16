@@ -61,6 +61,24 @@ struct SnapshotLease final {
   }
 };
 
+/*
+** publication_mutex is held by the caller. Replace only the persistence
+** frontier of the currently visible logical state; transaction publication
+** and checkpoint publication therefore cannot overwrite one another.
+*/
+void AdvanceCheckpointState(const std::shared_ptr<ReaderGateControl> &control, std::uint64_t checkpoint_lsn) {
+  auto lock = std::lock_guard(control->mutex);
+  const auto &current = control->state;
+  TINYDB_CHECK(checkpoint_lsn >= current->checkpoint_lsn, "visible checkpoint frontier moved backward");
+  TINYDB_CHECK(checkpoint_lsn <= current->visible_lsn, "checkpoint advanced beyond visible state");
+  if (checkpoint_lsn == current->checkpoint_lsn) {
+    return;
+  }
+  auto next = std::make_shared<DatabaseState>(*current);
+  next->checkpoint_lsn = checkpoint_lsn;
+  control->state = std::move(next);
+}
+
 auto SnapshotToken::State() const -> const DatabaseState & {
   TINYDB_CHECK(lease_ != nullptr, "reading an empty snapshot token");
   return *lease_->state;
@@ -118,23 +136,7 @@ void ReaderGate::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
   ** rather than restoring its older base.
   */
   auto publication_lock = std::unique_lock(control_->publication_mutex);
-  auto current = std::shared_ptr<const DatabaseState>{};
-  {
-    auto lock = std::lock_guard(control_->mutex);
-    current = control_->state;
-  }
-  TINYDB_CHECK(checkpoint_lsn >= current->checkpoint_lsn, "visible checkpoint frontier moved backward");
-  TINYDB_CHECK(checkpoint_lsn <= current->visible_lsn, "checkpoint advanced beyond visible state");
-  if (checkpoint_lsn == current->checkpoint_lsn) {
-    return;
-  }
-  auto next = std::make_shared<DatabaseState>(*current);
-  next->checkpoint_lsn = checkpoint_lsn;
-  {
-    auto lock = std::lock_guard(control_->mutex);
-    TINYDB_CHECK(control_->state == current, "checkpoint state changed while publication was serialized");
-    control_->state = std::move(next);
-  }
+  AdvanceCheckpointState(control_, checkpoint_lsn);
 }
 
 auto ReaderGate::Stats() const -> ReaderGateStats {
@@ -157,6 +159,11 @@ auto CheckpointCaptureGuard::CurrentState() const -> std::shared_ptr<const Datab
   TINYDB_CHECK(control_ != nullptr && publication_lock_.owns_lock(), "reading an empty checkpoint capture guard");
   auto lock = std::lock_guard(control_->mutex);
   return control_->state;
+}
+
+void CheckpointCaptureGuard::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
+  TINYDB_CHECK(control_ != nullptr && publication_lock_.owns_lock(), "advancing through an empty checkpoint guard");
+  AdvanceCheckpointState(control_, checkpoint_lsn);
 }
 
 PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) noexcept

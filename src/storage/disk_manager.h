@@ -32,6 +32,7 @@ namespace tinydb {
 class DiskManager {
  public:
   static auto Open(const std::filesystem::path &path) -> Result<DiskManager>;
+  static auto OpenReadOnly(const std::filesystem::path &path) -> Result<DiskManager>;
 
   DiskManager(const DiskManager &) = delete;
   auto operator=(const DiskManager &) -> DiskManager & = delete;
@@ -55,10 +56,17 @@ class DiskManager {
                         std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) -> Status;
   auto Sync() const -> Status;
 
+  // Copy exactly the pages owned by the selected durable superblock. The
+  // caller supplies a new private file and is responsible for publishing its
+  // name only after this method synchronizes the complete image.
+  auto CopyCheckpointTo(int destination_fd) const -> Status;
+
   auto ReadPage(page_id_t page_id, char *data) const -> Status;
 
  private:
-  explicit DiskManager(UniqueFd fd) : fd_(std::move(fd)) {}
+  static auto OpenImpl(const std::filesystem::path &path, bool writable) -> Result<DiskManager>;
+
+  explicit DiskManager(UniqueFd fd, bool writable) : fd_(std::move(fd)), writable_(writable) {}
 
   auto EncodeSuperblock(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
                         std::uint64_t transaction_id, std::uint64_t checkpoint_lsn,
@@ -66,6 +74,7 @@ class DiskManager {
   auto EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE>;
 
   UniqueFd fd_;
+  bool writable_{true};
 
   // Logical metadata represented by the newest durable superblock. The
   // allocator index itself lives in ordinary checkpointed pages rooted here.

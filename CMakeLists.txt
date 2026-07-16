@@ -73,6 +73,8 @@ endfunction()
 
 add_library(
   TinyDB
+  src/backup/backup_manager.cpp
+  src/backup/backup_manager.h
   src/btree/b_plus_tree.cpp
   src/btree/b_plus_tree.h
   src/btree/internal_page_builder.cpp
@@ -127,6 +129,8 @@ add_library(
   src/txn/transaction_pages.h
   src/util/check.h
   src/util/crc32.h
+  src/verify/verifier.cpp
+  src/verify/verifier.h
   src/wal/wal.cpp
   src/wal/wal.h
   src/wal/wal_codec.cpp

@@ -41,6 +41,10 @@ class Database final {
   // Commits are durable before this call. Checkpoint only makes the visible
   // state self-contained in the database file and shortens future recovery.
   auto Checkpoint() -> Status;
+
+  // Publishes a self-contained checkpointed file without a WAL. The
+  // destination must not already exist and is never exposed partially.
+  auto CreateBackup(const std::filesystem::path &destination) -> Status;
   auto Stats() const -> Result<DatabaseStats>;
   auto Close() -> Status;
 

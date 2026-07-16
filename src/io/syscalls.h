@@ -21,6 +21,7 @@ namespace tinydb::io {
 // lives under src/ on purpose: it is not part of TinyDB's public API.
 enum class Syscall {
   Open,
+  Link,
   Rename,
   Unlink,
   Fstat,
@@ -96,6 +97,13 @@ inline auto Rename(const std::filesystem::path &from, const std::filesystem::pat
     return -1;
   }
   return ::rename(from.c_str(), to.c_str());
+}
+
+inline auto Link(const std::filesystem::path &from, const std::filesystem::path &to) -> int {
+  if (MaybeFault(Call{.syscall = Syscall::Link, .path = to})) {
+    return -1;
+  }
+  return ::link(from.c_str(), to.c_str());
 }
 
 inline auto Unlink(const std::filesystem::path &path) -> int {

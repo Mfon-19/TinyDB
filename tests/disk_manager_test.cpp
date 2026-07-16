@@ -128,6 +128,24 @@ TEST(DiskManagerTest, RejectsTruncatedAndOldFormatsWithoutMutation) {
   }
 }
 
+TEST(DiskManagerTest, ReadOnlyOpenNeverCreatesOrInitializesPersistentState) {
+  const auto missing = TestPath("read_only_missing");
+  std::filesystem::remove(missing);
+  const auto absent = tinydb::DiskManager::OpenReadOnly(missing);
+  ASSERT_FALSE(absent.has_value());
+  EXPECT_EQ(absent.error().Code(), tinydb::StatusCode::IoError);
+  EXPECT_FALSE(std::filesystem::exists(missing));
+
+  const auto empty = TestPath("read_only_empty");
+  std::filesystem::remove(empty);
+  std::ofstream(empty, std::ios::binary).close();
+  const auto invalid = tinydb::DiskManager::OpenReadOnly(empty);
+  ASSERT_FALSE(invalid.has_value());
+  EXPECT_EQ(invalid.error().Code(), tinydb::StatusCode::UnsupportedFormat);
+  EXPECT_EQ(std::filesystem::file_size(empty), 0U);
+  std::filesystem::remove(empty);
+}
+
 TEST(DiskManagerTest, OneValidSuperblockSurvivesDamageToTheOther) {
   const auto path = TestPath("one_superblock");
   std::filesystem::remove(path);

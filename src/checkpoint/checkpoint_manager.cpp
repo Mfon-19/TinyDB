@@ -26,6 +26,9 @@ auto DirtyBytes(const cache::CommittedCacheStats &stats) -> std::size_t {
 
 }  // namespace
 
+CheckpointedFileGuard::CheckpointedFileGuard(CheckpointedFileGuard &&) noexcept = default;
+CheckpointedFileGuard::~CheckpointedFileGuard() = default;
+
 Manager::Manager(DiskManager *disk, cache::CommittedPageCache *cache, txn::ReaderGate *readers, Wal *wal, Policy policy)
     : disk_(disk), cache_(cache), readers_(readers), wal_(wal), policy_(policy) {
   TINYDB_CHECK(disk_ != nullptr && cache_ != nullptr && readers_ != nullptr && wal_ != nullptr,
@@ -53,11 +56,37 @@ auto Manager::Checkpoint() -> Status {
   // The mutex spans capture, I/O, and cleanup. Two checkpoints can otherwise
   // write old and new page versions out of order even though each snapshot is
   // internally valid.
-  auto checkpoint_lock = std::lock_guard(checkpoint_mutex_);
+  auto checkpoint_lock = std::unique_lock(checkpoint_mutex_);
+  return CheckpointLocked(nullptr);
+}
+
+auto Manager::CheckpointAndFreeze() -> Result<CheckpointedFileGuard> {
+  auto checkpoint_lock = std::unique_lock(checkpoint_mutex_);
+  auto publication_pause = std::make_unique<txn::CheckpointCaptureGuard>(readers_->BeginCheckpointCapture());
+  if (auto status = CheckpointLocked(publication_pause.get()); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
+  return CheckpointedFileGuard(std::move(checkpoint_lock), std::move(publication_pause));
+}
+
+/*
+** checkpoint_mutex_ is held on entry and remains owned through WAL cleanup.
+** Success establishes a self-contained database file at the captured state;
+** CheckpointAndFreeze keeps that physical image immutable for its caller.
+*/
+auto Manager::CheckpointLocked(txn::CheckpointCaptureGuard *publication_pause) -> Status {
 
   auto state = std::shared_ptr<const txn::DatabaseState>{};
   auto pages = std::vector<cache::PageGuard>{};
-  {
+  const auto capture = [&](txn::CheckpointCaptureGuard &guard) {
+    state = guard.CurrentState();
+    const auto durable_lsn = disk_->CheckpointLsn();
+    TINYDB_CHECK(durable_lsn <= state->visible_lsn, "database file is newer than visible state");
+    pages = cache_->CaptureCheckpointPages(durable_lsn, state->visible_lsn);
+  };
+  if (publication_pause != nullptr) {
+    capture(*publication_pause);
+  } else {
     /*
     ** CAPTURE PHASE
     **
@@ -66,11 +95,8 @@ auto Manager::Checkpoint() -> Status {
     ** irrelevant to page lifetime, while the capture lock ensures no publisher
     ** changes the dense page table as these exact current versions are selected.
     */
-    auto capture = readers_->BeginCheckpointCapture();
-    state = capture.CurrentState();
-    const auto durable_lsn = disk_->CheckpointLsn();
-    TINYDB_CHECK(durable_lsn <= state->visible_lsn, "database file is newer than visible state");
-    pages = cache_->CaptureCheckpointPages(durable_lsn, state->visible_lsn);
+    auto capture_guard = readers_->BeginCheckpointCapture();
+    capture(capture_guard);
   }
 
   const auto target_lsn = state->visible_lsn;
@@ -105,7 +131,11 @@ auto Manager::Checkpoint() -> Status {
   ** marking similarly tests each current frame's LSN, so P@N+1 remains dirty
   ** when this checkpoint wrote the retained P@N guard.
   */
-  readers_->AdvanceCheckpoint(target_lsn);
+  if (publication_pause != nullptr) {
+    publication_pause->AdvanceCheckpoint(target_lsn);
+  } else {
+    readers_->AdvanceCheckpoint(target_lsn);
+  }
   cache_->MarkCheckpointed(target_lsn);
   if (auto status = wal_->CleanupCheckpointed(target_lsn); !status.Ok()) {
     return Record(std::move(status));
