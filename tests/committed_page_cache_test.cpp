@@ -70,11 +70,13 @@ struct CacheFixture {
 
   auto AddDiskPage(tinydb::page_id_t marker, std::uint64_t lsn = 0) -> tinydb::page_id_t {
     const auto page_id = disk->HighWaterPageId();
-    disk->AdoptState(disk->GetRootPageId(), disk->GetAllocatorRootPageId(), page_id + 1, disk->TransactionId(),
-                     disk->CheckpointLsn());
     EXPECT_TRUE(disk->EnsurePageCount(page_id + 1).Ok());
     const auto page = EncodedPage(page_id, lsn, marker);
-    EXPECT_TRUE(disk->WritePage(page_id, page->data()).Ok());
+    EXPECT_TRUE(disk->WriteCheckpointPage(page_id, page->data(), page_id + 1).Ok());
+    EXPECT_TRUE(disk->Sync().Ok());
+    EXPECT_TRUE(disk->CommitCheckpoint(disk->GetRootPageId(), disk->GetAllocatorRootPageId(), page_id + 1,
+                                       disk->TransactionId(), disk->CheckpointLsn())
+                    .Ok());
     return page_id;
   }
 
@@ -140,8 +142,8 @@ TEST(CommittedPageCacheTest, CacheHitsRefreshTheEvictionOrder) {
   // immutable frame survived or had to be loaded again.
   const auto changed_first = EncodedPage(first, 1, third);
   const auto changed_second = EncodedPage(second, 1, third);
-  ASSERT_TRUE(fixture.disk->WritePage(first, changed_first->data()).Ok());
-  ASSERT_TRUE(fixture.disk->WritePage(second, changed_second->data()).Ok());
+  ASSERT_TRUE(fixture.disk->WriteCheckpointPage(first, changed_first->data(), fixture.disk->HighWaterPageId()).Ok());
+  ASSERT_TRUE(fixture.disk->WriteCheckpointPage(second, changed_second->data(), fixture.disk->HighWaterPageId()).Ok());
 
   ASSERT_TRUE(cache.Read(third).has_value());  // Evicts least-recently-used second.
   auto retained_first = cache.Read(first).value();

@@ -62,10 +62,11 @@ struct SnapshotFixture {
     std::filesystem::remove(path);
     disk = std::make_unique<tinydb::DiskManager>(tinydb::DiskManager::Open(path).value());
     root = disk->HighWaterPageId();
-    disk->AdoptState(root, disk->GetAllocatorRootPageId(), root + 1, disk->TransactionId(), disk->CheckpointLsn());
     EXPECT_TRUE(disk->EnsurePageCount(root + 1).Ok());
     auto initial = Leaf(root, {{"alpha", "one"}, {"bravo", "two"}});
-    EXPECT_TRUE(disk->WritePage(root, initial->data()).Ok());
+    EXPECT_TRUE(disk->WriteCheckpointPage(root, initial->data(), root + 1).Ok());
+    EXPECT_TRUE(disk->Sync().Ok());
+    EXPECT_TRUE(disk->CommitCheckpoint(root, disk->GetAllocatorRootPageId(), root + 1, 1, 1).Ok());
     cache = std::make_unique<tinydb::cache::CommittedPageCache>(disk.get(), 4 * tinydb::PAGE_SIZE, 1);
     pages = std::make_unique<tinydb::cache::CommittedPageSource>(cache.get());
     gate = std::make_unique<tinydb::txn::ReaderGate>(State(1, root));

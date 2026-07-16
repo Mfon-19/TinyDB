@@ -16,15 +16,17 @@ namespace tinydb {
 ** DISK MANAGER BOUNDARY
 **
 ** DiskManager owns the database file descriptor and the metadata represented
-** by the currently published superblock. It performs physical page I/O and
-** durable superblock selection; it does not allocate, retire, or reuse logical
-** page IDs. Those operations belong to TransactionPages.
+** by the newest durable superblock. It performs physical page I/O and durable
+** superblock selection; it does not track the newer state visible only through
+** the committed cache and WAL. Logical allocation, retirement, and reuse
+** belong to TransactionPages.
 **
-** Logical publication and checkpointing are separate. AdoptState changes the
-** published fields only after WAL durability and cache publication. Checkpoint
-** encodes that logical state into the inactive superblock so that older WAL
-** can eventually be discarded. Superblocks are checkpoint artifacts; they are
-** never transaction page images.
+** Checkpoint data pages are written against an explicit captured high-water
+** frontier. CommitCheckpoint then writes only the inactive superblock and
+** synchronizes it before adopting the captured metadata in memory. Until that
+** synchronization succeeds, the previously selected superblock and WAL remain
+** the recovery basis. Superblocks are checkpoint artifacts; they are never
+** transaction page images.
 */
 
 class DiskManager {
@@ -44,18 +46,16 @@ class DiskManager {
   auto CheckpointLsn() const -> std::uint64_t;
   auto Uuid() const -> const DatabaseUuid &;
 
-  void AdoptState(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
-                  std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) noexcept;
-  void AdvanceCheckpoint(std::uint64_t checkpoint_lsn);
-
   // Checkpoint data-page writes may need to extend the file to the published
   // logical frontier. Allocation itself never performs this physical growth.
   auto EnsurePageCount(page_id_t high_water_page_id) -> Status;
-  auto Checkpoint() -> Status;
+
+  auto WriteCheckpointPage(page_id_t page_id, const char *data, page_id_t captured_high_water_page_id) const -> Status;
+  auto CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
+                        std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) -> Status;
   auto Sync() const -> Status;
 
   auto ReadPage(page_id_t page_id, char *data) const -> Status;
-  auto WritePage(page_id_t page_id, const char *data) const -> Status;
 
  private:
   explicit DiskManager(UniqueFd fd) : fd_(std::move(fd)) {}
@@ -64,12 +64,11 @@ class DiskManager {
                         std::uint64_t transaction_id, std::uint64_t checkpoint_lsn,
                         std::uint64_t generation) const -> Result<std::array<char, PAGE_SIZE>>;
   auto EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE>;
-  auto WriteCurrentSuperblock() const -> Status;
 
   UniqueFd fd_;
 
-  // Logical metadata represented by the latest published state. The allocator
-  // index itself lives in ordinary committed pages rooted here.
+  // Logical metadata represented by the newest durable superblock. The
+  // allocator index itself lives in ordinary checkpointed pages rooted here.
   DatabaseUuid database_uuid_{};
   std::uint64_t generation_{1};
   std::uint64_t checkpoint_lsn_{0};

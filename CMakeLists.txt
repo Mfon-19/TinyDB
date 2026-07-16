@@ -97,6 +97,8 @@ add_library(
   src/cache/committed_page_cache.h
   src/cache/committed_page_source.cpp
   src/cache/committed_page_source.h
+  src/checkpoint/checkpoint_manager.cpp
+  src/checkpoint/checkpoint_manager.h
   src/engine/storage_engine.cpp
   src/io/file_io.cpp
   src/io/file_io.h
@@ -224,6 +226,15 @@ if(BUILD_TESTING)
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_committed_page_cache_test)
     gtest_discover_tests(TinyDB_committed_page_cache_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/checkpoint_manager_test.cpp")
+    add_executable(TinyDB_checkpoint_manager_test tests/checkpoint_manager_test.cpp)
+    target_link_libraries(TinyDB_checkpoint_manager_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_checkpoint_manager_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_checkpoint_manager_test)
+    gtest_discover_tests(TinyDB_checkpoint_manager_test)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/read_snapshot_test.cpp")

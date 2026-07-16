@@ -1,7 +1,6 @@
 #include "txn/commit_coordinator.h"
 
 #include <tinydb/check.h>
-#include <tinydb/disk_manager.h>
 #include <tinydb/wal.h>
 
 #include "btree/b_plus_tree.h"
@@ -73,7 +72,10 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
     transaction_state = TransactionState::Aborted;
     return std::unexpected(publication_plan.error());
   }
-  auto published_state = std::make_shared<const DatabaseState>(state);
+  // This object remains private through WAL synchronization. Publication may
+  // raise its checkpoint frontier to one completed concurrently, which is a
+  // no-throw scalar update and does not change the WAL-authenticated mutation.
+  auto published_state = std::make_shared<DatabaseState>(state);
 
   transaction_state = TransactionState::WritingWal;
   const auto durable = wal_->Commit(state);
@@ -99,9 +101,9 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
   */
   {
     auto publication = readers_->BeginPublication();
+    published_state->checkpoint_lsn =
+        std::max(published_state->checkpoint_lsn, publication.CurrentState()->checkpoint_lsn);
     cache_->Publish(std::move(*publication_plan));
-    disk_->AdoptState(state.root_page_id, state.allocator_root_page_id, state.high_water_page_id, state.transaction_id,
-                      state.checkpoint_lsn);
     publication.Publish(std::move(published_state));
   }
   transaction_state = TransactionState::Published;

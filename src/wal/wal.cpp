@@ -31,8 +31,9 @@ namespace {
 ** The writer collects final data pages in memory, adds the resulting logical
 ** database state, and appends the complete run with its binding Commit record
 ** before calling fsync. That fsync is the durability point. StorageEngine may
-** publish only after it succeeds. On append or sync failure the durable tail
-** is not advanced in memory and the engine stops accepting work until reopen.
+** publish only after it succeeds. A failed append that can be truncated back
+** to the known-good tail is a definite abort. Failed repair or ambiguous sync
+** prevents more work until recovery establishes the durable tail.
 **
 ** WAL files are append-only durability artifacts.  The writer does not parse
 ** or replay existing records; the recovery subsystem owns all interpretation
@@ -191,7 +192,11 @@ auto Wal::RotateSegment() -> Status {
   }
 
   retained_size_bytes_ += size_bytes_;
-  archived_segments_.push_back(archive_path);
+  archived_segments_.push_back(ArchivedSegment{
+      .path = archive_path,
+      .final_lsn = next_lsn_ - 1U,
+      .size_bytes = size_bytes_,
+  });
   fd_ = std::move(next_fd);
   segment_id_ = next_segment_id;
   size_bytes_ = wal_format::HEADER_BYTES;
@@ -212,6 +217,7 @@ void Wal::DiscardPending() {
 }
 
 auto Wal::NextCommitLsn(std::size_t page_count) const -> Result<std::uint64_t> {
+  auto lock = std::lock_guard(*mutex_);
   if (page_count == 0 || page_count > std::numeric_limits<std::uint32_t>::max() - 2U ||
       next_lsn_ >= std::numeric_limits<std::uint64_t>::max() ||
       page_count > std::numeric_limits<std::uint64_t>::max() - next_lsn_ - 1U) {
@@ -221,6 +227,7 @@ auto Wal::NextCommitLsn(std::size_t page_count) const -> Result<std::uint64_t> {
 }
 
 auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
+  auto lock = std::lock_guard(*mutex_);
   TINYDB_CHECK(fd_.Valid(), "committing on a moved-from log");
   TINYDB_CHECK(!pending_.empty(), "committing an operation that logged no page images");
   if (needs_recovery_) {
@@ -293,49 +300,52 @@ auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
   return result;
 }
 
-auto Wal::SizeBytes() const -> std::uint64_t { return retained_size_bytes_ + size_bytes_; }
+auto Wal::SizeBytes() const -> std::uint64_t {
+  auto lock = std::lock_guard(*mutex_);
+  auto live_bytes = std::uint64_t{0};
+  for (const auto &segment : archived_segments_) {
+    if (segment.final_lsn > checkpoint_lsn_) {
+      live_bytes += segment.size_bytes;
+    }
+  }
+  // A covered active segment remains the append target. Keeping it avoids a
+  // destructive truncate during ordinary maintenance; it contributes only a
+  // logical header to checkpoint pressure until a new transaction is appended.
+  live_bytes += next_lsn_ - 1U > checkpoint_lsn_ ? size_bytes_ : wal_format::HEADER_BYTES;
+  return live_bytes;
+}
 
-auto Wal::Reset() -> Status {
-  TINYDB_CHECK(fd_.Valid(), "resetting a moved-from log");
-  TINYDB_CHECK(pending_.empty(), "resetting the log mid-operation");
-  // Replace the header so its starting LSN continues after the checkpointed
-  // transaction even though the physical byte offset returns to HEADER_BYTES.
-  if (io::Ftruncate(fd_.Get(), 0) < 0) {
-    return ErrnoStatus("ftruncate");
-  }
-  const auto header = wal_format::EncodeHeader(wal_format::Header{
-      .database_uuid = database_uuid_,
-      .segment_id = segment_id_,
-      .starting_lsn = next_lsn_,
-  });
-  if (!header) {
-    return header.error();
-  }
-  if (auto status = FullPwrite(fd_.Get(), header->data(), header->size(), 0); !status.Ok()) {
-    needs_recovery_ = true;
-    return Status::NeedsRecovery("checkpoint reset could not restore the WAL header: " + status.Message());
-  }
-  if (io::Fsync(fd_.Get()) < 0) {
-    needs_recovery_ = true;
-    return Status::NeedsRecovery("checkpoint WAL reset synchronization failed");
-  }
-  auto removed_archive = false;
-  for (const auto &archive : archived_segments_) {
-    if (io::Unlink(archive) < 0 && errno != ENOENT) {
-      needs_recovery_ = true;
-      return Status::NeedsRecovery("checkpoint could not remove a covered WAL segment");
+auto Wal::CleanupCheckpointed(std::uint64_t checkpoint_lsn) -> Status {
+  auto lock = std::lock_guard(*mutex_);
+  TINYDB_CHECK(fd_.Valid(), "cleaning a moved-from log");
+  TINYDB_CHECK(checkpoint_lsn >= checkpoint_lsn_, "WAL checkpoint frontier moved backward");
+  checkpoint_lsn_ = checkpoint_lsn;
+
+  /*
+  ** COVERED SEGMENT CLEANUP
+  **
+  ** Rotation is the only operation that makes a segment immutable. Therefore
+  ** cleanup never truncates or renames the active append target. Archives are
+  ** ordered, so deletion stops at the first segment containing a record newer
+  ** than the durable superblock. A failed unlink leaves all remaining files as
+  ** redundant, checkpoint-covered history.
+  */
+  while (!archived_segments_.empty() && archived_segments_.front().final_lsn <= checkpoint_lsn) {
+    const auto segment = archived_segments_.front();
+    if (io::Unlink(segment.path) < 0 && errno != ENOENT) {
+      return io::ErrnoStatus("remove checkpointed WAL segment");
     }
-    removed_archive = true;
+    TINYDB_CHECK(retained_size_bytes_ >= segment.size_bytes, "retained WAL byte count underflow");
+    retained_size_bytes_ -= segment.size_bytes;
+    archived_segments_.pop_front();
+    cleanup_directory_dirty_ = true;
   }
-  if (removed_archive) {
+  if (cleanup_directory_dirty_) {
     if (auto status = SyncParentDirectory(wal_path_); !status.Ok()) {
-      needs_recovery_ = true;
-      return Status::NeedsRecovery("checkpointed WAL segment deletion is not durable");
+      return status;
     }
+    cleanup_directory_dirty_ = false;
   }
-  size_bytes_ = wal_format::HEADER_BYTES;
-  retained_size_bytes_ = 0;
-  archived_segments_.clear();
   return {};
 }
 

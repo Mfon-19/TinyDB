@@ -17,11 +17,13 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
@@ -793,23 +795,25 @@ TEST_F(StorageEngineTest, CommittedWritesSurviveACrash) {
   EXPECT_TRUE(recovered.Close().Ok());
 }
 
-TEST_F(StorageEngineTest, CleanCloseEmptiesTheLog) {
+TEST_F(StorageEngineTest, CleanCloseLeavesCoveredActiveWalForRecoveryCleanup) {
   {
     auto engine = tinydb::StorageEngine::Open(db_path_).value();
     ASSERT_TRUE(engine.Put("k", "v").Ok());
     ASSERT_TRUE(engine.Close().Ok());
   }
 
-  // Close checkpointed: the log is down to its encoded header, and the
-  // database file alone carries the data.
+  // Ordinary checkpointing never truncates its active append target. The
+  // durable superblock covers these retained records, so reopen can validate
+  // and discard them without using them as redo.
   const auto wal_path = tinydb::Wal::PathFor(db_path_);
-  EXPECT_EQ(std::filesystem::file_size(wal_path), tinydb::wal_format::HEADER_BYTES);
+  EXPECT_GT(std::filesystem::file_size(wal_path), tinydb::wal_format::HEADER_BYTES);
 
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
   EXPECT_EQ(engine.Get("k").value(), "v");
+  EXPECT_EQ(std::filesystem::file_size(wal_path), tinydb::wal_format::HEADER_BYTES);
 }
 
-TEST_F(StorageEngineTest, CleanCloseSyncsDatabaseBeforeResettingWal) {
+TEST_F(StorageEngineTest, CleanCloseSyncsPagesBeforePublishingTheInactiveSuperblock) {
   auto engine = tinydb::StorageEngine::Open(db_path_).value();
   ASSERT_TRUE(engine.Put("k", "v").Ok());
 
@@ -822,16 +826,17 @@ TEST_F(StorageEngineTest, CleanCloseSyncsDatabaseBeforeResettingWal) {
     ASSERT_TRUE(engine.Close().Ok());
   }
 
-  const auto db_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path_);
-  const auto wal_truncate =
-      FindCall(calls, tinydb::io::Syscall::Ftruncate, tinydb::Wal::PathFor(db_path_), db_sync + 1);
-  const auto wal_sync = FindCall(calls, tinydb::io::Syscall::Fsync, tinydb::Wal::PathFor(db_path_), wal_truncate + 1);
+  const auto page_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path_);
+  const auto superblock_write = FindCall(calls, tinydb::io::Syscall::Pwrite, db_path_, page_sync + 1);
+  const auto superblock_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path_, superblock_write + 1);
+  const auto wal_truncate = FindCall(calls, tinydb::io::Syscall::Ftruncate, tinydb::Wal::PathFor(db_path_));
 
-  ASSERT_NE(db_sync, std::numeric_limits<std::size_t>::max());
-  ASSERT_NE(wal_truncate, std::numeric_limits<std::size_t>::max());
-  ASSERT_NE(wal_sync, std::numeric_limits<std::size_t>::max());
-  EXPECT_LT(db_sync, wal_truncate);
-  EXPECT_LT(wal_truncate, wal_sync);
+  ASSERT_NE(page_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(superblock_write, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(superblock_sync, std::numeric_limits<std::size_t>::max());
+  EXPECT_LT(page_sync, superblock_write);
+  EXPECT_LT(superblock_write, superblock_sync);
+  EXPECT_EQ(wal_truncate, std::numeric_limits<std::size_t>::max());
 }
 
 TEST_F(StorageEngineTest, CleanCloseLeavesWalIntactWhenDatabaseSyncFails) {
@@ -853,6 +858,51 @@ TEST_F(StorageEngineTest, CleanCloseLeavesWalIntactWhenDatabaseSyncFails) {
   }
 
   ASSERT_TRUE(engine.Close().Ok());
+}
+
+TEST_F(StorageEngineTest, WritePublishingDuringCheckpointRecoversFromTheNewCheckpointBase) {
+  auto engine = tinydb::StorageEngine::Open(db_path_).value();
+  ASSERT_TRUE(engine.Put("key", "before").Ok());
+
+  auto mutex = std::mutex{};
+  auto changed = std::condition_variable{};
+  auto page_write_reached = false;
+  auto release_page_write = false;
+  auto checkpoint_status = tinydb::Status{};
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      if (call.syscall == tinydb::io::Syscall::Pwrite && call.path == db_path_ &&
+          call.offset >= tinydb::FIRST_DATA_PAGE_ID * tinydb::PAGE_SIZE) {
+        auto lock = std::unique_lock(mutex);
+        page_write_reached = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release_page_write; });
+      }
+      return std::nullopt;
+    }};
+    auto checkpoint = std::thread([&] { checkpoint_status = engine.Checkpoint(); });
+    {
+      auto lock = std::unique_lock(mutex);
+      changed.wait(lock, [&] { return page_write_reached; });
+    }
+
+    // This transaction began from the older checkpoint frontier. Its WAL
+    // record retains that conservative allocator base, while publication later
+    // merges the checkpoint that is currently writing.
+    ASSERT_TRUE(engine.Put("key", "after").Ok());
+    {
+      auto lock = std::lock_guard(mutex);
+      release_page_write = true;
+    }
+    changed.notify_all();
+    checkpoint.join();
+  }
+  ASSERT_TRUE(checkpoint_status.Ok()) << checkpoint_status.ToString();
+  EXPECT_EQ(engine.Get("key").value(), "after");
+
+  SnapshotDatabase();
+  auto recovered = tinydb::StorageEngine::Open(second_db_path_).value();
+  EXPECT_EQ(recovered.Get("key").value(), "after");
 }
 
 TEST_F(StorageEngineTest, LogOutgrowingItsThresholdCheckpoints) {

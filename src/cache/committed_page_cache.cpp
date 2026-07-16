@@ -315,13 +315,16 @@ auto CommittedPageCache::DirtyPageIds() const -> std::vector<page_id_t> {
   return result;
 }
 
-auto CommittedPageCache::DirtyPages() -> std::vector<PageGuard> {
+auto CommittedPageCache::CaptureCheckpointPages(std::uint64_t checkpoint_lsn,
+                                                std::uint64_t target_lsn) -> std::vector<PageGuard> {
+  TINYDB_CHECK(checkpoint_lsn <= target_lsn, "checkpoint capture has a reversed LSN range");
   auto lock = std::lock_guard(impl_->mutex);
-  // Return guards in page-ID order. Checkpointing receives a stable version of
-  // every frame even if a later publication replaces the page-table entry.
+  // Return guards in page-ID order. A later publication may replace a table
+  // entry, but the guard keeps this exact old immutable version alive until
+  // checkpoint I/O finishes.
   auto result = std::vector<PageGuard>{};
   for (const auto &page : impl_->pages) {
-    if (page != nullptr && !page->checkpointed.load(std::memory_order_acquire)) {
+    if (page != nullptr && page->page_lsn > checkpoint_lsn && page->page_lsn <= target_lsn) {
       result.push_back(PageGuard(page));
     }
   }

@@ -271,7 +271,7 @@ TEST(WalTest, OpenRejectsALogFromAnotherDatabase) {
   std::filesystem::remove(path);
 }
 
-TEST(WalTest, CommitGrowsTheLogAndResetEmptiesIt) {
+TEST(WalTest, CheckpointCoverageDropsLogicalPressureWithoutRewritingActiveTail) {
   const auto path = TestPath("wal_commit_reset");
   std::filesystem::remove(path);
   auto wal = tinydb::Wal::Open(path, TEST_UUID).value();
@@ -280,19 +280,17 @@ TEST(WalTest, CommitGrowsTheLogAndResetEmptiesIt) {
   const auto second = DataPage(3, 'a');
   wal.AppendPageImage(2, first.data());
   wal.AppendPageImage(3, second.data());
-  ASSERT_TRUE(Commit(wal).has_value());
+  const auto committed = Commit(wal);
+  ASSERT_TRUE(committed.has_value());
 
   const auto expected =
       WAL_HEADER_BYTES + (2 * PAGE_IMAGE_RECORD_BYTES) + DATABASE_STATE_RECORD_BYTES + COMMIT_RECORD_BYTES;
   EXPECT_EQ(wal.SizeBytes(), expected);
   EXPECT_EQ(std::filesystem::file_size(path), expected);
 
-  ASSERT_TRUE(wal.Reset().Ok());
+  ASSERT_TRUE(wal.CleanupCheckpointed(committed->commit_lsn).Ok());
   EXPECT_EQ(wal.SizeBytes(), WAL_HEADER_BYTES);
-  EXPECT_EQ(std::filesystem::file_size(path), WAL_HEADER_BYTES);
-
-  // The magic survives a reset: the file still opens as a log.
-  EXPECT_TRUE(tinydb::Wal::Open(path, TEST_UUID).has_value());
+  EXPECT_EQ(std::filesystem::file_size(path), expected);
 
   std::filesystem::remove(path);
 }
@@ -330,7 +328,40 @@ TEST(WalTest, RotationKeepsEachTransactionInsideOneOrderedSegment) {
   EXPECT_EQ(active_header->segment_id, 2U);
   EXPECT_EQ(active_header->starting_lsn, committed->commit_lsn - 2U);
 
-  ASSERT_TRUE(wal.Reset().Ok());
+  ASSERT_TRUE(wal.CleanupCheckpointed(committed->commit_lsn).Ok());
+  EXPECT_FALSE(std::filesystem::exists(archive));
+  EXPECT_EQ(wal.SizeBytes(), WAL_HEADER_BYTES);
+  std::filesystem::remove(path);
+}
+
+TEST(WalTest, CoveredArchiveCleanupFailureLeavesLiveAppendingAndIsRetryable) {
+  const auto path = TestPath("wal_checkpoint_cleanup_retry");
+  const auto archive = tinydb::Wal::SegmentPathFor(path, 1);
+  std::filesystem::remove(path);
+  std::filesystem::remove(archive);
+  auto wal = tinydb::Wal::Open(path, TEST_UUID, 1, 0, WAL_HEADER_BYTES + ONE_PAGE_TRANSACTION_BYTES).value();
+
+  wal.AppendPageImage(2, DataPage(2, 'a').data());
+  ASSERT_TRUE(Commit(wal).has_value());
+  wal.AppendPageImage(3, DataPage(3, 'b').data());
+  const auto second = Commit(wal);
+  ASSERT_TRUE(second.has_value());
+  ASSERT_TRUE(std::filesystem::exists(archive));
+
+  {
+    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+      if (call.syscall == tinydb::io::Syscall::Unlink && call.path == archive) {
+        return tinydb::io::Fault{.error = EIO};
+      }
+      return std::nullopt;
+    }};
+    EXPECT_EQ(wal.CleanupCheckpointed(second->commit_lsn).Code(), tinydb::StatusCode::IoError);
+  }
+
+  // Cleanup is maintenance: the immutable covered segment remains harmless,
+  // and failure does not poison the active append target.
+  EXPECT_TRUE(std::filesystem::exists(archive));
+  ASSERT_TRUE(wal.CleanupCheckpointed(second->commit_lsn).Ok());
   EXPECT_FALSE(std::filesystem::exists(archive));
   EXPECT_EQ(wal.SizeBytes(), WAL_HEADER_BYTES);
   std::filesystem::remove(path);
@@ -428,7 +459,7 @@ TEST(WalDurabilityTest, RotationSynchronizesArchiveAndNewActiveDirectoryEntriesB
   EXPECT_LT(header_sync, active_dir_sync);
   EXPECT_LT(active_dir_sync, transaction_write);
 
-  ASSERT_TRUE(wal.Reset().Ok());
+  ASSERT_TRUE(wal.CleanupCheckpointed(6).Ok());
   std::filesystem::remove(path);
 }
 

@@ -99,6 +99,11 @@ class StorageEngine final {
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
   auto Remove(std::string_view key) -> Status;
   auto Scan(std::string_view start, std::string_view end) -> Result<std::vector<std::pair<std::string, std::string>>>;
+
+  // Makes the current visible state self-contained in the database file.
+  // Commits are already durable through WAL; checkpoint failure therefore
+  // leaves acknowledged transactions valid and may be retried.
+  auto Checkpoint() -> Status;
   auto CheckIntegrity() -> Status;
   auto Close() -> Status;
 

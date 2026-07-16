@@ -5,11 +5,13 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 namespace tinydb::txn {
 
 class ReaderGate;
+class CheckpointCaptureGuard;
 class PublicationGuard;
 struct ReaderGateControl;
 struct SnapshotLease;
@@ -65,12 +67,37 @@ class ReaderGate final {
   auto operator=(const ReaderGate &) -> ReaderGate & = delete;
 
   auto BeginRead() -> SnapshotToken;
+  auto BeginCheckpointCapture() -> CheckpointCaptureGuard;
   auto BeginPublication() noexcept -> PublicationGuard;
   auto CurrentState() const -> std::shared_ptr<const DatabaseState>;
+  void AdvanceCheckpoint(std::uint64_t checkpoint_lsn);
   auto Stats() const -> ReaderGateStats;
 
  private:
   std::shared_ptr<ReaderGateControl> control_;
+};
+
+/*
+** Checkpoint capture serializes only with the cache/state replacement inside
+** publication. It does not close reader admission or wait for existing
+** readers: committed frames are immutable and their guards own page lifetime.
+*/
+class CheckpointCaptureGuard final {
+ public:
+  CheckpointCaptureGuard(const CheckpointCaptureGuard &) = delete;
+  auto operator=(const CheckpointCaptureGuard &) -> CheckpointCaptureGuard & = delete;
+  CheckpointCaptureGuard(CheckpointCaptureGuard &&) noexcept = default;
+  auto operator=(CheckpointCaptureGuard &&) noexcept -> CheckpointCaptureGuard & = default;
+
+  auto CurrentState() const -> std::shared_ptr<const DatabaseState>;
+
+ private:
+  explicit CheckpointCaptureGuard(std::shared_ptr<ReaderGateControl> control);
+
+  std::shared_ptr<ReaderGateControl> control_;
+  std::unique_lock<std::mutex> publication_lock_;
+
+  friend class ReaderGate;
 };
 
 /*
@@ -96,6 +123,7 @@ class PublicationGuard final {
   void Reopen() noexcept;
 
   std::shared_ptr<ReaderGateControl> control_;
+  std::unique_lock<std::mutex> publication_lock_;
 
   friend class ReaderGate;
 };

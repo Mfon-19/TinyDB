@@ -8,7 +8,6 @@
 namespace tinydb {
 
 class BPlusTree;
-class DiskManager;
 class Wal;
 
 namespace cache {
@@ -39,8 +38,8 @@ class TransactionPages;
 */
 class CommitCoordinator final {
  public:
-  CommitCoordinator(Wal *wal, cache::CommittedPageCache *cache, DiskManager *disk, ReaderGate *readers)
-      : wal_(wal), cache_(cache), disk_(disk), readers_(readers) {}
+  CommitCoordinator(Wal *wal, cache::CommittedPageCache *cache, ReaderGate *readers)
+      : wal_(wal), cache_(cache), readers_(readers) {}
 
   auto Commit(TransactionPages &transaction, BPlusTree &tree,
               TransactionState &transaction_state) -> Result<TransactionCommitInfo>;
@@ -48,7 +47,6 @@ class CommitCoordinator final {
  private:
   Wal *wal_;
   cache::CommittedPageCache *cache_;
-  DiskManager *disk_;
   ReaderGate *readers_;
 };
 

@@ -18,6 +18,9 @@ using Clock = std::chrono::steady_clock;
 ** reader departs, the two events on which a waiter can make progress.
 */
 struct ReaderGateControl final {
+  // Held only while cache pages and the state pointer are captured/replaced.
+  // Checkpoints use it without entering the reader-draining state.
+  std::mutex publication_mutex;
   mutable std::mutex mutex;         // protects every field below
   std::condition_variable changed;  // admission or drain may progress
   std::shared_ptr<const DatabaseState> state;
@@ -94,11 +97,44 @@ auto ReaderGate::BeginRead() -> SnapshotToken {
   return SnapshotToken(std::move(lease));
 }
 
+auto ReaderGate::BeginCheckpointCapture() -> CheckpointCaptureGuard { return CheckpointCaptureGuard(control_); }
+
 auto ReaderGate::BeginPublication() noexcept -> PublicationGuard { return PublicationGuard(control_); }
 
 auto ReaderGate::CurrentState() const -> std::shared_ptr<const DatabaseState> {
   auto lock = std::lock_guard(control_->mutex);
   return control_->state;
+}
+
+void ReaderGate::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
+  /*
+  ** CHECKPOINT FRONTIER PUBLICATION
+  **
+  ** The database file is already durable through checkpoint_lsn. Serialize
+  ** with the cache/state replacement part of normal publication, but do not
+  ** drain readers: old readers may safely retain the older immutable state.
+  ** Clone whichever logical state is current now and change only its
+  ** persistence frontier. A transaction publishing later merges this frontier
+  ** rather than restoring its older base.
+  */
+  auto publication_lock = std::unique_lock(control_->publication_mutex);
+  auto current = std::shared_ptr<const DatabaseState>{};
+  {
+    auto lock = std::lock_guard(control_->mutex);
+    current = control_->state;
+  }
+  TINYDB_CHECK(checkpoint_lsn >= current->checkpoint_lsn, "visible checkpoint frontier moved backward");
+  TINYDB_CHECK(checkpoint_lsn <= current->visible_lsn, "checkpoint advanced beyond visible state");
+  if (checkpoint_lsn == current->checkpoint_lsn) {
+    return;
+  }
+  auto next = std::make_shared<DatabaseState>(*current);
+  next->checkpoint_lsn = checkpoint_lsn;
+  {
+    auto lock = std::lock_guard(control_->mutex);
+    TINYDB_CHECK(control_->state == current, "checkpoint state changed while publication was serialized");
+    control_->state = std::move(next);
+  }
 }
 
 auto ReaderGate::Stats() const -> ReaderGateStats {
@@ -114,7 +150,17 @@ auto ReaderGate::Stats() const -> ReaderGateStats {
   return result;
 }
 
-PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) noexcept : control_(std::move(control)) {
+CheckpointCaptureGuard::CheckpointCaptureGuard(std::shared_ptr<ReaderGateControl> control)
+    : control_(std::move(control)), publication_lock_(control_->publication_mutex) {}
+
+auto CheckpointCaptureGuard::CurrentState() const -> std::shared_ptr<const DatabaseState> {
+  TINYDB_CHECK(control_ != nullptr && publication_lock_.owns_lock(), "reading an empty checkpoint capture guard");
+  auto lock = std::lock_guard(control_->mutex);
+  return control_->state;
+}
+
+PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) noexcept
+    : control_(std::move(control)), publication_lock_(control_->publication_mutex) {
   auto lock = std::unique_lock(control_->mutex);
 
   // Serializing publishers here makes the gate robust independently of the
@@ -125,12 +171,14 @@ PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) n
   control_->changed.wait(lock, [this] { return control_->active_readers == 0; });
 }
 
-PublicationGuard::PublicationGuard(PublicationGuard &&other) noexcept : control_(std::move(other.control_)) {}
+PublicationGuard::PublicationGuard(PublicationGuard &&other) noexcept
+    : control_(std::move(other.control_)), publication_lock_(std::move(other.publication_lock_)) {}
 
 auto PublicationGuard::operator=(PublicationGuard &&other) noexcept -> PublicationGuard & {
   if (this != &other) {
     Reopen();
     control_ = std::move(other.control_);
+    publication_lock_ = std::move(other.publication_lock_);
   }
   return *this;
 }
@@ -166,6 +214,7 @@ void PublicationGuard::Reopen() noexcept {
     control_->publication_pending = false;
   }
   control_->changed.notify_all();
+  publication_lock_.unlock();
   control_.reset();
 }
 

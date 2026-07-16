@@ -8,6 +8,7 @@
 #include "btree/b_plus_tree.h"
 #include "cache/committed_page_cache.h"
 #include "cache/committed_page_source.h"
+#include "checkpoint/checkpoint_manager.h"
 #include "io/file_io.h"
 #include "io/syscalls.h"
 #include "recovery/recovery.h"
@@ -51,7 +52,7 @@ namespace {
 **   TransactionPages       private, mutable, discardable
 **   WAL                    committed state newer than the checkpoint
 **   CommittedPageCache     visible immutable page versions
-**   DiskManager            checkpointed file and published metadata
+**   DiskManager            checkpointed file and durable metadata
 **
 ** Commit order is fixed:
 **
@@ -65,7 +66,6 @@ namespace {
 */
 constexpr std::size_t CACHE_TARGET_BYTES = 64 * PAGE_SIZE;
 constexpr std::size_t WRITE_TRANSACTION_LIMIT_BYTES = 16U << 20U;
-constexpr std::uint64_t CHECKPOINT_THRESHOLD_BYTES = 1U << 20U;
 
 using io::ErrnoStatus;
 using io::SyncParentDirectory;
@@ -146,7 +146,8 @@ class DatabaseCore final {
         cache(std::move(page_cache)),
         pages(std::move(page_source)),
         readers(std::move(reader_gate)),
-        wal(std::move(write_ahead_log)) {}
+        wal(std::move(write_ahead_log)),
+        checkpoints(std::make_unique<checkpoint::Manager>(disk.get(), cache.get(), readers.get(), wal.get())) {}
 
   DatabaseCore(const DatabaseCore &) = delete;
   auto operator=(const DatabaseCore &) -> DatabaseCore & = delete;
@@ -168,7 +169,7 @@ class DatabaseCore final {
 
   auto Commit(txn::TransactionPages &transaction, BPlusTree &tree,
               txn::TransactionState &transaction_state) -> Result<TransactionCommitInfo> {
-    auto coordinator = txn::CommitCoordinator(wal.get(), cache.get(), disk.get(), readers.get());
+    auto coordinator = txn::CommitCoordinator(wal.get(), cache.get(), readers.get());
     auto result = coordinator.Commit(transaction, tree, transaction_state);
     if (!result && (result.error().Code() == StatusCode::IndeterminateCommit ||
                     result.error().Code() == StatusCode::NeedsRecovery)) {
@@ -177,44 +178,42 @@ class DatabaseCore final {
     return result;
   }
 
-  auto CheckpointLocked() -> Status {
-    /*
-    ** CHECKPOINT ORDER
-    **
-    **   extend file -> write captured dirty pages -> write superblocks
-    **   -> fsync database -> reset WAL -> mark frames checkpointed
-    **   -> publish advanced checkpoint frontier
-    **
-    ** Commit success never depends on this maintenance path. A failure leaves
-    ** WAL authoritative and moves the live handle to CheckpointDegraded.
-    */
-    const auto state = readers->CurrentState();
-    auto next = *state;
-    next.checkpoint_lsn = state->visible_lsn;
-    auto checkpointed_state = std::make_shared<const txn::DatabaseState>(std::move(next));
-    if (auto status = disk->EnsurePageCount(state->high_water_page_id); !status.Ok()) {
-      return status;
+  auto Checkpoint() -> Status {
+    {
+      auto lock = std::lock_guard(lifecycle_mutex);
+      if (auto status = LifecycleError(lifecycle, txn::DatabaseOperation::Checkpoint); !status.Ok()) {
+        return status;
+      }
+      ++active_checkpoints;
     }
-    auto dirty = cache->DirtyPages();
-    for (const auto &page : dirty) {
-      if (auto status = disk->WritePage(page.Id(), page.Data().data()); !status.Ok()) {
+
+    const auto status = checkpoints->Checkpoint();
+    {
+      auto lock = std::lock_guard(lifecycle_mutex);
+      TINYDB_CHECK(active_checkpoints != 0, "database checkpoint count underflow");
+      --active_checkpoints;
+      if (lifecycle == txn::DatabaseLifecycle::Open || lifecycle == txn::DatabaseLifecycle::CheckpointDegraded) {
+        if (status.Code() == StatusCode::NeedsRecovery || status.Code() == StatusCode::IndeterminateCommit) {
+          lifecycle = txn::DatabaseLifecycle::NeedsRecovery;
+        } else if (status.Code() == StatusCode::Corruption) {
+          lifecycle = txn::DatabaseLifecycle::Corrupt;
+        } else {
+          lifecycle = status.Ok() ? txn::DatabaseLifecycle::Open : txn::DatabaseLifecycle::CheckpointDegraded;
+        }
+      }
+    }
+    return status;
+  }
+
+  auto MaybeCheckpoint() -> Status {
+    if (checkpoints->ShouldCheckpoint()) {
+      const auto status = Checkpoint();
+      if (status.Code() == StatusCode::NeedsRecovery || status.Code() == StatusCode::IndeterminateCommit ||
+          status.Code() == StatusCode::Corruption || status.Code() == StatusCode::Closed) {
         return status;
       }
     }
-    disk->AdvanceCheckpoint(state->visible_lsn);
-    if (auto status = disk->Checkpoint(); !status.Ok()) {
-      return status;
-    }
-    if (auto status = disk->Sync(); !status.Ok()) {
-      return status;
-    }
-    if (auto status = wal->Reset(); !status.Ok()) {
-      return status;
-    }
-    cache->MarkCheckpointed(state->visible_lsn);
-    auto publication = readers->BeginPublication();
-    publication.Publish(std::move(checkpointed_state));
-    return {};
+    return checkpoints->WriteAdmissionStatus();
   }
 
   auto Close() -> Status {
@@ -222,15 +221,15 @@ class DatabaseCore final {
     if (lifecycle == txn::DatabaseLifecycle::Closed) {
       return {};
     }
-    if (active_transactions != 0) {
-      return Status::Busy("database has active transactions");
+    if (active_transactions != 0 || active_checkpoints != 0) {
+      return Status::Busy("database has active transactions or checkpoints");
     }
 
     // Holding the lifecycle mutex prevents new admission while the writer
     // permit and final checkpoint are acquired.
     auto writer = std::unique_lock(writer_mutex);
     if (lifecycle == txn::DatabaseLifecycle::Open || lifecycle == txn::DatabaseLifecycle::CheckpointDegraded) {
-      if (auto status = CheckpointLocked(); !status.Ok()) {
+      if (auto status = checkpoints->Checkpoint(); !status.Ok()) {
         lifecycle = txn::DatabaseLifecycle::CheckpointDegraded;
         return status;
       }
@@ -241,6 +240,7 @@ class DatabaseCore final {
   }
 
   void ReleaseResources() noexcept {
+    checkpoints.reset();
     readers.reset();
     pages.reset();
     cache.reset();
@@ -253,6 +253,7 @@ class DatabaseCore final {
   mutable std::mutex lifecycle_mutex;
   txn::DatabaseLifecycle lifecycle{txn::DatabaseLifecycle::Open};
   std::size_t active_transactions{0};
+  std::size_t active_checkpoints{0};
   std::mutex writer_mutex;
 
   UniqueFd lock_fd;
@@ -261,6 +262,7 @@ class DatabaseCore final {
   std::unique_ptr<cache::CommittedPageSource> pages;
   std::unique_ptr<txn::ReaderGate> readers;
   std::unique_ptr<Wal> wal;
+  std::unique_ptr<checkpoint::Manager> checkpoints;
 };
 
 }  // namespace detail
@@ -476,29 +478,48 @@ auto StorageEngine::BeginWrite() -> Result<WriteTransaction> {
   if (core_ == nullptr) {
     return std::unexpected(Status::Closed("BeginWrite on a moved-from database"));
   }
+  {
+    auto lifecycle_lock = std::lock_guard(core_->lifecycle_mutex);
+    if (auto status = LifecycleError(core_->lifecycle, txn::DatabaseOperation::Write); !status.Ok()) {
+      return std::unexpected(std::move(status));
+    }
+    // Reserve lifetime before releasing lifecycle_mutex for checkpoint I/O.
+    // Close will report Busy instead of freeing the manager and cache between
+    // this admission check and construction of the transaction handle.
+    ++core_->active_transactions;
+  }
+  struct PendingAdmission final {
+    std::shared_ptr<detail::DatabaseCore> core;
+    bool transferred{false};
+    ~PendingAdmission() {
+      if (!transferred) {
+        core->ReleaseTransaction();
+      }
+    }
+  } admission{.core = core_};
+
+  /*
+  ** MAINTENANCE OPPORTUNITY
+  **
+  ** Checkpoint capture and I/O do not own the writer permit. A write may
+  ** therefore prepare and publish while another thread writes a retained
+  ** checkpoint snapshot. This admission path merely gives requested
+  ** maintenance one opportunity before applying hard-pressure backoff.
+  */
+  if (auto status = core_->MaybeCheckpoint(); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
+
   auto lifecycle_lock = std::lock_guard(core_->lifecycle_mutex);
   if (auto status = LifecycleError(core_->lifecycle, txn::DatabaseOperation::Write); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
+  if (auto status = core_->checkpoints->WriteAdmissionStatus(); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   auto writer = std::unique_lock(core_->writer_mutex, std::try_to_lock);
   if (!writer.owns_lock()) {
     return std::unexpected(Status::Busy("another write transaction is active"));
-  }
-
-  /*
-  ** CHECKPOINT BEFORE THE NEXT WRITE
-  **
-  ** Maintenance never runs between WAL durability and returning CommitInfo.
-  ** If the retained log crossed its target, the next writer attempts a
-  ** checkpoint while it is still in a definite pre-transaction region.
-  */
-  if (core_->wal->SizeBytes() > CHECKPOINT_THRESHOLD_BYTES) {
-    const auto checkpoint = core_->CheckpointLocked();
-    if (checkpoint.Code() == StatusCode::NeedsRecovery || checkpoint.Code() == StatusCode::IndeterminateCommit) {
-      core_->lifecycle = txn::DatabaseLifecycle::NeedsRecovery;
-      return std::unexpected(checkpoint);
-    }
-    core_->lifecycle = checkpoint.Ok() ? txn::DatabaseLifecycle::Open : txn::DatabaseLifecycle::CheckpointDegraded;
   }
 
   const auto base = core_->readers->CurrentState();
@@ -525,7 +546,7 @@ auto StorageEngine::BeginWrite() -> Result<WriteTransaction> {
   auto private_tree = std::make_unique<BPlusTree>(std::move(*tree));
   auto impl = std::make_unique<WriteTransaction::Impl>(core_, std::move(writer), std::move(private_pages),
                                                        std::move(private_tree));
-  ++core_->active_transactions;
+  admission.transferred = true;
   return WriteTransaction(std::move(impl));
 }
 
@@ -602,6 +623,13 @@ auto StorageEngine::CheckIntegrity() -> Status {
       std::unordered_set<page_id_t>(transaction->AllocatorPageIds().begin(), transaction->AllocatorPageIds().end());
   return BPlusTree::CheckIntegrity(core_->pages.get(), state.root_page_id, state.high_water_page_id, free_pages,
                                    allocator_pages);
+}
+
+auto StorageEngine::Checkpoint() -> Status {
+  if (core_ == nullptr) {
+    return Status::Closed("Checkpoint on a moved-from database");
+  }
+  return core_->Checkpoint();
 }
 
 auto StorageEngine::Close() -> Status {

@@ -61,10 +61,13 @@ void FlipByteAt(const std::filesystem::path &path, std::uint64_t offset) {
   file.put(static_cast<char>(byte ^ 0x1));
 }
 
-void AdoptOnePage(tinydb::DiskManager &disk, tinydb::page_id_t root, std::uint64_t transaction_id = 1) {
+void CheckpointOnePage(tinydb::DiskManager &disk, tinydb::page_id_t root,
+                       const std::array<char, tinydb::PAGE_SIZE> &page = {}, std::uint64_t transaction_id = 1) {
   const auto high_water = tinydb::FIRST_DATA_PAGE_ID + 1;
-  disk.AdoptState(root, tinydb::HEADER_PAGE_ID, high_water, transaction_id, 0);
   ASSERT_TRUE(disk.EnsurePageCount(high_water).Ok());
+  ASSERT_TRUE(disk.WriteCheckpointPage(tinydb::FIRST_DATA_PAGE_ID, page.data(), high_water).Ok());
+  ASSERT_TRUE(disk.Sync().Ok());
+  ASSERT_TRUE(disk.CommitCheckpoint(root, tinydb::HEADER_PAGE_ID, high_water, transaction_id, 1).Ok());
 }
 
 }  // namespace
@@ -74,14 +77,10 @@ TEST(DiskManagerTest, AdoptCheckpointAndReopenPage) {
   std::filesystem::remove(path);
   {
     auto disk = tinydb::DiskManager::Open(path).value();
-    AdoptOnePage(disk, tinydb::FIRST_DATA_PAGE_ID);
     auto page = std::array<char, tinydb::PAGE_SIZE>{};
     page.front() = 'a';
     page.back() = 'z';
-    ASSERT_TRUE(disk.WritePage(tinydb::FIRST_DATA_PAGE_ID, page.data()).Ok());
-    disk.AdvanceCheckpoint(1);
-    ASSERT_TRUE(disk.Checkpoint().Ok());
-    ASSERT_TRUE(disk.Sync().Ok());
+    CheckpointOnePage(disk, tinydb::FIRST_DATA_PAGE_ID, page);
   }
   {
     auto disk = tinydb::DiskManager::Open(path).value();
@@ -134,10 +133,7 @@ TEST(DiskManagerTest, OneValidSuperblockSurvivesDamageToTheOther) {
   std::filesystem::remove(path);
   {
     auto disk = tinydb::DiskManager::Open(path).value();
-    AdoptOnePage(disk, tinydb::FIRST_DATA_PAGE_ID);
-    disk.AdvanceCheckpoint(1);
-    ASSERT_TRUE(disk.Checkpoint().Ok());
-    ASSERT_TRUE(disk.Sync().Ok());
+    CheckpointOnePage(disk, tinydb::FIRST_DATA_PAGE_ID);
   }
   FlipByteAt(path, tinydb::storage::superblock_offset::GENERATION);
   const auto reopened = tinydb::DiskManager::Open(path);
@@ -163,10 +159,7 @@ TEST(DiskManagerTest, RejectsAFrontierBeyondTheFile) {
   std::filesystem::remove(path);
   {
     auto disk = tinydb::DiskManager::Open(path).value();
-    AdoptOnePage(disk, tinydb::FIRST_DATA_PAGE_ID);
-    disk.AdvanceCheckpoint(1);
-    ASSERT_TRUE(disk.Checkpoint().Ok());
-    ASSERT_TRUE(disk.Sync().Ok());
+    CheckpointOnePage(disk, tinydb::FIRST_DATA_PAGE_ID);
   }
   std::filesystem::resize_file(path, 2 * tinydb::PAGE_SIZE);
   const auto result = tinydb::DiskManager::Open(path);

@@ -1,6 +1,7 @@
 #include <tinydb/check.h>
 #include <tinydb/disk_manager.h>
 
+#include "io/file_io.h"
 #include "io/syscalls.h"
 #include "storage/page_codec.h"
 #include "storage/superblock.h"
@@ -39,7 +40,8 @@ namespace {
 ** Thus any completed creation has at least one durable, checksummed root of
 ** state, and a crash before completion leaves either a retryable zero file or
 ** a valid first copy. Data-page writes occur during checkpoint. The WAL stays
-** authoritative until those writes and the matching superblocks are synced.
+** authoritative until those writes and the next inactive superblock are
+** synchronized.
 */
 auto ErrnoStatus(std::string_view operation) -> Status {
   // Capture errno immediately at the syscall boundary; later library work can
@@ -98,17 +100,9 @@ auto ReadWholePage(int fd, page_id_t page_id) -> Result<std::array<char, PAGE_SI
 }
 
 auto WriteWholePage(int fd, page_id_t page_id, const std::array<char, PAGE_SIZE> &page) -> Status {
-  // DiskManager page writes deliberately reject short completion rather than
-  // retrying it. The fault is surfaced and the still-authoritative WAL makes
-  // checkpoint/recovery retryable.
-  const auto bytes_written = io::Pwrite(fd, page.data(), page.size(), page_id * PAGE_SIZE);
-  if (bytes_written < 0) {
-    return ErrnoStatus("pwrite");
-  }
-  if (static_cast<std::size_t>(bytes_written) != page.size()) {
-    return Status::IoError("short write on a persistent page");
-  }
-  return {};
+  // Checkpoint and superblock pages are logical 4 KiB writes even when POSIX
+  // completes them through several short writes or an interrupted syscall.
+  return io::FullPwrite(fd, page.data(), page.size(), page_id * PAGE_SIZE);
 }
 
 auto ToBytes(const std::array<char, PAGE_SIZE> &page) -> std::span<const std::byte> {
@@ -256,40 +250,8 @@ auto DiskManager::EncodeSuperblock(page_id_t root_page_id, page_id_t allocator_r
 auto DiskManager::EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE> {
   const auto encoded = EncodeSuperblock(root_page_id_, allocator_root_page_id_, high_water_page_id_, transaction_id_,
                                         checkpoint_lsn_, generation_);
-  TINYDB_CHECK(encoded.has_value(), "invalid published superblock state");
+  TINYDB_CHECK(encoded.has_value(), "invalid durable superblock state");
   return *encoded;
-}
-
-void DiskManager::AdoptState(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
-                             std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) noexcept {
-  TINYDB_CHECK(high_water_page_id >= FIRST_DATA_PAGE_ID, "adopting an invalid allocation frontier");
-  TINYDB_CHECK(
-      root_page_id == HEADER_PAGE_ID || (root_page_id >= FIRST_DATA_PAGE_ID && root_page_id < high_water_page_id),
-      "adopting an invalid tree root");
-  TINYDB_CHECK(allocator_root_page_id == HEADER_PAGE_ID ||
-                   (allocator_root_page_id >= FIRST_DATA_PAGE_ID && allocator_root_page_id < high_water_page_id),
-               "adopting an invalid allocator root");
-  // This method performs no I/O. It mirrors an already durable state image in
-  // memory so subsequent checkpoint and open-state queries describe what was
-  // just published.
-  ++generation_;
-  active_superblock_page_id_ =
-      active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
-  root_page_id_ = root_page_id;
-  allocator_root_page_id_ = allocator_root_page_id;
-  high_water_page_id_ = high_water_page_id;
-  transaction_id_ = transaction_id;
-  checkpoint_lsn_ = checkpoint_lsn;
-}
-
-void DiskManager::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
-  // LSNs count WAL records and are deliberately independent of logical
-  // transaction IDs. The caller supplies the current visible upper bound.
-  TINYDB_CHECK(checkpoint_lsn >= checkpoint_lsn_, "checkpoint frontier moved backward");
-  ++generation_;
-  active_superblock_page_id_ =
-      active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
-  checkpoint_lsn_ = checkpoint_lsn;
 }
 
 auto DiskManager::EnsurePageCount(page_id_t high_water_page_id) -> Status {
@@ -305,23 +267,58 @@ auto DiskManager::EnsurePageCount(page_id_t high_water_page_id) -> Status {
   return {};
 }
 
-auto DiskManager::Checkpoint() -> Status {
-  TINYDB_CHECK(fd_.Valid(), "checkpointing a closed disk manager");
-  return WriteCurrentSuperblock();
+auto DiskManager::WriteCheckpointPage(page_id_t page_id, const char *data,
+                                      page_id_t captured_high_water_page_id) const -> Status {
+  TINYDB_CHECK(fd_.Valid(), "writing through a closed disk manager");
+  if (data == nullptr || captured_high_water_page_id < FIRST_DATA_PAGE_ID || page_id < FIRST_DATA_PAGE_ID ||
+      page_id >= captured_high_water_page_id) {
+    return Status::InvalidArgument("checkpoint page lies outside its captured allocation frontier");
+  }
+  return io::FullPwrite(fd_.Get(), data, PAGE_SIZE, page_id * PAGE_SIZE);
 }
 
-auto DiskManager::WriteCurrentSuperblock() const -> Status {
-  // Current checkpointing writes data pages in place. Once the WAL is reset,
-  // either surviving superblock must describe those same checkpointed bytes;
-  // falling back to an older generation could pair new pages with stale roots
-  // or allocator-root state. Therefore checkpoint mirrors one identical final
-  // generation to both slots before StorageEngine fsyncs and resets the WAL.
-  const auto encoded = EncodeCurrentSuperblock();
-  if (auto status = WriteWholePage(fd_.Get(), active_superblock_page_id_, encoded); !status.Ok()) {
+auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id,
+                                   page_id_t high_water_page_id, std::uint64_t transaction_id,
+                                   std::uint64_t checkpoint_lsn) -> Status {
+  TINYDB_CHECK(fd_.Valid(), "checkpointing a closed disk manager");
+  if (checkpoint_lsn < checkpoint_lsn_) {
+    return Status::InvalidArgument("checkpoint frontier moved backward");
+  }
+  if (generation_ == std::numeric_limits<std::uint64_t>::max()) {
+    return Status::ResourceExhausted("superblock generation space exhausted");
+  }
+
+  /*
+  ** SUPERBLOCK PUBLICATION
+  **
+  ** Data pages were synchronized by CheckpointManager before this call. Write
+  ** the slot not named by active_superblock_page_id_, then synchronize that
+  ** one new recovery root. The old slot is deliberately left untouched.
+  ** In-memory metadata changes only after fsync succeeds.
+  */
+  const auto next_generation = generation_ + 1U;
+  const auto encoded = EncodeSuperblock(root_page_id, allocator_root_page_id, high_water_page_id, transaction_id,
+                                        checkpoint_lsn, next_generation);
+  if (!encoded) {
+    return encoded.error();
+  }
+  const auto inactive =
+      active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
+  if (auto status = WriteWholePage(fd_.Get(), inactive, *encoded); !status.Ok()) {
     return status;
   }
-  const auto mirror = active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
-  return WriteWholePage(fd_.Get(), mirror, encoded);
+  if (auto status = Sync(); !status.Ok()) {
+    return status;
+  }
+
+  generation_ = next_generation;
+  checkpoint_lsn_ = checkpoint_lsn;
+  transaction_id_ = transaction_id;
+  root_page_id_ = root_page_id;
+  allocator_root_page_id_ = allocator_root_page_id;
+  high_water_page_id_ = high_water_page_id;
+  active_superblock_page_id_ = inactive;
+  return {};
 }
 
 auto DiskManager::Sync() const -> Status {
@@ -345,21 +342,6 @@ auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> Status {
   }
   if (static_cast<std::size_t>(bytes_read) != PAGE_SIZE) {
     return Status::Corruption("short read on a page");
-  }
-  return {};
-}
-
-auto DiskManager::WritePage(page_id_t page_id, const char *data) const -> Status {
-  TINYDB_CHECK(fd_.Valid(), "writing to a closed disk manager");
-  if (page_id < FIRST_DATA_PAGE_ID || page_id >= high_water_page_id_) {
-    return Status::InvalidArgument("writing a page that was never allocated");
-  }
-  const auto bytes_written = io::Pwrite(fd_.Get(), data, PAGE_SIZE, page_id * PAGE_SIZE);
-  if (bytes_written < 0) {
-    return ErrnoStatus("pwrite");
-  }
-  if (static_cast<std::size_t>(bytes_written) != PAGE_SIZE) {
-    return Status::IoError("short write on a page");
   }
   return {};
 }

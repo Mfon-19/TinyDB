@@ -126,13 +126,17 @@ class CommittedPageCache final {
                           page_id_t high_water_page_id) -> Result<PublicationPlan>;
   void Publish(PublicationPlan plan) noexcept;
 
+  // Capture strong references to exact current versions in (checkpoint_lsn,
+  // target_lsn]. The caller must serialize this call with publication so the
+  // returned versions and captured DatabaseState describe one visibility point.
+  auto CaptureCheckpointPages(std::uint64_t checkpoint_lsn, std::uint64_t target_lsn) -> std::vector<PageGuard>;
+
   // The caller invokes this only after the database file and superblock make
   // every page through checkpoint_lsn durable.
   void MarkCheckpointed(std::uint64_t checkpoint_lsn);
   void Trim();
 
   auto DirtyPageIds() const -> std::vector<page_id_t>;
-  auto DirtyPages() -> std::vector<PageGuard>;
   auto Stats() const -> CommittedCacheStats;
 
  private:

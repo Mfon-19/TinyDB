@@ -471,7 +471,10 @@ auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> 
       } else {
         ++expected_live_transaction_id;
       }
-      if (transaction->state.checkpoint_lsn != checkpoint_lsn ||
+      // A transaction may have begun while this checkpoint was writing and
+      // therefore record an older allocator-reuse frontier. It may never claim
+      // a checkpoint newer than the selected durable base.
+      if (transaction->state.checkpoint_lsn > checkpoint_lsn ||
           transaction->state.high_water_page_id < previous_high_water ||
           transaction->state.high_water_page_id > MAX_FILE_PAGES) {
         return std::unexpected(Status::Corruption("WAL database-state frontier is inconsistent with its base"));
