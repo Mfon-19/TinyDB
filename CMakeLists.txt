@@ -86,6 +86,8 @@ add_library(
   src/btree/leaf_node.h
   src/btree/page_format.cpp
   src/btree/page_format.h
+  src/btree/page_view.cpp
+  src/btree/page_view.h
   src/buffer/buffer_pool.cpp
   src/engine/storage_engine.cpp
   src/io/syscalls.h
@@ -176,6 +178,15 @@ if(BUILD_TESTING)
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     TinyDB_apply_local_tooling(TinyDB_storage_codec_test)
     gtest_discover_tests(TinyDB_storage_codec_test)
+  endif()
+
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/page_view_test.cpp")
+    add_executable(TinyDB_page_view_test tests/page_view_test.cpp)
+    target_link_libraries(TinyDB_page_view_test PRIVATE TinyDB::TinyDB GTest::gtest_main)
+    target_include_directories(TinyDB_page_view_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    TinyDB_apply_local_tooling(TinyDB_page_view_test)
+    gtest_discover_tests(TinyDB_page_view_test)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/contract_test.cpp")

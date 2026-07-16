@@ -18,23 +18,27 @@
 #include "internal_node.h"
 #include "leaf_node.h"
 #include "page_format.h"
+#include "page_view.h"
+#include "txn/contract.h"
 
 /**
   B+ tree algorithms: descend, split, repair, collapse.
 
   Division of labor inside src/btree/:
 
-      page_format.h        the raw on-disk structs and their layout rules
-      leaf_node.cpp        page bytes <-> sorted (key, value) records
-      internal_node.cpp    page bytes <-> routing table
+      page_format.*        encoded offsets and structural validation
+      page_view.*          borrowed, allocation-free read access
+      leaf_node.cpp        owning leaf builder for mutations
+      internal_node.cpp    owning internal builder for mutations
       this file            everything that spans more than one node
 
-  The codecs own single-page concerns: decoding, validation, packing,
-  choosing split points. This file owns the relationships between pages —
-  which child a key descends into, how a split's separator climbs the
-  tree, how an underfull node borrows from or merges with a sibling. It
-  touches raw page bytes in exactly two places: sniffing a page's node
-  type before choosing a codec, and copying a whole page in CollapseRoot.
+  Views and builders own single-page concerns: validation, searching,
+  packing, and choosing split points. This file owns the relationships
+  between pages — which child a key descends into, how a split's separator
+  climbs the tree, and how an underfull node borrows from or merges with a
+  sibling. Read paths use views directly over pinned bytes. Mutation paths
+  still decode into owning builders until the page-source boundary gives
+  each write transaction private page ownership.
 
   The logical shape, and the separator rule that search depends on:
 
@@ -64,7 +68,7 @@
   merges remove separators, and the root collapses away once it is down to
   a single child.
 
-  Every mutation follows one shape:
+  Every current mutation follows one shape:
 
       load page bytes into a node
         -> edit the sorted records in memory
@@ -72,22 +76,22 @@
         -> Store rewrites the page fully packed
 
   Nodes are rewritten whole on every change. A 4 KiB page is cheap to
-  re-encode, and it buys a lot of simplicity: no fragmentation, no
-  tombstone bookkeeping, no in-place fast path to keep consistent with a
-  slow path.
+  re-encode, and it buys a lot of simplicity: no fragmentation or
+  tombstone bookkeeping, and one canonical encoded result per mutation.
 
   Invariants this file maintains:
 
-  1. Keys are unique and sorted inside every node, and the separator rule
-     sends each key to exactly one leaf. The codecs re-verify sortedness
-     on every Load, so a broken page aborts the process at the next read
-     rather than silently misrouting searches.
+  1. Keys are unique and sorted by unsigned byte order inside every node,
+     and the separator rule sends each key to exactly one leaf. Page views
+     validate ordering, slots, links, identity, and checksum before access,
+     returning persistent damage as Corruption rather than misrouting a
+     search.
 
-  2. The root page id never changes for the life of the tree. A root split
+  2. For now, the root page id never changes for the life of the tree. A root split
      moves both halves out to fresh pages and rewrites the root page in
      place as an internal node above them; a root collapse copies the last
-     surviving child over the root page. The engine can therefore record
-     the root id once and never chase it.
+     surviving child over the root page. The page-source cutover removes
+     this special case and publishes a newly allocated root ID as state.
 
   3. The leaf chain stays complete and in key order: a leaf split splices
      the new right leaf into the chain, and a merge adopts the absorbed
@@ -173,9 +177,12 @@ auto DescendToLeaf(BufferPool *pool, page_id_t root_page_id, std::string_view ke
       return path;
     }
     TINYDB_CHECK(type == static_cast<std::uint16_t>(NodeType::Internal), "descended into a non-tree page");
-    const auto node = InternalNode::Load(page->Data());
-    const auto child_index = node.FindChildIndex(key);
-    path.push_back({node.ChildAt(child_index), child_index});
+    const auto node = InternalPageView::Open(page->Data(), page->Id());
+    if (!node) {
+      return std::unexpected(node.error());
+    }
+    const auto child_index = node->FindChildIndex(key);
+    path.push_back({node->ChildAt(child_index), child_index});
   }
 }
 
@@ -689,7 +696,12 @@ auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> 
   if (!leaf_page) {
     return std::unexpected(std::move(leaf_page).error());
   }
-  return LeafNode::Load(leaf_page->Data()).Get(key);
+  const auto leaf = LeafPageView::Open(leaf_page->Data(), leaf_page->Id());
+  if (!leaf) {
+    return std::unexpected(leaf.error());
+  }
+  const auto value = leaf->Get(key);
+  return value ? std::optional<std::string>{*value} : std::nullopt;
 }
 
 auto BPlusTree::Remove(std::string_view key) -> Status {
@@ -804,6 +816,7 @@ auto BPlusTree::Scan(std::string_view start,
     unique. So checking the order at every hop is a cycle check too.
   */
   auto rows = std::vector<std::pair<std::string, std::string>>{};
+  const auto less = txn::BytewiseLess{};
   const auto path = DescendToLeaf(buffer_pool_, root_page_id_, start);
   if (!path) {
     return std::unexpected(path.error());
@@ -816,23 +829,23 @@ auto BPlusTree::Scan(std::string_view start,
     if (!leaf_page) {
       return std::unexpected(std::move(leaf_page).error());
     }
-    const auto node = LeafNode::Load(leaf_page->Data());
-    const auto &records = node.Records();
-    if (!records.empty()) {
-      const bool ascending = !previous_last_key.has_value() || *previous_last_key < records.front().key;
-      TINYDB_CHECK(ascending, "leaf chain out of key order; page cycle likely");
-      previous_last_key = records.back().key;
+    const auto leaf = LeafPageView::Open(leaf_page->Data(), leaf_page->Id());
+    if (!leaf) {
+      return std::unexpected(leaf.error());
     }
-    auto it =
-        std::lower_bound(records.begin(), records.end(), start,
-                         [](const LeafNode::Record &record, std::string_view target) { return record.key < target; });
-    for (; it != records.end(); ++it) {
-      if (it->key >= end) {
+    if (leaf->Count() != 0) {
+      const bool ascending = !previous_last_key.has_value() || less(*previous_last_key, leaf->KeyAt(0));
+      TINYDB_CHECK(ascending, "leaf chain out of key order; page cycle likely");
+      previous_last_key = leaf->KeyAt(leaf->Count() - 1);
+    }
+    for (auto index = leaf->LowerBound(start); index < leaf->Count(); ++index) {
+      const auto key = leaf->KeyAt(index);
+      if (!less(key, end)) {
         return rows;
       }
-      rows.emplace_back(it->key, it->value);
+      rows.emplace_back(key, leaf->ValueAt(index));
     }
-    page_id = node.NextLeaf();
+    page_id = leaf->NextLeaf();
   }
   return rows;
 }
@@ -853,6 +866,7 @@ auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<
   auto visited = std::unordered_set<page_id_t>{};
   auto leaf_pages = std::vector<std::pair<page_id_t, page_id_t>>{};
   using Bound = std::optional<std::string>;
+  const auto less = txn::BytewiseLess{};
 
   std::function<Result<Summary>(page_id_t, const Bound &, const Bound &)> visit;
   visit = [&](page_id_t page_id, const Bound &lower, const Bound &upper) -> Result<Summary> {
@@ -872,32 +886,39 @@ auto BPlusTree::CheckIntegrity(page_id_t next_page_id, const std::unordered_set<
     }
     const auto type = RawNodeType(page->Data());
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
-      const auto node = LeafNode::Load(page->Data());
-      const auto &records = node.Records();
-      for (const auto &record : records) {
-        if ((lower.has_value() && record.key < *lower) || (upper.has_value() && record.key >= *upper)) {
+      const auto leaf = LeafPageView::Open(page->Data(), page->Id());
+      if (!leaf) {
+        return std::unexpected(leaf.error());
+      }
+      for (std::size_t index = 0; index < leaf->Count(); ++index) {
+        const auto key = leaf->KeyAt(index);
+        if ((lower.has_value() && less(key, *lower)) || (upper.has_value() && !less(key, *upper))) {
           return std::unexpected(Status::Corruption("leaf key lies outside its parent routing range"));
         }
       }
-      leaf_pages.emplace_back(page_id, node.NextLeaf());
-      if (records.empty()) {
+      leaf_pages.emplace_back(page_id, leaf->NextLeaf());
+      if (leaf->Count() == 0) {
         return Summary{};
       }
-      return Summary{.minimum = records.front().key, .maximum = records.back().key};
+      return Summary{.minimum = std::string{leaf->KeyAt(0)}, .maximum = std::string{leaf->KeyAt(leaf->Count() - 1)}};
     }
     if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
       return std::unexpected(Status::Corruption("reachable page is not a B+ tree node"));
     }
 
-    const auto node = InternalNode::Load(page->Data());
+    const auto node = InternalPageView::Open(page->Data(), page->Id());
+    if (!node) {
+      return std::unexpected(node.error());
+    }
     auto result = Summary{};
-    for (std::size_t child_index = 0; child_index <= node.SeparatorCount(); ++child_index) {
-      const auto child_lower = child_index == 0 ? lower : Bound{node.SeparatorKeyAt(child_index - 1)};
-      const auto child_upper = child_index == node.SeparatorCount() ? upper : Bound{node.SeparatorKeyAt(child_index)};
-      if (child_lower.has_value() && child_upper.has_value() && *child_lower >= *child_upper) {
+    for (std::size_t child_index = 0; child_index <= node->SeparatorCount(); ++child_index) {
+      const auto child_lower = child_index == 0 ? lower : Bound{std::string{node->KeyAt(child_index - 1)}};
+      const auto child_upper =
+          child_index == node->SeparatorCount() ? upper : Bound{std::string{node->KeyAt(child_index)}};
+      if (child_lower.has_value() && child_upper.has_value() && !less(*child_lower, *child_upper)) {
         return std::unexpected(Status::Corruption("internal node has an invalid routing range"));
       }
-      auto child = visit(node.ChildAt(child_index), child_lower, child_upper);
+      auto child = visit(node->ChildAt(child_index), child_lower, child_upper);
       if (!child) {
         return std::unexpected(std::move(child).error());
       }

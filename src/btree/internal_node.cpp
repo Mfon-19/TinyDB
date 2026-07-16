@@ -15,6 +15,7 @@
 #include "page_format.h"
 #include "storage/encoding.h"
 #include "storage/page_codec.h"
+#include "txn/contract.h"
 
 /*
   InternalNode is the logical codec for one internal page: Load decodes the
@@ -74,7 +75,9 @@ constexpr std::size_t USABLE_BYTES = PAGE_SIZE - INTERNAL_HEADER_SIZE;
 // that by re-splitting.)
 constexpr std::size_t MIN_FILL_BYTES = USABLE_BYTES / 2;
 
-auto KeyIsBefore(const InternalNode::Record &record, std::string_view target) -> bool { return record.key < target; }
+auto KeyIsBefore(const InternalNode::Record &record, std::string_view target) -> bool {
+  return txn::BytewiseLess{}(record.key, target);
+}
 
 // The bytes one record will consume in a packed page: its slot plus its
 // cell, the cell rounded up to the cell header's alignment. This is exact,
@@ -120,7 +123,8 @@ auto InternalNode::Load(const char *page) -> InternalNode {
         storage::GetLittleEndian<std::uint16_t>(bytes, offset + internal_cell_offset::KEY_BYTES).value();
     TINYDB_CHECK(offset + INTERNAL_CELL_HEADER_SIZE + key_size <= PAGE_SIZE, "internal cell overruns page");
     auto record = Record{std::string(page + offset + INTERNAL_CELL_HEADER_SIZE, key_size), right_child};
-    TINYDB_CHECK(node.records_.empty() || node.records_.back().key < record.key, "keys out of order on page");
+    TINYDB_CHECK(node.records_.empty() || txn::BytewiseLess{}(node.records_.back().key, record.key),
+                 "keys out of order on page");
     node.records_.push_back(std::move(record));
   }
   return node;
@@ -188,8 +192,9 @@ auto InternalNode::FindChildIndex(std::string_view key) const -> std::size_t {
     it lives in the right half. lower_bound here would send lookups for
     that exact key down the wrong side.
   */
-  const auto it = std::upper_bound(records_.begin(), records_.end(), key,
-                                   [](std::string_view target, const Record &record) { return target < record.key; });
+  const auto it = std::upper_bound(
+      records_.begin(), records_.end(), key,
+      [](std::string_view target, const Record &record) { return txn::BytewiseLess{}(target, record.key); });
   return static_cast<std::size_t>(it - records_.begin());
 }
 
@@ -342,7 +347,8 @@ void InternalNode::Absorb(std::string separator, InternalNode &&right) {
     erases S from the parent (merge) or replaces it (rebalance), and frees
     right's page if it merged away.
   */
-  TINYDB_CHECK(records_.empty() || records_.back().key < separator, "separator does not sort after this node's keys");
+  TINYDB_CHECK(records_.empty() || txn::BytewiseLess{}(records_.back().key, separator),
+               "separator does not sort after this node's keys");
   records_.push_back(Record{std::move(separator), right.first_child_});
   records_.insert(records_.end(), std::make_move_iterator(right.records_.begin()),
                   std::make_move_iterator(right.records_.end()));

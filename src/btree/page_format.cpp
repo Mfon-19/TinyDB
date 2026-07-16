@@ -1,6 +1,7 @@
 #include "btree/page_format.h"
 
 #include "storage/encoding.h"
+#include "txn/contract.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -41,12 +42,12 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
     std::size_t cell_bytes = 0;
     if (type == storage::DataPageType::Leaf) {
       // Read lengths before constructing string_view, then prove the entire
-      // cell lies inside the page. The flags byte is reserved/tombstone legacy
-      // and currently has no valid nonzero meaning.
+      // cell lies inside the page. The reserved byte has no valid nonzero
+      // meaning in this format version.
       const auto key = storage::GetLittleEndian<std::uint16_t>(page, *slot + leaf_cell_offset::KEY_BYTES);
       const auto value = storage::GetLittleEndian<std::uint16_t>(page, *slot + leaf_cell_offset::VALUE_BYTES);
       if (!key || !value || *slot + LEAF_CELL_HEADER_SIZE > PAGE_SIZE ||
-          page[*slot + leaf_cell_offset::FLAGS] != std::byte{0}) {
+          page[*slot + leaf_cell_offset::RESERVED] != std::byte{0}) {
         return Status::Corruption("invalid leaf-cell header");
       }
       key_offset = *slot + LEAF_CELL_HEADER_SIZE;
@@ -70,7 +71,7 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
     const auto key = std::string_view{reinterpret_cast<const char *>(page.data() + key_offset), key_bytes};
     // Strict ordering rules out duplicate leaf keys and ambiguous internal
     // separators. Byte-string ordering is the engine's persisted comparator.
-    if (!first && !(previous_key < key)) {
+    if (!first && !txn::BytewiseLess{}(previous_key, key)) {
       return Status::Corruption("tree-page keys are not strictly ordered");
     }
     previous_key = key;

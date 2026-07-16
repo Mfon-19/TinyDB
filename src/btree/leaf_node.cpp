@@ -16,6 +16,7 @@
 #include "page_format.h"
 #include "storage/encoding.h"
 #include "storage/page_codec.h"
+#include "txn/contract.h"
 
 /*
   LeafNode is the logical codec for one leaf page: Load decodes the packed
@@ -39,8 +40,7 @@
   - Store writes only fully packed pages and aborts unless Fits() holds:
     the caller proves the fit (splitting first if it must) before anything
     reaches the page. Every write rebuilds slots and cells from scratch, so
-    fragmentation never accumulates, and tombstoned cells left by older
-    page images (flags != 0, skipped by Load) vanish on the next Store.
+    fragmentation never accumulates.
 
   What the tree above relies on:
 
@@ -65,7 +65,9 @@ constexpr std::size_t USABLE_BYTES = PAGE_SIZE - LEAF_HEADER_SIZE;
 // for space.
 constexpr std::size_t MIN_FILL_BYTES = USABLE_BYTES / 2;
 
-auto KeyIsBefore(const LeafNode::Record &record, std::string_view target) -> bool { return record.key < target; }
+auto KeyIsBefore(const LeafNode::Record &record, std::string_view target) -> bool {
+  return txn::BytewiseLess{}(record.key, target);
+}
 
 // The bytes one record will consume in a packed page: its slot plus its
 // cell, the cell rounded up to the cell header's alignment. This is exact,
@@ -101,14 +103,12 @@ auto LeafNode::Load(const char *page) -> LeafNode {
     const auto key_size = storage::GetLittleEndian<std::uint16_t>(bytes, offset + leaf_cell_offset::KEY_BYTES).value();
     const auto value_size =
         storage::GetLittleEndian<std::uint16_t>(bytes, offset + leaf_cell_offset::VALUE_BYTES).value();
-    const auto flags = bytes[offset + leaf_cell_offset::FLAGS];
     TINYDB_CHECK(offset + LEAF_CELL_HEADER_SIZE + key_size + value_size <= PAGE_SIZE, "leaf cell overruns page");
-    if (flags != std::byte{0}) {
-      continue;
-    }
+    TINYDB_CHECK(bytes[offset + leaf_cell_offset::RESERVED] == std::byte{0}, "leaf cell reserved byte is nonzero");
     const char *key = page + offset + LEAF_CELL_HEADER_SIZE;
     auto record = Record{std::string(key, key_size), std::string(key + key_size, value_size)};
-    TINYDB_CHECK(node.records_.empty() || node.records_.back().key < record.key, "keys out of order on page");
+    TINYDB_CHECK(node.records_.empty() || txn::BytewiseLess{}(node.records_.back().key, record.key),
+                 "keys out of order on page");
     node.records_.push_back(std::move(record));
   }
   return node;
@@ -141,7 +141,7 @@ void LeafNode::Store(char *page, page_id_t page_id) const {
                      storage::PutLittleEndian(bytes, offset + leaf_cell_offset::VALUE_BYTES,
                                               static_cast<std::uint16_t>(record.value.size())),
                  "leaf cell header exceeds page");
-    bytes[offset + leaf_cell_offset::FLAGS] = std::byte{0};
+    bytes[offset + leaf_cell_offset::RESERVED] = std::byte{0};
     std::copy_n(record.key.data(), record.key.size(), page + offset + LEAF_CELL_HEADER_SIZE);
     std::copy_n(record.value.data(), record.value.size(), page + offset + LEAF_CELL_HEADER_SIZE + record.key.size());
     TINYDB_CHECK(storage::PutLittleEndian(bytes, LEAF_HEADER_SIZE + i * SLOT_SIZE, static_cast<slot_t>(offset)),
@@ -310,7 +310,8 @@ void LeafNode::Absorb(LeafNode &&right) {
     way the caller also finishes the tree-level bookkeeping: fixing the
     parent's separator, and freeing right's page if it merged away.
   */
-  TINYDB_CHECK(records_.empty() || right.records_.empty() || records_.back().key < right.records_.front().key,
+  TINYDB_CHECK(records_.empty() || right.records_.empty() ||
+                   txn::BytewiseLess{}(records_.back().key, right.records_.front().key),
                "absorbed leaf does not sort after this one");
   records_.insert(records_.end(), std::make_move_iterator(right.records_.begin()),
                   std::make_move_iterator(right.records_.end()));

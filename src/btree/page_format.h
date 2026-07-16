@@ -36,12 +36,12 @@ inline constexpr std::size_t HEADER_BYTES = LINK + sizeof(page_id_t);
 }  // namespace node_page_offset
 
 namespace leaf_cell_offset {
-// A leaf cell is [key bytes u16][value bytes u16][flags u8][key][value].
-// Flags are currently required to be zero; Milestone 3 removes the obsolete
-// tombstone field when page builders replace the current node representation.
+// A leaf cell is [key bytes u16][value bytes u16][reserved u8][key][value].
+// The final byte is reserved and must remain zero. Older in-memory code briefly
+// interpreted it as a tombstone flag, but no persisted writer ever emitted one.
 inline constexpr std::size_t KEY_BYTES = 0;
 inline constexpr std::size_t VALUE_BYTES = 2;
-inline constexpr std::size_t FLAGS = 4;
+inline constexpr std::size_t RESERVED = 4;
 inline constexpr std::size_t HEADER_BYTES = 5;
 }  // namespace leaf_cell_offset
 
