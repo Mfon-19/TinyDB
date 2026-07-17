@@ -213,24 +213,7 @@ if(BUILD_TESTING)
 endif()
 
 if(TINYDB_BUILD_BENCHMARKS)
-  # Ordinary TinyDB builds have no comparison-engine dependency. A pinned
-  # LevelDB release makes repeated measurements use the same baseline.
-  set(LEVELDB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  set(LEVELDB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-  set(LEVELDB_INSTALL OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(
-    leveldb
-    GIT_REPOSITORY https://github.com/google/leveldb.git
-    GIT_TAG 1.23
-    GIT_SHALLOW TRUE
-    SYSTEM)
-  FetchContent_MakeAvailable(leveldb)
-
   add_executable(TinyDB_bench bench/bench.cpp)
-  target_link_libraries(TinyDB_bench PRIVATE TinyDB::TinyDB leveldb)
-  # The point-read measurement intentionally interposes global new/delete.
-  # GCC otherwise diagnoses the malloc/free implementation of that matched
-  # pair as though an ordinary allocation crossed allocation families.
-  target_compile_options(TinyDB_bench PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wno-mismatched-new-delete>)
+  target_link_libraries(TinyDB_bench PRIVATE TinyDB::TinyDB)
   TinyDB_apply_local_tooling(TinyDB_bench)
 endif()

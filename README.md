@@ -110,22 +110,23 @@ cmake --preset tsan && cmake --build --preset tsan && ctest --preset tsan -LE cr
 
 ## Benchmark
 
-The benchmark compares TinyDB with pinned LevelDB 1.23 using the same keys,
-values, batch sizes, 256 KiB cache, disabled compression, and synchronous
-durability. It also reports TinyDB-specific checkpoint and publication costs.
+The benchmark measures TinyDB alone. Setup and warmup are excluded from timed
+trials; fixed seeds make access order reproducible, and repeated trials report
+mean, sample deviation, minimum, p50, p95, p99, and maximum. Every timed
+workload validates its results.
 
 ```sh
 cmake -S . -B build/bench -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF -DTINYDB_BUILD_BENCHMARKS=ON
 cmake --build build/bench --target TinyDB_bench
-build/bench/TinyDB_bench --rows 2000 --transactions 100 --batch 16
+build/bench/TinyDB_bench --rows 5000 --trials 7 --warmups 2
 ```
 
-CSV output includes transaction throughput and commit percentiles, WAL bytes
-per application byte, checkpoint time and bandwidth, reader publication wait,
-point-read allocations and cache hit rate, cursor throughput, recovery time,
-and file size after churn. The harness makes measurements; this repository does
-not embed machine-specific performance claims.
+CSV output covers insert and overwrite commits, convenience and
+transaction-scoped hot point reads, cursor scans, checkpoints, process-restart
+recovery, and space reuse under churn. Use `--workload` to isolate one family
+and `--minimum-trial-ms` to lengthen CPU-bound samples. The harness records
+measurements; this repository does not embed machine-specific claims.
 
 ## Repository
 

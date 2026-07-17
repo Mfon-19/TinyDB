@@ -29,7 +29,7 @@ rewrite:
 - Short-I/O handling.
 - Structural integrity checks.
 - Crash, power-loss, and recovery-interruption tests.
-- Durability-matched LevelDB comparison tooling.
+- Repeatable local performance measurement tooling.
 
 These tests and lessons remain useful even where the implementation is later
 replaced. First make the baseline reproducible from a clean checkout; do not
@@ -893,11 +893,12 @@ Delivered:
   boundaries and accepts only a complete acknowledged prefix.
 - Moved superblock and WAL golden bytes into checked-in external fixtures read
   by the format suite and every compiler CI job.
-- Replaced the stale microbenchmarks with one CSV harness comparing synchronous
-  TinyDB and LevelDB 1.23 under identical keys, values, batches, cache target,
-  and compression policy. It measures commit percentiles, WAL amplification,
-  checkpoint transfer, reader publication wait, lookup allocations/cache
-  hits, cursor throughput, recovery, and churn space.
+- Replaced the stale microbenchmarks with one TinyDB-only CSV harness. Warmups,
+  repeated trials, deterministic access order, result validation, and
+  distribution statistics make measurements reproducible without carrying an
+  external performance baseline in the source tree. It measures insert and
+  overwrite commits, WAL amplification, point reads, cursor traversal,
+  checkpointing, recovery, and churn space reuse.
 - Added [guarantees.md](guarantees.md), which maps every product promise to its
   smallest primary test and records the sanitizer and crash coverage.
 - Profiling and optimization were deliberately excluded from this milestone;
@@ -914,14 +915,13 @@ performance measurements.
 - Maintain deterministic crash sweeps for commit, checkpoint, recovery, segment
   rotation.
 - Add format golden files to CI.
-- Benchmark against a durability-matched embedded engine using identical cache,
-  data, transaction, and synchronization settings.
+- Benchmark TinyDB operations directly with setup outside timed regions,
+  discarded warmups, repeated trials, fixed workload seeds, and validation.
 - Measure:
-  - transaction throughput and p50/p95/p99 commit latency;
+  - insert and overwrite throughput and p50/p95/p99 commit latency;
   - WAL bytes per application byte;
   - checkpoint pause and bandwidth;
-  - reader publication wait;
-  - point lookup allocations;
+  - convenience and transaction-scoped point lookup throughput;
   - cursor throughput;
   - cache hit rate;
   - recovery time;

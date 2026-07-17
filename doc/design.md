@@ -933,7 +933,7 @@ src/checkpoint/       immutable snapshot and checkpoint manager
 src/recovery/         WAL validation and physical redo
 src/verify/           read-only cross-page verifier
 tests/                focused guarantee, fault, crash, and format tests
-bench/                durability-matched measurement harness
+bench/                repeatable TinyDB measurement harness
 tools/                CLI and dump programs
 ```
 
