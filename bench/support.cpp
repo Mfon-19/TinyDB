@@ -48,6 +48,10 @@ struct ProfileSettings final {
   std::size_t churn_warmup_rounds;
   std::size_t churn_measured_rounds;
   std::vector<std::uint64_t> lifecycle_bytes;
+  std::uint64_t io_bytes;
+  std::size_t io_random_reads;
+  std::size_t io_trials;
+  std::size_t io_warmups;
   bool full_matrix;
 };
 
@@ -60,15 +64,40 @@ auto CheckedMultiply(std::size_t left, std::size_t right, std::string_view descr
 
 auto Profile(std::string_view name) -> ProfileSettings {
   if (name == "smoke") {
-    return ProfileSettings{1U << 20U, 3, 1, std::chrono::milliseconds(100), 8, 1, 1, 3, {2U << 20U}, false};
+    return ProfileSettings{
+        1U << 20U, 3, 1, std::chrono::milliseconds(100), 8, 1, 1, 3, {2U << 20U}, 8U << 20U, 2'048, 3, 1, false};
   }
   if (name == "standard") {
-    return ProfileSettings{
-        8U << 20U, 15, 3, std::chrono::seconds(1), 72, 3, 3, 10, {16U << 20U, 64U << 20U, 256U << 20U}, true};
+    return ProfileSettings{8U << 20U,
+                           15,
+                           3,
+                           std::chrono::seconds(1),
+                           72,
+                           3,
+                           3,
+                           10,
+                           {16U << 20U, 64U << 20U, 256U << 20U},
+                           128U << 20U,
+                           8'192,
+                           7,
+                           1,
+                           true};
   }
   if (name == "soak") {
-    return ProfileSettings{
-        32U << 20U, 30, 5, std::chrono::seconds(5), 128, 5, 10, 40, {64U << 20U, 256U << 20U, 1ULL << 30U}, true};
+    return ProfileSettings{32U << 20U,
+                           30,
+                           5,
+                           std::chrono::seconds(5),
+                           128,
+                           5,
+                           10,
+                           40,
+                           {64U << 20U, 256U << 20U, 1ULL << 30U},
+                           512U << 20U,
+                           32'768,
+                           10,
+                           2,
+                           true};
   }
   Fail("unknown benchmark profile");
 }
@@ -91,6 +120,8 @@ auto WorkloadName(Workload workload) -> std::string_view {
       return "recovery";
     case Workload::Churn:
       return "churn";
+    case Workload::IoRead:
+      return "io_read";
   }
   Fail("unknown workload kind");
 }
@@ -300,6 +331,30 @@ void AddScalingScenarios(std::vector<Scenario> &scenarios, const ProfileSettings
   if (profile.full_matrix) {
     add("32x_cache", 32, 1);
   }
+}
+
+void AddDirectIoScenarios(std::vector<Scenario> &scenarios, const ProfileSettings &profile) {
+  const auto mebibytes = profile.io_bytes >> 20U;
+  const auto rows = RowsForBytes(profile.io_bytes, 16, 1U << 10U);
+  const auto add = [&](std::string operation, AccessPattern access, std::size_t operations) {
+    auto scenario =
+        BaseScenario(profile, "io." + std::move(operation) + ".cache_dropped." + std::to_string(mebibytes) + "MiB",
+                     "direct_io", Workload::IoRead);
+    scenario.access = access;
+    scenario.rows = rows;
+    scenario.value_bytes = 1U << 10U;
+    scenario.target_bytes = profile.io_bytes;
+    scenario.operations = operations;
+    scenario.trials = profile.io_trials;
+    scenario.warmups = profile.io_warmups;
+    scenario.minimum_trial = std::chrono::milliseconds::zero();
+    scenario.drop_file_cache = true;
+    scenarios.push_back(std::move(scenario));
+  };
+
+  /* A zero operation count asks the workload to stream the complete tree. */
+  add("scan", AccessPattern::Sequential, 0);
+  add("random", AccessPattern::Uniform, profile.io_random_reads);
 }
 
 auto ParseUnsigned(std::string_view text, std::string_view flag) -> std::uint64_t {
@@ -512,6 +567,7 @@ auto BuildScenarios(const Config &config) -> std::vector<Scenario> {
   AddLifecycleScenarios(scenarios, profile);
   AddChurnScenario(scenarios, profile);
   AddScalingScenarios(scenarios, profile);
+  AddDirectIoScenarios(scenarios, profile);
 
   for (auto &scenario : scenarios) {
     if (config.trials) {
@@ -549,15 +605,16 @@ auto BuildScenarios(const Config &config) -> std::vector<Scenario> {
 void PrintScenarios(const std::vector<Scenario> &scenarios) {
   std::puts(
       "scenario,family,workload,access,rows,key_bytes,value_bytes,cache_bytes,trials,warmups,minimum_trial_ms,"
-      "commits,batch,scan_rows,reader_threads,target_bytes");
+      "commits,batch,scan_rows,operations,reader_threads,target_bytes,drop_file_cache");
   for (const auto &scenario : scenarios) {
-    std::printf("%s,%s,%.*s,%.*s,%zu,%zu,%zu,%zu,%zu,%zu,%lld,%zu,%zu,%zu,%zu,%llu\n", scenario.name.c_str(),
+    std::printf("%s,%s,%.*s,%.*s,%zu,%zu,%zu,%zu,%zu,%zu,%lld,%zu,%zu,%zu,%zu,%zu,%llu,%s\n", scenario.name.c_str(),
                 scenario.family.c_str(), static_cast<int>(WorkloadName(scenario.workload).size()),
                 WorkloadName(scenario.workload).data(), static_cast<int>(AccessName(scenario.access).size()),
                 AccessName(scenario.access).data(), scenario.rows, scenario.key_bytes, scenario.value_bytes,
                 scenario.cache_bytes, scenario.trials, scenario.warmups,
                 static_cast<long long>(scenario.minimum_trial.count()), scenario.commits, scenario.batch,
-                scenario.scan_rows, scenario.reader_threads, static_cast<unsigned long long>(scenario.target_bytes));
+                scenario.scan_rows, scenario.operations, scenario.reader_threads,
+                static_cast<unsigned long long>(scenario.target_bytes), scenario.drop_file_cache ? "true" : "false");
   }
 }
 
@@ -652,7 +709,7 @@ void WriteMetadata(const Config &config, const std::vector<Scenario> &scenarios,
   }
 
   output << "{\n"
-         << "  \"suite_version\": 2,\n"
+         << "  \"suite_version\": 3,\n"
          << "  \"profile\": \"" << JsonEscape(config.profile) << "\",\n"
          << "  \"seed\": " << config.seed << ",\n"
          << "  \"started_utc\": \"" << Timestamp(started, false) << "\",\n"
@@ -684,7 +741,9 @@ void WriteMetadata(const Config &config, const std::vector<Scenario> &scenarios,
          << "  \"cache_terms\": {\n"
          << "    \"engine_hot\": \"working set fits in TinyDB's configured page cache\",\n"
          << "    \"eviction\": \"working set exceeds TinyDB's configured page cache\",\n"
-         << "    \"recovery_os_warm\": \"process restart without an OS page-cache eviction claim\"\n"
+         << "    \"recovery_os_warm\": \"process restart without an OS page-cache eviction claim\",\n"
+         << "    \"cache_dropped\": \"POSIX_FADV_DONTNEED was requested; pre-residency records what Linux actually "
+            "evicted\"\n"
          << "  },\n"
          << "  \"arguments\": [";
   for (std::size_t index = 0; index < config.arguments.size(); ++index) {
@@ -705,7 +764,7 @@ void WriteMetadata(const Config &config, const std::vector<Scenario> &scenarios,
            << ", \"trials\": " << scenario.trials << ", \"warmups\": " << scenario.warmups
            << ", \"minimum_trial_ms\": " << scenario.minimum_trial.count() << ", \"commits\": " << scenario.commits
            << ", \"batch\": " << scenario.batch << ", \"scan_rows\": " << scenario.scan_rows
-           << ", \"reader_threads\": " << scenario.reader_threads
+           << ", \"operations\": " << scenario.operations << ", \"reader_threads\": " << scenario.reader_threads
            << ", \"churn_warmup_rounds\": " << scenario.churn_warmup_rounds
            << ", \"churn_measured_rounds\": " << scenario.churn_measured_rounds
            << ", \"target_bytes\": " << scenario.target_bytes
@@ -713,7 +772,8 @@ void WriteMetadata(const Config &config, const std::vector<Scenario> &scenarios,
            << ", \"random_write_order\": " << (scenario.random_write_order ? "true" : "false")
            << ", \"transaction_scoped_reads\": " << (scenario.transaction_scoped_reads ? "true" : "false")
            << ", \"include_missing_reads\": " << (scenario.include_missing_reads ? "true" : "false")
-           << ", \"copy_values\": " << (scenario.copy_values ? "true" : "false") << '}';
+           << ", \"copy_values\": " << (scenario.copy_values ? "true" : "false")
+           << ", \"drop_file_cache\": " << (scenario.drop_file_cache ? "true" : "false") << '}';
     output << (index + 1U == scenarios.size() ? "\n" : ",\n");
   }
   output << "  ]\n}\n";

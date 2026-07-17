@@ -46,7 +46,13 @@ def scenario_matrix(binary: pathlib.Path, args: argparse.Namespace) -> list[dict
 def direction(metric: str) -> str:
     if "throughput" in metric or metric.endswith("_rate") or metric == "cache_hit_rate":
         return "higher"
-    if any(word in metric for word in ("latency", "amplification", "size", "growth")):
+    if (metric.endswith("cache_drop_accepted") or metric.startswith("page_cache_pre_")
+            or metric in ("engine_cache_resident_bytes", "read_characters")):
+        return "neutral"
+    if (any(word in metric for word in ("latency", "amplification", "size", "growth"))
+            or "page_cache" in metric or "combined_cache" in metric
+            or "storage_read_bytes" in metric or "storage_write_bytes" in metric
+            or metric.endswith("_syscalls")):
         return "lower"
     return "neutral"
 

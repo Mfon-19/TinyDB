@@ -22,6 +22,7 @@ enum class Workload {
   Checkpoint,
   Recovery,
   Churn,
+  IoRead,
 };
 
 enum class AccessPattern {
@@ -49,6 +50,7 @@ struct Scenario final {
   std::size_t commits{0};
   std::size_t batch{0};
   std::size_t scan_rows{0};
+  std::size_t operations{0};
   std::size_t reader_threads{0};
   std::size_t churn_warmup_rounds{3};
   std::size_t churn_measured_rounds{10};
@@ -59,6 +61,7 @@ struct Scenario final {
   bool transaction_scoped_reads{true};
   bool include_missing_reads{false};
   bool copy_values{true};
+  bool drop_file_cache{false};
 };
 
 struct Config final {

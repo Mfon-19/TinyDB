@@ -22,10 +22,15 @@ The standard matrix covers:
 - one writer with 0, 1, 4, and 8 concurrent readers;
 - checkpoint and process-restart recovery at 16, 64, and 256 MiB;
 - repeated delete/reinsert churn after warmup; and
-- point reads with logical working sets near 0.5, 8, and 32 times the cache target.
+- point reads with logical working sets near 0.5, 8, and 32 times the cache target; and
+- cache-dropped sequential and random reads that measure Linux database-file
+  residency and process I/O independently of TinyDB's own cache.
 
 The soak profile uses the same matrix with longer trials, larger cache and
 lifecycle fixtures, and more churn rounds. It is intentionally expensive.
+The exact-pass `direct_io` scenarios use 3 + 1, 7 + 1, and 10 + 2 measured
+trials and warmups in the smoke, standard, and soak profiles respectively;
+they do not repeat work to satisfy the CPU duration floor.
 
 ## Running the suite
 
@@ -86,6 +91,63 @@ The terms in scenario names are narrow:
 No scenario is called a cold-device benchmark. Reproducible cold-device tests
 require machine-specific cache control and should be run by a dedicated host
 harness.
+
+## Measuring buffered I/O against direct I/O
+
+The `direct_io` family is the before-and-after instrument for the database-file
+I/O change. It makes one complete pass over a fixture or executes one fixed
+uniform-random read plan. Before `Open` and again before the workload, it
+requests `POSIX_FADV_DONTNEED` for the database file and records actual
+residency with `mincore`. Open and workload time are reported separately.
+
+Run the buffered and direct-I/O binaries through the normal A/B runner:
+
+```sh
+python3 bench/compare.py /path/to/buffered/TinyDB_bench \
+  /path/to/direct/TinyDB_bench --profile standard --family direct_io
+```
+
+The most useful metrics are:
+
+| Metric | What it answers |
+|---|---|
+| `page_cache_pre_open_resident_ratio` | Did the first advisory cache drop establish a cold file-cache state for `Open`? |
+| `page_cache_pre_workload_resident_ratio` | Did the second cache drop remove pages that `Open` itself loaded? |
+| `page_cache_post_resident_bytes` | How much of the database did this run leave in Linux's file cache? |
+| `engine_cache_resident_bytes` | How much database data remained in TinyDB's own page cache? |
+| `combined_cache_resident_bytes` | What was the observable engine-cache plus file-cache footprint after the read? |
+| `storage_read_bytes` | How many bytes Linux submitted to storage during open, workload, and close? |
+| `workload_storage_read_bytes` | How many of those storage bytes belong to the measured reads? |
+| `workload_storage_read_amplification` | How many storage bytes were read per logical key/value byte returned? |
+| `read_syscalls` | How many read-family syscalls the complete observation issued? |
+| `open_latency`, `workload_latency`, `throughput` | What performance was paid for that cache and I/O behavior? |
+
+Both `open_cache_drop_accepted` and `workload_cache_drop_accepted` must be one,
+and both pre-residency ratios should be near zero before treating a trial as
+cache-dropped. TinyDB remains quiescent while the second advisory request is
+made; its temporary descriptor never reads or writes file contents. The
+post-residency probe is performed only after the database handle closes. The
+harness therefore never performs buffered data I/O through a second handle
+while an `O_DIRECT` candidate is open.
+
+Checkpoint and recovery scenarios also report database-file residency and
+`/proc/self/io` storage bytes. Compare those paths separately when changing
+their I/O mode:
+
+```sh
+python3 bench/compare.py /path/to/buffered/TinyDB_bench \
+  /path/to/direct/TinyDB_bench --profile standard --family checkpoint
+python3 bench/compare.py /path/to/buffered/TinyDB_bench \
+  /path/to/direct/TinyDB_bench --profile standard --family recovery
+```
+
+These are Linux measurements. `mincore` covers only the TinyDB database file,
+not the deliberately buffered WAL. `/proc/self/io` is process-wide, although
+the harness runs scenarios serially and creates no background database work.
+`POSIX_FADV_DONTNEED` removes the host file-cache advantage when Linux honors
+it; it does not flush a drive's internal cache. Use `TMPDIR` to place fixtures
+on the device and filesystem being evaluated, and inspect `metadata.json`
+before comparing runs.
 
 ## Comparing revisions
 

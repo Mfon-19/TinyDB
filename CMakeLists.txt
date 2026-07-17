@@ -239,6 +239,8 @@ if(TINYDB_BUILD_BENCHMARKS)
     bench/benchmark.h
     bench/main.cpp
     bench/support.cpp
+    bench/system_metrics.cpp
+    bench/system_metrics.h
     bench/workloads.cpp)
   target_link_libraries(TinyDB_bench PRIVATE TinyDB::TinyDB)
   target_compile_definitions(

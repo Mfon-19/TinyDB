@@ -1,4 +1,5 @@
 #include "benchmark.h"
+#include "system_metrics.h"
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -45,6 +46,27 @@ struct LifecycleObservation final {
   double milliseconds{0};
   double mebibytes_per_second{0};
   double bytes{0};
+  double dirty_bytes{0};
+  FileResidency residency;
+  ProcessIo process_io;
+};
+
+struct IoReadObservation final {
+  double open_milliseconds{0};
+  double workload_milliseconds{0};
+  double operations_per_second{0};
+  double cache_hit_rate{0};
+  double engine_cache_resident_bytes{0};
+  bool open_cache_drop_accepted{false};
+  bool workload_cache_drop_accepted{false};
+  FileResidency before_open_residency;
+  FileResidency before_workload_residency;
+  FileResidency after_residency;
+  ProcessIo open_io;
+  ProcessIo workload_io;
+  ProcessIo close_io;
+  ProcessIo process_io;
+  double logical_read_bytes{0};
 };
 
 void BuildCheckpointedFixture(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data) {
@@ -514,6 +536,7 @@ auto ObserveCheckpoint(const Scenario &scenario, const Dataset &data) -> Lifecyc
   if (before.dirty_bytes == 0) {
     Fail("checkpoint fixture produced no dirty bytes");
   }
+  const auto process_io_before = ObserveProcessIo();
   const auto started = Clock::now();
   Check(database.Checkpoint(), "Checkpoint measured");
   const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -528,11 +551,16 @@ auto ObserveCheckpoint(const Scenario &scenario, const Dataset &data) -> Lifecyc
   }
   const auto bytes = DatabaseFileBytes(path);
   Check(database.Close(), "Close checkpoint benchmark");
+  const auto process_io = SubtractProcessIo(ObserveProcessIo(), process_io_before);
+  const auto residency = ObserveFileResidency(path);
   RemoveDatabase(path);
   return LifecycleObservation{
       .milliseconds = seconds * 1'000.0,
       .mebibytes_per_second = (static_cast<double>(before.dirty_bytes) / static_cast<double>(1U << 20U)) / seconds,
       .bytes = static_cast<double>(bytes),
+      .dirty_bytes = static_cast<double>(before.dirty_bytes),
+      .residency = residency,
+      .process_io = process_io,
   };
 }
 
@@ -546,6 +574,17 @@ void RunCheckpoint(const Scenario &scenario, Results &results) {
     results.Add(scenario, "latency", "milliseconds", trial, 0, observation.milliseconds);
     results.Add(scenario, "dirty_transfer_rate", "MiB/second", trial, 0, observation.mebibytes_per_second);
     results.Add(scenario, "database_size", "bytes", trial, 0, observation.bytes);
+    results.Add(scenario, "page_cache_resident_bytes", "bytes", trial, 0,
+                static_cast<double>(observation.residency.resident_bytes));
+    results.Add(scenario, "page_cache_resident_ratio", "ratio", trial, 0, observation.residency.Ratio());
+    results.Add(scenario, "storage_write_bytes", "bytes", trial, 0,
+                static_cast<double>(observation.process_io.storage_write_bytes));
+    results.Add(scenario, "storage_write_amplification", "bytes/dirty_byte", trial, 0,
+                observation.dirty_bytes == 0
+                    ? 0.0
+                    : static_cast<double>(observation.process_io.storage_write_bytes) / observation.dirty_bytes);
+    results.Add(scenario, "write_syscalls", "calls", trial, 0,
+                static_cast<double>(observation.process_io.write_syscalls));
   }
 }
 
@@ -574,6 +613,7 @@ auto ObserveRecovery(const Scenario &scenario, const Dataset &data) -> Lifecycle
   }
   WaitForWriter(child);
   const auto bytes = PersistentBytes(path);
+  const auto process_io_before = ObserveProcessIo();
   const auto started = Clock::now();
   auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open measured recovery");
   const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -583,11 +623,16 @@ auto ObserveRecovery(const Scenario &scenario, const Dataset &data) -> Lifecycle
     Fail("recovery validation failed");
   }
   Check(database.Close(), "Close recovery benchmark");
+  const auto process_io = SubtractProcessIo(ObserveProcessIo(), process_io_before);
+  const auto residency = ObserveFileResidency(path);
   RemoveDatabase(path);
   return LifecycleObservation{
       .milliseconds = seconds * 1'000.0,
       .mebibytes_per_second = (static_cast<double>(bytes) / static_cast<double>(1U << 20U)) / seconds,
       .bytes = static_cast<double>(bytes),
+      .dirty_bytes = 0,
+      .residency = residency,
+      .process_io = process_io,
   };
 }
 
@@ -601,7 +646,172 @@ void RunRecovery(const Scenario &scenario, Results &results) {
     results.Add(scenario, "open_latency", "milliseconds", trial, 0, observation.milliseconds);
     results.Add(scenario, "replay_rate", "MiB/second", trial, 0, observation.mebibytes_per_second);
     results.Add(scenario, "persistent_size", "bytes", trial, 0, observation.bytes);
+    results.Add(scenario, "page_cache_resident_bytes", "bytes", trial, 0,
+                static_cast<double>(observation.residency.resident_bytes));
+    results.Add(scenario, "page_cache_resident_ratio", "ratio", trial, 0, observation.residency.Ratio());
+    results.Add(scenario, "storage_read_bytes", "bytes", trial, 0,
+                static_cast<double>(observation.process_io.storage_read_bytes));
+    results.Add(scenario, "storage_write_bytes", "bytes", trial, 0,
+                static_cast<double>(observation.process_io.storage_write_bytes));
   }
+}
+
+auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data,
+                   const std::vector<std::size_t> &random_plan,
+                   std::uint64_t expected_scan_digest) -> IoReadObservation {
+  const auto open_cache_drop_accepted = !scenario.drop_file_cache || AdviseDropFileCache(path);
+  const auto before_open_residency = ObserveFileResidency(path);
+  const auto process_io_before = ObserveProcessIo();
+
+  const auto open_started = Clock::now();
+  auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open direct-I/O read benchmark");
+  const auto open_seconds = std::chrono::duration<double>(Clock::now() - open_started).count();
+  const auto process_io_after_open = ObserveProcessIo();
+  const auto stats_before = Take(database.Stats(), "Stats before direct-I/O read");
+
+  /*
+  ** Open performs real database work and may populate the file cache.  Evict a
+  ** second time so open cost and cold workload cost remain separately visible.
+  ** The database is quiescent and the advisory descriptor never reads or
+  ** writes file contents.
+  */
+  const auto workload_cache_drop_accepted = !scenario.drop_file_cache || AdviseDropFileCache(path);
+  const auto before_workload_residency = ObserveFileResidency(path);
+  const auto process_io_before_workload = ObserveProcessIo();
+
+  auto operations = std::uint64_t{0};
+  auto digest = std::uint64_t{0};
+  const auto workload_started = Clock::now();
+  if (scenario.access == AccessPattern::Sequential) {
+    auto read = Take(database.BeginRead(), "BeginRead direct-I/O scan");
+    auto cursor = Take(read.Scan(), "Scan direct-I/O fixture");
+    while (cursor.Valid()) {
+      digest += cursor.Key().size() * 257U;
+      digest += ValueDigest(Take(cursor.CopyValue(), "Copy direct-I/O scan value"));
+      ++operations;
+      Check(cursor.Next(), "Advance direct-I/O scan");
+    }
+    if (operations != scenario.rows || digest != expected_scan_digest) {
+      Fail("direct-I/O scan validation failed");
+    }
+  } else {
+    auto read = Take(database.BeginRead(), "BeginRead direct-I/O random reads");
+    for (const auto row : random_plan) {
+      const auto value = Take(read.Get(data.keys[row]), "Get direct-I/O random key");
+      if (!value || *value != data.first_values[row]) {
+        Fail("direct-I/O random-read validation failed");
+      }
+      digest += ValueDigest(*value);
+      ++operations;
+    }
+    if (operations != random_plan.size() || digest == 0) {
+      Fail("direct-I/O random-read plan was not fully executed");
+    }
+  }
+  const auto workload_seconds = std::chrono::duration<double>(Clock::now() - workload_started).count();
+  const auto process_io_after_workload = ObserveProcessIo();
+  const auto stats_after = Take(database.Stats(), "Stats after direct-I/O read");
+  Check(database.Close(), "Close direct-I/O read benchmark");
+
+  const auto process_io_after_close = ObserveProcessIo();
+  const auto process_io = SubtractProcessIo(process_io_after_close, process_io_before);
+  const auto after_residency = ObserveFileResidency(path);
+  const auto hits = stats_after.cache_hits - stats_before.cache_hits;
+  const auto misses = stats_after.cache_misses - stats_before.cache_misses;
+  return IoReadObservation{
+      .open_milliseconds = open_seconds * 1'000.0,
+      .workload_milliseconds = workload_seconds * 1'000.0,
+      .operations_per_second = static_cast<double>(operations) / workload_seconds,
+      .cache_hit_rate = hits + misses == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(hits + misses),
+      .engine_cache_resident_bytes = static_cast<double>(stats_after.cache_resident_bytes),
+      .open_cache_drop_accepted = open_cache_drop_accepted,
+      .workload_cache_drop_accepted = workload_cache_drop_accepted,
+      .before_open_residency = before_open_residency,
+      .before_workload_residency = before_workload_residency,
+      .after_residency = after_residency,
+      .open_io = SubtractProcessIo(process_io_after_open, process_io_before),
+      .workload_io = SubtractProcessIo(process_io_after_workload, process_io_before_workload),
+      .close_io = SubtractProcessIo(process_io_after_close, process_io_after_workload),
+      .process_io = process_io,
+      .logical_read_bytes =
+          static_cast<double>(operations) * static_cast<double>(scenario.key_bytes + scenario.value_bytes),
+  };
+}
+
+void AddIoReadResults(const Scenario &scenario, Results &results, std::size_t trial,
+                      const IoReadObservation &observation) {
+  results.Add(scenario, "open_latency", "milliseconds", trial, 0, observation.open_milliseconds);
+  results.Add(scenario, "workload_latency", "milliseconds", trial, 0, observation.workload_milliseconds);
+  results.Add(scenario, "throughput", scenario.access == AccessPattern::Sequential ? "rows/second" : "reads/second",
+              trial, 0, observation.operations_per_second);
+  results.Add(scenario, "cache_hit_rate", "ratio", trial, 0, observation.cache_hit_rate);
+  results.Add(scenario, "open_cache_drop_accepted", "boolean", trial, 0,
+              observation.open_cache_drop_accepted ? 1.0 : 0.0);
+  results.Add(scenario, "workload_cache_drop_accepted", "boolean", trial, 0,
+              observation.workload_cache_drop_accepted ? 1.0 : 0.0);
+  results.Add(scenario, "page_cache_pre_open_resident_bytes", "bytes", trial, 0,
+              static_cast<double>(observation.before_open_residency.resident_bytes));
+  results.Add(scenario, "page_cache_pre_open_resident_ratio", "ratio", trial, 0,
+              observation.before_open_residency.Ratio());
+  results.Add(scenario, "page_cache_pre_workload_resident_bytes", "bytes", trial, 0,
+              static_cast<double>(observation.before_workload_residency.resident_bytes));
+  results.Add(scenario, "page_cache_pre_workload_resident_ratio", "ratio", trial, 0,
+              observation.before_workload_residency.Ratio());
+  results.Add(scenario, "page_cache_post_resident_bytes", "bytes", trial, 0,
+              static_cast<double>(observation.after_residency.resident_bytes));
+  results.Add(scenario, "page_cache_post_resident_ratio", "ratio", trial, 0, observation.after_residency.Ratio());
+  results.Add(scenario, "page_cache_growth", "bytes", trial, 0,
+              static_cast<double>(observation.after_residency.resident_bytes) -
+                  static_cast<double>(observation.before_workload_residency.resident_bytes));
+  results.Add(scenario, "engine_cache_resident_bytes", "bytes", trial, 0, observation.engine_cache_resident_bytes);
+  results.Add(
+      scenario, "combined_cache_resident_bytes", "bytes", trial, 0,
+      observation.engine_cache_resident_bytes + static_cast<double>(observation.after_residency.resident_bytes));
+  results.Add(scenario, "storage_read_bytes", "bytes", trial, 0,
+              static_cast<double>(observation.process_io.storage_read_bytes));
+  results.Add(scenario, "open_storage_read_bytes", "bytes", trial, 0,
+              static_cast<double>(observation.open_io.storage_read_bytes));
+  results.Add(scenario, "workload_storage_read_bytes", "bytes", trial, 0,
+              static_cast<double>(observation.workload_io.storage_read_bytes));
+  results.Add(scenario, "close_storage_read_bytes", "bytes", trial, 0,
+              static_cast<double>(observation.close_io.storage_read_bytes));
+  results.Add(scenario, "workload_storage_read_amplification", "bytes/logical_byte", trial, 0,
+              observation.logical_read_bytes == 0
+                  ? 0.0
+                  : static_cast<double>(observation.workload_io.storage_read_bytes) / observation.logical_read_bytes);
+  results.Add(scenario, "read_characters", "bytes", trial, 0,
+              static_cast<double>(observation.process_io.characters_read));
+  results.Add(scenario, "read_syscalls", "calls", trial, 0, static_cast<double>(observation.process_io.read_syscalls));
+}
+
+void RunIoRead(const Scenario &scenario, const Config &config, Results &results) {
+  const auto path = TemporaryDatabasePath(scenario.name);
+  RemoveDatabase(path);
+  const auto data = MakeDataset(scenario.rows, scenario.key_bytes, scenario.value_bytes);
+  BuildCheckpointedFixture(path, scenario, data);
+
+  auto random_plan = std::vector<std::size_t>{};
+  random_plan.reserve(scenario.operations);
+  auto generator = std::mt19937_64{config.seed ^ 0x444952454354494FULL};
+  for (std::size_t operation = 0; operation < scenario.operations; ++operation) {
+    random_plan.push_back(static_cast<std::size_t>(generator() % scenario.rows));
+  }
+  auto expected_scan_digest = std::uint64_t{0};
+  if (scenario.access == AccessPattern::Sequential) {
+    for (std::size_t row = 0; row < scenario.rows; ++row) {
+      expected_scan_digest += data.keys[row].size() * 257U;
+      expected_scan_digest += ValueDigest(data.first_values[row]);
+    }
+  }
+
+  for (std::size_t warmup = 0; warmup < scenario.warmups; ++warmup) {
+    (void)ObserveIoRead(path, scenario, data, random_plan, expected_scan_digest);
+  }
+  for (std::size_t trial = 0; trial < scenario.trials; ++trial) {
+    const auto observation = ObserveIoRead(path, scenario, data, random_plan, expected_scan_digest);
+    AddIoReadResults(scenario, results, trial, observation);
+  }
+  RemoveDatabase(path);
 }
 
 auto ChurnRound(Database &database, const Scenario &scenario, const Dataset &data, bool second) -> double {
@@ -680,6 +890,9 @@ void RunScenario(const Scenario &scenario, const Config &config, Results &result
       return;
     case Workload::Churn:
       RunChurn(scenario, results);
+      return;
+    case Workload::IoRead:
+      RunIoRead(scenario, config, results);
       return;
   }
   Fail("unknown workload kind");

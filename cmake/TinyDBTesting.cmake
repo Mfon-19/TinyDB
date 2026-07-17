@@ -30,6 +30,7 @@ function(TinyDB_add_test test_name)
 endfunction()
 
 TinyDB_add_test(contract)
+TinyDB_add_test(cache)
 TinyDB_add_test(database)
 TinyDB_add_test(durability)
 TinyDB_add_test(page_view)
