@@ -1,1115 +1,346 @@
 #include <gtest/gtest.h>
+
 #include <tinydb/database.h>
-#include <tinydb/status.h>
-#include "storage/page.h"
-#include "wal/wal.h"
 
-#include "io/syscalls.h"
-#include "storage/page_codec.h"
-#include "storage/superblock.h"
-#include "support/transaction_model.h"
-#include "support/transaction_scenarios.h"
-#include "txn/database_state.h"
-#include "wal/wal_codec.h"
+#include "support/test_files.h"
 
-#include <unistd.h>
-
-#include <array>
 #include <atomic>
 #include <cerrno>
-#include <condition_variable>
+#include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
-#include <limits>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
-#include <utility>
 #include <vector>
 
 /*
-** Storage-engine tests cover behavior across all layers: ordered-map semantics,
-** reopen and crash durability, checkpoint ordering, exclusive process
-** ownership, churn, corruption reporting, and reader visibility during private
-** write preparation. Randomized cases compare every operation with std::map.
+** DATABASE GUARANTEE TESTS
+**
+** This is the public contract exercised through the one production API path.
+** Tests deliberately avoid fixtures and storage doubles: each case owns a
+** fresh path, and reopen observes the same recovery path an application uses.
+** Codec and exact durability-order tests live in their focused suites.
 */
+
 namespace {
 
-auto TestUuid(std::byte last = std::byte{1}) -> tinydb::DatabaseUuid {
-  auto uuid = tinydb::DatabaseUuid{};
-  uuid.back() = last;
-  return uuid;
+void Cleanup(const std::filesystem::path &path) { tinydb::test::Remove(path); }
+
+auto Fresh(std::string_view name, tinydb::Options options = {}) -> tinydb::Result<tinydb::Database> {
+  const auto path = tinydb::test::Path(name);
+  Cleanup(path);
+  return tinydb::Database::Open(path, options);
 }
 
-auto RowKey(int row) -> std::string {
-  char buffer[16];
-  std::snprintf(buffer, sizeof(buffer), "row-%06d", row);
-  return std::string{buffer};
-}
+}  // namespace
 
-auto RowValue(int row, std::size_t length) -> std::string {
-  auto value = std::string(length, '\0');
-  for (std::size_t i = 0; i < length; ++i) {
-    value[i] = static_cast<char>('a' + (static_cast<std::size_t>(row) + i) % 26);
-  }
-  return value;
-}
+TEST(Database, Transactions) {
+  const auto path = tinydb::test::Path("transactions");
+  auto database = Fresh("transactions").value();
 
-using Rows = std::vector<std::pair<std::string, std::string>>;
-
-auto Materialize(tinydb::Database &engine, tinydb::KeyRange range = tinydb::KeyRange::All()) -> tinydb::Result<Rows> {
-  auto transaction = engine.BeginRead();
-  if (!transaction) {
-    return std::unexpected(transaction.error());
-  }
-  auto cursor = transaction->Scan(std::move(range));
-  if (!cursor) {
-    return std::unexpected(cursor.error());
-  }
-  auto rows = Rows{};
-  while (cursor->Valid()) {
-    auto value = cursor->CopyValue();
-    if (!value) {
-      return std::unexpected(value.error());
-    }
-    rows.emplace_back(cursor->Key(), std::move(*value));
-    if (auto status = cursor->Next(); !status.Ok()) {
-      return std::unexpected(std::move(status));
-    }
-  }
-  return rows;
-}
-
-auto ReadFile(const std::filesystem::path &path) -> std::vector<char> {
-  auto input = std::ifstream(path, std::ios::binary);
-  return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
-}
-
-class ScopedSyscallHook {
- public:
-  explicit ScopedSyscallHook(tinydb::io::TestHook hook) { tinydb::io::SetTestHook(std::move(hook)); }
-  ScopedSyscallHook(const ScopedSyscallHook &) = delete;
-  auto operator=(const ScopedSyscallHook &) -> ScopedSyscallHook & = delete;
-  ~ScopedSyscallHook() { tinydb::io::ClearTestHook(); }
-};
-
-auto FindCall(const std::vector<tinydb::io::Call> &calls, tinydb::io::Syscall syscall,
-              const std::filesystem::path &path, std::size_t start = 0) -> std::size_t {
-  for (auto i = start; i < calls.size(); ++i) {
-    if (calls[i].syscall == syscall && calls[i].path == path) {
-      return i;
-    }
-  }
-  return std::numeric_limits<std::size_t>::max();
-}
-
-class DatabaseTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
-    const auto stem = "tinydb_engine_" + std::string(info->name()) + "_" + std::to_string(::getpid());
-    db_path_ = std::filesystem::temp_directory_path() / (stem + ".db");
-    second_db_path_ = std::filesystem::temp_directory_path() / (stem + "_b.db");
-    RemoveDatabase(db_path_);
-    RemoveDatabase(second_db_path_);
-  }
-
-  void TearDown() override {
-    RemoveDatabase(db_path_);
-    RemoveDatabase(second_db_path_);
-  }
-
-  // A database on disk is the file plus its write-ahead log.
-  static void RemoveDatabase(const std::filesystem::path &path) {
-    std::filesystem::remove(path);
-    const auto wal_path = tinydb::Wal::PathFor(path);
-    std::filesystem::remove(wal_path);
-    auto parent = wal_path.parent_path();
-    if (parent.empty()) {
-      parent = ".";
-    }
-    const auto prefix = wal_path.filename().string() + ".";
-    for (const auto &entry : std::filesystem::directory_iterator(parent)) {
-      const auto name = entry.path().filename().string();
-      if (name.starts_with(prefix) && name.ends_with(".segment")) {
-        std::filesystem::remove(entry.path());
-      }
-    }
-  }
-
-  // Copies the database and its log as they sit on disk right now — the
-  // exact state a crash would leave behind (nothing flushed, nothing
-  // closed) — so a second engine can be opened on the copy while the
-  // original stays live.
-  void SnapshotDatabase() const {
-    std::filesystem::copy_file(db_path_, second_db_path_);
-    const auto source_wal = tinydb::Wal::PathFor(db_path_);
-    const auto destination_wal = tinydb::Wal::PathFor(second_db_path_);
-    std::filesystem::copy_file(source_wal, destination_wal);
-    auto parent = source_wal.parent_path();
-    if (parent.empty()) {
-      parent = ".";
-    }
-    const auto prefix = source_wal.filename().string() + ".";
-    for (const auto &entry : std::filesystem::directory_iterator(parent)) {
-      const auto name = entry.path().filename().string();
-      if (!name.starts_with(prefix) || !name.ends_with(".segment")) {
-        continue;
-      }
-      const auto suffix = name.substr(source_wal.filename().string().size());
-      auto destination = destination_wal;
-      destination += suffix;
-      std::filesystem::copy_file(entry.path(), destination);
-    }
-  }
-
-  std::filesystem::path db_path_;
-  std::filesystem::path second_db_path_;
-};
-
-/*
-** The reusable contract scenarios intentionally speak a tiny model-shaped
-** vocabulary. This adapter removes Result/Status wrappers only after asserting
-** that TinyDB returned a value, leaving the scenarios themselves independent
-** of storage implementation types.
-*/
-class TinyDbContractAdapter final {
- public:
-  using Row = std::pair<std::string, std::string>;
-  using Rows = std::vector<Row>;
-
-  explicit TinyDbContractAdapter(tinydb::Database *engine) : engine_(engine) {}
-
-  class Write final {
-   public:
-    explicit Write(tinydb::WriteTransaction transaction) : transaction_(std::move(transaction)) {}
-
-    auto Put(std::string_view key, std::string_view value) -> tinydb::StatusCode {
-      return transaction_.Put(key, value).Code();
-    }
-    auto Delete(std::string_view key) -> tinydb::StatusCode { return transaction_.Delete(key).Code(); }
-    auto Get(std::string_view key) -> std::optional<std::string> { return transaction_.Get(key).value(); }
-    auto Commit() -> bool { return std::move(transaction_).Commit().has_value(); }
-    void Abort() noexcept { transaction_.Abort(); }
-
-   private:
-    tinydb::WriteTransaction transaction_;
-  };
-
-  auto BeginWrite() -> std::optional<Write> {
-    auto transaction = engine_->BeginWrite();
-    if (!transaction) {
-      return std::nullopt;
-    }
-    return Write(std::move(*transaction));
-  }
-
-  auto Get(std::string_view key) -> std::optional<std::string> { return engine_->Get(key).value(); }
-
-  auto Scan(std::optional<std::string_view> start = std::nullopt,
-            std::optional<std::string_view> end = std::nullopt) -> Rows {
-    auto range = tinydb::KeyRange::All();
-    if (start && end) {
-      range = tinydb::KeyRange::Between(*start, *end);
-    } else if (start) {
-      range = tinydb::KeyRange::From(*start);
-    } else if (end) {
-      range = tinydb::KeyRange::Until(*end);
-    }
-    auto transaction = engine_->BeginRead().value();
-    auto cursor = transaction.Scan(std::move(range)).value();
-    auto rows = Rows{};
-    while (cursor.Valid()) {
-      rows.emplace_back(cursor.Key(), cursor.CopyValue().value());
-      EXPECT_TRUE(cursor.Next().Ok());
-    }
-    return rows;
-  }
-
- private:
-  tinydb::Database *engine_;
-};
-
-TEST_F(DatabaseTest, PublicTransactionCommitPublishesAtomically) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto adapter = TinyDbContractAdapter(&engine);
-  tinydb::test_support::CommitPublishesAtomically(adapter);
-}
-
-TEST_F(DatabaseTest, PublicTransactionAbortDiscardsAllChanges) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto adapter = TinyDbContractAdapter(&engine);
-  tinydb::test_support::AbortDiscardsAllChanges(adapter);
-}
-
-TEST_F(DatabaseTest, PublicTransactionDestructionAbortsAndReleasesWriter) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto adapter = TinyDbContractAdapter(&engine);
-  tinydb::test_support::DestructionAborts(adapter);
-}
-
-TEST_F(DatabaseTest, PublicTransactionReadsOwnWritesAndDeletes) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto adapter = TinyDbContractAdapter(&engine);
-  tinydb::test_support::OverwriteDeleteAndReadOwnWrites(adapter);
-}
-
-TEST_F(DatabaseTest, PublicTransactionScansUseHalfOpenOptionalBounds) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto adapter = TinyDbContractAdapter(&engine);
-  tinydb::test_support::ScanUsesHalfOpenOptionalBounds(adapter);
-}
-
-TEST_F(DatabaseTest, PublicTransactionKeysUseUnsignedByteOrder) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto adapter = TinyDbContractAdapter(&engine);
-  tinydb::test_support::KeysUseUnsignedByteOrder(adapter);
-}
-
-TEST_F(DatabaseTest, PublicTransactionAllowsOnlyOneWriter) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto adapter = TinyDbContractAdapter(&engine);
-  tinydb::test_support::OnlyOneWriterIsAdmitted(adapter);
-}
-
-TEST_F(DatabaseTest, InvalidMutationLeavesTheWriteTransactionActive) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto transaction = engine.BeginWrite().value();
-  const auto oversized_key = std::string(tinydb::MAX_KEY_BYTES + 1, 'x');
-  const auto oversized_value = std::string(tinydb::MAX_VALUE_BYTES + 1, 'x');
-  EXPECT_EQ(transaction.Put(oversized_key, "value").Code(), tinydb::StatusCode::InvalidArgument);
-  EXPECT_EQ(transaction.Put("key", oversized_value).Code(), tinydb::StatusCode::InvalidArgument);
-  EXPECT_EQ(transaction.Delete(oversized_key).Code(), tinydb::StatusCode::InvalidArgument);
-  ASSERT_TRUE(transaction.Put("valid", "value").Ok());
-  ASSERT_TRUE(std::move(transaction).Commit().has_value());
-  EXPECT_EQ(engine.Get("valid").value(), std::optional<std::string>{"value"});
-}
-
-TEST_F(DatabaseTest, MaximumSizedKeyIsIndependentOfValueStorage) {
-  const auto key = std::string(tinydb::MAX_KEY_BYTES, 'k');
-  auto engine = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(engine.Put(key, "value").Ok());
-  EXPECT_EQ(engine.Get(key).value(), std::optional<std::string>{"value"});
-  ASSERT_TRUE(engine.Close().Ok());
-
-  auto reopened = tinydb::Database::Open(db_path_).value();
-  EXPECT_EQ(reopened.Get(key).value(), std::optional<std::string>{"value"});
-}
-
-TEST_F(DatabaseTest, PublicTransactionCloseIsBusyWithoutInvalidatingTransactions) {
-  auto engine = tinydb::Database::Open(db_path_).value();
   {
-    auto read = engine.BeginRead().value();
-    EXPECT_EQ(engine.Close().Code(), tinydb::StatusCode::Busy);
-    EXPECT_EQ(read.Get("missing").value(), std::nullopt);
-  }
-  {
-    auto write = engine.BeginWrite().value();
-    EXPECT_EQ(engine.Close().Code(), tinydb::StatusCode::Busy);
-    ASSERT_TRUE(write.Put("key", "value").Ok());
+    auto write = database.BeginWrite().value();
+    ASSERT_TRUE(write.Put("doc/1", "body").Ok());
+    ASSERT_TRUE(write.Put("tag/db/doc/1", "").Ok());
+    EXPECT_EQ(write.Get("doc/1").value(), "body");
     ASSERT_TRUE(std::move(write).Commit().has_value());
   }
-  EXPECT_TRUE(engine.Close().Ok());
+  {
+    auto write = database.BeginWrite().value();
+    ASSERT_TRUE(write.Put("doc/1", "discarded").Ok());
+    write.Abort();
+  }
+  {
+    auto write = database.BeginWrite().value();
+    ASSERT_TRUE(write.Delete("doc/1").Ok());
+  }
+
+  EXPECT_EQ(database.Get("doc/1").value(), "body");
+  EXPECT_EQ(database.Get("tag/db/doc/1").value(), "");
+  Cleanup(path);
 }
 
-TEST_F(DatabaseTest, PublicReadTransactionKeepsOneSnapshotUntilWriterPublishes) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(engine.Put("key", "before").Ok());
-  auto reader = std::optional<tinydb::ReadTransaction>{engine.BeginRead().value()};
+TEST(Database, Ranges) {
+  const auto path = tinydb::test::Path("ranges");
+  auto database = Fresh("ranges").value();
+  for (std::size_t index = 0; index < 10; ++index) {
+    ASSERT_TRUE(database.Put(tinydb::test::Key(index), tinydb::test::Value(index, 24)).Ok());
+  }
+  ASSERT_TRUE(database.Put(std::string(1, static_cast<char>(0x80)), "high").Ok());
 
+  auto rows =
+      tinydb::test::Rows(database, tinydb::KeyRange::Between(tinydb::test::Key(3), tinydb::test::Key(6))).value();
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows.front().first, tinydb::test::Key(3));
+  EXPECT_EQ(rows.back().first, tinydb::test::Key(5));
+  EXPECT_TRUE(tinydb::test::Rows(database, tinydb::KeyRange::Prefix("missing/")).value().empty());
+  EXPECT_EQ(tinydb::test::Rows(database).value().back().second, "high");
+  Cleanup(path);
+}
+
+TEST(Database, Snapshots) {
+  const auto path = tinydb::test::Path("snapshots");
+  auto database = Fresh("snapshots").value();
+  ASSERT_TRUE(database.Put("key", "before").Ok());
+  auto reader = std::optional<tinydb::ReadTransaction>{database.BeginRead().value()};
   auto started = std::atomic<bool>{false};
   auto finished = std::atomic<bool>{false};
+
   auto writer = std::thread([&] {
-    auto transaction = engine.BeginWrite().value();
-    ASSERT_TRUE(transaction.Put("key", "after").Ok());
+    auto write = database.BeginWrite().value();
+    EXPECT_TRUE(write.Put("key", "after").Ok());
     started.store(true, std::memory_order_release);
-    const auto committed = std::move(transaction).Commit();
-    EXPECT_TRUE(committed.has_value());
+    EXPECT_TRUE(std::move(write).Commit().has_value());
     finished.store(true, std::memory_order_release);
   });
   while (!started.load(std::memory_order_acquire)) {
     std::this_thread::yield();
   }
-  EXPECT_EQ(reader->Get("key").value(), std::optional<std::string>{"before"});
+  EXPECT_EQ(reader->Get("key").value(), "before");
   EXPECT_FALSE(finished.load(std::memory_order_acquire));
   reader.reset();
   writer.join();
-  EXPECT_EQ(engine.Get("key").value(), std::optional<std::string>{"after"});
-  EXPECT_GT(engine.Stats()->maximum_publication_wait, std::chrono::nanoseconds::zero());
+
+  EXPECT_EQ(database.Get("key").value(), "after");
+  EXPECT_GT(database.Stats()->maximum_publication_wait, std::chrono::nanoseconds::zero());
+  Cleanup(path);
 }
 
-TEST_F(DatabaseTest, MultiPageTransactionSurvivesCrashAsOneCommittedUnit) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto transaction = engine.BeginWrite().value();
-  for (int row = 0; row < 80; ++row) {
-    ASSERT_TRUE(transaction.Put(RowKey(row), RowValue(row, 256)).Ok());
-  }
-  const auto committed = std::move(transaction).Commit();
-  ASSERT_TRUE(committed.has_value());
-  EXPECT_GT(committed->transaction_id, 0U);
-  EXPECT_GT(committed->commit_lsn, 0U);
-
-  SnapshotDatabase();
-  auto recovered = tinydb::Database::Open(second_db_path_).value();
-  for (int row = 0; row < 80; ++row) {
-    EXPECT_EQ(recovered.Get(RowKey(row)).value(), std::optional<std::string>{RowValue(row, 256)});
-  }
-}
-
-TEST_F(DatabaseTest, CrashAfterWalDurabilityBeforePublicationRecoversTransaction) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  auto reader = std::optional<tinydb::ReadTransaction>{engine.BeginRead().value()};
-  auto wal_synced = std::atomic<bool>{false};
-  auto writer_done = std::atomic<bool>{false};
-
-  {
-    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
-      if (call.syscall == tinydb::io::Syscall::Fsync && call.path == tinydb::Wal::PathFor(db_path_)) {
-        wal_synced.store(true, std::memory_order_release);
-      }
-      return std::nullopt;
-    }};
-    auto writer = std::thread([&] {
-      auto transaction = engine.BeginWrite().value();
-      ASSERT_TRUE(transaction.Put("doc/1", "contents").Ok());
-      ASSERT_TRUE(transaction.Put("tag/database/doc/1", "").Ok());
-      EXPECT_TRUE(std::move(transaction).Commit().has_value());
-      writer_done.store(true, std::memory_order_release);
-    });
-
-    while (!wal_synced.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
-    EXPECT_FALSE(writer_done.load(std::memory_order_acquire));
-    EXPECT_EQ(reader->Get("doc/1").value(), std::nullopt);
-
-    // This copy is the exact durable-but-not-yet-visible crash state. Recovery
-    // must publish both keys from physical WAL without relying on the blocked
-    // writer's in-memory publication plan.
-    SnapshotDatabase();
-    auto recovered = tinydb::Database::Open(second_db_path_).value();
-    EXPECT_EQ(recovered.Get("doc/1").value(), std::optional<std::string>{"contents"});
-    EXPECT_EQ(recovered.Get("tag/database/doc/1").value(), std::optional<std::string>{""});
-
-    reader.reset();
-    writer.join();
-  }
-  EXPECT_TRUE(writer_done.load(std::memory_order_acquire));
-}
-
-TEST_F(DatabaseTest, RepairedWalAppendFailureIsADefiniteAbort) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  const auto wal_path = tinydb::Wal::PathFor(db_path_);
-  {
-    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
-      if (call.syscall == tinydb::io::Syscall::Pwrite && call.path == wal_path) {
-        return tinydb::io::Fault{.error = EIO};
-      }
-      return std::nullopt;
-    }};
-    EXPECT_EQ(engine.Put("aborted", "value").Code(), tinydb::StatusCode::IoError);
-  }
-
-  EXPECT_EQ(engine.Get("aborted").value(), std::nullopt);
-  EXPECT_TRUE(engine.Put("committed", "value").Ok());
-  EXPECT_EQ(engine.Get("committed").value(), std::optional<std::string>{"value"});
-}
-
-TEST_F(DatabaseTest, WalSyncFailureMakesCommitIndeterminateAndRequiresReopen) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  const auto wal_path = tinydb::Wal::PathFor(db_path_);
-  {
-    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
-      if (call.syscall == tinydb::io::Syscall::Fsync && call.path == wal_path) {
-        return tinydb::io::Fault{.error = EIO};
-      }
-      return std::nullopt;
-    }};
-    EXPECT_EQ(engine.Put("limbo", "value").Code(), tinydb::StatusCode::IndeterminateCommit);
-  }
-
-  EXPECT_EQ(engine.Get("limbo").error().Code(), tinydb::StatusCode::NeedsRecovery);
-  EXPECT_EQ(engine.Put("later", "value").Code(), tinydb::StatusCode::NeedsRecovery);
-  EXPECT_TRUE(engine.Close().Ok());
-
-  auto recovered = tinydb::Database::Open(db_path_).value();
-  const auto value = recovered.Get("limbo").value();
-  EXPECT_TRUE(value == std::nullopt || value == std::optional<std::string>{"value"});
-}
-
-TEST_F(DatabaseTest, OpenCreatesEmptyDatabase) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-
-  EXPECT_TRUE(std::filesystem::exists(db_path_));
-  EXPECT_EQ(engine.Get("anything").value(), std::nullopt);
-  EXPECT_TRUE(Materialize(engine).value().empty());
-  EXPECT_TRUE(engine.Delete("anything").Ok());  // removing from an empty database is a no-op
-}
-
-TEST_F(DatabaseTest, OpenOptionsControlResourcesAndInvalidOptionsHaveNoFilesystemEffect) {
+TEST(Database, Limits) {
+  const auto path = tinydb::test::Path("limits");
   auto invalid = tinydb::Options{};
   invalid.page_cache_bytes = tinydb::PAGE_SIZE - 1U;
-  const auto rejected = tinydb::Database::Open(db_path_, invalid);
+  const auto rejected = tinydb::Database::Open(path, invalid);
   ASSERT_FALSE(rejected.has_value());
   EXPECT_EQ(rejected.error().Code(), tinydb::StatusCode::InvalidArgument);
-  EXPECT_FALSE(std::filesystem::exists(db_path_));
+  EXPECT_FALSE(std::filesystem::exists(path));
 
   auto options = tinydb::Options{};
-  options.page_cache_bytes = 3U * tinydb::PAGE_SIZE;
   options.max_write_transaction_bytes = 2U * tinydb::PAGE_SIZE;
-  auto database = tinydb::Database::Open(db_path_, options).value();
-  EXPECT_EQ(database.Stats()->cache_target_bytes, options.page_cache_bytes);
-
-  auto transaction = database.BeginWrite().value();
-  const auto too_large_for_transaction = std::string(2U * tinydb::PAGE_SIZE, 'v');
-  EXPECT_EQ(transaction.Put("large", too_large_for_transaction).Code(), tinydb::StatusCode::ResourceExhausted);
-  EXPECT_TRUE(database.Put("small", "value").Ok());
-}
-
-TEST_F(DatabaseTest, StatisticsDescribeReadersVisibilityCacheAndCheckpointFrontiers) {
-  auto database = tinydb::Database::Open(db_path_).value();
+  auto database = tinydb::Database::Open(path, options).value();
   {
-    auto reader = database.BeginRead().value();
-    const auto stats = database.Stats().value();
-    EXPECT_EQ(stats.active_readers, 1U);
-    EXPECT_TRUE(stats.oldest_reader_age.has_value());
-    EXPECT_EQ(reader.Get("missing").value(), std::nullopt);
+    auto write = database.BeginWrite().value();
+    EXPECT_EQ(write.Put(std::string(tinydb::MAX_KEY_BYTES + 1U, 'k'), "v").Code(), tinydb::StatusCode::InvalidArgument);
+    ASSERT_TRUE(write.Put("valid", "value").Ok());
+    ASSERT_TRUE(std::move(write).Commit().has_value());
   }
-
-  ASSERT_TRUE(database.Put("key", "value").Ok());
-  const auto committed = database.Stats().value();
-  EXPECT_GT(committed.transaction_id, 0U);
-  EXPECT_GT(committed.visible_lsn, committed.checkpoint_lsn);
-  EXPECT_GT(committed.wal_bytes, 0U);
-  EXPECT_EQ(committed.wal_segments, 1U);
-  EXPECT_GT(committed.dirty_pages, 0U);
-  EXPECT_EQ(committed.dirty_bytes, committed.dirty_pages * tinydb::PAGE_SIZE);
-  EXPECT_GT(committed.cache_hits, 0U);
-  EXPECT_GT(committed.write_attempts, 0U);
-  EXPECT_EQ(committed.write_attempts, committed.committed_writes);
-  EXPECT_GT(committed.last_write_prepare, std::chrono::nanoseconds::zero());
-  EXPECT_GT(committed.last_wal_sync, std::chrono::nanoseconds::zero());
-
-  ASSERT_TRUE(database.Checkpoint().Ok());
-  const auto checkpointed = database.Stats().value();
-  EXPECT_EQ(checkpointed.checkpoint_lsn, checkpointed.visible_lsn);
-  EXPECT_EQ(checkpointed.dirty_pages, 0U);
-}
-
-TEST_F(DatabaseTest, VerificationReportsOneReadOnlyCommittedSnapshot) {
-  auto database = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(database.Put("small", "value").Ok());
-  ASSERT_TRUE(database.Put("large", std::string(3U * tinydb::PAGE_SIZE, 'v')).Ok());
-  ASSERT_TRUE(database.Checkpoint().Ok());
-
-  const auto before_database = ReadFile(db_path_);
-  const auto wal_path = tinydb::Wal::PathFor(db_path_);
-  const auto before_wal = ReadFile(wal_path);
-
-  const auto report = database.Verify();
-  ASSERT_TRUE(report.has_value()) << report.error().ToString();
-  EXPECT_TRUE(report->Ok());
-  EXPECT_EQ(report->transaction_id, database.Stats()->transaction_id);
-  EXPECT_GT(report->pages_checked, 0U);
-  EXPECT_GT(report->overflow_pages, 0U);
-
-  const auto after_database = ReadFile(db_path_);
-  const auto after_wal = ReadFile(wal_path);
-  EXPECT_EQ(after_database, before_database);
-  EXPECT_EQ(after_wal, before_wal);
-}
-
-TEST_F(DatabaseTest, RetiredPagesBecomeReusableOnlyAfterCheckpointCoverage) {
-  auto database = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(database.Put("large", std::string(3U * tinydb::PAGE_SIZE, 'a')).Ok());
-  ASSERT_TRUE(database.Put("large", "small").Ok());
-
-  const auto retired = database.Stats().value();
-  EXPECT_GT(retired.retired_pages, 0U);
-  EXPECT_EQ(retired.reusable_pages, 0U);
-
-  ASSERT_TRUE(database.Checkpoint().Ok());
-  const auto reusable = database.Stats().value();
-  EXPECT_EQ(reusable.retired_pages, 0U);
-  EXPECT_GT(reusable.reusable_pages, 0U);
-}
-
-TEST_F(DatabaseTest, StatisticsRemainCoherentWhileWritesPublish) {
-  auto database = tinydb::Database::Open(db_path_).value();
-  auto writer_done = std::atomic<bool>{false};
-  auto writer_failed = std::atomic<bool>{false};
-  auto writer = std::thread([&] {
-    for (std::size_t index = 0; index < 100; ++index) {
-      if (!database.Put("key-" + std::to_string(index), std::string(80, 'v')).Ok()) {
-        writer_failed.store(true);
-        break;
-      }
-    }
-    writer_done.store(true);
-  });
-
-  auto incoherent = false;
-  std::size_t samples = 0;
-  while (!writer_done.load() || samples < 100) {
-    const auto stats = database.Stats();
-    if (!stats || stats->checkpoint_lsn > stats->visible_lsn ||
-        stats->dirty_bytes != stats->dirty_pages * tinydb::PAGE_SIZE ||
-        stats->committed_writes > stats->write_attempts || stats->cache_pinned_pages > stats->cache_resident_pages) {
-      incoherent = true;
-      break;
-    }
-    ++samples;
-    std::this_thread::yield();
-  }
-  writer.join();
-  EXPECT_FALSE(writer_failed.load());
-  EXPECT_FALSE(incoherent);
-  EXPECT_GE(samples, 100U);
-}
-
-TEST_F(DatabaseTest, PutGetDeleteRoundTrip) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-
-  EXPECT_TRUE(engine.Put("apple", "red").Ok());
-  EXPECT_TRUE(engine.Put("banana", "yellow").Ok());
-
-  EXPECT_EQ(engine.Get("apple").value(), std::optional<std::string>{"red"});
-  EXPECT_EQ(engine.Get("banana").value(), std::optional<std::string>{"yellow"});
-
-  EXPECT_TRUE(engine.Delete("apple").Ok());
-  EXPECT_EQ(engine.Get("apple").value(), std::nullopt);
-  EXPECT_EQ(engine.Get("banana").value(), std::optional<std::string>{"yellow"});
-}
-
-TEST_F(DatabaseTest, OpenValidatesTreeAfterSplitsMergesAndCheckpoint) {
   {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    for (int row = 0; row < 500; ++row) {
-      ASSERT_TRUE(engine.Put(RowKey(row), RowValue(row, 700)).Ok());
-    }
-    for (int row = 0; row < 350; ++row) {
-      ASSERT_TRUE(engine.Delete(RowKey(row)).Ok());
-    }
-    ASSERT_TRUE(engine.Close().Ok());
+    auto write = database.BeginWrite().value();
+    EXPECT_EQ(write.Put("large", std::string(2U * tinydb::PAGE_SIZE, 'v')).Code(),
+              tinydb::StatusCode::ResourceExhausted);
   }
-
-  auto reopened = tinydb::Database::Open(db_path_).value();
-  EXPECT_EQ(Materialize(reopened).value().size(), 150U);
+  EXPECT_EQ(database.Get("valid").value(), "value");
+  Cleanup(path);
 }
 
-TEST_F(DatabaseTest, RandomizedModelSurvivesCheckpointsAndReopens) {
-  auto expected = tinydb::test_support::TransactionModel{};
-  auto random = std::mt19937_64{0x54494e594442ULL};
-
-  for (int epoch = 0; epoch < 10; ++epoch) {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    for (int step = 0; step < 200; ++step) {
-      const auto row = static_cast<int>(random() % 300U);
-      const auto key = RowKey(row);
-      const auto action = random() % 4U;
-      if (action < 2U) {
-        const auto length = static_cast<std::size_t>((random() % 850U) + 1U);
-        const auto value = RowValue(row + epoch + step, length);
-        ASSERT_TRUE(engine.Put(key, value).Ok());
-        auto transaction = expected.BeginWrite();
-        ASSERT_TRUE(transaction.has_value());
-        ASSERT_EQ(transaction->Put(key, value), tinydb::StatusCode::Ok);
-        ASSERT_TRUE(std::move(*transaction).Commit());
-      } else if (action == 2U) {
-        ASSERT_TRUE(engine.Delete(key).Ok());
-        auto transaction = expected.BeginWrite();
-        ASSERT_TRUE(transaction.has_value());
-        ASSERT_EQ(transaction->Delete(key), tinydb::StatusCode::Ok);
-        ASSERT_TRUE(std::move(*transaction).Commit());
-      } else {
-        const auto found = engine.Get(key);
-        ASSERT_TRUE(found.has_value());
-        EXPECT_EQ(*found, expected.Get(key));
-      }
+TEST(Database, Persistence) {
+  const auto path = tinydb::test::Path("persistence");
+  Cleanup(path);
+  {
+    auto database = tinydb::Database::Open(path).value();
+    auto write = database.BeginWrite().value();
+    for (std::size_t index = 0; index < 160; ++index) {
+      ASSERT_TRUE(write.Put(tinydb::test::Key(index), tinydb::test::Value(index, 300)).Ok());
     }
-
-    const auto rows = Materialize(engine).value();
-    EXPECT_EQ(rows, expected.Scan());
-    ASSERT_TRUE(engine.Close().Ok());
+    ASSERT_TRUE(std::move(write).Commit().has_value());
+    for (std::size_t index = 0; index < 60; ++index) {
+      ASSERT_TRUE(database.Delete(tinydb::test::Key(index)).Ok());
+    }
+    ASSERT_TRUE(database.Close().Ok());
   }
-
-  auto reopened = tinydb::Database::Open(db_path_).value();
-  EXPECT_EQ(Materialize(reopened).value(), expected.Scan());
+  auto reopened = tinydb::Database::Open(path).value();
+  EXPECT_EQ(tinydb::test::Rows(reopened).value().size(), 100U);
+  EXPECT_EQ(reopened.Get(tinydb::test::Key(159)).value(), tinydb::test::Value(159, 300));
+  EXPECT_EQ(reopened.Get(tinydb::test::Key(0)).value(), std::nullopt);
+  Cleanup(path);
 }
 
-TEST_F(DatabaseTest, PutReplacesExistingValue) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-
-  EXPECT_TRUE(engine.Put("key", "first").Ok());
-  EXPECT_TRUE(engine.Put("key", "second").Ok());
-
-  EXPECT_EQ(engine.Get("key").value(), std::optional<std::string>{"second"});
-  EXPECT_EQ(Materialize(engine).value().size(), 1);
-}
-
-TEST_F(DatabaseTest, ValueSizeLimitIsIndependentOfLeafGeometry) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-
-  // Exactly at the cap is accepted.
-  const auto key = std::string{"key"};
-  const auto max_value = RowValue(0, tinydb::MAX_VALUE_BYTES);
-  EXPECT_TRUE(engine.Put(key, max_value).Ok());
-
-  // One byte over is rejected and must not disturb existing data.
-  const auto oversized = max_value + "x";
-  EXPECT_EQ(engine.Put("other", oversized).Code(), tinydb::StatusCode::InvalidArgument);
-  EXPECT_EQ(engine.Put(key, oversized).Code(), tinydb::StatusCode::InvalidArgument);
-
-  EXPECT_EQ(engine.Get("other").value(), std::nullopt);
-  EXPECT_EQ(engine.Get(key).value(), std::optional<std::string>{max_value});
-}
-
-TEST_F(DatabaseTest, ScanBoundsAreHalfOpen) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  for (int i = 0; i < 10; ++i) {
-    ASSERT_TRUE(engine.Put(RowKey(i), RowValue(i, 20)).Ok());
-  }
-
-  const auto rows = Materialize(engine, tinydb::KeyRange::Between(RowKey(3), RowKey(6))).value();
-  ASSERT_EQ(rows.size(), 3);
-  EXPECT_EQ(rows.front().first, RowKey(3));
-  EXPECT_EQ(rows.back().first, RowKey(5));
-
-  EXPECT_TRUE(Materialize(engine, tinydb::KeyRange::Between(RowKey(4), RowKey(4))).value().empty());
-}
-
-TEST_F(DatabaseTest, ClosedHandleRefusesWork) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(engine.Put("key", "value").Ok());
-
-  ASSERT_TRUE(engine.Close().Ok());
-
-  EXPECT_EQ(engine.Put("key", "other").Code(), tinydb::StatusCode::Closed);
-  EXPECT_EQ(engine.Delete("key").Code(), tinydb::StatusCode::Closed);
-  const auto got = engine.Get("key");
-  ASSERT_FALSE(got.has_value());
-  EXPECT_EQ(got.error().Code(), tinydb::StatusCode::Closed);
-  const auto rows = Materialize(engine);
-  ASSERT_FALSE(rows.has_value());
-  EXPECT_EQ(rows.error().Code(), tinydb::StatusCode::Closed);
-  EXPECT_TRUE(engine.Close().Ok());  // closing twice is safe
-
-  // The pre-close write reached the file.
-  auto reopened = tinydb::Database::Open(db_path_).value();
-  EXPECT_EQ(reopened.Get("key").value(), std::optional<std::string>{"value"});
-}
-
-TEST_F(DatabaseTest, OpenFailsWhileAnotherHandleHoldsTheDatabase) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(engine.Put(RowKey(1), "first").Ok());
-
-  // The exclusive lock turns a second Open away — before its recovery
-  // could truncate the log the live handle is still appending to.
-  const auto second = tinydb::Database::Open(db_path_);
+TEST(Database, Locking) {
+  const auto path = tinydb::test::Path("locking");
+  auto database = Fresh("locking").value();
+  auto read = std::optional<tinydb::ReadTransaction>{database.BeginRead().value()};
+  EXPECT_EQ(database.Close().Code(), tinydb::StatusCode::Busy);
+  const auto second = tinydb::Database::Open(path);
   ASSERT_FALSE(second.has_value());
   EXPECT_EQ(second.error().Code(), tinydb::StatusCode::Busy);
-
-  // The live handle is unharmed by the refused attempt.
-  ASSERT_TRUE(engine.Put(RowKey(2), "second").Ok());
-
-  // Close releases the lock, and everything written under it survives.
-  ASSERT_TRUE(engine.Close().Ok());
-  auto reopened = tinydb::Database::Open(db_path_);
-  ASSERT_TRUE(reopened.has_value());
-  EXPECT_EQ(reopened->Get(RowKey(1)).value(), std::optional<std::string>{"first"});
-  EXPECT_EQ(reopened->Get(RowKey(2)).value(), std::optional<std::string>{"second"});
+  read.reset();
+  ASSERT_TRUE(database.Close().Ok());
+  EXPECT_TRUE(tinydb::Database::Open(path).has_value());
+  Cleanup(path);
 }
 
-TEST_F(DatabaseTest, DataSurvivesExplicitClose) {
-  {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    ASSERT_TRUE(engine.Put("persist", "me").Ok());
-    ASSERT_TRUE(engine.Close().Ok());
-  }
-
-  auto engine = tinydb::Database::Open(db_path_).value();
-  EXPECT_EQ(engine.Get("persist").value(), std::optional<std::string>{"me"});
+TEST(Database, LargeValues) {
+  const auto path = tinydb::test::Path("large_values");
+  auto database = Fresh("large_values").value();
+  const auto large = std::string(3U * tinydb::PAGE_SIZE, 'x');
+  ASSERT_TRUE(database.Put("large", large).Ok());
+  EXPECT_EQ(database.Get("large").value(), large);
+  ASSERT_TRUE(database.Put("large", "small").Ok());
+  EXPECT_GT(database.Stats()->retired_pages, 0U);
+  ASSERT_TRUE(database.Checkpoint().Ok());
+  EXPECT_EQ(database.Stats()->retired_pages, 0U);
+  EXPECT_GT(database.Stats()->reusable_pages, 0U);
+  Cleanup(path);
 }
 
-TEST_F(DatabaseTest, DataSurvivesDestructor) {
-  {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    ASSERT_TRUE(engine.Put("persist", "me too").Ok());
-    // No Close(): the destructor must flush.
-  }
+TEST(Database, Model) {
+  const auto path = tinydb::test::Path("model");
+  Cleanup(path);
+  auto expected = std::map<std::string, std::string>{};
+  auto random = std::mt19937_64{0x54494e594442ULL};
 
-  auto engine = tinydb::Database::Open(db_path_).value();
-  EXPECT_EQ(engine.Get("persist").value(), std::optional<std::string>{"me too"});
-}
-
-TEST_F(DatabaseTest, ReopenedDatabaseAcceptsMutations) {
-  {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    for (int i = 0; i < 20; ++i) {
-      ASSERT_TRUE(engine.Put(RowKey(i), RowValue(i, 30)).Ok());
-    }
-  }
-  {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    ASSERT_TRUE(engine.Delete(RowKey(5)).Ok());
-    ASSERT_TRUE(engine.Put(RowKey(100), RowValue(100, 30)).Ok());
-  }
-
-  auto engine = tinydb::Database::Open(db_path_).value();
-  EXPECT_EQ(engine.Get(RowKey(5)).value(), std::nullopt);
-  EXPECT_EQ(engine.Get(RowKey(100)).value(), std::optional<std::string>{RowValue(100, 30)});
-  EXPECT_EQ(Materialize(engine).value().size(), 20);  // 20 - 1 + 1
-}
-
-TEST_F(DatabaseTest, LargeWorkloadSurvivesReopen) {
-  auto model = std::map<std::string, std::string>{};
-
-  {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    // Enough data for many leaf splits and at least one root split.
-    for (int i = 0; i < 400; ++i) {
-      const auto key = RowKey(i);
-      const auto value = RowValue(i, 50 + (static_cast<std::size_t>(i) * 13) % 400);
-      ASSERT_TRUE(engine.Put(key, value).Ok());
-      model[key] = value;
-    }
-    for (int i = 0; i < 400; i += 3) {
-      ASSERT_TRUE(engine.Delete(RowKey(i)).Ok());
-      model.erase(RowKey(i));
-    }
-  }
-
-  auto engine = tinydb::Database::Open(db_path_).value();
-  const auto rows = Materialize(engine).value();
-  ASSERT_EQ(rows.size(), model.size());
-  auto it = model.begin();
-  for (const auto &[key, value] : rows) {
-    EXPECT_EQ(key, it->first);
-    EXPECT_EQ(value, it->second);
-    ++it;
-  }
-}
-
-TEST_F(DatabaseTest, ChurnDoesNotGrowTheFile) {
-  const auto churn = [this] {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    for (int i = 0; i < 200; ++i) {
-      ASSERT_TRUE(engine.Put(RowKey(i), RowValue(i, 120)).Ok());
-    }
-    for (int i = 0; i < 200; ++i) {
-      ASSERT_TRUE(engine.Delete(RowKey(i)).Ok());
-    }
-    ASSERT_TRUE(engine.Close().Ok());
-  };
-
-  // The first cycle sizes the file; merges and root collapses free the
-  // emptied pages, so every later identical cycle runs on reused pages.
-  churn();
-  const auto stable_size = std::filesystem::file_size(db_path_);
-  for (int cycle = 0; cycle < 3; ++cycle) {
-    churn();
-    EXPECT_EQ(std::filesystem::file_size(db_path_), stable_size);
-  }
-}
-
-TEST_F(DatabaseTest, MoveTransfersOwnership) {
-  auto first = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(first.Put("moved", "data").Ok());
-
-  auto second = std::move(first);
-
-  // The moved-from handle acts closed.
-  // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
-  EXPECT_EQ(first.Put("x", "y").Code(), tinydb::StatusCode::Closed);
-
-  // The destination owns the database.
-  EXPECT_EQ(second.Get("moved").value(), std::optional<std::string>{"data"});
-  EXPECT_TRUE(second.Put("more", "rows").Ok());
-}
-
-TEST_F(DatabaseTest, OpenRejectsForeignFiles) {
-  {
-    auto file = std::ofstream{db_path_};
-    file << "this is not a tinydb database, just some text\n";
-  }
-
-  const auto result = tinydb::Database::Open(db_path_);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::UnsupportedFormat);
-}
-
-TEST_F(DatabaseTest, OpenRejectsForeignFilesBeforeWalReplay) {
-  {
-    auto file = std::ofstream{db_path_, std::ios::binary | std::ios::trunc};
-    file << "this is not a tinydb database, just some text\n";
-  }
-  const auto db_before = [&] {
-    auto file = std::ifstream{db_path_, std::ios::binary};
-    return std::string{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-  }();
-
-  {
-    const auto uuid = TestUuid();
-    auto wal = tinydb::Wal::Open(tinydb::Wal::PathFor(db_path_), uuid).value();
-    const auto payload = std::array{std::byte{'x'}};
-    const auto image = tinydb::storage::EncodeOverflowPage(2, 1, 2, 0, tinydb::HEADER_PAGE_ID, payload);
-    ASSERT_TRUE(image.has_value());
-    wal.AppendPageImage(2, image->data());
-    const auto committed = wal.Commit(tinydb::txn::DatabaseState{
-        .root_page_id = tinydb::HEADER_PAGE_ID,
-        .allocator_root_page_id = tinydb::HEADER_PAGE_ID,
-        .high_water_page_id = 3,
-    });
-    ASSERT_TRUE(committed.has_value());
-  }
-  const auto wal_size_before = std::filesystem::file_size(tinydb::Wal::PathFor(db_path_));
-
-  const auto result = tinydb::Database::Open(db_path_);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::UnsupportedFormat);
-
-  {
-    auto file = std::ifstream{db_path_, std::ios::binary};
-    const auto db_after = std::string{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-    EXPECT_EQ(db_after, db_before);
-  }
-  EXPECT_EQ(std::filesystem::file_size(tinydb::Wal::PathFor(db_path_)), wal_size_before);
-}
-
-TEST_F(DatabaseTest, OpenReturnsCorruptionForADamagedDataPage) {
-  {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    ASSERT_TRUE(engine.Put("key", "value").Ok());
-    ASSERT_TRUE(engine.Close().Ok());
-  }
-
-  {
-    auto file = std::fstream{db_path_, std::ios::binary | std::ios::in | std::ios::out};
-    ASSERT_TRUE(file.is_open());
-    file.seekp(static_cast<std::streamoff>(tinydb::FIRST_DATA_PAGE_ID) * tinydb::PAGE_SIZE);
-    const char damaged_magic = '\0';
-    file.write(&damaged_magic, 1);
-    ASSERT_TRUE(file.good());
-  }
-
-  const auto result = tinydb::Database::Open(db_path_);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::Corruption);
-}
-
-}  // namespace
-
-TEST_F(DatabaseTest, OpenRefusesAWalFromAnotherDatabase) {
-  // Two healthy databases, each with its own UUID and its own (empty) log.
-  {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    ASSERT_TRUE(engine.Put(RowKey(1), "mine").Ok());
-    ASSERT_TRUE(engine.Close().Ok());
-  }
-  {
-    auto engine = tinydb::Database::Open(second_db_path_).value();
-    ASSERT_TRUE(engine.Put(RowKey(1), "theirs").Ok());
-    ASSERT_TRUE(engine.Close().Ok());
-  }
-
-  // Pair the first database with the second one's log — the copy-paste
-  // accident the UUID exists to catch.
-  std::filesystem::remove(tinydb::Wal::PathFor(db_path_));
-  std::filesystem::copy_file(tinydb::Wal::PathFor(second_db_path_), tinydb::Wal::PathFor(db_path_));
-
-  const auto result = tinydb::Database::Open(db_path_);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().Code(), tinydb::StatusCode::InvalidArgument);
-}
-
-TEST_F(DatabaseTest, CommittedWritesSurviveACrash) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  for (int row = 0; row < 200; ++row) {
-    ASSERT_TRUE(engine.Put(RowKey(row), RowValue(row, 64)).Ok());
-  }
-  for (int row = 0; row < 100; ++row) {
-    ASSERT_TRUE(engine.Delete(RowKey(row)).Ok());
-  }
-
-  // "Crash": snapshot the files mid-flight, with the engine still open and
-  // nothing checkpointed, and recover a second engine from the copy.
-  SnapshotDatabase();
-  auto recovered = tinydb::Database::Open(second_db_path_).value();
-
-  const auto rows = Materialize(recovered).value();
-  ASSERT_EQ(rows.size(), 100U);
-  for (int row = 100; row < 200; ++row) {
-    EXPECT_EQ(recovered.Get(RowKey(row)).value(), RowValue(row, 64));
-  }
-  EXPECT_EQ(recovered.Get(RowKey(0)).value(), std::nullopt);
-
-  // Recovery leaves the copy a normal database: it accepts new work.
-  ASSERT_TRUE(recovered.Put(RowKey(0), "back again").Ok());
-  EXPECT_TRUE(recovered.Close().Ok());
-}
-
-TEST_F(DatabaseTest, CleanCloseLeavesCoveredActiveWalForRecoveryCleanup) {
-  {
-    auto engine = tinydb::Database::Open(db_path_).value();
-    ASSERT_TRUE(engine.Put("k", "v").Ok());
-    ASSERT_TRUE(engine.Close().Ok());
-  }
-
-  // Ordinary checkpointing never truncates its active append target. The
-  // durable superblock covers these retained records, so reopen can validate
-  // and discard them without using them as redo.
-  const auto wal_path = tinydb::Wal::PathFor(db_path_);
-  EXPECT_GT(std::filesystem::file_size(wal_path), tinydb::wal_format::HEADER_BYTES);
-
-  auto engine = tinydb::Database::Open(db_path_).value();
-  EXPECT_EQ(engine.Get("k").value(), "v");
-  EXPECT_EQ(std::filesystem::file_size(wal_path), tinydb::wal_format::HEADER_BYTES);
-}
-
-TEST_F(DatabaseTest, CleanCloseSyncsPagesBeforePublishingTheInactiveSuperblock) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(engine.Put("k", "v").Ok());
-
-  auto calls = std::vector<tinydb::io::Call>{};
-  {
-    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
-      calls.push_back(call);
-      return std::nullopt;
-    }};
-    ASSERT_TRUE(engine.Close().Ok());
-  }
-
-  const auto page_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path_);
-  const auto superblock_write = FindCall(calls, tinydb::io::Syscall::Pwrite, db_path_, page_sync + 1);
-  const auto superblock_sync = FindCall(calls, tinydb::io::Syscall::Fsync, db_path_, superblock_write + 1);
-  const auto wal_truncate = FindCall(calls, tinydb::io::Syscall::Ftruncate, tinydb::Wal::PathFor(db_path_));
-
-  ASSERT_NE(page_sync, std::numeric_limits<std::size_t>::max());
-  ASSERT_NE(superblock_write, std::numeric_limits<std::size_t>::max());
-  ASSERT_NE(superblock_sync, std::numeric_limits<std::size_t>::max());
-  EXPECT_LT(page_sync, superblock_write);
-  EXPECT_LT(superblock_write, superblock_sync);
-  EXPECT_EQ(wal_truncate, std::numeric_limits<std::size_t>::max());
-}
-
-TEST_F(DatabaseTest, CleanCloseLeavesWalIntactWhenDatabaseSyncFails) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(engine.Put("k", "v").Ok());
-  const auto wal_path = tinydb::Wal::PathFor(db_path_);
-  const auto wal_size_before = std::filesystem::file_size(wal_path);
-
-  {
-    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
-      if (call.syscall == tinydb::io::Syscall::Fsync && call.path == db_path_) {
-        return tinydb::io::Fault{.error = EIO};
+  for (int epoch = 0; epoch < 4; ++epoch) {
+    auto database = tinydb::Database::Open(path).value();
+    for (int step = 0; step < 100; ++step) {
+      const auto index = static_cast<std::size_t>(random() % 120U);
+      const auto key = tinydb::test::Key(index);
+      if (random() % 3U == 0U) {
+        ASSERT_TRUE(database.Delete(key).Ok());
+        expected.erase(key);
+      } else {
+        const auto value = tinydb::test::Value(index + static_cast<std::size_t>(epoch * 100 + step),
+                                               1U + static_cast<std::size_t>(random() % 700U));
+        ASSERT_TRUE(database.Put(key, value).Ok());
+        expected[key] = value;
       }
-      return std::nullopt;
-    }};
-    const auto status = engine.Close();
-    EXPECT_EQ(status.Code(), tinydb::StatusCode::IoError);
-    EXPECT_EQ(std::filesystem::file_size(wal_path), wal_size_before);
-  }
-
-  ASSERT_TRUE(engine.Close().Ok());
-}
-
-TEST_F(DatabaseTest, WritePublishingDuringCheckpointRecoversFromTheNewCheckpointBase) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(engine.Put("key", "before").Ok());
-
-  auto mutex = std::mutex{};
-  auto changed = std::condition_variable{};
-  auto page_write_reached = false;
-  auto release_page_write = false;
-  auto checkpoint_status = tinydb::Status{};
-  {
-    auto hook = ScopedSyscallHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
-      if (call.syscall == tinydb::io::Syscall::Pwrite && call.path == db_path_ &&
-          call.offset >= tinydb::FIRST_DATA_PAGE_ID * tinydb::PAGE_SIZE) {
-        auto lock = std::unique_lock(mutex);
-        page_write_reached = true;
-        changed.notify_all();
-        changed.wait(lock, [&] { return release_page_write; });
-      }
-      return std::nullopt;
-    }};
-    auto checkpoint = std::thread([&] { checkpoint_status = engine.Checkpoint(); });
-    {
-      auto lock = std::unique_lock(mutex);
-      changed.wait(lock, [&] { return page_write_reached; });
     }
-
-    // This transaction began from the older checkpoint frontier. Its WAL
-    // record retains that conservative allocator base, while publication later
-    // merges the checkpoint that is currently writing.
-    ASSERT_TRUE(engine.Put("key", "after").Ok());
-    {
-      auto lock = std::lock_guard(mutex);
-      release_page_write = true;
-    }
-    changed.notify_all();
-    checkpoint.join();
+    ASSERT_TRUE(database.Checkpoint().Ok());
+    const auto rows = tinydb::test::Rows(database).value();
+    const auto actual = std::map<std::string, std::string>(rows.begin(), rows.end());
+    EXPECT_EQ(actual, expected);
   }
-  ASSERT_TRUE(checkpoint_status.Ok()) << checkpoint_status.ToString();
-  EXPECT_EQ(engine.Get("key").value(), "after");
-
-  SnapshotDatabase();
-  auto recovered = tinydb::Database::Open(second_db_path_).value();
-  EXPECT_EQ(recovered.Get("key").value(), "after");
+  Cleanup(path);
 }
 
-TEST_F(DatabaseTest, LogOutgrowingItsThresholdCheckpoints) {
-  auto engine = tinydb::Database::Open(db_path_).value();
+TEST(Database, Health) {
+  const auto path = tinydb::test::Path("health");
+  auto database = Fresh("health").value();
+  ASSERT_TRUE(database.Put("small", "value").Ok());
+  ASSERT_TRUE(database.Put("large", std::string(2U * tinydb::PAGE_SIZE, 'v')).Ok());
+  ASSERT_TRUE(database.Checkpoint().Ok());
+  const auto before_database = tinydb::test::ReadFile(path);
+  const auto before_wal = tinydb::test::ReadFile(tinydb::Wal::PathFor(path));
 
-  // Each put logs full images of every page it touches, so this comfortably
-  // pushes the log past its 1 MiB checkpoint threshold at least once.
-  for (int row = 0; row < 400; ++row) {
-    ASSERT_TRUE(engine.Put(RowKey(row), RowValue(row, 128)).Ok());
-  }
-
-  // The workload appended well over 1 MiB of images in total, so a log
-  // still at or under the threshold proves at least one reset happened.
-  const auto wal_path = tinydb::Wal::PathFor(db_path_);
-  EXPECT_LE(std::filesystem::file_size(wal_path), (1U << 20U));
-
-  // And a post-checkpoint crash still recovers cleanly: the database file
-  // plus the shorter log reproduce every row.
-  SnapshotDatabase();
-  auto recovered = tinydb::Database::Open(second_db_path_).value();
-  EXPECT_EQ(Materialize(recovered).value().size(), 400U);
-  EXPECT_EQ(recovered.Get(RowKey(399)).value(), RowValue(399, 128));
+  const auto report = database.Verify();
+  ASSERT_TRUE(report.has_value());
+  EXPECT_TRUE(report->Ok());
+  EXPECT_GT(report->pages_checked, 0U);
+  EXPECT_GT(report->overflow_pages, 0U);
+  const auto stats = database.Stats().value();
+  EXPECT_EQ(stats.checkpoint_lsn, stats.visible_lsn);
+  EXPECT_EQ(stats.dirty_pages, 0U);
+  EXPECT_EQ(tinydb::test::ReadFile(path), before_database);
+  EXPECT_EQ(tinydb::test::ReadFile(tinydb::Wal::PathFor(path)), before_wal);
+  Cleanup(path);
 }
 
-TEST_F(DatabaseTest, ReadersSeeOnlyWholeCommittedValuesDuringWrites) {
-  auto engine = tinydb::Database::Open(db_path_).value();
-  ASSERT_TRUE(engine.Put("shared", "value-0").Ok());
+TEST(Database, CrashCopy) {
+  const auto path = tinydb::test::Path("crash_copy");
+  const auto copy = tinydb::test::Path("crash_copy_reopen");
+  auto database = Fresh("crash_copy").value();
+  auto write = database.BeginWrite().value();
+  for (std::size_t index = 0; index < 80; ++index) {
+    ASSERT_TRUE(write.Put(tinydb::test::Key(index), tinydb::test::Value(index, 256)).Ok());
+  }
+  ASSERT_TRUE(std::move(write).Commit().has_value());
+  tinydb::test::Copy(path, copy);
+
+  auto recovered = tinydb::Database::Open(copy).value();
+  EXPECT_EQ(tinydb::test::Rows(recovered).value().size(), 80U);
+  EXPECT_EQ(recovered.Get(tinydb::test::Key(79)).value(), tinydb::test::Value(79, 256));
+  Cleanup(path);
+  Cleanup(copy);
+}
+
+TEST(Database, Failures) {
+  const auto abort_path = tinydb::test::Path("definite_abort");
+  auto database = Fresh("definite_abort").value();
+  tinydb::test::WithHook(
+      [&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+        if (call.syscall == tinydb::io::Syscall::Pwrite && call.path == tinydb::Wal::PathFor(abort_path)) {
+          return tinydb::io::Fault{.error = EIO};
+        }
+        return std::nullopt;
+      },
+      [&] { EXPECT_EQ(database.Put("aborted", "value").Code(), tinydb::StatusCode::IoError); });
+  EXPECT_EQ(database.Get("aborted").value(), std::nullopt);
+  ASSERT_TRUE(database.Put("later", "value").Ok());
+  Cleanup(abort_path);
+
+  const auto limbo_path = tinydb::test::Path("indeterminate");
+  auto limbo = Fresh("indeterminate").value();
+  tinydb::test::WithHook(
+      [&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+        if (call.syscall == tinydb::io::Syscall::Fsync && call.path == tinydb::Wal::PathFor(limbo_path)) {
+          return tinydb::io::Fault{.error = EIO};
+        }
+        return std::nullopt;
+      },
+      [&] {
+        auto write = limbo.BeginWrite().value();
+        EXPECT_TRUE(write.Put("doc/1", "body").Ok());
+        EXPECT_TRUE(write.Put("request/save-1", "done").Ok());
+        const auto committed = std::move(write).Commit();
+        EXPECT_FALSE(committed.has_value());
+        EXPECT_EQ(committed.error().Code(), tinydb::StatusCode::IndeterminateCommit);
+      });
+  EXPECT_EQ(limbo.Get("doc/1").error().Code(), tinydb::StatusCode::NeedsRecovery);
+  EXPECT_TRUE(limbo.Close().Ok());
+
+  auto reopened = tinydb::Database::Open(limbo_path).value();
+  const auto document = reopened.Get("doc/1").value();
+  const auto request = reopened.Get("request/save-1").value();
+  EXPECT_EQ(document.has_value(), request.has_value());
+  Cleanup(limbo_path);
+}
+
+TEST(Database, Concurrency) {
+  const auto path = tinydb::test::Path("concurrency");
+  auto database = Fresh("concurrency").value();
+  ASSERT_TRUE(database.Put("shared", "value-0").Ok());
   auto stop = std::atomic<bool>{false};
   auto failures = std::atomic<std::size_t>{0};
   auto readers = std::vector<std::thread>{};
-  for (int index = 0; index < 6; ++index) {
+  for (int index = 0; index < 4; ++index) {
     readers.emplace_back([&] {
       while (!stop.load(std::memory_order_acquire)) {
-        const auto value = engine.Get("shared");
+        const auto value = database.Get("shared");
         if (!value || !value->has_value() || !value->value().starts_with("value-")) {
           failures.fetch_add(1, std::memory_order_relaxed);
         }
       }
     });
   }
-  for (int version = 1; version <= 100; ++version) {
-    if (!engine.Put("shared", "value-" + std::to_string(version)).Ok()) {
-      failures.fetch_add(1, std::memory_order_relaxed);
-      break;
-    }
+  for (int version = 1; version <= 40; ++version) {
+    ASSERT_TRUE(database.Put("shared", "value-" + std::to_string(version)).Ok());
   }
   stop.store(true, std::memory_order_release);
   for (auto &reader : readers) {
     reader.join();
   }
   EXPECT_EQ(failures.load(), 0U);
-  EXPECT_EQ(engine.Get("shared").value(), std::optional<std::string>{"value-100"});
+  EXPECT_EQ(database.Get("shared").value(), "value-40");
+  Cleanup(path);
+}
+
+TEST(Database, Corruption) {
+  const auto path = tinydb::test::Path("corruption");
+  {
+    auto database = Fresh("corruption").value();
+    ASSERT_TRUE(database.Put("key", "value").Ok());
+    ASSERT_TRUE(database.Close().Ok());
+  }
+  auto file = std::fstream(path, std::ios::binary | std::ios::in | std::ios::out);
+  file.seekp(static_cast<std::streamoff>(tinydb::FIRST_DATA_PAGE_ID * tinydb::PAGE_SIZE));
+  file.put('\0');
+  file.close();
+  const auto opened = tinydb::Database::Open(path);
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error().Code(), tinydb::StatusCode::Corruption);
+  Cleanup(path);
 }

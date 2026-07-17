@@ -1,5 +1,0 @@
-# The fixtures hold engine components in std::optional and emplace them in
-# SetUp(). bugprone-unchecked-optional-access reasons one function at a time,
-# so every fixture-member use in a test body is a false positive here.
-InheritParentConfig: true
-Checks: '-bugprone-unchecked-optional-access'

@@ -439,6 +439,14 @@ class DatabaseCore final {
   }
 
   auto Close() -> Status {
+    // The global order is writer_mutex before lifecycle_mutex. try_to_lock
+    // preserves Close's Busy contract instead of waiting for an application
+    // transaction while still preventing a new writer from crossing the
+    // lifecycle check.
+    auto writer = std::unique_lock(writer_mutex, std::try_to_lock);
+    if (!writer.owns_lock()) {
+      return Status::Busy("database has an active write transaction");
+    }
     auto lifecycle_lock = std::unique_lock(lifecycle_mutex);
     if (lifecycle == txn::DatabaseLifecycle::Closed) {
       return {};
@@ -446,10 +454,6 @@ class DatabaseCore final {
     if (active_transactions != 0 || active_maintenance != 0) {
       return Status::Busy("database has active transactions or maintenance");
     }
-
-    // Holding the lifecycle mutex prevents new admission while the writer
-    // permit and final checkpoint are acquired.
-    auto writer = std::unique_lock(writer_mutex);
     if (lifecycle == txn::DatabaseLifecycle::Open || lifecycle == txn::DatabaseLifecycle::CheckpointDegraded) {
       if (auto status = checkpoints->Checkpoint(); !status.Ok()) {
         lifecycle = txn::DatabaseLifecycle::CheckpointDegraded;
@@ -473,6 +477,16 @@ class DatabaseCore final {
 
   std::filesystem::path path;
   Options options;
+
+  /*
+  ** CORE LOCK ORDER
+  **
+  ** Code needing both the writer permit and lifecycle state acquires
+  ** writer_mutex first. lifecycle_mutex protects admission counts and state;
+  ** writer_mutex protects exclusive write preparation. Close uses a
+  ** non-blocking writer acquisition, so an application-owned writer still
+  ** produces Busy rather than turning Close into a wait.
+  */
   mutable std::mutex lifecycle_mutex;
   txn::DatabaseLifecycle lifecycle{txn::DatabaseLifecycle::Open};
   std::size_t active_transactions{0};
@@ -578,10 +592,15 @@ struct WriteTransaction::Impl final {
       return;
     }
     active = false;
-    core->ReleaseTransaction();
+
+    // Preserve the global writer-before-lifecycle order by dropping the writer
+    // before ReleaseTransaction takes lifecycle_mutex. This is safe because
+    // commit or abort has finished, while the lifetime reservation still keeps
+    // Close from reclaiming the core until the count is decremented.
     if (writer.owns_lock()) {
       writer.unlock();
     }
+    core->ReleaseTransaction();
   }
 
   void Abort() noexcept {
@@ -864,6 +883,10 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
     return std::unexpected(std::move(status));
   }
 
+  auto writer = std::unique_lock(core->writer_mutex, std::try_to_lock);
+  if (!writer.owns_lock()) {
+    return std::unexpected(Status::Busy("another write transaction is active"));
+  }
   auto lifecycle_lock = std::lock_guard(core->lifecycle_mutex);
   if (auto status = LifecycleError(core->lifecycle, txn::DatabaseOperation::Write); !status.Ok()) {
     return std::unexpected(std::move(status));
@@ -871,11 +894,6 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
   if (auto status = core->checkpoints->WriteAdmissionStatus(); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  auto writer = std::unique_lock(core->writer_mutex, std::try_to_lock);
-  if (!writer.owns_lock()) {
-    return std::unexpected(Status::Busy("another write transaction is active"));
-  }
-
   const auto base = core->readers->CurrentState();
   auto transaction = txn::TransactionPages::Begin(core->pages.get(), *base, core->options.max_write_transaction_bytes);
   if (!transaction) {

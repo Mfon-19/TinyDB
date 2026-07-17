@@ -1,8 +1,8 @@
-/docs
-
 # Build outputs
 /build/
+/build-comparison/
 /cmake-build-*/
+/build-asan
 
 # Local CMake/editor state
 /CMakeUserPresets.json

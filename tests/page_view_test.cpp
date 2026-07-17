@@ -19,13 +19,13 @@
 /*
 ** Page-view tests establish the trust boundary between untrusted encoded
 ** bytes and unchecked borrowed accessors. Valid pages exercise direct search
-** and routing. Corruption and fuzz cases alter identity, slots, lengths,
+** and routing. Corruption cases alter identity, slots, lengths,
 ** links, ordering, and reserved fields and require Open to reject them before
 ** any accessor can expose a slice.
 */
 namespace {
 
-TEST(LeafPageViewTest, SearchesEncodedRecordsWithoutOwningThem) {
+TEST(Page, LeafSearch) {
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};
   builder.Upsert("alpha", tinydb::LeafValue::Inline("one"));
@@ -52,7 +52,7 @@ TEST(LeafPageViewTest, SearchesEncodedRecordsWithoutOwningThem) {
   EXPECT_LT(value.InlineBytes().data(), page.data() + page.size());
 }
 
-TEST(LeafPageViewTest, UsesUnsignedBytewiseKeyOrder) {
+TEST(Page, ByteOrder) {
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};
   const auto low = std::string(1, static_cast<char>(0x7F));
@@ -68,7 +68,7 @@ TEST(LeafPageViewTest, UsesUnsignedBytewiseKeyOrder) {
   EXPECT_EQ(view.Get(high)->InlineBytes(), "high");
 }
 
-TEST(InternalPageViewTest, EqualKeysRouteToTheRightChild) {
+TEST(Page, InternalRouting) {
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::InternalPageBuilder{2, "bravo", 3};
   builder.InsertSeparator("delta", 4);
@@ -87,7 +87,7 @@ TEST(InternalPageViewTest, EqualKeysRouteToTheRightChild) {
   EXPECT_EQ(view->FindChildIndex("zulu"), 3U);
 }
 
-TEST(PageViewTest, RejectsWrongTypeIdentityAndReservedBytes) {
+TEST(Page, Identity) {
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto leaf = tinydb::LeafPageBuilder{};
   leaf.Upsert("key", tinydb::LeafValue::Inline("value"));
@@ -104,7 +104,7 @@ TEST(PageViewTest, RejectsWrongTypeIdentityAndReservedBytes) {
   EXPECT_EQ(tinydb::LeafPageView::Open(leaf_page.data(), 2).error().Code(), tinydb::StatusCode::Corruption);
 }
 
-TEST(PageViewTest, RejectsMalformedSlotsAsCorruption) {
+TEST(Page, Slots) {
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};
   builder.Upsert("key", tinydb::LeafValue::Inline("value"));
@@ -118,7 +118,7 @@ TEST(PageViewTest, RejectsMalformedSlotsAsCorruption) {
   EXPECT_EQ(view.error().Code(), tinydb::StatusCode::Corruption);
 }
 
-TEST(PageViewTest, RejectsInvalidLinksAndSlotOrdering) {
+TEST(Page, Links) {
   auto internal_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto internal = tinydb::InternalPageBuilder{2, "bravo", 3};
   internal.InsertSeparator("delta", 4);
@@ -128,8 +128,7 @@ TEST(PageViewTest, RejectsInvalidLinksAndSlotOrdering) {
   auto bytes = std::as_writable_bytes(std::span{internal_page});
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::node_page_offset::LINK, tinydb::HEADER_PAGE_ID));
   ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
-  EXPECT_EQ(tinydb::InternalPageView::Open(internal_page.data(), 5).error().Code(),
-            tinydb::StatusCode::Corruption);
+  EXPECT_EQ(tinydb::InternalPageView::Open(internal_page.data(), 5).error().Code(), tinydb::StatusCode::Corruption);
 
   internal.Store(internal_page.data(), 5);
   bytes = std::as_writable_bytes(std::span{internal_page});
@@ -138,22 +137,19 @@ TEST(PageViewTest, RejectsInvalidLinksAndSlotOrdering) {
       tinydb::storage::GetLittleEndian<tinydb::slot_t>(bytes, tinydb::INTERNAL_HEADER_SIZE + tinydb::SLOT_SIZE);
   ASSERT_TRUE(first_slot.has_value() && second_slot.has_value());
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::INTERNAL_HEADER_SIZE, *second_slot));
-  ASSERT_TRUE(
-      tinydb::storage::PutLittleEndian(bytes, tinydb::INTERNAL_HEADER_SIZE + tinydb::SLOT_SIZE, *first_slot));
+  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::INTERNAL_HEADER_SIZE + tinydb::SLOT_SIZE, *first_slot));
   ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
-  EXPECT_EQ(tinydb::InternalPageView::Open(internal_page.data(), 5).error().Code(),
-            tinydb::StatusCode::Corruption);
+  EXPECT_EQ(tinydb::InternalPageView::Open(internal_page.data(), 5).error().Code(), tinydb::StatusCode::Corruption);
 
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
   tinydb::LeafPageBuilder{}.Store(leaf_page.data(), 6);
   bytes = std::as_writable_bytes(std::span{leaf_page});
-  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::node_page_offset::LINK,
-                                               tinydb::SUPERBLOCK_B_PAGE_ID));
+  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::node_page_offset::LINK, tinydb::SUPERBLOCK_B_PAGE_ID));
   ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
   EXPECT_EQ(tinydb::LeafPageView::Open(leaf_page.data(), 6).error().Code(), tinydb::StatusCode::Corruption);
 }
 
-TEST(PageViewTest, DecoderFuzzNeverExposesUncheckedSlotsOrCells) {
+TEST(Page, Mutations) {
   auto seed_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};
   for (int index = 0; index < 24; ++index) {
@@ -162,7 +158,7 @@ TEST(PageViewTest, DecoderFuzzNeverExposesUncheckedSlotsOrCells) {
   }
   builder.Store(seed_page.data(), 2);
 
-  // Recompute the checksum after each mutation so the fuzzer reaches the
+  // Recompute the checksum after each mutation so the test reaches the
   // structural decoder instead of being rejected at the outer checksum on
   // every iteration. A successful Open must make every accessor safe.
   auto rng = std::mt19937{0xB17E5U};

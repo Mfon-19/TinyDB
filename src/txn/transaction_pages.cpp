@@ -434,8 +434,8 @@ auto TransactionPages::HasChanges() const -> bool {
 
 auto TransactionPages::FinalPageCount() const -> std::size_t {
   TINYDB_CHECK(frozen_, "counting transaction pages before freeze");
-  return std::ranges::count_if(
-      pages_, [this](const auto &entry) { return entry.second->dirty && !retired_page_ids_.contains(entry.first); });
+  return static_cast<std::size_t>(std::ranges::count_if(
+      pages_, [this](const auto &entry) { return entry.second->dirty && !retired_page_ids_.contains(entry.first); }));
 }
 
 auto TransactionPages::ResultingState() const -> const DatabaseState & {

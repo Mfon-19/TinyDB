@@ -23,8 +23,7 @@ using namespace std::chrono_literals;
 using tinydb::txn::DatabaseState;
 using tinydb::txn::ReaderGate;
 
-auto State(std::uint64_t transaction_id, tinydb::page_id_t root_page_id)
-    -> std::shared_ptr<const DatabaseState> {
+auto State(std::uint64_t transaction_id, tinydb::page_id_t root_page_id) -> std::shared_ptr<const DatabaseState> {
   return std::make_shared<const DatabaseState>(DatabaseState{
       .root_page_id = root_page_id,
       .allocator_root_page_id = 11,
@@ -46,7 +45,7 @@ auto WaitUntil(const auto &predicate) -> bool {
   return true;
 }
 
-TEST(ReaderGateTest, ManyReadersCaptureOneImmutableState) {
+TEST(Readers, Snapshot) {
   auto gate = ReaderGate(State(7, 3));
   constexpr auto THREADS = std::size_t{12};
   auto start = std::atomic<bool>{false};
@@ -72,9 +71,7 @@ TEST(ReaderGateTest, ManyReadersCaptureOneImmutableState) {
   }
 
   start.store(true, std::memory_order_release);
-  const auto all_admitted = WaitUntil([&] {
-    return admitted.load(std::memory_order_acquire) == THREADS;
-  });
+  const auto all_admitted = WaitUntil([&] { return admitted.load(std::memory_order_acquire) == THREADS; });
   EXPECT_TRUE(all_admitted);
   EXPECT_EQ(gate.Stats().active_readers, THREADS);
   EXPECT_TRUE(gate.Stats().oldest_reader_age.has_value());
@@ -87,7 +84,7 @@ TEST(ReaderGateTest, ManyReadersCaptureOneImmutableState) {
   EXPECT_FALSE(gate.Stats().oldest_reader_age.has_value());
 }
 
-TEST(ReaderGateTest, SharedTokenOutlivesTransactionWrapper) {
+TEST(Readers, Lifetime) {
   auto gate = ReaderGate(State(1, 3));
   auto cursor_token = tinydb::txn::SnapshotToken{};
   {
@@ -104,7 +101,7 @@ TEST(ReaderGateTest, SharedTokenOutlivesTransactionWrapper) {
   EXPECT_EQ(gate.Stats().active_readers, 0U);
 }
 
-TEST(ReaderGateTest, PendingPublisherDrainsOldReadersAndBlocksNewReaders) {
+TEST(Readers, Fairness) {
   auto gate = ReaderGate(State(1, 3));
   auto old_reader = gate.BeginRead();
   auto publisher_has_gate = std::atomic<bool>{false};
@@ -124,8 +121,7 @@ TEST(ReaderGateTest, PendingPublisherDrainsOldReadersAndBlocksNewReaders) {
 
   auto late_reader = std::thread([&] {
     auto snapshot = gate.BeginRead();
-    late_reader_transaction.store(snapshot.State().transaction_id,
-                                  std::memory_order_release);
+    late_reader_transaction.store(snapshot.State().transaction_id, std::memory_order_release);
     late_reader_entered.store(true, std::memory_order_release);
   });
 
@@ -134,9 +130,7 @@ TEST(ReaderGateTest, PendingPublisherDrainsOldReadersAndBlocksNewReaders) {
   EXPECT_FALSE(late_reader_entered.load(std::memory_order_acquire));
 
   old_reader = {};
-  ASSERT_TRUE(WaitUntil([&] {
-    return publisher_has_gate.load(std::memory_order_acquire);
-  }));
+  ASSERT_TRUE(WaitUntil([&] { return publisher_has_gate.load(std::memory_order_acquire); }));
   EXPECT_FALSE(late_reader_entered.load(std::memory_order_acquire));
 
   release_publisher.store(true, std::memory_order_release);
@@ -146,7 +140,7 @@ TEST(ReaderGateTest, PendingPublisherDrainsOldReadersAndBlocksNewReaders) {
   EXPECT_EQ(late_reader_transaction.load(std::memory_order_acquire), 2U);
 }
 
-TEST(ReaderGateTest, AbandonedPublicationReopensTheOldState) {
+TEST(Readers, Abandon) {
   auto gate = ReaderGate(State(4, 5));
   {
     auto publication = gate.BeginPublication();

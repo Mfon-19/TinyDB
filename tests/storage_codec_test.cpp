@@ -14,10 +14,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 /*
@@ -34,6 +37,17 @@ using tinydb::storage::SelectedSuperblock;
 using tinydb::storage::Superblock;
 using tinydb::storage::SuperblockPage;
 using tinydb::storage::SuperblockSlot;
+
+auto Golden(std::string_view name) -> std::vector<std::byte> {
+  const auto path = std::filesystem::path{TINYDB_TEST_SOURCE_DIR} / "tests" / "fixtures" / name;
+  auto input = std::ifstream{path};
+  auto result = std::vector<std::byte>{};
+  auto token = std::string{};
+  while (input >> token) {
+    result.push_back(static_cast<std::byte>(std::stoul(token, nullptr, 16)));
+  }
+  return result;
+}
 
 // Deliberately choose asymmetric, byte-distinct numbers. A native-endian or
 // misaligned field will then disagree visibly with the golden fixture instead
@@ -70,7 +84,7 @@ void ResealWalHeader(std::vector<char> &header) {
       tinydb::storage::PutLittleEndian(bytes, tinydb::wal_format::header_offset::CHECKSUM, tinydb::Crc32(bytes)));
 }
 
-TEST(EncodingTest, FixedWidthIntegersAreLittleEndianAndBoundsChecked) {
+TEST(Format, Encoding) {
   auto encoded = std::array<std::byte, 16>{};
   auto bytes = std::span<std::byte>{encoded};
 
@@ -91,7 +105,7 @@ TEST(EncodingTest, FixedWidthIntegersAreLittleEndianAndBoundsChecked) {
   EXPECT_EQ(tinydb::storage::GetLittleEndian<std::uint64_t>(encoded, 9), std::nullopt);
 }
 
-TEST(SuperblockCodecTest, RoundTripsEveryLogicalField) {
+TEST(Format, Superblock) {
   auto wanted = Fixture();
   wanted.optional_features = 1ULL << 47U;
   const auto encoded = tinydb::storage::EncodeSuperblock(wanted);
@@ -101,39 +115,22 @@ TEST(SuperblockCodecTest, RoundTripsEveryLogicalField) {
   EXPECT_EQ(*decoded, wanted);
 }
 
-TEST(SuperblockCodecTest, MatchesTheGoldenLittleEndianFixture) {
+TEST(Format, SuperblockGolden) {
   const auto encoded = tinydb::storage::EncodeSuperblock(Fixture());
   ASSERT_TRUE(encoded.has_value());
 
-  // This byte array is intentionally independent of EncodeSuperblock helpers.
-  // It is the compatibility contract: refactoring the codec may not change it
-  // merely because round-trip tests still agree with themselves.
-  constexpr auto golden_prefix = std::array<std::byte, 100>{
-      std::byte{0x54}, std::byte{0x49}, std::byte{0x4E}, std::byte{0x59}, std::byte{0x44}, std::byte{0x42},
-      std::byte{0x30}, std::byte{0x34}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x10}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01}, std::byte{0x02}, std::byte{0x03},
-      std::byte{0x04}, std::byte{0x05}, std::byte{0x06}, std::byte{0x07}, std::byte{0x08}, std::byte{0x09},
-      std::byte{0x0A}, std::byte{0x0B}, std::byte{0x0C}, std::byte{0x0D}, std::byte{0x0E}, std::byte{0x0F},
-      std::byte{0x08}, std::byte{0x07}, std::byte{0x06}, std::byte{0x05}, std::byte{0x04}, std::byte{0x03},
-      std::byte{0x02}, std::byte{0x01}, std::byte{0x18}, std::byte{0x17}, std::byte{0x16}, std::byte{0x15},
-      std::byte{0x14}, std::byte{0x13}, std::byte{0x12}, std::byte{0x11}, std::byte{0x28}, std::byte{0x27},
-      std::byte{0x26}, std::byte{0x25}, std::byte{0x24}, std::byte{0x23}, std::byte{0x22}, std::byte{0x21},
-      std::byte{0x02}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x03}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x04}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0xA6}, std::byte{0x08}, std::byte{0x5E}, std::byte{0x1D},
-  };
+  // The checked-in bytes are a compatibility contract independent of this
+  // translation unit. CI therefore catches a codec and fixture disagreement
+  // even when encoder and decoder are changed together.
+  const auto golden_prefix = Golden("superblock_v4.hex");
+  ASSERT_EQ(golden_prefix.size(), tinydb::storage::superblock_offset::ENCODED_BYTES);
 
   EXPECT_TRUE(std::ranges::equal(golden_prefix, std::span{*encoded}.first(golden_prefix.size())));
   EXPECT_TRUE(std::ranges::all_of(std::span{*encoded}.subspan(golden_prefix.size()),
                                   [](std::byte byte) { return byte == std::byte{0}; }));
 }
 
-TEST(SuperblockCodecTest, CompletePageChecksumDetectsEveryFieldAndReservedBytes) {
+TEST(Format, Checksums) {
   const auto original = tinydb::storage::EncodeSuperblock(Fixture());
   ASSERT_TRUE(original.has_value());
   // Touch one byte in every logical field plus the first reserved byte. The
@@ -155,7 +152,7 @@ TEST(SuperblockCodecTest, CompletePageChecksumDetectsEveryFieldAndReservedBytes)
   }
 }
 
-TEST(SuperblockCodecTest, RejectsUnsupportedVersionRequiredFeaturesAndEndian) {
+TEST(Format, Versions) {
   const auto original = tinydb::storage::EncodeSuperblock(Fixture());
   ASSERT_TRUE(original.has_value());
 
@@ -185,7 +182,7 @@ TEST(SuperblockCodecTest, RejectsUnsupportedVersionRequiredFeaturesAndEndian) {
   EXPECT_EQ(decoded.error().Code(), StatusCode::UnsupportedFormat);
 }
 
-TEST(SuperblockCodecTest, AllowsUnknownOptionalFeatures) {
+TEST(Format, Features) {
   auto wanted = Fixture();
   wanted.optional_features = 1ULL << 63U;
   const auto encoded = tinydb::storage::EncodeSuperblock(wanted);
@@ -193,7 +190,7 @@ TEST(SuperblockCodecTest, AllowsUnknownOptionalFeatures) {
   EXPECT_EQ(tinydb::storage::DecodeSuperblock(*encoded), wanted);
 }
 
-TEST(SuperblockSelectionTest, ChoosesHighestValidGeneration) {
+TEST(Format, Selection) {
   const auto page_a = tinydb::storage::EncodeSuperblock(Fixture(7));
   const auto page_b = tinydb::storage::EncodeSuperblock(Fixture(8));
   ASSERT_TRUE(page_a.has_value());
@@ -205,7 +202,7 @@ TEST(SuperblockSelectionTest, ChoosesHighestValidGeneration) {
   EXPECT_EQ(selected->value.generation, 8U);
 }
 
-TEST(SuperblockSelectionTest, OneValidCopySurvivesAnyDamageToTheOther) {
+TEST(Format, Damage) {
   const auto valid = tinydb::storage::EncodeSuperblock(Fixture(9));
   ASSERT_TRUE(valid.has_value());
   auto damaged = *valid;
@@ -219,7 +216,7 @@ TEST(SuperblockSelectionTest, OneValidCopySurvivesAnyDamageToTheOther) {
   EXPECT_EQ(second->slot, SuperblockSlot::B);
 }
 
-TEST(SuperblockSelectionTest, EveryTornWriteBoundaryLeavesAValidGeneration) {
+TEST(Format, Tears) {
   const auto page_a = tinydb::storage::EncodeSuperblock(Fixture(2));
   const auto old_b = tinydb::storage::EncodeSuperblock(Fixture(1));
   const auto new_b = tinydb::storage::EncodeSuperblock(Fixture(3));
@@ -238,7 +235,7 @@ TEST(SuperblockSelectionTest, EveryTornWriteBoundaryLeavesAValidGeneration) {
   }
 }
 
-TEST(SuperblockSelectionTest, EqualGenerationsMustDescribeIdenticalState) {
+TEST(Format, Conflict) {
   auto first = Fixture(5);
   auto second = first;
   ++second.transaction_id;
@@ -252,7 +249,7 @@ TEST(SuperblockSelectionTest, EqualGenerationsMustDescribeIdenticalState) {
   EXPECT_EQ(selected.error().Code(), StatusCode::Corruption);
 }
 
-TEST(DataPageCodecTest, FreeExtentPageRoundTripsSortedRetirementMetadata) {
+TEST(Format, Allocator) {
   const auto extents = std::array{
       tinydb::storage::FreeExtent{.first_page_id = 4, .page_count = 3, .retire_lsn = 11},
       tinydb::storage::FreeExtent{.first_page_id = 20, .page_count = 5, .retire_lsn = 17},
@@ -271,7 +268,7 @@ TEST(DataPageCodecTest, FreeExtentPageRoundTripsSortedRetirementMetadata) {
   EXPECT_EQ(tinydb::storage::EncodeFreeExtentPage(2, 0, 0, adjacent).error().Code(), StatusCode::InvalidArgument);
 }
 
-TEST(DataPageCodecTest, OverflowLengthsIdentityAndChecksumAreValidated) {
+TEST(Format, Overflow) {
   // Include NUL and high-bit bytes to prove values are opaque bytes rather
   // than C strings or signed characters.
   const auto payload = std::array{std::byte{0x00}, std::byte{0x7F}, std::byte{0x80}, std::byte{0xFF}};
@@ -292,7 +289,7 @@ TEST(DataPageCodecTest, OverflowLengthsIdentityAndChecksumAreValidated) {
             StatusCode::Corruption);
 }
 
-TEST(DataPageCodecTest, RejectsUnsupportedVersionAndOppositeEndianIdentity) {
+TEST(Format, PageVersion) {
   const auto encoded = tinydb::storage::EncodeFreeExtentPage(2, 0, 0, std::span<const tinydb::storage::FreeExtent>{});
   ASSERT_TRUE(encoded.has_value());
 
@@ -314,7 +311,7 @@ TEST(DataPageCodecTest, RejectsUnsupportedVersionAndOppositeEndianIdentity) {
             StatusCode::Corruption);
 }
 
-TEST(DataPageCodecTest, LeafAndInternalPagesUseTheValidatedCommonHeader) {
+TEST(Format, Tree) {
   // Exercise the one builder/view encoding path, ensuring tree pages did not
   // retain a parallel legacy decoder beside the common page codec.
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
@@ -338,7 +335,7 @@ TEST(DataPageCodecTest, LeafAndInternalPagesUseTheValidatedCommonHeader) {
   EXPECT_EQ(loaded_internal.ChildAt(1), 3U);
 }
 
-TEST(WalCodecTest, HeaderMatchesGoldenBytesAndRoundTrips) {
+TEST(Format, WalHeader) {
   auto uuid = tinydb::DatabaseUuid{};
   for (std::size_t i = 0; i < uuid.size(); ++i) {
     uuid[i] = static_cast<std::byte>(i);
@@ -349,42 +346,20 @@ TEST(WalCodecTest, HeaderMatchesGoldenBytesAndRoundTrips) {
   };
   const auto encoded = tinydb::wal_format::EncodeHeader(wanted);
   ASSERT_TRUE(encoded.has_value());
-  constexpr auto golden = std::array<std::byte, 80>{
-      std::byte{0x54}, std::byte{0x49}, std::byte{0x4E}, std::byte{0x59}, std::byte{0x57}, std::byte{0x4C},
-      std::byte{0x30}, std::byte{0x35}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x50}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01}, std::byte{0x02}, std::byte{0x03},
-      std::byte{0x04}, std::byte{0x05}, std::byte{0x06}, std::byte{0x07}, std::byte{0x08}, std::byte{0x09},
-      std::byte{0x0A}, std::byte{0x0B}, std::byte{0x0C}, std::byte{0x0D}, std::byte{0x0E}, std::byte{0x0F},
-      std::byte{0x08}, std::byte{0x07}, std::byte{0x06}, std::byte{0x05}, std::byte{0x04}, std::byte{0x03},
-      std::byte{0x02}, std::byte{0x01}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0xD9}, std::byte{0x41},
-      std::byte{0x4B}, std::byte{0x58}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00},
-  };
+  const auto golden = Golden("wal_header_v5.hex");
+  ASSERT_EQ(golden.size(), tinydb::wal_format::HEADER_BYTES);
   const auto bytes = std::as_bytes(std::span{*encoded});
   EXPECT_TRUE(std::ranges::equal(golden, bytes));
   EXPECT_EQ(tinydb::wal_format::DecodeHeader(bytes), wanted);
 }
 
-TEST(WalCodecTest, RecordMatchesGoldenBytesAndDetectsCorruption) {
+TEST(Format, WalRecord) {
   constexpr auto payload = std::array{std::byte{0xAA}, std::byte{0xBB}, std::byte{0xCC}};
   const auto encoded = tinydb::wal_format::EncodeRecord(tinydb::wal_format::RecordType::PageImage,
                                                         0x0102030405060708ULL, 80, 0x0A0B0C0DU, payload);
   ASSERT_TRUE(encoded.has_value());
-  constexpr auto golden = std::array<std::byte, 43>{
-      std::byte{0x2B}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x08}, std::byte{0x07}, std::byte{0x06}, std::byte{0x05},
-      std::byte{0x04}, std::byte{0x03}, std::byte{0x02}, std::byte{0x01}, std::byte{0x50}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x0D}, std::byte{0x0C}, std::byte{0x0B}, std::byte{0x0A}, std::byte{0x9A}, std::byte{0x30},
-      std::byte{0x7A}, std::byte{0xC9}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0xAA}, std::byte{0xBB},
-      std::byte{0xCC},
-  };
+  const auto golden = Golden("wal_record_v5.hex");
+  ASSERT_EQ(golden.size(), 43U);
   const auto bytes = std::as_bytes(std::span{*encoded});
   EXPECT_TRUE(std::ranges::equal(golden, bytes));
   const auto decoded = tinydb::wal_format::DecodeRecord(bytes);
@@ -405,13 +380,11 @@ TEST(WalCodecTest, RecordMatchesGoldenBytesAndDetectsCorruption) {
   }
 }
 
-TEST(WalCodecTest, TransactionBindsPagesStateOrderAndLsnRange) {
+TEST(Format, Transaction) {
   const auto first =
-      tinydb::storage::EncodeOverflowPage(2, 100, 2, 0, tinydb::HEADER_PAGE_ID,
-                                          std::array{std::byte{'a'}}).value();
+      tinydb::storage::EncodeOverflowPage(2, 100, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
   const auto second =
-      tinydb::storage::EncodeOverflowPage(3, 100, 3, 0, tinydb::HEADER_PAGE_ID,
-                                          std::array{std::byte{'b'}}).value();
+      tinydb::storage::EncodeOverflowPage(3, 100, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
   const auto pages = std::array{
       tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
       tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},
@@ -449,13 +422,11 @@ TEST(WalCodecTest, TransactionBindsPagesStateOrderAndLsnRange) {
   EXPECT_EQ(exhausted.error().Code(), StatusCode::ResourceExhausted);
 }
 
-TEST(WalCodecTest, TransactionRejectsMissingDuplicatedReorderedAndCorruptRecords) {
+TEST(Format, TransactionDamage) {
   const auto first =
-      tinydb::storage::EncodeOverflowPage(2, 50, 2, 0, tinydb::HEADER_PAGE_ID,
-                                          std::array{std::byte{'a'}}).value();
+      tinydb::storage::EncodeOverflowPage(2, 50, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
   const auto second =
-      tinydb::storage::EncodeOverflowPage(3, 50, 3, 0, tinydb::HEADER_PAGE_ID,
-                                          std::array{std::byte{'b'}}).value();
+      tinydb::storage::EncodeOverflowPage(3, 50, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
   const auto pages = std::array{
       tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
       tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},
@@ -502,7 +473,7 @@ TEST(WalCodecTest, TransactionRejectsMissingDuplicatedReorderedAndCorruptRecords
             StatusCode::Corruption);
 }
 
-TEST(WalCodecTest, RejectsUnsupportedVersionsFeaturesAndOppositeEndianHeader) {
+TEST(Format, WalVersion) {
   auto uuid = tinydb::DatabaseUuid{};
   uuid.back() = std::byte{1};
   const auto original = tinydb::wal_format::EncodeHeader(tinydb::wal_format::Header{.database_uuid = uuid});

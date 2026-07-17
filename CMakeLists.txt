@@ -5,10 +5,11 @@ project(
   VERSION 0.1.0
   LANGUAGES CXX)
 
-option(SANITIZE "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(TINYDB_ENABLE_CLANG_TIDY "Run clang-tidy while compiling local targets" OFF)
 option(TINYDB_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(TINYDB_BUILD_BENCHMARKS "Build the workload benchmarks in bench/" OFF)
+set(TINYDB_SANITIZER "none" CACHE STRING "Sanitizer: none, address, or thread")
+set_property(CACHE TINYDB_SANITIZER PROPERTY STRINGS none address thread)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,7 +35,7 @@ target_compile_options(
     $<$<AND:$<BOOL:${TINYDB_WARNINGS_AS_ERRORS}>,$<CXX_COMPILER_ID:MSVC>>:/WX>)
 
 add_library(TinyDB_sanitizers INTERFACE)
-if(SANITIZE)
+if(TINYDB_SANITIZER STREQUAL "address")
   target_compile_options(
     TinyDB_sanitizers
     INTERFACE
@@ -43,6 +44,20 @@ if(SANITIZE)
   target_link_options(
     TinyDB_sanitizers
     INTERFACE $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fsanitize=address,undefined>)
+elseif(TINYDB_SANITIZER STREQUAL "thread")
+  target_compile_options(
+    TinyDB_sanitizers
+    INTERFACE
+      $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fsanitize=thread>
+      $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fno-omit-frame-pointer>
+      $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fno-pie>)
+  target_link_options(
+    TinyDB_sanitizers
+    INTERFACE
+      $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fsanitize=thread>
+      $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-no-pie>)
+elseif(NOT TINYDB_SANITIZER STREQUAL "none")
+  message(FATAL_ERROR "TINYDB_SANITIZER must be none, address, or thread")
 endif()
 
 set(TINYDB_CLANG_TIDY_COMMAND "")
@@ -198,26 +213,24 @@ if(BUILD_TESTING)
 endif()
 
 if(TINYDB_BUILD_BENCHMARKS)
-  # SYSTEM keeps the library's headers out of our warning set; the benchmarks
-  # themselves still build with the project's -Werror flags.
+  # Ordinary TinyDB builds have no comparison-engine dependency. A pinned
+  # LevelDB release makes repeated measurements use the same baseline.
+  set(LEVELDB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(LEVELDB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+  set(LEVELDB_INSTALL OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(
-    googlebenchmark
-    GIT_REPOSITORY https://github.com/google/benchmark.git
-    GIT_TAG v1.9.1
+    leveldb
+    GIT_REPOSITORY https://github.com/google/leveldb.git
+    GIT_TAG 1.23
     GIT_SHALLOW TRUE
     SYSTEM)
-  set(BENCHMARK_ENABLE_TESTING
-      OFF
-      CACHE BOOL "" FORCE)
-  set(BENCHMARK_ENABLE_GTEST_TESTS
-      OFF
-      CACHE BOOL "" FORCE)
-  set(BENCHMARK_ENABLE_WERROR
-      OFF
-      CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(googlebenchmark)
+  FetchContent_MakeAvailable(leveldb)
 
-  add_executable(TinyDB_workloads_bench bench/workloads_bench.cpp)
-  target_link_libraries(TinyDB_workloads_bench PRIVATE TinyDB::TinyDB benchmark::benchmark_main)
-  TinyDB_apply_local_tooling(TinyDB_workloads_bench)
+  add_executable(TinyDB_bench bench/bench.cpp)
+  target_link_libraries(TinyDB_bench PRIVATE TinyDB::TinyDB leveldb)
+  # The point-read measurement intentionally interposes global new/delete.
+  # GCC otherwise diagnoses the malloc/free implementation of that matched
+  # pair as though an ordinary allocation crossed allocation families.
+  target_compile_options(TinyDB_bench PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wno-mismatched-new-delete>)
+  TinyDB_apply_local_tooling(TinyDB_bench)
 endif()

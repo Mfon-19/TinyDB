@@ -22,7 +22,7 @@ endif()
 execute_process(
   COMMAND "${CMAKE_COMMAND}" -S "${TINYDB_SOURCE_DIR}/tests/downstream" -B "${consumer_build}"
           -G "${TINYDB_GENERATOR}" -DCMAKE_BUILD_TYPE=${TINYDB_BUILD_TYPE}
-          -DCMAKE_PREFIX_PATH=${install_prefix} -DTINYDB_TEST_SANITIZE=${TINYDB_SANITIZE}
+          -DCMAKE_PREFIX_PATH=${install_prefix} -DTINYDB_TEST_SANITIZER=${TINYDB_SANITIZER}
   RESULT_VARIABLE configure_result
   OUTPUT_VARIABLE configure_output
   ERROR_VARIABLE configure_error)

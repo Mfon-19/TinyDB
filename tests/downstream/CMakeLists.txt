@@ -11,8 +11,11 @@ target_compile_features(tinydb_downstream PRIVATE cxx_std_23)
 # A sanitizer-instrumented static library needs the same runtime only in this
 # repository's install test. Sanitizers are deliberately not an install-time
 # requirement of normal TinyDB packages.
-if(TINYDB_TEST_SANITIZE)
+if(TINYDB_TEST_SANITIZER STREQUAL "address")
   target_compile_options(tinydb_downstream PRIVATE -fsanitize=address,undefined
                                                     -fno-omit-frame-pointer)
   target_link_options(tinydb_downstream PRIVATE -fsanitize=address,undefined)
+elseif(TINYDB_TEST_SANITIZER STREQUAL "thread")
+  target_compile_options(tinydb_downstream PRIVATE -fsanitize=thread -fno-omit-frame-pointer -fno-pie)
+  target_link_options(tinydb_downstream PRIVATE -fsanitize=thread -no-pie)
 endif()

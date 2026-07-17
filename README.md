@@ -1,9 +1,14 @@
 # TinyDB
 
-TinyDB is a single-process, ordered, transactional key-value database embedded
-directly in a C++23 application. It stores byte-string keys and values in a
-checksummed B+ tree, commits through a physical write-ahead log, and recovers
-automatically when the database is reopened after a crash.
+TinyDB is a C++23 embedded, ordered key-value database. It provides atomic
+multi-key transactions, stable read snapshots, streaming cursors, synchronous
+crash durability, automatic recovery, and values up to 4 MiB without running a
+database server.
+
+The permanent boundary is intentionally narrow: one process owns a database,
+many readers may run concurrently, and one writer prepares at a time. The
+application defines its own key schema and updates primary records and
+secondary-index keys in the same transaction.
 
 ```cpp
 #include <tinydb/database.h>
@@ -11,149 +16,128 @@ automatically when the database is reopened after a crash.
 auto database = tinydb::Database::Open("notes.db").value();
 
 auto write = database.BeginWrite().value();
-if (!write.Put("doc/1", "contents").Ok() ||
-    !write.Put("tag/database/doc/1", "").Ok()) {
-  write.Abort();
-  return;
-}
-auto committed = std::move(write).Commit();
-if (!committed) {
-  return;
-}
+write.Put("doc/42", "storage engine notes");
+write.Put("tag/database/42", "");
+auto commit = std::move(write).Commit().value();
 
 auto read = database.BeginRead().value();
 auto cursor = read.Scan(tinydb::KeyRange::Prefix("tag/database/")).value();
 while (cursor.Valid()) {
-  Use(cursor.Key(), cursor.CopyValue().value());
-  if (!cursor.Next().Ok()) {
-    break;
-  }
+  auto key = cursor.Key();       // borrowed until cursor movement
+  auto value = cursor.CopyValue();
+  cursor.Next();
 }
 ```
 
-## Contract
+## Guarantees
 
 - Keys are unique byte strings ordered by unsigned lexicographic order.
-- `Put` inserts or replaces, and `Delete` is idempotent.
-- A write transaction publishes all of its mutations or none of them.
-- A successful commit is durable without `Close` or an explicit checkpoint.
-- An indeterminate durability failure moves the handle to `NeedsRecovery`; the
-  application must reopen before determining the transaction outcome.
-- Read transactions and their cursors retain one stable committed snapshot.
-- Many readers may coexist. One write transaction may prepare at a time.
-- One process owns a database file at a time through an exclusive file lock.
-- Keys are limited to 1 KiB and values to 4 MiB. Large values use checksummed
-  overflow pages and are copied by `Get` and `Cursor::CopyValue`.
-- Detected malformed persistent state is returned as `Corruption` or
-  `UnsupportedFormat`; it is not treated as an internal assertion failure.
+- A write transaction publishes all of its puts and deletes, or none of them.
+- A successful commit is WAL-durable before it becomes visible and before the
+  call returns.
+- A read transaction and its cursors retain one stable committed snapshot.
+- Existing readers may delay writer publication; new readers cannot starve a
+  publication that is ready to proceed.
+- Recovery accepts only complete checksummed WAL transactions and is safe to
+  repeat after interruption.
+- Database pages, superblocks, and WAL records use fixed little-endian codecs,
+  checksums, versions, and one database UUID.
+- Persistent corruption and environmental failures are returned as statuses;
+  they do not terminate the embedding process.
+- An OS lock rejects a second process while the database is open.
 
-TinyDB does not provide SQL, schemas, networking, replication, multi-process
-readers, or concurrent write transactions.
+A commit whose final synchronization reports an ambiguous failure returns
+`IndeterminateCommit`. The handle then requires recovery; the application must
+reopen and inspect an idempotency key written in the transaction to determine
+its outcome.
 
-## Storage model
+TinyDB does not provide SQL, networking, replication, concurrent writers,
+multi-process readers, custom comparators, or cross-database transactions. The
+complete contract and protocol are in [doc/design.md](doc/design.md), with its
+test evidence in [doc/guarantees.md](doc/guarantees.md).
+
+## Architecture
 
 ```text
-application
-    │
-    ├── ReadTransaction ── immutable committed snapshot ──┐
-    │                                                     │
-    └── WriteTransaction ── private mutable page overlay  │
-                              │                           │
-                              ├── fsynced physical WAL    │
-                              └── atomic publication ─────┘
-                                           │
-                                  committed page cache
-                                           │ checkpoint
-                                  checksummed page file
+Database / transactions / cursors
+              |
+        B+ tree and allocator
+              |
+ write overlay | committed immutable cache
+              |             |
+       commit coordinator    | checkpoint
+              |             |
+           WAL segments    database file
+                 \         /
+                   recovery
 ```
 
-Before WAL synchronization, write pages are private and discardable. The
-commit path prepares every allocation required for visibility, appends final
-page images and resulting roots, synchronizes the WAL, drains older readers,
-and publishes without further allocation or I/O. Checkpointing later writes
-those immutable committed versions to the database file and removes covered
-WAL segments. It is not a commit boundary.
+A writer copies pages into a private transaction overlay. Commit freezes and
+validates the final page images, reserves everything publication needs, appends
+one self-binding physical WAL transaction, and synchronizes it. Only then does
+it wait for older readers and transfer the prepared page buffers into the
+committed cache. Publication performs no allocation or I/O.
 
-The database file uses explicit little-endian encodings, per-page checksums,
-and alternating checksummed superblocks. The WAL is segmented, checksummed,
-bound to the database UUID, and replays only complete self-binding
-transactions.
+The database file contains the latest checkpoint. WAL segments contain newer
+durable commits. A checkpoint writes exact captured cache versions, syncs those
+pages, advances the inactive superblock, and only then removes covered WAL
+segments. Recovery physically replays complete transactions; it never reruns
+tree mutations.
 
 ## Build and test
 
+The default build needs CMake 3.25 and a C++23 compiler:
+
 ```sh
-cmake --preset release
-cmake --build --preset release
-ctest --preset release
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug
 ```
 
-Sanitizer and clang-tidy presets are defined in `CMakePresets.json`. Benchmarks
-are optional:
+The focused CTest suite contains 60 cases: 59 discovered cases across seven
+test binaries plus one installed-package consumer. It covers the public
+contract, model transactions, pages and persistent codecs, durability ordering,
+concurrency, fault injection, and deterministic process-kill sweeps.
+
+CI runs GCC and Clang in Debug and Release configurations, ASan+UBSan, TSan,
+the crash sweeps, and external format golden files.
+The same sanitizer configurations are available locally:
 
 ```sh
-cmake -S . -B build/bench -DCMAKE_BUILD_TYPE=Release \
+cmake --preset asan && cmake --build --preset asan && ctest --preset asan
+cmake --preset tsan && cmake --build --preset tsan && ctest --preset tsan -LE crash
+```
+
+## Benchmark
+
+The benchmark compares TinyDB with pinned LevelDB 1.23 using the same keys,
+values, batch sizes, 256 KiB cache, disabled compression, and synchronous
+durability. It also reports TinyDB-specific checkpoint and publication costs.
+
+```sh
+cmake -S . -B build/bench -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF -DTINYDB_BUILD_BENCHMARKS=ON
-cmake --build build/bench --target TinyDB_workloads_bench
+cmake --build build/bench --target TinyDB_bench
+build/bench/TinyDB_bench --rows 2000 --transactions 100 --batch 16
 ```
 
-No historical performance figures are claimed here; storage, filesystem, and
-durability settings materially change the result.
+CSV output includes transaction throughput and commit percentiles, WAL bytes
+per application byte, checkpoint time and bandwidth, reader publication wait,
+point-read allocations and cache hit rate, cursor throughput, recovery time,
+and file size after churn. The harness makes measurements; this repository does
+not embed machine-specific performance claims.
 
-## Install and consume
+## Repository
 
-```sh
-cmake --install build/release --prefix /your/prefix
-```
-
-A downstream CMake project can then use only the installed public boundary:
-
-```cmake
-find_package(TinyDB CONFIG REQUIRED)
-target_link_libraries(my_application PRIVATE TinyDB::TinyDB)
-```
-
-The installed headers are:
-
-```text
-tinydb/bytes.h
-tinydb/cursor.h
-tinydb/database.h
-tinydb/options.h
-tinydb/stats.h
-tinydb/status.h
-tinydb/transaction.h
-```
-
-Page formats, the cache, WAL, allocator, recovery, and B+ tree types are
-private implementation details under `src/`.
-
-## Command line
-
-The `tinydb` executable performs one operation per invocation:
-
-```text
-tinydb <database> put <key> <value>
-tinydb <database> get <key>
-tinydb <database> del <key>
-tinydb <database> scan
-tinydb <database> scan <lower> <upper>
-```
-
-The CLI is a thin demonstration of the public API. It is not a server or an
-interactive shell.
-
-## Repository layout
-
-| Path | Responsibility |
+| Path | Purpose |
 |---|---|
-| `include/tinydb` | Installed application API |
-| `src/api` | Handle, transaction, lifecycle, and publication coordination |
-| `src/btree` | Ordered index, cursors, and overflow values |
-| `src/cache` | Immutable committed page versions |
-| `src/txn` | Reader gate, private overlay, allocator, and commit protocol |
-| `src/wal` | Segmented WAL and physical transaction codec |
-| `src/recovery` | WAL validation and idempotent redo |
-| `src/checkpoint` | Immutable checkpoint capture and cleanup |
-| `src/storage` | Database file, superblocks, and page codecs |
-| `src/io` | POSIX I/O boundary and fault-injection hooks |
-| `tests` | Contract, model, corruption, durability, and crash tests |
+| `include/tinydb` | Public application API only |
+| `src/api` | Handle ownership and public operations |
+| `src/txn` | Transaction overlay, commit protocol, reader gate |
+| `src/btree` | Ordered-map algorithms, page views, overflow values |
+| `src/cache` | Immutable committed-page cache |
+| `src/storage` | Page/superblock codecs and database file |
+| `src/wal`, `src/recovery`, `src/checkpoint` | Durability lifecycle |
+| `src/verify` | Read-only structural verification |
+| `tests`, `bench` | Guarantee tests and reproducible measurements |
+| `tools` | Binary-safe dump utility |
