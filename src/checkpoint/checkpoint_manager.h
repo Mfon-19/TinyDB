@@ -1,16 +1,14 @@
 #pragma once
 
-#include "storage/page.h"
 #include <tinydb/status.h>
+#include "storage/page.h"
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <utility>
 
 namespace tinydb {
 
@@ -22,7 +20,6 @@ class CommittedPageCache;
 }
 
 namespace txn {
-class CheckpointCaptureGuard;
 class ReaderGate;
 }
 
@@ -54,34 +51,6 @@ struct Stats {
   std::optional<std::string> last_error;
 };
 
-class Manager;
-
-/*
-** A successful CheckpointedFileGuard means the database file contains one
-** complete checkpoint and no other checkpoint can write it until the guard
-** is destroyed. It also retains the checkpoint capture lock: readers remain
-** admitted, writers may prepare privately, but no writer can publish a new
-** visible state until the frozen file has been copied.
-*/
-class CheckpointedFileGuard final {
- public:
-  CheckpointedFileGuard(const CheckpointedFileGuard &) = delete;
-  auto operator=(const CheckpointedFileGuard &) -> CheckpointedFileGuard & = delete;
-  CheckpointedFileGuard(CheckpointedFileGuard &&) noexcept;
-  auto operator=(CheckpointedFileGuard &&) -> CheckpointedFileGuard & = delete;
-  ~CheckpointedFileGuard();
-
- private:
-  CheckpointedFileGuard(std::unique_lock<std::mutex> checkpoint_lock,
-                        std::unique_ptr<txn::CheckpointCaptureGuard> publication_pause)
-      : checkpoint_lock_(std::move(checkpoint_lock)), publication_pause_(std::move(publication_pause)) {}
-
-  std::unique_lock<std::mutex> checkpoint_lock_;
-  std::unique_ptr<txn::CheckpointCaptureGuard> publication_pause_;
-
-  friend class Manager;
-};
-
 /*
 ** IMMUTABLE CHECKPOINT MANAGER
 **
@@ -110,13 +79,12 @@ class Manager final {
   auto operator=(const Manager &) -> Manager & = delete;
 
   auto Checkpoint() -> Status;
-  auto CheckpointAndFreeze() -> Result<CheckpointedFileGuard>;
   auto ShouldCheckpoint() const -> bool;
   auto WriteAdmissionStatus() const -> Status;
   auto GetStats() const -> Stats;
 
  private:
-  auto CheckpointLocked(txn::CheckpointCaptureGuard *publication_pause) -> Status;
+  auto CheckpointLocked() -> Status;
   auto Record(Status status) -> Status;
 
   DiskManager *disk_;

@@ -49,7 +49,6 @@ enum class DatabaseOperation {
   Read,
   Write,
   Checkpoint,
-  Backup,
   Verify,
   Stats,
   Close,

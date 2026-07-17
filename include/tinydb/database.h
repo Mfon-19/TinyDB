@@ -42,10 +42,6 @@ class Database final {
   // state self-contained in the database file and shortens future recovery.
   auto Checkpoint() -> Status;
 
-  // Publishes a self-contained checkpointed file without a WAL. The
-  // destination must not already exist and is never exposed partially.
-  auto CreateBackup(const std::filesystem::path &destination) -> Status;
-
   // Audits one stable read snapshot without repair or persistent writes.
   // Detected damage is represented by VerifyReport::issues; Result errors are
   // reserved for environmental failures that prevented the audit.

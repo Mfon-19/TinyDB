@@ -71,23 +71,23 @@ TEST(DatabaseStateTest, OnlyDefinedTransitionsAreLegal) {
 
 TEST(DatabaseStateTest, AdmissionPolicyDefinesEveryOperationInEveryState) {
   constexpr auto operations = std::array{
-      DatabaseOperation::Read,   DatabaseOperation::Write, DatabaseOperation::Checkpoint, DatabaseOperation::Backup,
+      DatabaseOperation::Read, DatabaseOperation::Write, DatabaseOperation::Checkpoint,
       DatabaseOperation::Verify, DatabaseOperation::Stats, DatabaseOperation::Close};
   constexpr auto cases = std::array{
       std::pair{DatabaseLifecycle::Open, std::array{StatusCode::Ok, StatusCode::Ok, StatusCode::Ok, StatusCode::Ok,
-                                                StatusCode::Ok, StatusCode::Ok, StatusCode::Ok}},
+                                                   StatusCode::Ok, StatusCode::Ok}},
       std::pair{DatabaseLifecycle::CheckpointDegraded,
                 std::array{StatusCode::Ok, StatusCode::Ok, StatusCode::Ok, StatusCode::Ok, StatusCode::Ok,
-                           StatusCode::Ok, StatusCode::Ok}},
+                           StatusCode::Ok}},
       std::pair{DatabaseLifecycle::NeedsRecovery,
                 std::array{StatusCode::NeedsRecovery, StatusCode::NeedsRecovery, StatusCode::NeedsRecovery,
-                           StatusCode::NeedsRecovery, StatusCode::NeedsRecovery, StatusCode::Ok, StatusCode::Ok}},
+                           StatusCode::NeedsRecovery, StatusCode::Ok, StatusCode::Ok}},
       std::pair{DatabaseLifecycle::Corrupt,
-                std::array{StatusCode::Corruption, StatusCode::Corruption, StatusCode::Corruption,
-                           StatusCode::Corruption, StatusCode::Ok, StatusCode::Ok, StatusCode::Ok}},
+                std::array{StatusCode::Corruption, StatusCode::Corruption, StatusCode::Corruption, StatusCode::Ok,
+                           StatusCode::Ok, StatusCode::Ok}},
       std::pair{DatabaseLifecycle::Closed,
                 std::array{StatusCode::Closed, StatusCode::Closed, StatusCode::Closed, StatusCode::Closed,
-                           StatusCode::Closed, StatusCode::Closed, StatusCode::Ok}},
+                           StatusCode::Closed, StatusCode::Ok}},
   };
 
   for (const auto &[state, expected] : cases) {

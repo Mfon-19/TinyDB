@@ -6,7 +6,6 @@
 #include "wal/wal.h"
 
 #include "btree/b_plus_tree.h"
-#include "backup/backup_manager.h"
 #include "cache/committed_page_cache.h"
 #include "cache/committed_page_source.h"
 #include "checkpoint/checkpoint_manager.h"
@@ -325,27 +324,6 @@ class DatabaseCore final {
     }
   }
 
-  /*
-  ** CheckpointAndFreeze owns both checkpoint serialization and the cache/state
-  ** publication lock through the copy. Read transactions remain admitted and
-  ** a writer may continue private preparation and WAL synchronization, but it
-  ** cannot publish a new visible state until the backup snapshot is complete.
-  */
-  auto CreateBackup(const std::filesystem::path &destination) -> Status {
-    auto admission = AdmitMaintenance(txn::DatabaseOperation::Backup);
-    if (!admission) {
-      return admission.error();
-    }
-
-    auto frozen = checkpoints->CheckpointAndFreeze();
-    if (!frozen) {
-      ObserveCheckpoint(frozen.error());
-      return frozen.error();
-    }
-    ObserveCheckpoint({});
-    return backup::Create(*disk, destination, options.page_cache_bytes, options.max_write_transaction_bytes);
-  }
-
   auto MaybeCheckpoint() -> Status {
     if (checkpoints->ShouldCheckpoint()) {
       const auto status = Checkpoint();
@@ -442,16 +420,15 @@ class DatabaseCore final {
         .maximum_publication_wait = operation_stats.maximum_publication_wait,
         .consecutive_checkpoint_failures = checkpoint_stats.consecutive_failures,
         .checkpoint_requested = checkpoint_stats.checkpoint_requested,
-        .checkpoint_age =
-            std::chrono::duration_cast<std::chrono::milliseconds>(checkpoint_stats.age_since_success),
+        .checkpoint_age = std::chrono::duration_cast<std::chrono::milliseconds>(checkpoint_stats.age_since_success),
         .last_checkpoint_error = checkpoint_stats.last_error,
     };
     if (reader_stats.oldest_reader_age) {
       result.oldest_reader_age = std::chrono::duration_cast<std::chrono::milliseconds>(*reader_stats.oldest_reader_age);
     }
     for (const auto &extent : operation_stats.free_extents) {
-      auto *const destination = extent.retire_lsn <= state->checkpoint_lsn ? &result.reusable_pages
-                                                                          : &result.retired_pages;
+      auto *const destination =
+          extent.retire_lsn <= state->checkpoint_lsn ? &result.reusable_pages : &result.retired_pages;
       if (extent.page_count > std::numeric_limits<std::size_t>::max() - *destination) {
         *destination = std::numeric_limits<std::size_t>::max();
       } else {
@@ -964,13 +941,6 @@ auto Database::Checkpoint() -> Status {
     return Status::Closed("Checkpoint on a moved-from database");
   }
   return impl_->core->Checkpoint();
-}
-
-auto Database::CreateBackup(const std::filesystem::path &destination) -> Status {
-  if (impl_ == nullptr) {
-    return Status::Closed("CreateBackup on a moved-from database");
-  }
-  return impl_->core->CreateBackup(destination);
 }
 
 auto Database::Verify(VerifyOptions options) -> Result<VerifyReport> {

@@ -3,9 +3,6 @@
 #include "btree/page_format.h"
 #include "btree/page_view.h"
 #include "btree/value_storage.h"
-#include "cache/committed_page_cache.h"
-#include "cache/committed_page_source.h"
-#include "storage/disk_manager.h"
 #include "storage/page_codec.h"
 #include "txn/contract.h"
 #include "txn/database_state.h"
@@ -14,7 +11,6 @@
 #include <algorithm>
 #include <expected>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -283,27 +279,6 @@ auto StatusFrom(const SnapshotReport &verified) -> Status {
   const auto message = verified.report.issues.empty() ? "verification did not complete"
                                                        : verified.report.issues.front().message;
   return Status::Corruption(message);
-}
-
-auto CheckpointedFile(const std::filesystem::path &path, std::size_t cache_bytes,
-                      std::size_t memory_budget) -> Status {
-  auto opened = DiskManager::OpenReadOnly(path);
-  if (!opened) {
-    return opened.error();
-  }
-  auto disk = std::make_unique<DiskManager>(*std::move(opened));
-  auto page_cache = cache::CommittedPageCache(disk.get(), cache_bytes, disk->CheckpointLsn());
-  auto pages = cache::CommittedPageSource(&page_cache);
-  const auto state = txn::DatabaseState{
-      .root_page_id = disk->GetRootPageId(),
-      .allocator_root_page_id = disk->GetAllocatorRootPageId(),
-      .high_water_page_id = disk->HighWaterPageId(),
-      .transaction_id = disk->TransactionId(),
-      .visible_lsn = disk->CheckpointLsn(),
-      .checkpoint_lsn = disk->CheckpointLsn(),
-  };
-  const auto verified = Snapshot(&pages, state, memory_budget);
-  return verified ? StatusFrom(*verified) : verified.error();
 }
 
 }  // namespace tinydb::verify

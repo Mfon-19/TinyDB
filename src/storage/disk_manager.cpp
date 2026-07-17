@@ -1,5 +1,5 @@
-#include "util/check.h"
 #include "storage/disk_manager.h"
+#include "util/check.h"
 
 #include "io/file_io.h"
 #include "io/syscalls.h"
@@ -24,7 +24,6 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 namespace tinydb {
 namespace {
@@ -112,23 +111,14 @@ auto ToBytes(const std::array<char, PAGE_SIZE> &page) -> std::span<const std::by
 
 }  // namespace
 
-auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager> { return OpenImpl(path, true); }
-
-auto DiskManager::OpenReadOnly(const std::filesystem::path &path) -> Result<DiskManager> {
-  return OpenImpl(path, false);
-}
-
 /*
-** Writable open may create and initialize an absent database.  Read-only open
-** is for verification: it never passes O_CREAT and rejects an empty file
-** instead of converting untrusted input into a new database.  Both modes use
-** the same superblock selection and physical-frontier checks below.
+** Open may create and initialize an absent database. O_CREAT can leave an
+** empty directory entry before initialization begins, so the zero-file and
+** two-zero-superblock states are explicitly retryable. Existing nonempty
+** files pass superblock and physical-frontier validation before any mutation.
 */
-auto DiskManager::OpenImpl(const std::filesystem::path &path, bool writable) -> Result<DiskManager> {
-  // Writable O_CREAT may leave an empty directory entry before initialization
-  // begins. The initialization path below is therefore safely retryable.
-  const auto flags = writable ? O_RDWR | O_CREAT | O_CLOEXEC : O_RDONLY | O_CLOEXEC;
-  auto fd = UniqueFd(io::Open(path, flags, 0644));
+auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager> {
+  auto fd = UniqueFd(io::Open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
   if (!fd.Valid()) {
     return std::unexpected(ErrnoStatus("open"));
   }
@@ -137,7 +127,7 @@ auto DiskManager::OpenImpl(const std::filesystem::path &path, bool writable) -> 
   if (io::Fstat(fd.Get(), &file_stat) < 0) {
     return std::unexpected(ErrnoStatus("fstat"));
   }
-  DiskManager disk(std::move(fd), writable);
+  DiskManager disk(std::move(fd));
 
   const auto initialize_fresh = [&]() -> Status {
     // Creation ordering:
@@ -173,9 +163,6 @@ auto DiskManager::OpenImpl(const std::filesystem::path &path, bool writable) -> 
 
   if (file_stat.st_size == 0) {
     // Includes a zero-byte entry left by a failed/terminated earlier creation.
-    if (!writable) {
-      return std::unexpected(Status::UnsupportedFormat("file does not contain TinyDB superblocks"));
-    }
     if (auto status = initialize_fresh(); !status.Ok()) {
       return std::unexpected(std::move(status));
     }
@@ -202,7 +189,7 @@ auto DiskManager::OpenImpl(const std::filesystem::path &path, bool writable) -> 
     const auto page_is_zero = [](const std::array<char, PAGE_SIZE> &page) {
       return std::ranges::all_of(page, [](char byte) { return byte == 0; });
     };
-    if (writable && file_stat.st_size == static_cast<off_t>(FIRST_DATA_PAGE_ID * PAGE_SIZE) && page_is_zero(*page_a) &&
+    if (file_stat.st_size == static_cast<off_t>(FIRST_DATA_PAGE_ID * PAGE_SIZE) && page_is_zero(*page_a) &&
         page_is_zero(*page_b)) {
       // ftruncate may have reserved two zero-filled pages before the first
       // superblock write failed. This exact state contains no acknowledged
@@ -273,7 +260,6 @@ auto DiskManager::EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE>
 
 auto DiskManager::EnsurePageCount(page_id_t high_water_page_id) -> Status {
   TINYDB_CHECK(fd_.Valid(), "extending a closed disk manager");
-  TINYDB_CHECK(writable_, "extending a read-only disk manager");
   if (high_water_page_id < FIRST_DATA_PAGE_ID) {
     return Status::InvalidArgument("allocation frontier overlaps superblocks");
   }
@@ -288,7 +274,6 @@ auto DiskManager::EnsurePageCount(page_id_t high_water_page_id) -> Status {
 auto DiskManager::WriteCheckpointPage(page_id_t page_id, const char *data,
                                       page_id_t captured_high_water_page_id) const -> Status {
   TINYDB_CHECK(fd_.Valid(), "writing through a closed disk manager");
-  TINYDB_CHECK(writable_, "writing through a read-only disk manager");
   if (data == nullptr || captured_high_water_page_id < FIRST_DATA_PAGE_ID || page_id < FIRST_DATA_PAGE_ID ||
       page_id >= captured_high_water_page_id) {
     return Status::InvalidArgument("checkpoint page lies outside its captured allocation frontier");
@@ -300,7 +285,6 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
                                    page_id_t high_water_page_id, std::uint64_t transaction_id,
                                    std::uint64_t checkpoint_lsn) -> Status {
   TINYDB_CHECK(fd_.Valid(), "checkpointing a closed disk manager");
-  TINYDB_CHECK(writable_, "checkpointing a read-only disk manager");
   if (checkpoint_lsn < checkpoint_lsn_) {
     return Status::InvalidArgument("checkpoint frontier moved backward");
   }
@@ -343,50 +327,8 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
 
 auto DiskManager::Sync() const -> Status {
   TINYDB_CHECK(fd_.Valid(), "syncing a closed disk manager");
-  TINYDB_CHECK(writable_, "syncing a read-only disk manager");
   if (io::Fsync(fd_.Get()) < 0) {
     return ErrnoStatus("fsync");
-  }
-  return {};
-}
-
-auto DiskManager::CopyCheckpointTo(int destination_fd) const -> Status {
-  TINYDB_CHECK(fd_.Valid(), "copying a closed disk manager");
-  if (destination_fd < 0) {
-    return Status::InvalidArgument("backup destination descriptor is invalid");
-  }
-  if (high_water_page_id_ > std::numeric_limits<std::uint64_t>::max() / PAGE_SIZE) {
-    return Status::Corruption("database allocation frontier overflows its physical file size");
-  }
-
-  /*
-  ** Copy the superblocks and every page below the selected high-water mark.
-  ** Trailing pages from an interrupted older checkpoint are deliberately not
-  ** copied: neither selected superblock owns them.  The destination is private
-  ** until its fsync succeeds and the backup validator accepts all page bytes.
-  */
-  const auto byte_count = high_water_page_id_ * PAGE_SIZE;
-  if (io::Ftruncate(destination_fd, byte_count) < 0) {
-    return ErrnoStatus("ftruncate backup");
-  }
-  auto buffer = std::array<char, 64U * 1024U>{};
-  for (std::uint64_t offset = 0; offset < byte_count;) {
-    const auto remaining = byte_count - offset;
-    const auto chunk = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size()));
-    const auto read = io::FullPread(fd_.Get(), buffer.data(), chunk, offset);
-    if (!read) {
-      return read.error();
-    }
-    if (*read != chunk) {
-      return Status::Corruption("short read while copying the checkpointed database file");
-    }
-    if (auto status = io::FullPwrite(destination_fd, buffer.data(), chunk, offset); !status.Ok()) {
-      return status;
-    }
-    offset += chunk;
-  }
-  if (io::Fsync(destination_fd) < 0) {
-    return ErrnoStatus("fsync backup");
   }
   return {};
 }

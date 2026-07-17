@@ -7,7 +7,6 @@
 #include "storage/page_codec.h"
 
 #include <cstddef>
-#include <filesystem>
 #include <vector>
 
 namespace tinydb {
@@ -34,14 +33,6 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
               VerifyOptions options = {}) -> Result<SnapshotReport>;
 
 auto StatusFrom(const SnapshotReport &verified) -> Status;
-
-/*
-** Open and verify a database file without creating a WAL, initializing an
-** empty file, checkpointing, or otherwise changing persistent bytes.  This is
-** the validation boundary used before a private backup image is published.
-*/
-auto CheckpointedFile(const std::filesystem::path &path, std::size_t cache_bytes,
-                      std::size_t memory_budget) -> Status;
 
 }  // namespace verify
 }  // namespace tinydb

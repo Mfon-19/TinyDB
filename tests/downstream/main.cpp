@@ -20,12 +20,10 @@ auto main() -> int {
   // Referencing the complete public surface forces this consumer to compile
   // and link through installed headers and the exported target only.
   const auto open = &tinydb::Database::Open;
-  const auto backup = &tinydb::Database::CreateBackup;
   const auto all = tinydb::KeyRange::All();
   const auto bytes = tinydb::Bytes{"value"};
   static_cast<void>(options);
   static_cast<void>(open);
-  static_cast<void>(backup);
   static_cast<void>(all);
   static_cast<void>(bytes);
   return 0;
