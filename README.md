@@ -223,32 +223,38 @@ tinydb_dump <database>
 
 ## Benchmarking
 
-The benchmark excludes fixture construction from timed regions, discards
-warmups, uses deterministic access order, validates
-every workload, and summarizes repeated samples with mean, sample deviation,
-minimum, p50, p95, p99, and maximum.
+The benchmark suite covers writes, reads, scans, mixed traffic, reader/writer
+concurrency, checkpoints, process-restart recovery, churn, large values, and
+working-set scaling. Named `smoke`, `standard`, and `soak` profiles keep the
+scenario geometry reproducible; `standard` is the default performance profile.
 
 ```sh
 cmake -S . -B build/bench -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF -DTINYDB_BUILD_BENCHMARKS=ON
 cmake --build build/bench --target TinyDB_bench
-build/bench/TinyDB_bench
+build/bench/TinyDB_bench --profile standard
 ```
 
-The CSV workloads cover insert and overwrite commits, hot point reads,
-metadata-only and value-copy cursor scans, checkpoints, process-restart
-recovery, and space reuse under churn. Run one family or lengthen CPU-bound
-trials with:
+Each run writes raw observations, statistical summaries, and machine/build
+metadata under `benchmark-results/`. Scenario order is randomized from a
+recorded seed. Fixture construction and warmups are outside timed regions, and
+every workload validates its results. List or select scenarios with:
 
 ```sh
-build/bench/TinyDB_bench --workload reads --minimum-trial-ms 1000
+build/bench/TinyDB_bench --profile standard --list
+build/bench/TinyDB_bench --profile standard --family reads
+build/bench/TinyDB_bench --profile standard --filter read.eviction.hotspot
 ```
 
-### Reference results
+The [benchmark guide](bench/README.md) defines the profiles, cache-state terms,
+artifact formats, host preparation, and the alternating baseline/candidate
+runner.
 
-The following results are from a complete run. They
-describe this machine and build; they are a reproducible reference, not a
-performance guarantee for other systems.
+### Reference smoke results: short validation
+
+The following results are from a complete smoke-profile run on July 17, 2026.
+They verify the suite end to end and provide a machine-specific sanity
+reference; use the standard profile for optimization or release claims.
 
 | Component | Configuration |
 |---|---|
@@ -257,30 +263,99 @@ performance guarantee for other systems.
 | Storage | Intel SSDPEKNW512G8 NVMe SSD; ext4 on an LVM logical volume |
 | Operating system | Linux 6.17.0-29-generic, x86-64 |
 | Compiler | GCC 13.3.0, Release build |
+| CPU policy | Linux `powersave` scaling governor; host otherwise unisolated |
 
-The run used 5,000 rows, 128-byte values, a 16 MiB cache, 64 transactions of
-16 writes each, seven measured trials after two warmups, a 250 ms minimum for
-CPU-bound trials, and deterministic seed `92673823818818`. Put throughput
-counts individual key updates; the corresponding transaction rate is shown in
-parentheses.
+The smoke profile used a 1 MiB cache, three measured trials after one warmup,
+a 100 ms CPU-workload floor, eight commits per write trial, and deterministic
+seed `92673823818818`. Fixtures vary by scenario; the run metadata records
+every row count, key/value size, cache ratio, and execution order.
 
-| Workload | Median result | Tail and storage details |
+| Scenario | Median result | Tail and cache/storage details |
 |---|---:|---|
-| Insert new keys | 6,519 updates/s (407 transactions/s) | Commit p50 1.607 ms, p95 2.182 ms, p99 2.580 ms; WAL amplification 3.95× |
-| Overwrite keys | 7,202 updates/s (450 transactions/s) | Commit p50 1.500 ms, p95 1.946 ms, p99 2.301 ms; WAL amplification 4.09× |
-| Hot `Database::Get` | 28,963 reads/s | 34.53 µs/read; 100% TinyDB cache-hit rate |
-| Hot `ReadTransaction::Get` | 29,044 reads/s | 34.43 µs/read; 100% TinyDB cache-hit rate |
-| Cursor metadata scan | 2.837 million rows/s | 352.5 ns/row |
-| Cursor value-copy scan | 2.690 million rows/s | 371.8 ns/row |
-| Checkpoint | 3.208 ms | 235.0 MiB/s dirty-page transfer; p95 3.639 ms |
-| Process-restart recovery | 22.346 ms | 42.41 MiB/s replay; p95 23.741 ms |
-| Three-round churn | 22,539 operations/s | 1.107× file amplification; 819,200-byte final database file |
+| Sequential insert, batch 1 | 626 updates/s | Commit p50 1.515 ms, p95 2.036 ms, p99 2.309 ms; 29.89× WAL amplification |
+| Random insert, batch 16 | 6,074 updates/s | Commit p50 1.878 ms, p95 2.247 ms, p99 2.278 ms; 7.94× WAL amplification |
+| Random overwrite, batch 16 | 7,100 updates/s | Commit p50 1.685 ms, p95 2.147 ms, p99 2.182 ms; 10.43× WAL amplification |
+| Engine-hot transaction reads | 38,142 reads/s | 26.22 µs/read; 100% TinyDB cache-hit rate |
+| 8×-cache uniform reads | 22,820 reads/s | 43.82 µs/read; 78.50% TinyDB cache-hit rate |
+| Full metadata scan | 167,365 rows/s | 5.975 µs/row; 0.15% TinyDB cache-hit rate |
+| Full value-copy scan | 165,809 rows/s | 6.031 µs/row; 0.15% TinyDB cache-hit rate |
+| Writer with four readers | 4,632 updates/s and 93,958 reads/s | Commit p50 2.588 ms, p95 2.733 ms, p99 3.066 ms |
+| 2 MiB checkpoint | 5.601 ms | 461.0 MiB/s dirty-page transfer; p95 5.979 ms |
+| 2 MiB OS-warm recovery | 56.453 ms | 47.84 MiB/s replay; p95 56.951 ms |
+| Steady-state churn | 22,069 operations/s | 2.244× file amplification; zero measured file growth per round |
 
-Process-restart recovery is filesystem-cache-warm: the writer exits without a
-TinyDB close, but the harness does not evict the operating system's page cache.
-The insert run also recorded one 16.276 ms commit outlier; its p99 remained
-2.580 ms. The machine was not otherwise isolated from normal operating-system
-activity.
+Recovery is OS-cache-warm: the writer exits without closing TinyDB, but the
+harness does not evict the operating system or device cache. The host was not
+isolated from normal operating-system activity.
+
+### Reference soak results: long diagnostic
+
+The following results are from a complete soak-profile run later on July 17,
+2026. Unlike the smoke run above, this run exercised the largest fixture sizes,
+with most scenarios using 30 measured trials after five warmups, 5-second
+CPU-workload floors, and 3,840 commit-latency samples per write scenario. The
+churn workload used five trials of 40 measured rounds. The run completed all 38
+scenarios and collected 65,195 observations in 13 hours, 21 minutes.
+
+Smoke and soak results are deliberately reported separately. The profiles use
+different fixture geometry, cache sizes, trial lengths, and operation counts,
+so differences between their raw rates do not represent a TinyDB performance
+regression or improvement.
+
+| Component | Configuration |
+|---|---|
+| CPU | Intel Core i5-1135G7, 4 cores / 8 threads, 2.4 GHz base and 4.2 GHz maximum |
+| Memory | 7.5 GiB |
+| Storage | Fixtures under `/tmp` on ext4 |
+| Operating system | Linux 6.17.0-29-generic, x86-64 |
+| Compiler | GCC 13.3.0, Release build |
+| CPU policy | Linux `powersave` scaling governor; host otherwise unisolated |
+| Source state | Base commit `e00f65d`; worktree included uncommitted benchmark-suite changes |
+
+The soak profile used a 32 MiB TinyDB page-cache target and deterministic seed
+`92673823818818`. Each scenario's row count and logical working-set size are
+recorded separately in the run metadata.
+
+| Scenario | Median result | Tail and cache/storage details |
+|---|---:|---|
+| Sequential insert, batch 1 | 564 updates/s | Commit p50 1.624 ms, p95 2.205 ms, p99 2.507 ms; 31.69× WAL amplification |
+| Random insert, batch 16 | 5,576 updates/s | Commit p50 2.327 ms, p95 2.943 ms, p99 3.380 ms; 25.31× WAL amplification |
+| Sequential insert, batch 256 | 22,229 updates/s | Commit p50 2.268 ms, p95 2.828 ms, p99 3.184 ms; 1.364× WAL amplification |
+| Engine-hot transaction reads | 28,819 reads/s | 34.70 µs/read; 100% TinyDB cache-hit rate |
+| 8×-cache uniform reads | 6,406 reads/s | 156.10 µs/read; 82.53% TinyDB cache-hit rate |
+| 32×-cache uniform reads | 2,303 reads/s | 434.23 µs/read; 76.94% TinyDB cache-hit rate |
+| Full metadata scan | 28,879 rows/s | 34.63 µs/row; effectively no TinyDB cache hits |
+| Full value-copy scan | 28,338 rows/s | 35.29 µs/row; effectively no TinyDB cache hits |
+| Uniform 80/12/4/4 mixed traffic | 4,038 operations/s | Commit p50 1.777 ms, p95 2.385 ms, p99 2.656 ms |
+| Writer without readers | 3,904 updates/s | Commit p50 2.401 ms, p95 2.994 ms, p99 3.300 ms |
+| Writer with four readers | 1,290 updates/s and 10,761 reads/s | Commit p50 5.271 ms, p95 7.050 ms, p99 8.015 ms |
+| Writer with eight readers | 420 updates/s and 6,367 reads/s | Commit p50 15.65 ms, p95 28.04 ms, p99 33.30 ms |
+| 64 MiB checkpoint | 129.9 ms | 636.2 MiB/s median transfer; p95 1.443 s |
+| 256 MiB checkpoint | 521.5 ms | 633.9 MiB/s median transfer; p95 5.876 s |
+| 1 GiB checkpoint | 1.641 s | 805.7 MiB/s median transfer; p95 1.697 s |
+| 64 MiB OS-warm recovery | 2.055 s | 42.11 MiB/s median replay; p95 2.536 s |
+| 256 MiB OS-warm recovery | 11.207 s | 30.90 MiB/s median replay; p95 16.234 s |
+| 1 GiB OS-warm recovery | 88.508 s | 15.65 MiB/s median replay; p95 98.862 s |
+| Steady-state churn | 17,670 operations/s | 2.219× file amplification; zero measured file growth per round |
+
+The long run makes several trends visible. Batching 256 writes delivered about
+39 times the median throughput of single-write commits while reducing WAL
+amplification from 31.69× to 1.364×. Point-read throughput fell by about 12.5
+times between an engine-hot working set and one sized at 32 times the cache.
+Four readers produced the highest measured aggregate concurrent-read rate;
+eight readers reduced both reader and writer throughput. Recovery throughput
+also declined as the WAL grew, from 42.11 MiB/s at 64 MiB to 15.65 MiB/s at
+1 GiB.
+
+Two measurements are retained as diagnostics rather than reference numbers.
+Sequential batch-16 writes moved between distinct performance phases, ranging
+from 765 to 8,278 updates/s across trials, so their aggregate median is not
+representative. Mixed-workload WAL amplification accumulated across trials and
+reset after WAL rotation; that metric has an accounting defect and is omitted
+from the table. The checkpoint p95 values likewise show substantial host or
+storage tail events. As with the smoke run, recovery is OS-cache-warm, and the
+unisolated `powersave` host makes this a diagnostic baseline rather than a
+controlled release comparison.
 
 ## Repository
 

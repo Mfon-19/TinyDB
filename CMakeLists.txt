@@ -213,7 +213,40 @@ if(BUILD_TESTING)
 endif()
 
 if(TINYDB_BUILD_BENCHMARKS)
-  add_executable(TinyDB_bench bench/bench.cpp)
+  execute_process(
+    COMMAND git rev-parse HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE TINYDB_BENCH_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  execute_process(
+    COMMAND git status --porcelain --untracked-files=normal
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE TINYDB_BENCH_GIT_STATUS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(TINYDB_BENCH_GIT_STATUS)
+    set(TINYDB_BENCH_GIT_DIRTY "true")
+  else()
+    set(TINYDB_BENCH_GIT_DIRTY "false")
+  endif()
+  if(NOT TINYDB_BENCH_GIT_COMMIT)
+    set(TINYDB_BENCH_GIT_COMMIT "unknown")
+  endif()
+
+  add_executable(
+    TinyDB_bench
+    bench/benchmark.h
+    bench/main.cpp
+    bench/support.cpp
+    bench/system_metrics.cpp
+    bench/system_metrics.h
+    bench/workloads.cpp)
   target_link_libraries(TinyDB_bench PRIVATE TinyDB::TinyDB)
+  target_compile_definitions(
+    TinyDB_bench
+    PRIVATE TINYDB_BENCH_GIT_COMMIT="${TINYDB_BENCH_GIT_COMMIT}"
+            TINYDB_BENCH_GIT_DIRTY="${TINYDB_BENCH_GIT_DIRTY}"
+            TINYDB_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
   TinyDB_apply_local_tooling(TinyDB_bench)
 endif()

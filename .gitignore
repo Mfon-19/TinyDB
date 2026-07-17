@@ -10,6 +10,7 @@
 /build-comparison/
 /cmake-build-*/
 /build-asan
+/benchmark-results/
 
 # Local CMake/editor state
 /CMakeUserPresets.json
@@ -25,3 +26,4 @@
 
 # Local bench artifacts
 /benchmark-results/
+__pycache__/
