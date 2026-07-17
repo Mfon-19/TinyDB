@@ -1,5 +1,9 @@
 # TinyDB
 
+<p align="center">
+  <img src="assets/tinydb-mascot-clean.png" alt="TinyDB pixel mascot" width="420">
+</p>
+
 TinyDB is a C++23 embedded, ordered key-value database. It provides atomic
 multi-key transactions, stable read snapshots, streaming cursors, synchronous
 crash durability, automatic recovery, and values up to 4 MiB without running a
