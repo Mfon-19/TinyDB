@@ -1,6 +1,10 @@
 # macOS metadata
 .DS_Store
 
+# Local design documents
+/doc/
+/docs/
+
 # Build outputs
 /build/
 /build-comparison/
