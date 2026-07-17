@@ -22,3 +22,6 @@
 *.gcno
 *.profraw
 *.profdata
+
+# Local bench artifacts
+/benchmark-results/

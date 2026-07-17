@@ -112,8 +112,9 @@ struct CommittedCacheStats {
 
 /*
 ** Thread-safe cache for latest committed versions. Its mutex protects the
-** dense page table and recency clock. Pin and checkpoint flags are atomic
-** because guards release outside that mutex.
+** dense page table and the intrusive evictable LRU queue. Pin and checkpoint
+** flags are atomic because guards release outside that mutex; a final release
+** briefly reacquires it to return an eligible frame to the queue.
 */
 class CommittedPageCache final {
  public:
