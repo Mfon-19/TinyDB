@@ -47,22 +47,6 @@ TEST(Contract, DatabaseStates) {
   EXPECT_EQ(tinydb::txn::StateStatus(Open, Close, 1), StatusCode::Busy);
 }
 
-TEST(Contract, TransactionStates) {
-  using enum tinydb::txn::TransactionState;
-  using tinydb::txn::CommitOutcome;
-
-  EXPECT_TRUE(tinydb::txn::CanTransition(Active, Frozen));
-  EXPECT_TRUE(tinydb::txn::CanTransition(Frozen, WritingWal));
-  EXPECT_TRUE(tinydb::txn::CanTransition(WritingWal, Durable));
-  EXPECT_TRUE(tinydb::txn::CanTransition(Durable, Published));
-  EXPECT_TRUE(tinydb::txn::CanTransition(WritingWal, Indeterminate));
-  EXPECT_FALSE(tinydb::txn::CanTransition(Durable, Aborted));
-  EXPECT_EQ(tinydb::txn::Outcome(Published), CommitOutcome::Committed);
-  EXPECT_EQ(tinydb::txn::Outcome(Aborted), CommitOutcome::DefinitelyAborted);
-  EXPECT_EQ(tinydb::txn::Outcome(Indeterminate), CommitOutcome::Indeterminate);
-  EXPECT_FALSE(tinydb::txn::Outcome(Active).has_value());
-}
-
 TEST(Contract, Limits) {
   EXPECT_EQ(tinydb::txn::ValidateKeySize(0), tinydb::StatusCode::Ok);
   EXPECT_EQ(tinydb::txn::ValidateKeySize(tinydb::MAX_KEY_BYTES), tinydb::StatusCode::Ok);

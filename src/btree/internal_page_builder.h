@@ -46,8 +46,6 @@ class InternalPageBuilder {
   // Pulls the parent separator down between two adjacent child ranges.
   void Absorb(std::string separator, InternalPageBuilder &&right);
 
-  auto FirstChild() const -> page_id_t { return first_child_; }
-
  private:
   auto Bytes() const -> std::size_t;
   auto ChooseSplitIndex() const -> std::size_t;

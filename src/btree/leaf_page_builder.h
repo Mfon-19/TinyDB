@@ -41,7 +41,6 @@ class LeafPageBuilder {
   // Appends an adjacent right range and bypasses it in the leaf chain.
   void Absorb(LeafPageBuilder &&right);
 
-  auto Records() const -> const std::vector<Record> & { return records_; }
   auto NextLeaf() const -> page_id_t { return next_leaf_; }
 
  private:

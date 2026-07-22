@@ -109,8 +109,6 @@ add_library(
   src/btree/value_storage.h
   src/cache/committed_page_cache.cpp
   src/cache/committed_page_cache.h
-  src/cache/committed_page_source.cpp
-  src/cache/committed_page_source.h
   src/checkpoint/checkpoint_manager.cpp
   src/checkpoint/checkpoint_manager.h
   src/api/database.cpp

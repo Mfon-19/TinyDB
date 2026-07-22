@@ -9,8 +9,8 @@
 #include "txn/reader_gate.h"
 #include "txn/transaction_pages.h"
 
-#include <expected>
 #include <chrono>
+#include <expected>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -18,7 +18,7 @@
 namespace tinydb::txn {
 
 auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
-                               TransactionState &transaction_state, CommitTiming *timing) -> Result<CommitInfo> {
+                               CommitTiming *timing) -> Result<CommitInfo> {
   using Clock = std::chrono::steady_clock;
   const auto prepare_started = Clock::now();
   const auto record_prepare = [&] {
@@ -30,14 +30,11 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
   if (auto status = transaction.Freeze(); !status.Ok()) {
     record_prepare();
     transaction.Abort();
-    transaction_state = TransactionState::Aborted;
     return std::unexpected(std::move(status));
   }
-  transaction_state = TransactionState::Frozen;
   if (!transaction.HasChanges()) {
     record_prepare();
     const auto &state = transaction.ResultingState();
-    transaction_state = TransactionState::Published;
     return CommitInfo{.transaction_id = state.transaction_id, .commit_lsn = state.visible_lsn};
   }
 
@@ -45,13 +42,11 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
   if (!commit_lsn) {
     record_prepare();
     transaction.Abort();
-    transaction_state = TransactionState::Aborted;
     return std::unexpected(commit_lsn.error());
   }
   if (auto status = transaction.Seal(*commit_lsn); !status.Ok()) {
     record_prepare();
     transaction.Abort();
-    transaction_state = TransactionState::Aborted;
     return std::unexpected(std::move(status));
   }
 
@@ -69,12 +64,11 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
   }
   auto state = transaction.ResultingState();
   auto retired = std::vector<page_id_t>(transaction.RetiredPageIds().begin(), transaction.RetiredPageIds().end());
-  auto committed_pages = transaction.TakePages(state.transaction_id);
+  auto committed_pages = transaction.TakePages();
   if (!committed_pages) {
     record_prepare();
     wal_->DiscardPending();
     transaction.Abort();
-    transaction_state = TransactionState::Aborted;
     return std::unexpected(committed_pages.error());
   }
   auto publication_plan =
@@ -83,7 +77,6 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
     record_prepare();
     wal_->DiscardPending();
     transaction.Abort();
-    transaction_state = TransactionState::Aborted;
     return std::unexpected(publication_plan.error());
   }
   // This object remains private through WAL synchronization. Publication may
@@ -92,7 +85,6 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
   auto published_state = std::make_shared<DatabaseState>(state);
   record_prepare();
 
-  transaction_state = TransactionState::WritingWal;
   const auto wal_started = Clock::now();
   const auto durable = wal_->Commit(state);
   if (timing != nullptr) {
@@ -101,13 +93,8 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
   if (!durable) {
     wal_->DiscardPending();
     transaction.Abort();
-    transaction_state =
-        durable.error().Code() == StatusCode::IndeterminateCommit || durable.error().Code() == StatusCode::NeedsRecovery
-            ? TransactionState::Indeterminate
-            : TransactionState::Aborted;
     return std::unexpected(durable.error());
   }
-  transaction_state = TransactionState::Durable;
   TINYDB_CHECK(durable->transaction_id == state.transaction_id && durable->commit_lsn == state.visible_lsn,
                "WAL committed a different frozen transaction");
 
@@ -129,7 +116,6 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
     cache_->Publish(std::move(*publication_plan));
     publication.Publish(std::move(published_state));
   }
-  transaction_state = TransactionState::Published;
   return CommitInfo{.transaction_id = durable->transaction_id, .commit_lsn = durable->commit_lsn};
 }
 

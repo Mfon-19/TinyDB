@@ -45,7 +45,6 @@ struct Policy {
 
 struct Stats {
   std::size_t consecutive_failures{0};
-  std::uint64_t checkpoint_lsn{0};
   bool checkpoint_requested{false};
   std::chrono::steady_clock::duration age_since_success{};
   std::optional<std::string> last_error;

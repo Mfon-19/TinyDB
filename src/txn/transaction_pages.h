@@ -62,9 +62,6 @@ class TransactionPages final : public PageSource {
   void Abort() noexcept;
 
   auto ResultingState() const -> const DatabaseState &;
-  auto MemoryUsedBytes() const -> std::size_t { return memory_used_bytes_; }
-  auto MemoryLimitBytes() const -> std::size_t { return memory_limit_bytes_; }
-  auto PrivatePageCount() const -> std::size_t { return pages_.size(); }
   auto HasChanges() const -> bool;
   auto FinalPageCount() const -> std::size_t;
   auto RetiredPageIds() const -> const std::unordered_set<page_id_t> & { return retired_page_ids_; }
@@ -73,7 +70,7 @@ class TransactionPages final : public PageSource {
 
   // Borrowed images remain stable until Abort, destruction, or TakePages.
   auto PageImages() const -> std::vector<std::pair<page_id_t, const char *>>;
-  auto TakePages(std::uint64_t transaction_id) -> Result<std::vector<cache::CommittedPageImage>>;
+  auto TakePages() -> Result<std::vector<cache::CommittedPageImage>>;
 
  private:
   struct PrivateFrame {

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "storage/page.h"
 #include <tinydb/status.h>
+#include "storage/page.h"
 
 #include <memory>
 #include <utility>
@@ -30,7 +30,7 @@ class PageHandle {
 
   PageHandle() = default;
   PageHandle(void *owner, page_id_t page_id, char *data, bool editable, Release release)
-      : owner_(owner), page_id_(page_id), data_(data), mutable_data_(data), editable_(editable), release_(release) {}
+      : owner_(owner), page_id_(page_id), data_(data), mutable_data_(editable ? data : nullptr), release_(release) {}
 
   // Immutable caches retain a frame through keepalive while release updates
   // frame-local pin accounting. No per-read wrapper allocation is required.
@@ -67,7 +67,6 @@ class PageHandle {
   page_id_t page_id_{HEADER_PAGE_ID};
   const char *data_{nullptr};
   char *mutable_data_{nullptr};
-  bool editable_{false};
   bool dirty_{false};
   Release release_{nullptr};
   std::shared_ptr<const void> keepalive_;

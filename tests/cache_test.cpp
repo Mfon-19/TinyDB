@@ -46,7 +46,6 @@ auto Image(tinydb::page_id_t page_id, std::uint64_t page_lsn) -> tinydb::cache::
   return tinydb::cache::CommittedPageImage{
       .page_id = page_id,
       .page_lsn = page_lsn,
-      .transaction_id = 1,
       .bytes = std::make_unique<tinydb::cache::PageBytes>(*encoded),
   };
 }

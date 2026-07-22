@@ -3,8 +3,6 @@
 #include <tinydb/status.h>
 #include <tinydb/transaction.h>
 
-#include "txn/state.h"
-
 #include <chrono>
 
 namespace tinydb {
@@ -49,8 +47,7 @@ class CommitCoordinator final {
   CommitCoordinator(Wal *wal, cache::CommittedPageCache *cache, ReaderGate *readers)
       : wal_(wal), cache_(cache), readers_(readers) {}
 
-  auto Commit(TransactionPages &transaction, BPlusTree &tree,
-              TransactionState &transaction_state, CommitTiming *timing = nullptr) -> Result<CommitInfo>;
+  auto Commit(TransactionPages &transaction, BPlusTree &tree, CommitTiming *timing = nullptr) -> Result<CommitInfo>;
 
  private:
   Wal *wal_;

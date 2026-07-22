@@ -7,12 +7,12 @@
 namespace tinydb {
 
 auto PageHandle::MutableData() -> char * {
-  TINYDB_CHECK(editable_, "mutable access through a read-only page handle");
+  TINYDB_CHECK(mutable_data_ != nullptr, "mutable access through a read-only page handle");
   return mutable_data_;
 }
 
 void PageHandle::MarkDirty() {
-  TINYDB_CHECK(editable_, "marking a read-only page handle dirty");
+  TINYDB_CHECK(mutable_data_ != nullptr, "marking a read-only page handle dirty");
   dirty_ = true;
 }
 
@@ -34,7 +34,6 @@ void PageHandle::Take(PageHandle &&other) noexcept {
   page_id_ = other.page_id_;
   data_ = other.data_;
   mutable_data_ = other.mutable_data_;
-  editable_ = other.editable_;
   dirty_ = other.dirty_;
   release_ = other.release_;
   keepalive_ = std::move(other.keepalive_);

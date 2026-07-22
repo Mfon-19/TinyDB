@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tinydb/status.h>
+#include "btree/page_source.h"
 #include "storage/page.h"
 
 #include <array>
@@ -14,7 +15,6 @@
 namespace tinydb {
 
 class DiskManager;
-class PageHandle;
 
 namespace cache {
 
@@ -50,7 +50,6 @@ class PageGuard final {
   auto Id() const -> page_id_t;
   auto Data() const -> std::span<const char, PAGE_SIZE>;
   auto PageLsn() const -> std::uint64_t;
-  auto TransactionId() const -> std::uint64_t;
 
   // Transfers this exact pin into the tree's generic page lease. The frame's
   // shared owner keeps old immutable bytes alive after cache replacement.
@@ -70,7 +69,6 @@ class PageGuard final {
 struct CommittedPageImage {
   page_id_t page_id{HEADER_PAGE_ID};
   std::uint64_t page_lsn{0};
-  std::uint64_t transaction_id{0};
   std::unique_ptr<PageBytes> bytes;
 };
 
@@ -104,7 +102,6 @@ struct CommittedCacheStats {
   std::size_t resident_pages{0};
   std::size_t pinned_pages{0};
   std::size_t dirty_pages{0};
-  std::uint64_t checkpoint_lsn{0};
   std::uint64_t hits{0};
   std::uint64_t misses{0};
   std::uint64_t evictions{0};
@@ -116,7 +113,7 @@ struct CommittedCacheStats {
 ** flags are atomic because guards release outside that mutex; a final release
 ** briefly reacquires it to return an eligible frame to the queue.
 */
-class CommittedPageCache final {
+class CommittedPageCache final : public PageReader {
  public:
   CommittedPageCache(DiskManager *disk, std::size_t target_bytes, std::uint64_t checkpoint_lsn);
   CommittedPageCache(const CommittedPageCache &) = delete;
@@ -124,7 +121,7 @@ class CommittedPageCache final {
   ~CommittedPageCache();
 
   // A miss validates the complete common page header before caching bytes.
-  auto Read(page_id_t page_id) -> Result<PageGuard>;
+  auto Read(page_id_t page_id) -> Result<PageHandle> override;
 
   auto PreparePublication(std::vector<CommittedPageImage> images, std::vector<page_id_t> retired,
                           page_id_t high_water_page_id) -> Result<PublicationPlan>;
@@ -138,13 +135,11 @@ class CommittedPageCache final {
   // The caller invokes this only after the database file and superblock make
   // every page through checkpoint_lsn durable.
   void MarkCheckpointed(std::uint64_t checkpoint_lsn);
-  void Trim();
-
-  auto DirtyPageIds() const -> std::vector<page_id_t>;
   auto Stats() const -> CommittedCacheStats;
 
  private:
   struct Impl;
+  auto ReadGuard(page_id_t page_id) -> Result<PageGuard>;
   std::unique_ptr<Impl> impl_;
 };
 

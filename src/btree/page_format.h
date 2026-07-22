@@ -90,12 +90,6 @@ auto RawNodeType(const char *page) -> std::uint16_t;
 // Validates the common header plus all tree-local structural invariants.
 auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status;
 
-constexpr auto AlignUp(std::size_t value, std::size_t alignment) -> std::size_t {
-  return (value + alignment - 1) & ~(alignment - 1);
-}
-
-constexpr auto AlignDown(std::size_t value, std::size_t alignment) -> std::size_t { return value & ~(alignment - 1); }
-
 // One record at or below half the usable bytes guarantees that every
 // overflowing builder has a legal split boundary. Overflow descriptors keep a
 // maximum-sized key below this bound regardless of logical value size.

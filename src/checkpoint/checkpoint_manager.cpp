@@ -148,7 +148,6 @@ auto Manager::WriteAdmissionStatus() const -> Status {
 }
 
 auto Manager::GetStats() const -> Stats {
-  const auto state = readers_->CurrentState();
   const auto cache = cache_->Stats();
   const auto wal_bytes = wal_->SizeBytes();
   auto lock = std::lock_guard(state_mutex_);
@@ -156,7 +155,6 @@ auto Manager::GetStats() const -> Stats {
       cache.dirty_pages != 0 && std::chrono::steady_clock::now() - last_success_ >= policy_.maximum_age;
   return Stats{
       .consecutive_failures = consecutive_failures_,
-      .checkpoint_lsn = state->checkpoint_lsn,
       .checkpoint_requested = consecutive_failures_ != 0 || wal_bytes >= policy_.wal_trigger_bytes ||
                               DirtyBytes(cache) >= policy_.dirty_trigger_bytes || age_expired,
       .age_since_success = std::chrono::steady_clock::now() - last_success_,

@@ -83,9 +83,6 @@ struct DatabaseStats final {
   std::chrono::nanoseconds last_publication_wait{};
   std::chrono::nanoseconds maximum_publication_wait{};
 
-  std::size_t retired_pages{0};
-  std::size_t reusable_pages{0};
-
   std::size_t consecutive_checkpoint_failures{0};
   bool checkpoint_requested{false};
   std::chrono::milliseconds checkpoint_age{};

@@ -7,7 +7,6 @@
 
 #include "btree/b_plus_tree.h"
 #include "cache/committed_page_cache.h"
-#include "cache/committed_page_source.h"
 #include "checkpoint/checkpoint_manager.h"
 #include "io/file_io.h"
 #include "io/syscalls.h"
@@ -207,19 +206,16 @@ class DatabaseCore final {
     std::uint64_t committed_writes{0};
     txn::CommitTiming last_commit{};
     std::chrono::nanoseconds maximum_publication_wait{};
-    std::vector<storage::FreeExtent> free_extents;
   };
 
   DatabaseCore(std::filesystem::path database_path, UniqueFd database_lock, std::unique_ptr<DiskManager> database_file,
-               std::unique_ptr<cache::CommittedPageCache> page_cache,
-               std::unique_ptr<cache::CommittedPageSource> page_source, std::unique_ptr<txn::ReaderGate> reader_gate,
+               std::unique_ptr<cache::CommittedPageCache> page_cache, std::unique_ptr<txn::ReaderGate> reader_gate,
                std::unique_ptr<Wal> write_ahead_log, Options database_options)
       : path(std::move(database_path)),
         options(std::move(database_options)),
         lock_fd(std::move(database_lock)),
         disk(std::move(database_file)),
         cache(std::move(page_cache)),
-        pages(std::move(page_source)),
         readers(std::move(reader_gate)),
         wal(std::move(write_ahead_log)),
         checkpoints(std::make_unique<checkpoint::Manager>(disk.get(), cache.get(), readers.get(), wal.get(),
@@ -277,11 +273,10 @@ class DatabaseCore final {
     return MaintenancePermit(this);
   }
 
-  auto Commit(txn::TransactionPages &transaction, BPlusTree &tree,
-              txn::TransactionState &transaction_state) -> Result<CommitInfo> {
+  auto Commit(txn::TransactionPages &transaction, BPlusTree &tree) -> Result<CommitInfo> {
     auto coordinator = txn::CommitCoordinator(wal.get(), cache.get(), readers.get());
     auto timing = txn::CommitTiming{};
-    auto result = coordinator.Commit(transaction, tree, transaction_state, &timing);
+    auto result = coordinator.Commit(transaction, tree, &timing);
     {
       auto lock = std::lock_guard(operational_stats_mutex);
       ++operational_stats.write_attempts;
@@ -290,7 +285,6 @@ class DatabaseCore final {
           std::max(operational_stats.maximum_publication_wait, timing.publication_wait);
       if (result) {
         ++operational_stats.committed_writes;
-        operational_stats.free_extents = transaction.FreeExtents();
       }
     }
     if (!result && (result.error().Code() == StatusCode::IndeterminateCommit ||
@@ -336,24 +330,6 @@ class DatabaseCore final {
   }
 
   /*
-  ** Required state: Open has finished recovery and no caller can yet observe
-  ** this core. Validate every reachable tree and allocator page without
-  ** publishing, checkpointing, or changing lifecycle state.
-  */
-  auto CheckIntegrity() -> Status {
-    auto snapshot = txn::ReadSnapshot::Begin(readers.get(), pages.get());
-    auto verified = verify::Snapshot(pages.get(), snapshot.State(), options.max_write_transaction_bytes);
-    if (!verified) {
-      return verified.error();
-    }
-    if (verified->report.Ok()) {
-      auto lock = std::lock_guard(operational_stats_mutex);
-      operational_stats.free_extents = verified->free_extents;
-    }
-    return verify::StatusFrom(*verified);
-  }
-
-  /*
   ** Verify holds an ordinary read snapshot, so publication waits while the
   ** audit follows cross-page references.  It neither takes the writer permit
   ** nor invokes checkpointing.  Corruption is returned in the report; only an
@@ -364,13 +340,8 @@ class DatabaseCore final {
     if (!admission) {
       return std::unexpected(admission.error());
     }
-    auto snapshot = txn::ReadSnapshot::Begin(readers.get(), pages.get());
-    auto verified =
-        verify::Snapshot(pages.get(), snapshot.State(), options.max_write_transaction_bytes, verify_options);
-    if (!verified) {
-      return std::unexpected(verified.error());
-    }
-    return std::move(verified->report);
+    auto snapshot = txn::ReadSnapshot::Begin(readers.get(), cache.get());
+    return verify::Snapshot(cache.get(), snapshot.State(), options.max_write_transaction_bytes, verify_options);
   }
 
   /*
@@ -426,15 +397,6 @@ class DatabaseCore final {
     if (reader_stats.oldest_reader_age) {
       result.oldest_reader_age = std::chrono::duration_cast<std::chrono::milliseconds>(*reader_stats.oldest_reader_age);
     }
-    for (const auto &extent : operation_stats.free_extents) {
-      auto *const destination =
-          extent.retire_lsn <= state->checkpoint_lsn ? &result.reusable_pages : &result.retired_pages;
-      if (extent.page_count > std::numeric_limits<std::size_t>::max() - *destination) {
-        *destination = std::numeric_limits<std::size_t>::max();
-      } else {
-        *destination += static_cast<std::size_t>(extent.page_count);
-      }
-    }
     return result;
   }
 
@@ -468,7 +430,6 @@ class DatabaseCore final {
   void ReleaseResources() noexcept {
     checkpoints.reset();
     readers.reset();
-    pages.reset();
     cache.reset();
     disk.reset();
     wal.reset();
@@ -498,7 +459,6 @@ class DatabaseCore final {
   UniqueFd lock_fd;
   std::unique_ptr<DiskManager> disk;
   std::unique_ptr<cache::CommittedPageCache> cache;
-  std::unique_ptr<cache::CommittedPageSource> pages;
   std::unique_ptr<txn::ReaderGate> readers;
   std::unique_ptr<Wal> wal;
   std::unique_ptr<checkpoint::Manager> checkpoints;
@@ -608,7 +568,6 @@ struct WriteTransaction::Impl final {
       return;
     }
     transaction->Abort();
-    state = txn::TransactionState::Aborted;
     Release();
   }
 
@@ -616,7 +575,6 @@ struct WriteTransaction::Impl final {
   std::unique_lock<std::mutex> writer;
   std::unique_ptr<txn::TransactionPages> transaction;
   std::unique_ptr<BPlusTree> tree;
-  txn::TransactionState state{txn::TransactionState::Active};
   bool active{true};
 };
 
@@ -744,7 +702,7 @@ auto WriteTransaction::Commit() && -> Result<CommitInfo> {
   if (impl_ == nullptr || !impl_->active) {
     return std::unexpected(Status::Closed("Commit on an inactive write transaction"));
   }
-  auto result = impl_->core->Commit(*impl_->transaction, *impl_->tree, impl_->state);
+  auto result = impl_->core->Commit(*impl_->transaction, *impl_->tree);
   impl_->Release();
   return result;
 }
@@ -790,7 +748,6 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
   }
   auto disk = std::make_unique<DiskManager>(*std::move(disk_result));
   auto cache = std::make_unique<cache::CommittedPageCache>(disk.get(), options.page_cache_bytes, disk->CheckpointLsn());
-  auto pages = std::make_unique<cache::CommittedPageSource>(cache.get());
   auto readers = std::make_unique<txn::ReaderGate>(InitialState(*disk));
   auto wal_result = Wal::Open(wal_path, disk->Uuid(), disk->TransactionId() + 1, disk->CheckpointLsn() + 1,
                               options.wal_segment_bytes);
@@ -799,7 +756,7 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
   }
   auto wal = std::make_unique<Wal>(*std::move(wal_result));
   auto core = std::make_shared<detail::DatabaseCore>(path, std::move(*lock), std::move(disk), std::move(cache),
-                                                     std::move(pages), std::move(readers), std::move(wal), options);
+                                                     std::move(readers), std::move(wal), options);
   auto database = Database(std::make_unique<Impl>(core));
 
   // Bootstrap allocates the first root through the same public write path as
@@ -813,9 +770,6 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
     if (!committed) {
       return std::unexpected(committed.error());
     }
-  }
-  if (auto status = core->CheckIntegrity(); !status.Ok()) {
-    return std::unexpected(std::move(status));
   }
   return database;
 }
@@ -840,7 +794,7 @@ auto Database::BeginRead() -> Result<ReadTransaction> {
   if (auto status = LifecycleError(core->lifecycle, txn::DatabaseOperation::Read); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  auto snapshot = txn::ReadSnapshot::Begin(core->readers.get(), core->pages.get());
+  auto snapshot = txn::ReadSnapshot::Begin(core->readers.get(), core->cache.get());
   auto transaction = std::make_unique<ReadTransaction::Impl>(core, std::move(snapshot));
   ++core->active_transactions;
   return ReadTransaction(std::move(transaction));
@@ -895,7 +849,7 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
     return std::unexpected(std::move(status));
   }
   const auto base = core->readers->CurrentState();
-  auto transaction = txn::TransactionPages::Begin(core->pages.get(), *base, core->options.max_write_transaction_bytes);
+  auto transaction = txn::TransactionPages::Begin(core->cache.get(), *base, core->options.max_write_transaction_bytes);
   if (!transaction) {
     return std::unexpected(transaction.error());
   }

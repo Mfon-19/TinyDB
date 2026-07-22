@@ -458,7 +458,7 @@ auto TransactionPages::PageImages() const -> std::vector<std::pair<page_id_t, co
   return result;
 }
 
-auto TransactionPages::TakePages(std::uint64_t transaction_id) -> Result<std::vector<cache::CommittedPageImage>> {
+auto TransactionPages::TakePages() -> Result<std::vector<cache::CommittedPageImage>> {
   TINYDB_CHECK(sealed_, "taking transaction pages before seal");
   RequireUnpinned();
   auto result = std::vector<cache::CommittedPageImage>{};
@@ -476,7 +476,6 @@ auto TransactionPages::TakePages(std::uint64_t transaction_id) -> Result<std::ve
     result.push_back(cache::CommittedPageImage{
         .page_id = page_id,
         .page_lsn = header->page_lsn,
-        .transaction_id = transaction_id,
         .bytes = std::move(page->bytes),
     });
   }

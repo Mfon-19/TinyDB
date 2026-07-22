@@ -84,11 +84,6 @@ auto SnapshotToken::State() const -> const DatabaseState & {
   return *lease_->state;
 }
 
-auto SnapshotToken::SharedState() const -> std::shared_ptr<const DatabaseState> {
-  TINYDB_CHECK(lease_ != nullptr, "reading an empty snapshot token");
-  return lease_->state;
-}
-
 ReaderGate::ReaderGate(std::shared_ptr<const DatabaseState> initial_state)
     : control_(std::make_shared<ReaderGateControl>()) {
   TINYDB_CHECK(initial_state != nullptr, "reader gate requires an initial database state");
@@ -159,11 +154,6 @@ auto CheckpointCaptureGuard::CurrentState() const -> std::shared_ptr<const Datab
   TINYDB_CHECK(control_ != nullptr && publication_lock_.owns_lock(), "reading an empty checkpoint capture guard");
   auto lock = std::lock_guard(control_->mutex);
   return control_->state;
-}
-
-void CheckpointCaptureGuard::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
-  TINYDB_CHECK(control_ != nullptr && publication_lock_.owns_lock(), "advancing through an empty checkpoint guard");
-  AdvanceCheckpointState(control_, checkpoint_lsn);
 }
 
 PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) noexcept

@@ -42,7 +42,6 @@ class SnapshotToken final {
   SnapshotToken() = default;
 
   auto State() const -> const DatabaseState &;
-  auto SharedState() const -> std::shared_ptr<const DatabaseState>;
   explicit operator bool() const noexcept { return lease_ != nullptr; }
 
  private:
@@ -90,7 +89,6 @@ class CheckpointCaptureGuard final {
   auto operator=(CheckpointCaptureGuard &&) -> CheckpointCaptureGuard & = delete;
 
   auto CurrentState() const -> std::shared_ptr<const DatabaseState>;
-  void AdvanceCheckpoint(std::uint64_t checkpoint_lsn);
 
  private:
   explicit CheckpointCaptureGuard(std::shared_ptr<ReaderGateControl> control);

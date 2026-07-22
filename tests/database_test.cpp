@@ -181,10 +181,10 @@ TEST(Database, LargeValues) {
   ASSERT_TRUE(database.Put("large", large).Ok());
   EXPECT_EQ(database.Get("large").value(), large);
   ASSERT_TRUE(database.Put("large", "small").Ok());
-  EXPECT_GT(database.Stats()->retired_pages, 0U);
+  EXPECT_GT(database.Verify()->retired_pages, 0U);
   ASSERT_TRUE(database.Checkpoint().Ok());
-  EXPECT_EQ(database.Stats()->retired_pages, 0U);
-  EXPECT_GT(database.Stats()->reusable_pages, 0U);
+  EXPECT_EQ(database.Verify()->retired_pages, 0U);
+  EXPECT_GT(database.Verify()->reusable_pages, 0U);
   Cleanup(path);
 }
 
@@ -339,8 +339,13 @@ TEST(Database, Corruption) {
   file.seekp(static_cast<std::streamoff>(tinydb::FIRST_DATA_PAGE_ID * tinydb::PAGE_SIZE));
   file.put('\0');
   file.close();
-  const auto opened = tinydb::Database::Open(path);
-  ASSERT_FALSE(opened.has_value());
-  EXPECT_EQ(opened.error().Code(), tinydb::StatusCode::Corruption);
+  auto opened = tinydb::Database::Open(path);
+  ASSERT_TRUE(opened.has_value());
+  const auto value = opened->Get("key");
+  ASSERT_FALSE(value.has_value());
+  EXPECT_EQ(value.error().Code(), tinydb::StatusCode::Corruption);
+  const auto report = opened->Verify();
+  ASSERT_TRUE(report.has_value());
+  EXPECT_FALSE(report->Ok());
   Cleanup(path);
 }
