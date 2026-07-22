@@ -19,6 +19,7 @@ DIRECT_IO_BENCH := $(DIRECT_IO_BUILD)/TinyDB_bench
 
 BENCH_OUTPUT ?=
 COMPARISON_OUTPUT ?=
+DIRECT_CACHE_MIB ?=
 BENCH_ARGS ?=
 
 .PHONY: help bench bench-compare bench-build bench-direct-build
@@ -30,6 +31,7 @@ help:
 	@echo "  make bench-compare  Compare the current tree with direct I/O"
 	@echo
 	@echo "Use BENCH_ARGS='--family reads' or BENCH_ARGS='--filter cold' for a focused run."
+	@echo "Use DIRECT_CACHE_MIB=32 to override only direct I/O's cache in a comparison."
 	@echo "The latest default result replaces its predecessor; set BENCH_OUTPUT or COMPARISON_OUTPUT to archive one."
 	@echo "Override DIRECT_IO_REVISION or JOBS as needed."
 
@@ -39,6 +41,7 @@ bench: bench-build
 
 bench-compare: bench-build bench-direct-build
 	@$(PYTHON) bench/runner.py compare "$(CURRENT_BENCH)" "$(DIRECT_IO_BENCH)" \
+		$(if $(strip $(DIRECT_CACHE_MIB)),--candidate-cache-mib "$(DIRECT_CACHE_MIB)") \
 		$(if $(strip $(COMPARISON_OUTPUT)),--output "$(COMPARISON_OUTPUT)") $(BENCH_ARGS)
 
 bench-build:

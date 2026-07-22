@@ -80,6 +80,13 @@ T_CRITICAL_95 = {
 }
 
 
+def positive_integer(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -90,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     compare = subparsers.add_parser("compare", help="run a paired A/B comparison")
     compare.add_argument("baseline", type=pathlib.Path)
     compare.add_argument("candidate", type=pathlib.Path)
+    compare.add_argument("--candidate-cache-mib", type=positive_integer)
 
     for subparser in (run, compare):
         subparser.add_argument("--output", type=pathlib.Path)
@@ -355,6 +363,7 @@ def run_trial(
     fixture: pathlib.Path,
     manifest: dict[str, object],
     root: pathlib.Path,
+    page_cache_bytes: int | None,
 ) -> tuple[list[dict[str, str]], dict[str, object], dict[str, object]]:
     destination = root / "runs" / variant / scenario / f"trial-{trial:02d}"
     working_directory = root / "working" / variant / scenario / f"trial-{trial:02d}"
@@ -376,6 +385,8 @@ def run_trial(
         "--output",
         str(destination),
     ]
+    if page_cache_bytes is not None:
+        command += ["--page-cache-bytes", str(page_cache_bytes)]
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
     rows = read_child_rows(destination)
     for row in rows:
@@ -664,9 +675,20 @@ def write_report(
     comparisons: list[dict[str, object]],
     scenario_timings: list[dict[str, object]],
     elapsed: float,
+    candidate_cache_bytes: int | None,
 ) -> None:
     lines = ["# TinyDB benchmark report", "", f"Mode: `{mode}`  ", f"Wall time: {elapsed / 60.0:.1f} minutes", ""]
     specs = {row["scenario"]: row for row in matrix}
+    declared_cache_bytes = sorted({int(row["cache_bytes"]) for row in matrix})
+    declared_cache = ", ".join(format_value(value, "bytes") for value in declared_cache_bytes)
+    if mode == "compare" and candidate_cache_bytes is not None:
+        lines += [
+            f"Page cache: baseline {declared_cache} (scenario setting); "
+            f"candidate {format_value(candidate_cache_bytes, 'bytes')} (override)",
+            "",
+        ]
+    else:
+        lines += [f"Page cache: {declared_cache} (scenario setting)", ""]
     if mode == "run":
         lookup = {(str(row["scenario"]), str(row["metric"])): row for row in standalone}
         lines += ["## Primary results", "", "| Scenario | Median | p95 | Trials |", "|---|---:|---:|---:|"]
@@ -854,6 +876,11 @@ def main() -> None:
     started = time.monotonic()
     managed_output = ManagedOutput(default_output()) if args.output is None else None
     root = managed_output.path if managed_output is not None else args.output
+    candidate_cache_bytes = (
+        args.candidate_cache_mib << 20
+        if args.mode == "compare" and args.candidate_cache_mib is not None
+        else None
+    )
     if managed_output is None:
         root.mkdir(parents=True, exist_ok=False)
 
@@ -913,7 +940,15 @@ def main() -> None:
             for variant in order:
                 run_started = time.monotonic()
                 emitted, _, metadata = run_trial(
-                    binaries[variant], variant, scenario, trial, seed, fixture, manifest, root
+                    binaries[variant],
+                    variant,
+                    scenario,
+                    trial,
+                    seed,
+                    fixture,
+                    manifest,
+                    root,
+                    candidate_cache_bytes if variant == "candidate" else None,
                 )
                 trial_record["runs"].append(
                     {
@@ -945,7 +980,16 @@ def main() -> None:
         comparisons = write_comparison(root, trial_rows, matrix)
 
     elapsed = time.monotonic() - started
-    write_report(root, args.mode, matrix, standalone, comparisons, scenario_timings, elapsed)
+    write_report(
+        root,
+        args.mode,
+        matrix,
+        standalone,
+        comparisons,
+        scenario_timings,
+        elapsed,
+        candidate_cache_bytes,
+    )
     for variant, metadata in child_metadata.items():
         artifacts[variant]["reported_build"] = {
             field: metadata[field]
@@ -959,9 +1003,10 @@ def main() -> None:
             )
         }
     metadata = {
-        "suite_version": 6,
+        "suite_version": 7,
         "mode": args.mode,
         "seed": args.seed,
+        "candidate_page_cache_override_bytes": candidate_cache_bytes,
         "elapsed_seconds": elapsed,
         "binaries": artifacts,
         "system": next(iter(child_metadata.values()))["system"],

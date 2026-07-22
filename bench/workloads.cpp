@@ -309,10 +309,10 @@ auto MakeOrder(const Scenario &scenario, std::uint64_t seed) -> std::vector<std:
 }
 
 auto ObserveWrite(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data,
-                  std::uint64_t seed) -> WriteObservation {
+                  const Options &options, std::uint64_t seed) -> WriteObservation {
   PreparePreOpenCacheState(scenario, path);
   const auto memory_before_open = ObserveProcessMemory();
-  auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open write benchmark");
+  auto database = Take(Database::Open(path, options), "Open write benchmark");
   const auto order = MakeOrder(scenario, seed);
   const auto before = Take(database.Stats(), "Stats before writes");
   auto latencies = std::vector<double>{};
@@ -670,11 +670,11 @@ auto PrepareCheckpointWrites(Database &database, const Scenario &scenario, const
   return rows;
 }
 
-auto ObserveCheckpoint(const std::filesystem::path &path, const Scenario &scenario,
-                       const Dataset &data) -> LifecycleObservation {
+auto ObserveCheckpoint(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data,
+                       const Options &options) -> LifecycleObservation {
   PreparePreOpenCacheState(scenario, path);
   const auto memory_before_open = ObserveProcessMemory();
-  auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open checkpoint benchmark");
+  auto database = Take(Database::Open(path, options), "Open checkpoint benchmark");
   const auto updated_rows = PrepareCheckpointWrites(database, scenario, data);
   const auto before = Take(database.Stats(), "Stats before checkpoint");
   if (before.dirty_bytes == 0) {
@@ -721,14 +721,14 @@ void WaitForWriter(pid_t child) {
   }
 }
 
-auto ObserveRecovery(const std::filesystem::path &path, const Scenario &scenario,
-                     const Dataset &data) -> LifecycleObservation {
+auto ObserveRecovery(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data,
+                     const Options &options) -> LifecycleObservation {
   PreparePreOpenCacheState(scenario, path);
   const auto bytes = PersistentBytes(path);
   const auto memory_before_open = ObserveProcessMemory();
   const auto resources_started = StartResources();
   const auto started = Clock::now();
-  auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open measured recovery");
+  auto database = Take(Database::Open(path, options), "Open measured recovery");
   const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
   const auto stats = Take(database.Stats(), "Stats after recovery");
   auto resources = FinishResources(resources_started, memory_before_open);
@@ -750,14 +750,14 @@ auto ObserveRecovery(const std::filesystem::path &path, const Scenario &scenario
 }
 
 auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data,
-                   const std::vector<std::size_t> &random_plan,
+                   const Options &options, const std::vector<std::size_t> &random_plan,
                    std::uint64_t expected_scan_digest) -> IoReadObservation {
   const auto before_open_residency = DropAndRequireCold(path, "pre-open");
   const auto memory_before_open = ObserveProcessMemory();
   const auto process_io_before = ObserveProcessIo();
   const auto open_io_before = ObserveProcessIo();
   const auto open_started = Clock::now();
-  auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open cold-I/O benchmark");
+  auto database = Take(Database::Open(path, options), "Open cold-I/O benchmark");
   const auto open_seconds = std::chrono::duration<double>(Clock::now() - open_started).count();
   DatabaseTestAccess::WaitForReadQuiescence(database);
   const auto open_io = SubtractProcessIo(ObserveProcessIo(), open_io_before);
@@ -878,10 +878,10 @@ auto ChurnRound(Database &database, const Scenario &scenario, const Dataset &dat
 }
 
 void RunChurnTrial(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data, Results &results,
-                   std::size_t trial) {
+                   const Options &options, std::size_t trial) {
   PreparePreOpenCacheState(scenario, path);
   const auto memory_before_open = ObserveProcessMemory();
-  auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open churn benchmark");
+  auto database = Take(Database::Open(path, options), "Open churn benchmark");
   for (std::size_t round = 0; round < scenario.churn_warmup_rounds; ++round) {
     (void)ChurnRound(database, scenario, data, round % 2U == 0);
   }
@@ -1064,15 +1064,17 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
   }
   const auto trial = config.trial_index;
   const auto data = MakeDataset(scenario.rows, scenario.key_bytes, scenario.value_bytes);
+  const auto options = BenchmarkOptions(scenario, config.page_cache_bytes);
 
   switch (scenario.workload) {
     case Workload::Put:
-      AddWriteResults(scenario, results, trial, ObserveWrite(path, scenario, data, config.seed ^ 0x5752495445ULL));
+      AddWriteResults(scenario, results, trial,
+                      ObserveWrite(path, scenario, data, options, config.seed ^ 0x5752495445ULL));
       return;
     case Workload::PointRead: {
       PreparePreOpenCacheState(scenario, path);
       const auto memory_before_open = ObserveProcessMemory();
-      auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open point-read trial");
+      auto database = Take(Database::Open(path, options), "Open point-read trial");
       PrimeEngineReadState(database, scenario, data);
       const auto plan = MakeReadPlan(scenario, config.seed ^ 0x52454144ULL);
       if (scenario.warmup != std::chrono::milliseconds::zero()) {
@@ -1087,7 +1089,7 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
     case Workload::Scan: {
       PreparePreOpenCacheState(scenario, path);
       const auto memory_before_open = ObserveProcessMemory();
-      auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open scan trial");
+      auto database = Take(Database::Open(path, options), "Open scan trial");
       PrimeEngineReadState(database, scenario, data);
       const auto plan = MakeScanPlan(scenario, data, config.seed ^ 0x5343414EULL);
       if (scenario.warmup != std::chrono::milliseconds::zero()) {
@@ -1102,7 +1104,7 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
     case Workload::Mixed: {
       PreparePreOpenCacheState(scenario, path);
       const auto memory_before_open = ObserveProcessMemory();
-      auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open mixed trial");
+      auto database = Take(Database::Open(path, options), "Open mixed trial");
       PrimeEngineReadState(database, scenario, data);
       auto states = std::vector<MixedValueState>(scenario.rows, MixedValueState::First);
       for (std::size_t round = 0; round < scenario.preparation_rounds; ++round) {
@@ -1119,7 +1121,7 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
     case Workload::Concurrent: {
       PreparePreOpenCacheState(scenario, path);
       const auto memory_before_open = ObserveProcessMemory();
-      auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open concurrent trial");
+      auto database = Take(Database::Open(path, options), "Open concurrent trial");
       PrimeEngineReadState(database, scenario, data);
       for (std::size_t round = 0; round < scenario.preparation_rounds; ++round) {
         (void)ObserveConcurrent(database, scenario, data, config.seed ^ round, memory_before_open);
@@ -1138,13 +1140,13 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
       return;
     }
     case Workload::Checkpoint:
-      AddLifecycleResults(scenario, results, trial, ObserveCheckpoint(path, scenario, data), false);
+      AddLifecycleResults(scenario, results, trial, ObserveCheckpoint(path, scenario, data, options), false);
       return;
     case Workload::Recovery:
-      AddLifecycleResults(scenario, results, trial, ObserveRecovery(path, scenario, data), true);
+      AddLifecycleResults(scenario, results, trial, ObserveRecovery(path, scenario, data, options), true);
       return;
     case Workload::Churn:
-      RunChurnTrial(path, scenario, data, results, trial);
+      RunChurnTrial(path, scenario, data, results, options, trial);
       return;
     case Workload::IoRead: {
       auto random_plan = std::vector<std::size_t>{};
@@ -1161,7 +1163,7 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
         }
       }
       AddIoReadResults(scenario, results, trial,
-                       ObserveIoRead(path, scenario, data, random_plan, expected_scan_digest));
+                       ObserveIoRead(path, scenario, data, options, random_plan, expected_scan_digest));
       return;
     }
   }

@@ -100,6 +100,7 @@ struct Config final {
   std::optional<std::string> family;
   std::optional<std::string> filter;
   std::optional<std::string> scenario;
+  std::optional<std::size_t> page_cache_bytes;
   std::string fixture_id;
   std::uint64_t seed{0x54494E594442ULL};
   std::size_t trial_index{0};
@@ -167,7 +168,7 @@ auto MakeKey(std::size_t row, std::size_t bytes) -> Bytes;
 auto MakeValue(std::size_t row, std::size_t bytes, std::size_t generation) -> Bytes;
 auto DatabaseFileBytes(const std::filesystem::path &path) -> std::uint64_t;
 auto PersistentBytes(const std::filesystem::path &path) -> std::uint64_t;
-auto BenchmarkOptions(const Scenario &scenario) -> Options;
+auto BenchmarkOptions(const Scenario &scenario, std::optional<std::size_t> page_cache_bytes = std::nullopt) -> Options;
 void StoreDataset(Database &database, const Dataset &data, bool second, const Scenario &scenario);
 auto ValueDigest(BytesView value) -> std::uint64_t;
 

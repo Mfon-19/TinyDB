@@ -26,9 +26,15 @@ Named archives and focused investigations use Make variables:
 ```sh
 make bench BENCH_OUTPUT=/tmp/buffered-results
 make bench-compare COMPARISON_OUTPUT=/tmp/buffered-vs-direct
+make bench-compare DIRECT_CACHE_MIB=32
 make bench-compare BENCH_ARGS='--family cold_io'
 make bench BENCH_ARGS='--filter checkpoint'
 ```
+
+`DIRECT_CACHE_MIB` changes only the direct-I/O candidate's page cache. The
+buffered baseline, fixture construction, workload sizes, and scenario matrix
+retain their declared 8 MiB setting, which makes cache-size experiments
+comparable.
 
 An explicitly named output is never replaced; choose a new path or remove the
 old archive deliberately.

@@ -302,7 +302,8 @@ void Usage() {
       "usage: TinyDB_bench --list [--family NAME] [--filter TEXT]\n"
       "       TinyDB_bench --scenario NAME --build-fixture DATABASE\n"
       "       TinyDB_bench --scenario NAME --run-trial DATABASE --fixture-id SHA256\n"
-      "                    --trial-index N --seed N --output PATH\n");
+      "                    --trial-index N --seed N --output PATH\n"
+      "                    [--page-cache-bytes BYTES]\n");
 }
 
 auto JsonEscape(std::string_view value) -> std::string {
@@ -435,6 +436,11 @@ auto ParseConfig(int argc, char **argv) -> Config {
       config.fixture_id = value;
     } else if (flag == "--trial-index") {
       config.trial_index = AsSize(ParseUnsigned(value, flag), flag);
+    } else if (flag == "--page-cache-bytes") {
+      config.page_cache_bytes = AsSize(ParseUnsigned(value, flag), flag);
+      if (*config.page_cache_bytes == 0) {
+        Fail("--page-cache-bytes must be greater than zero");
+      }
     } else if (flag == "--seed") {
       config.seed = ParseUnsigned(value, flag);
     } else {
@@ -447,6 +453,9 @@ auto ParseConfig(int argc, char **argv) -> Config {
   }
   if (config.mode == BenchmarkMode::RunTrial && (config.fixture_id.empty() || config.output.empty())) {
     Fail("--run-trial requires --fixture-id and --output");
+  }
+  if (config.page_cache_bytes && config.mode != BenchmarkMode::RunTrial) {
+    Fail("--page-cache-bytes requires --run-trial");
   }
   return config;
 }
@@ -551,7 +560,7 @@ void WriteMetadata(const Config &config, const Scenario &scenario, const std::fi
     Fail("cannot open metadata.json");
   }
   output << "{\n"
-         << "  \"suite_version\": 6,\n"
+         << "  \"suite_version\": 7,\n"
          << "  \"trial_seed\": " << config.seed << ",\n"
          << "  \"trial\": " << config.trial_index << ",\n"
          << "  \"fixture_id\": \"" << JsonEscape(config.fixture_id) << "\",\n"
@@ -581,9 +590,9 @@ void WriteMetadata(const Config &config, const Scenario &scenario, const std::fi
          << (statvfs_ok ? static_cast<std::uint64_t>(filesystem.f_bavail) * filesystem.f_frsize : 0) << "\n"
          << "  },\n"
          << "  \"scenario\": {\"name\": \"" << JsonEscape(scenario.name) << "\", \"family\": \""
-         << JsonEscape(scenario.family) << "\", \"cache_condition\": \""
-         << CacheConditionName(scenario.cache_condition) << "\", \"rows\": " << scenario.rows
-         << ", \"cache_bytes\": " << scenario.cache_bytes << "},\n"
+         << JsonEscape(scenario.family) << "\", \"cache_condition\": \"" << CacheConditionName(scenario.cache_condition)
+         << "\", \"rows\": " << scenario.rows << ", \"cache_bytes\": " << scenario.cache_bytes
+         << ", \"effective_cache_bytes\": " << config.page_cache_bytes.value_or(scenario.cache_bytes) << "},\n"
          << "  \"arguments\": [";
   for (std::size_t index = 0; index < config.arguments.size(); ++index) {
     output << (index == 0 ? "" : ", ") << '"' << JsonEscape(config.arguments[index]) << '"';
@@ -657,9 +666,9 @@ auto PersistentBytes(const std::filesystem::path &path) -> std::uint64_t {
   return bytes;
 }
 
-auto BenchmarkOptions(const Scenario &scenario) -> Options {
+auto BenchmarkOptions(const Scenario &scenario, std::optional<std::size_t> page_cache_bytes) -> Options {
   auto options = Options{};
-  options.page_cache_bytes = scenario.cache_bytes;
+  options.page_cache_bytes = page_cache_bytes.value_or(scenario.cache_bytes);
   const auto transaction_payload =
       CheckedMultiply(scenario.batch, scenario.key_bytes + scenario.value_bytes, "transaction payload");
   options.max_write_transaction_bytes = std::max<std::size_t>(32U << 20U, transaction_payload * 3U);

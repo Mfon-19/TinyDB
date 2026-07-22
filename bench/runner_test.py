@@ -30,6 +30,11 @@ def sample(variant: str, value: float = 1.0, **changes: str) -> dict[str, str]:
 
 
 class RunnerTest(unittest.TestCase):
+    def test_positive_integer(self) -> None:
+        self.assertEqual(target.positive_integer("16"), 16)
+        with self.assertRaises(target.argparse.ArgumentTypeError):
+            target.positive_integer("0")
+
     def test_managed_output_replaces_only_a_completed_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             destination = pathlib.Path(directory) / "latest"
