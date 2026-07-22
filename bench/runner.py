@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
-import datetime as dt
 import errno
 import fcntl
 import hashlib
@@ -19,6 +19,7 @@ import shutil
 import statistics
 import struct
 import subprocess
+import tempfile
 import time
 from collections import defaultdict
 from typing import Iterable
@@ -792,16 +793,69 @@ def estimate_fixture_bytes(matrix: list[dict[str, str]]) -> int:
     return total + 2 * maximum + (512 << 20)
 
 
-def default_output(mode: str) -> pathlib.Path:
-    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return pathlib.Path("benchmark-results") / f"{mode}-{timestamp}"
+def default_output() -> pathlib.Path:
+    return pathlib.Path(tempfile.gettempdir()) / "tinydb-benchmark-latest"
+
+
+def rebase_output_paths(value: object, source: pathlib.Path, destination: pathlib.Path) -> object:
+    """Rewrite paths recorded while a managed result lived in its staging directory."""
+
+    source_text = os.fspath(source)
+    if isinstance(value, str):
+        if value == source_text or value.startswith(source_text + os.sep):
+            return os.fspath(destination) + value[len(source_text) :]
+        return value
+    if isinstance(value, list):
+        return [rebase_output_paths(item, source, destination) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: rebase_output_paths(item, source, destination) for key, item in value.items()
+        }
+    return value
+
+
+class ManagedOutput:
+    """Build a default result beside its predecessor, then replace it on success."""
+
+    def __init__(self, destination: pathlib.Path):
+        self.destination = destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self.path = pathlib.Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
+        self.active = True
+        atexit.register(self.cleanup)
+
+    def cleanup(self) -> None:
+        if self.active:
+            shutil.rmtree(self.path, ignore_errors=True)
+            self.active = False
+
+    def publish(self) -> pathlib.Path:
+        for metadata_path in self.path.rglob("*.json"):
+            metadata = json.loads(metadata_path.read_text())
+            metadata = rebase_output_paths(metadata, self.path, self.destination)
+            metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+        if self.destination.exists():
+            if (
+                self.destination.is_symlink()
+                or not self.destination.is_dir()
+                or not (self.destination / "report.md").is_file()
+                or not (self.destination / "metadata.json").is_file()
+            ):
+                raise SystemExit(f"refusing to replace non-benchmark output: {self.destination}")
+            shutil.rmtree(self.destination)
+        self.path.rename(self.destination)
+        fsync_directory(self.destination.parent)
+        self.active = False
+        return self.destination
 
 
 def main() -> None:
     args = parse_args()
     started = time.monotonic()
-    root = args.output or default_output(args.mode)
-    root.mkdir(parents=True, exist_ok=False)
+    managed_output = ManagedOutput(default_output()) if args.output is None else None
+    root = managed_output.path if managed_output is not None else args.output
+    if managed_output is None:
+        root.mkdir(parents=True, exist_ok=False)
 
     binaries: dict[str, pathlib.Path] = {}
     artifacts: dict[str, dict[str, object]] = {}
@@ -816,8 +870,12 @@ def main() -> None:
     if any(candidate != matrix for candidate in matrices.values()):
         raise SystemExit("engine revisions expose different benchmark matrices")
     required_free = estimate_fixture_bytes(matrix)
-    if shutil.disk_usage(root).free < required_free:
-        raise SystemExit(f"benchmark needs approximately {required_free / (1 << 30):.1f} GiB free")
+    available_free = shutil.disk_usage(root).free
+    if available_free < required_free:
+        raise SystemExit(
+            f"benchmark needs {required_free / (1 << 30):.2f} GiB free; "
+            f"{available_free / (1 << 30):.2f} GiB is available"
+        )
 
     generator = random.Random(args.seed)
     scenarios = matrix.copy()
@@ -921,6 +979,8 @@ def main() -> None:
         ),
     }
     (root / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    if managed_output is not None:
+        root = managed_output.publish()
     print(f"Benchmark report: {root / 'report.md'}")
 
 

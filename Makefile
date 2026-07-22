@@ -10,8 +10,6 @@ DIRECT_IO_COMMIT := $(shell git rev-parse $(DIRECT_IO_REVISION))
 DIRECT_IO_SHORT := $(shell git rev-parse --short=12 $(DIRECT_IO_COMMIT))
 
 WORKTREE_ROOT ?= /tmp/tinydb-benchmark-worktrees
-RESULTS_ROOT ?= /tmp
-TIMESTAMP := $(shell date -u +%Y%m%dT%H%M%SZ)
 
 CURRENT_BUILD ?= build/bench-current
 DIRECT_IO_BUILD ?= build/bench-direct-$(DIRECT_IO_SHORT)
@@ -19,8 +17,8 @@ DIRECT_IO_ROOT := $(WORKTREE_ROOT)/direct-io-$(DIRECT_IO_SHORT)
 CURRENT_BENCH := $(CURRENT_BUILD)/TinyDB_bench
 DIRECT_IO_BENCH := $(DIRECT_IO_BUILD)/TinyDB_bench
 
-BENCH_OUTPUT ?= $(RESULTS_ROOT)/tinydb-bench-$(TIMESTAMP)
-COMPARISON_OUTPUT ?= $(RESULTS_ROOT)/tinydb-bench-compare-$(TIMESTAMP)
+BENCH_OUTPUT ?=
+COMPARISON_OUTPUT ?=
 BENCH_ARGS ?=
 
 .PHONY: help bench bench-compare bench-build bench-direct-build
@@ -32,15 +30,16 @@ help:
 	@echo "  make bench-compare  Compare the current tree with direct I/O"
 	@echo
 	@echo "Use BENCH_ARGS='--family reads' or BENCH_ARGS='--filter cold' for a focused run."
-	@echo "Override BENCH_OUTPUT, COMPARISON_OUTPUT, DIRECT_IO_REVISION, or JOBS as needed."
+	@echo "The latest default result replaces its predecessor; set BENCH_OUTPUT or COMPARISON_OUTPUT to archive one."
+	@echo "Override DIRECT_IO_REVISION or JOBS as needed."
 
 bench: bench-build
 	@$(PYTHON) bench/runner.py run "$(CURRENT_BENCH)" \
-		--output "$(BENCH_OUTPUT)" $(BENCH_ARGS)
+		$(if $(strip $(BENCH_OUTPUT)),--output "$(BENCH_OUTPUT)") $(BENCH_ARGS)
 
 bench-compare: bench-build bench-direct-build
 	@$(PYTHON) bench/runner.py compare "$(CURRENT_BENCH)" "$(DIRECT_IO_BENCH)" \
-		--output "$(COMPARISON_OUTPUT)" $(BENCH_ARGS)
+		$(if $(strip $(COMPARISON_OUTPUT)),--output "$(COMPARISON_OUTPUT)") $(BENCH_ARGS)
 
 bench-build:
 	@$(CMAKE) -S bench -B "$(CURRENT_BUILD)" -G Ninja \

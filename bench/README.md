@@ -17,8 +17,11 @@ make bench-compare
 paired comparison between that tree and the revision named by
 `DIRECT_IO_REVISION`, which defaults to `direct-io`.
 
-Results go to `/tmp` by default. Stable locations and focused investigations
-use Make variables:
+The two default commands share `/tmp/tinydb-benchmark-latest`. A successful
+run replaces the previous successful default result, so ordinary use retains
+only one result. The replacement happens after the new report is complete.
+
+Named archives and focused investigations use Make variables:
 
 ```sh
 make bench BENCH_OUTPUT=/tmp/buffered-results
@@ -26,6 +29,9 @@ make bench-compare COMPARISON_OUTPUT=/tmp/buffered-vs-direct
 make bench-compare BENCH_ARGS='--family cold_io'
 make bench BENCH_ARGS='--filter checkpoint'
 ```
+
+An explicitly named output is never replaced; choose a new path or remove the
+old archive deliberately.
 
 On the reference development host the full paired comparison takes roughly
 8–12 minutes; a standalone run is shorter. Runtime depends on the storage

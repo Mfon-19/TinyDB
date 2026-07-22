@@ -3,7 +3,9 @@
 """Unit tests for TinyDB benchmark pairing and inference."""
 
 import math
+import pathlib
 import random
+import tempfile
 import unittest
 
 import runner as target
@@ -28,6 +30,47 @@ def sample(variant: str, value: float = 1.0, **changes: str) -> dict[str, str]:
 
 
 class RunnerTest(unittest.TestCase):
+    def test_managed_output_replaces_only_a_completed_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = pathlib.Path(directory) / "latest"
+            destination.mkdir()
+            (destination / "report.md").write_text("old report")
+            (destination / "metadata.json").write_text("{}")
+
+            output = target.ManagedOutput(destination)
+            self.assertEqual((destination / "report.md").read_text(), "old report")
+            (output.path / "report.md").write_text("new report")
+            staging_path = str(output.path)
+            metadata = {
+                "binary": f"{staging_path}/binaries/current/TinyDB_bench",
+                "arguments": [staging_path, "unchanged"],
+                "nested": {"directory": f"{staging_path}/working/trial-00"},
+            }
+            (output.path / "metadata.json").write_text(target.json.dumps(metadata))
+
+            self.assertEqual(output.publish(), destination)
+            self.assertEqual((destination / "report.md").read_text(), "new report")
+            published = target.json.loads((destination / "metadata.json").read_text())
+            self.assertEqual(
+                published["binary"], str(destination / "binaries/current/TinyDB_bench")
+            )
+            self.assertEqual(published["arguments"], [str(destination), "unchanged"])
+            self.assertEqual(
+                published["nested"]["directory"], str(destination / "working/trial-00")
+            )
+
+    def test_managed_output_refuses_an_unrecognized_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = pathlib.Path(directory) / "latest"
+            destination.mkdir()
+            (destination / "unrelated.txt").write_text("keep me")
+
+            output = target.ManagedOutput(destination)
+            with self.assertRaisesRegex(SystemExit, "non-benchmark output"):
+                output.publish()
+            self.assertEqual((destination / "unrelated.txt").read_text(), "keep me")
+            output.cleanup()
+
     def test_balanced_orders(self) -> None:
         even = target.balanced_orders(5, 0, random.Random(1))
         odd = target.balanced_orders(5, 1, random.Random(1))
