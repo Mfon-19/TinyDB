@@ -1,5 +1,6 @@
 #include <tinydb/database.h>
 
+#include "api/database_test_access.h"
 #include "io/unique_fd.h"
 #include "storage/disk_manager.h"
 #include "util/check.h"
@@ -587,6 +588,11 @@ void WriteTransaction::Abort() noexcept {
   if (impl_ != nullptr) {
     impl_->Abort();
   }
+}
+
+void DatabaseTestAccess::WaitForReadQuiescence(Database &database) noexcept {
+  /* Buffered reads complete on the calling thread. */
+  (void)database;
 }
 
 Database::Database(std::shared_ptr<detail::DatabaseCore> core) : core_(std::move(core)) {}

@@ -12,6 +12,7 @@
 
 namespace tinydb {
 
+class DatabaseTestAccess;
 namespace detail {
 class DatabaseCore;
 }
@@ -57,6 +58,8 @@ class Database final {
   auto Close() -> Status;
 
  private:
+  friend class DatabaseTestAccess;
+
   explicit Database(std::shared_ptr<detail::DatabaseCore> core);
 
   std::shared_ptr<detail::DatabaseCore> core_;

@@ -18,6 +18,8 @@
 
 # Test and coverage artifacts
 /Testing/
+__pycache__/
+*.pyc
 *.gcda
 *.gcno
 *.profraw
