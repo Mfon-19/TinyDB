@@ -49,12 +49,18 @@ auto PageHeader(PageReader *pages, page_id_t page_id, std::uint64_t visible_lsn,
   if (!page) {
     return std::unexpected(Stop(report, options, VerifyIssueKind::Page, page_id, page.error()));
   }
-  const auto header =
-      storage::DecodeDataPageHeader(std::as_bytes(std::span<const char, PAGE_SIZE>{page->Data(), PAGE_SIZE}), page_id);
-  if (!header) {
-    return std::unexpected(Stop(report, options, VerifyIssueKind::Page, page_id, header.error()));
+  auto page_lsn = std::uint64_t{0};
+  if (const auto *const header = page->ValidatedHeader(); header != nullptr) {
+    page_lsn = header->page_lsn;
+  } else {
+    const auto decoded = storage::DecodeDataPageHeader(
+        std::as_bytes(std::span<const char, PAGE_SIZE>{page->Data(), PAGE_SIZE}), page_id);
+    if (!decoded) {
+      return std::unexpected(Stop(report, options, VerifyIssueKind::Page, page_id, decoded.error()));
+    }
+    page_lsn = decoded->page_lsn;
   }
-  if (header->page_lsn > visible_lsn) {
+  if (page_lsn > visible_lsn) {
     return std::unexpected(Stop(report, options, VerifyIssueKind::Page, page_id,
                                 Status::Corruption("page LSN is newer than the verified snapshot")));
   }
@@ -177,7 +183,7 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
     ++report.pages_checked;
     const auto type = RawNodeType(page->Data());
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
-      const auto leaf = LeafPageView::Open(page->Data(), page->Id());
+      const auto leaf = LeafPageView::Open(*page);
       if (!leaf) {
         return std::unexpected(Stop(&report, options, VerifyIssueKind::TreeStructure, page_id, leaf.error()));
       }
@@ -213,7 +219,7 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
                                   Status::Corruption("reachable page is not a B+ tree node")));
     }
 
-    const auto node = InternalPageView::Open(page->Data(), page->Id());
+    const auto node = InternalPageView::Open(*page);
     if (!node) {
       return std::unexpected(Stop(&report, options, VerifyIssueKind::TreeStructure, page_id, node.error()));
     }

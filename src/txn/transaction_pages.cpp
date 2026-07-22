@@ -257,7 +257,10 @@ auto TransactionPages::LoadFreeExtents() -> Status {
     if (!page) {
       return std::move(page).error();
     }
-    const auto decoded = storage::DecodeFreeExtentPage(std::as_bytes(std::span{page->Data(), PAGE_SIZE}), page_id);
+    const auto bytes = std::as_bytes(std::span{page->Data(), PAGE_SIZE});
+    const auto *const validated_header = page->ValidatedHeader();
+    const auto decoded = validated_header != nullptr ? storage::DecodeFreeExtentPage(bytes, page_id, *validated_header)
+                                                     : storage::DecodeFreeExtentPage(bytes, page_id);
     if (!decoded) {
       return decoded.error();
     }

@@ -26,6 +26,7 @@ void PageHandle::Reset() noexcept {
   mutable_data_ = nullptr;
   release_ = nullptr;
   keepalive_.reset();
+  validated_header_ = nullptr;
 }
 
 void PageHandle::Take(PageHandle &&other) noexcept {
@@ -37,6 +38,7 @@ void PageHandle::Take(PageHandle &&other) noexcept {
   dirty_ = other.dirty_;
   release_ = other.release_;
   keepalive_ = std::move(other.keepalive_);
+  validated_header_ = other.validated_header_;
 
   // Ownership moves with the callback; the source object must release nothing.
   other.owner_ = nullptr;
@@ -44,6 +46,7 @@ void PageHandle::Take(PageHandle &&other) noexcept {
   other.mutable_data_ = nullptr;
   other.release_ = nullptr;
   other.dirty_ = false;
+  other.validated_header_ = nullptr;
 }
 
 }  // namespace tinydb

@@ -53,14 +53,14 @@ constexpr std::size_t OVERFLOW_DATA_OFFSET = OVERFLOW_RESERVED16_OFFSET + sizeof
 static_assert(PAGE_SIZE - OVERFLOW_DATA_OFFSET == OVERFLOW_PAGE_PAYLOAD_BYTES);
 
 auto ChecksumPage(std::span<const std::byte> input) -> std::uint32_t {
-  // Work on a copy so validation never mutates a pinned cache frame merely to
-  // zero its checksum field.
-  auto page = std::array<std::byte, PAGE_SIZE>{};
-  std::ranges::copy(input, page.begin());
-  std::ranges::fill(page.begin() + static_cast<std::ptrdiff_t>(data_page_offset::CHECKSUM),
-                    page.begin() + static_cast<std::ptrdiff_t>(data_page_offset::CHECKSUM + sizeof(std::uint32_t)),
-                    std::byte{0});
-  return Crc32(page);
+  // Hash a logical zero checksum field without copying or mutating a pinned
+  // cache frame. Incremental CRC produces exactly the same persistent value.
+  constexpr auto zero_checksum = std::array<std::byte, sizeof(std::uint32_t)>{};
+  auto checksum = Crc32Accumulator{};
+  checksum.Update(input.first(data_page_offset::CHECKSUM));
+  checksum.Update(zero_checksum);
+  checksum.Update(input.subspan(data_page_offset::CHECKSUM + sizeof(std::uint32_t)));
+  return checksum.Finish();
 }
 
 auto IsKnownType(DataPageType type) -> bool {
@@ -233,15 +233,12 @@ auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t n
   return output;
 }
 
-auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<FreeExtentPage> {
-  // Common validation verifies checksum, identity, version, and generic
-  // bounds before this decoder interprets the allocator-specific payload.
-  const auto header = DecodeDataPageHeader(page, expected_page_id);
-  if (!header) {
-    return std::unexpected(header.error());
-  }
-  if (header->type != DataPageType::Allocator ||
-      header->payload_bytes < EXTENT_ENTRIES_OFFSET - data_page_offset::HEADER_BYTES) {
+namespace {
+
+auto DecodeFreeExtentPayload(std::span<const std::byte> page, page_id_t expected_page_id,
+                             const DataPageHeader &header) -> Result<FreeExtentPage> {
+  if (page.size() != PAGE_SIZE || header.page_id != expected_page_id || header.type != DataPageType::Allocator ||
+      header.payload_bytes < EXTENT_ENTRIES_OFFSET - data_page_offset::HEADER_BYTES) {
     return std::unexpected(Status::Corruption("page is not free-extent metadata"));
   }
   const auto next = GetLittleEndian<page_id_t>(page, EXTENT_NEXT_PAGE_OFFSET);
@@ -250,7 +247,7 @@ auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_pa
   const auto reserved32 = GetLittleEndian<std::uint32_t>(page, EXTENT_RESERVED_OFFSET + sizeof(std::uint16_t));
   if (!next || !count || !reserved16 || !reserved32 || *reserved16 != 0 || *reserved32 != 0 ||
       (*next != HEADER_PAGE_ID && *next < FIRST_DATA_PAGE_ID) || *count > FREE_EXTENTS_PER_PAGE ||
-      header->payload_bytes != EXTENT_ENTRIES_OFFSET - data_page_offset::HEADER_BYTES + *count * EXTENT_ENTRY_BYTES) {
+      header.payload_bytes != EXTENT_ENTRIES_OFFSET - data_page_offset::HEADER_BYTES + *count * EXTENT_ENTRY_BYTES) {
     return std::unexpected(Status::Corruption("invalid free-extent page header"));
   }
   auto result = FreeExtentPage{.next_page_id = *next, .extents = {}};
@@ -275,8 +272,25 @@ auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_pa
   return result;
 }
 
-auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t owner_value_id,
-                        std::uint32_t chunk_index, page_id_t next_page_id,
+}  // namespace
+
+auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<FreeExtentPage> {
+  // Common validation verifies checksum, identity, version, and generic
+  // bounds before this decoder interprets the allocator-specific payload.
+  const auto header = DecodeDataPageHeader(page, expected_page_id);
+  if (!header) {
+    return std::unexpected(header.error());
+  }
+  return DecodeFreeExtentPayload(page, expected_page_id, *header);
+}
+
+auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_page_id,
+                          const DataPageHeader &validated_header) -> Result<FreeExtentPage> {
+  return DecodeFreeExtentPayload(page, expected_page_id, validated_header);
+}
+
+auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t owner_value_id, std::uint32_t chunk_index,
+                        page_id_t next_page_id,
                         std::span<const std::byte> payload) -> Result<std::array<char, PAGE_SIZE>> {
   if (payload.empty() || payload.size() > OVERFLOW_PAGE_PAYLOAD_BYTES) {
     return std::unexpected(Status::InvalidArgument("overflow payload exceeds one page"));
@@ -312,13 +326,12 @@ auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t own
   return output;
 }
 
-auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<OverflowPage> {
-  const auto header = DecodeDataPageHeader(page, expected_page_id);
-  if (!header) {
-    return std::unexpected(header.error());
-  }
-  if (header->type != DataPageType::Overflow ||
-      header->payload_bytes < OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES) {
+namespace {
+
+auto DecodeOverflowPayload(std::span<const std::byte> page, page_id_t expected_page_id,
+                           const DataPageHeader &header) -> Result<OverflowPage> {
+  if (page.size() != PAGE_SIZE || header.page_id != expected_page_id || header.type != DataPageType::Overflow ||
+      header.payload_bytes < OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES) {
     return std::unexpected(Status::Corruption("page is not an overflow page"));
   }
   const auto owner = GetLittleEndian<page_id_t>(page, OVERFLOW_OWNER_OFFSET);
@@ -329,20 +342,35 @@ auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page
   const auto reserved16 = GetLittleEndian<std::uint16_t>(page, OVERFLOW_RESERVED16_OFFSET);
   // Cross-check the inner data length against the common outer payload length.
   // Redundant lengths are useful only if inconsistent encodings are rejected.
-  if (!owner || !chunk_index || !reserved32 || !next || !data_bytes || !reserved16 ||
-      *owner < FIRST_DATA_PAGE_ID || *reserved32 != 0 || *reserved16 != 0 || *data_bytes == 0 ||
-      *data_bytes > OVERFLOW_PAGE_PAYLOAD_BYTES ||
-      header->payload_bytes != OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES + *data_bytes ||
+  if (!owner || !chunk_index || !reserved32 || !next || !data_bytes || !reserved16 || *owner < FIRST_DATA_PAGE_ID ||
+      *reserved32 != 0 || *reserved16 != 0 || *data_bytes == 0 || *data_bytes > OVERFLOW_PAGE_PAYLOAD_BYTES ||
+      header.payload_bytes != OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES + *data_bytes ||
       (*next != HEADER_PAGE_ID && *next < FIRST_DATA_PAGE_ID)) {
     return std::unexpected(Status::Corruption("invalid overflow page lengths or link"));
   }
   auto result = OverflowPage{
+      .page_lsn = header.page_lsn,
       .owner_value_id = *owner,
       .chunk_index = *chunk_index,
       .next_page_id = *next,
       .payload = page.subspan(OVERFLOW_DATA_OFFSET, *data_bytes),
   };
   return result;
+}
+
+}  // namespace
+
+auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<OverflowPage> {
+  const auto header = DecodeDataPageHeader(page, expected_page_id);
+  if (!header) {
+    return std::unexpected(header.error());
+  }
+  return DecodeOverflowPayload(page, expected_page_id, *header);
+}
+
+auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id,
+                        const DataPageHeader &validated_header) -> Result<OverflowPage> {
+  return DecodeOverflowPayload(page, expected_page_id, validated_header);
 }
 
 }  // namespace tinydb::storage

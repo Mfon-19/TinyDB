@@ -33,7 +33,7 @@ auto ReadSnapshot::Get(std::string_view key) -> Result<std::optional<std::string
   if (!page) {
     return std::unexpected(std::move(page).error());
   }
-  const auto leaf = LeafPageView::Open(page->Data(), page->Id());
+  const auto leaf = LeafPageView::Open(*page);
   if (!leaf) {
     return std::unexpected(leaf.error());
   }

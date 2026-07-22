@@ -12,6 +12,8 @@
 
 namespace tinydb {
 
+class PageHandle;
+
 /*
 ** B+ TREE PAGE FORMAT
 **
@@ -89,6 +91,7 @@ auto RawNodeType(const char *page) -> std::uint16_t;
 
 // Validates the common header plus all tree-local structural invariants.
 auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status;
+auto ValidateTreePage(const PageHandle &page) -> Status;
 
 // One record at or below half the usable bytes guarantees that every
 // overflowing builder has a legal split boundary. Overflow descriptors keep a

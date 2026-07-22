@@ -17,17 +17,18 @@
 namespace tinydb::cache {
 
 /*
-** A frame owns exactly one immutable encoded page version. page_lsn orders
-** physical versions of the same page. checkpointed controls eviction
-** eligibility, not visibility.
+** A frame owns exactly one immutable encoded page version. Its validated
+** common header orders physical versions and travels with immutable handles,
+** so consumers never checksum the same bytes twice. checkpointed controls
+** eviction eligibility, not visibility.
 */
 struct CommittedFrame final {
   using LastUnpin = void (*)(void *owner, CommittedFrame *frame) noexcept;
 
-  CommittedFrame(page_id_t initial_page_id, std::uint64_t initial_page_lsn, std::unique_ptr<PageBytes> initial_bytes,
+  CommittedFrame(storage::DataPageHeader initial_header, std::unique_ptr<PageBytes> initial_bytes,
                  bool initially_checkpointed, void *initial_eviction_owner, LastUnpin initial_last_unpin)
-      : page_id(initial_page_id),
-        page_lsn(initial_page_lsn),
+      : page_id(initial_header.page_id),
+        header(std::move(initial_header)),
         bytes(std::move(initial_bytes)),
         checkpointed(initially_checkpointed),
         eviction_owner(initial_eviction_owner),
@@ -45,7 +46,7 @@ struct CommittedFrame final {
   }
 
   page_id_t page_id;                 // physical page identity
-  std::uint64_t page_lsn;            // physical version ordering
+  storage::DataPageHeader header;    // checksum-authenticated common fields
   std::unique_ptr<PageBytes> bytes;  // immutable after construction
 
   // Pins and checkpoint status are cache metadata, not page contents. The
@@ -96,7 +97,7 @@ auto PageGuard::Data() const -> std::span<const char, PAGE_SIZE> {
 
 auto PageGuard::PageLsn() const -> std::uint64_t {
   TINYDB_CHECK(frame_ != nullptr, "reading an empty committed-page guard");
-  return frame_->page_lsn;
+  return frame_->header.page_lsn;
 }
 
 void PageGuard::Reset() noexcept {
@@ -121,7 +122,7 @@ auto PageGuard::IntoPageHandle() && -> PageHandle {
     released->ReleasePin();
   };
   frame_.reset();  // PageHandle now owns both the pin and shared lifetime.
-  return PageHandle(frame, frame->page_id, frame->bytes->data(), release, std::move(keeper));
+  return PageHandle(frame, frame->page_id, frame->bytes->data(), release, std::move(keeper), &frame->header);
 }
 
 struct CommittedPageCache::Impl final {
@@ -274,8 +275,7 @@ auto CommittedPageCache::ReadGuard(page_id_t page_id) -> Result<PageGuard> {
     return std::unexpected(header.error());
   }
 
-  auto frame = std::make_shared<CommittedFrame>(page_id, header->page_lsn, std::move(bytes), true, impl_.get(),
-                                                &Impl::LastUnpin);
+  auto frame = std::make_shared<CommittedFrame>(*header, std::move(bytes), true, impl_.get(), &Impl::LastUnpin);
   if (page_id >= impl_->pages.size()) {
     impl_->pages.resize(page_id + 1);
   }
@@ -322,12 +322,11 @@ auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> imag
       return std::unexpected(Status::InvalidArgument("committed page metadata disagrees with encoded LSN"));
     }
     const auto &existing = impl_->pages[image.page_id];
-    if (existing != nullptr && existing->page_lsn > image.page_lsn) {
+    if (existing != nullptr && existing->header.page_lsn > image.page_lsn) {
       return std::unexpected(Status::InvalidArgument("committed page version moves backward"));
     }
-    frames.push_back(std::make_shared<CommittedFrame>(image.page_id, image.page_lsn, std::move(image.bytes),
-                                                      image.page_lsn <= impl_->checkpoint_lsn, impl_.get(),
-                                                      &Impl::LastUnpin));
+    frames.push_back(std::make_shared<CommittedFrame>(
+        *header, std::move(image.bytes), image.page_lsn <= impl_->checkpoint_lsn, impl_.get(), &Impl::LastUnpin));
   }
   for (const auto page_id : retired) {
     if (page_id < FIRST_DATA_PAGE_ID || page_id >= high_water_page_id || seen.contains(page_id)) {
@@ -355,7 +354,7 @@ void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
   }
   for (auto &frame : plan.frames_) {
     auto &current = impl_->pages[frame->page_id];
-    TINYDB_CHECK(current == nullptr || current->page_lsn <= frame->page_lsn,
+    TINYDB_CHECK(current == nullptr || current->header.page_lsn <= frame->header.page_lsn,
                  "prepared publication regressed a page version");
     if (current == nullptr) {
       ++impl_->resident_pages;
@@ -379,7 +378,7 @@ void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
   // Only versions at or below the new frontier are now reproducible from the
   // database file. Later committed versions remain WAL-backed and non-evictable.
   for (const auto &page : impl_->pages) {
-    if (page != nullptr && page->page_lsn <= checkpoint_lsn) {
+    if (page != nullptr && page->header.page_lsn <= checkpoint_lsn) {
       page->checkpointed.store(true, std::memory_order_release);
       if (page->pin_count.load(std::memory_order_acquire) == 0 && !page->evictable) {
         impl_->LinkMostRecent(page.get());
@@ -398,11 +397,11 @@ auto CommittedPageCache::CaptureCheckpointPages(std::uint64_t checkpoint_lsn,
   // checkpoint I/O finishes.
   auto result = std::vector<PageGuard>{};
   const auto captured_pages = static_cast<std::size_t>(std::ranges::count_if(impl_->pages, [&](const auto &page) {
-    return page != nullptr && page->page_lsn > checkpoint_lsn && page->page_lsn <= target_lsn;
+    return page != nullptr && page->header.page_lsn > checkpoint_lsn && page->header.page_lsn <= target_lsn;
   }));
   result.reserve(captured_pages);
   for (const auto &page : impl_->pages) {
-    if (page != nullptr && page->page_lsn > checkpoint_lsn && page->page_lsn <= target_lsn) {
+    if (page != nullptr && page->header.page_lsn > checkpoint_lsn && page->header.page_lsn <= target_lsn) {
       impl_->Pin(page);
       result.push_back(PageGuard(page));
     }

@@ -37,8 +37,8 @@ struct ChainConstraints {
 ** compared only after the terminator proves the exact advertised length.
 */
 template <typename Visitor>
-auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, const ChainConstraints &constraints,
-                       Visitor visit) -> Status {
+auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor,
+                       const ChainConstraints &constraints, Visitor visit) -> Status {
   TINYDB_CHECK(pages != nullptr, "overflow traversal requires a page reader");
   if (descriptor.total_value_bytes == 0 || descriptor.total_value_bytes > MAX_VALUE_BYTES ||
       descriptor.first_page_id < FIRST_DATA_PAGE_ID) {
@@ -70,16 +70,14 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
     if (!page) {
       return std::move(page).error();
     }
-    const auto decoded =
-        storage::DecodeOverflowPage(std::as_bytes(std::span{page->Data(), PAGE_SIZE}), page->Id());
+    const auto bytes = std::as_bytes(std::span{page->Data(), PAGE_SIZE});
+    const auto *const validated_header = page->ValidatedHeader();
+    const auto decoded = validated_header != nullptr ? storage::DecodeOverflowPage(bytes, page->Id(), *validated_header)
+                                                     : storage::DecodeOverflowPage(bytes, page->Id());
     if (!decoded) {
       return decoded.error();
     }
-    const auto header = storage::DecodeDataPageHeader(std::as_bytes(std::span{page->Data(), PAGE_SIZE}), page->Id());
-    if (!header) {
-      return header.error();
-    }
-    if (header->page_lsn > constraints.maximum_page_lsn) {
+    if (decoded->page_lsn > constraints.maximum_page_lsn) {
       return Status::Corruption("overflow page LSN is newer than the verified snapshot");
     }
     if (decoded->owner_value_id != descriptor.first_page_id || decoded->chunk_index != expected_chunk) {
@@ -132,10 +130,8 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
     return LeafValue::Inline(value);
   }
 
-  const auto chunks = (value.size() + storage::OVERFLOW_PAGE_PAYLOAD_BYTES - 1) /
-                      storage::OVERFLOW_PAGE_PAYLOAD_BYTES;
-  static_assert(MAX_VALUE_BYTES / storage::OVERFLOW_PAGE_PAYLOAD_BYTES <
-                std::numeric_limits<std::uint32_t>::max());
+  const auto chunks = (value.size() + storage::OVERFLOW_PAGE_PAYLOAD_BYTES - 1) / storage::OVERFLOW_PAGE_PAYLOAD_BYTES;
+  static_assert(MAX_VALUE_BYTES / storage::OVERFLOW_PAGE_PAYLOAD_BYTES < std::numeric_limits<std::uint32_t>::max());
   auto page_ids = std::vector<page_id_t>{};
   page_ids.reserve(chunks);
   for (std::size_t index = 0; index < chunks; ++index) {
@@ -152,9 +148,9 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
     const auto offset = index * storage::OVERFLOW_PAGE_PAYLOAD_BYTES;
     const auto count = std::min(storage::OVERFLOW_PAGE_PAYLOAD_BYTES, value.size() - offset);
     const auto next = index + 1 < page_ids.size() ? page_ids[index + 1] : HEADER_PAGE_ID;
-    const auto encoded = storage::EncodeOverflowPage(page_ids[index], 0, owner_value_id,
-                                                     static_cast<std::uint32_t>(index), next,
-                                                     value_bytes.subspan(offset, count));
+    const auto encoded =
+        storage::EncodeOverflowPage(page_ids[index], 0, owner_value_id, static_cast<std::uint32_t>(index), next,
+                                    value_bytes.subspan(offset, count));
     if (!encoded) {
       return std::unexpected(encoded.error());
     }
@@ -181,12 +177,11 @@ auto CopyValue(PageReader *pages, LeafValueView value) -> Result<std::string> {
 
   auto output = std::string{};
   output.reserve(static_cast<std::size_t>(value.Size()));
-  const auto status = WalkOverflowValue(
-      pages, value.OverflowDescriptor(), ChainConstraints{},
-      [&output](page_id_t, std::span<const std::byte> payload) {
-        output.append(reinterpret_cast<const char *>(payload.data()), payload.size());
-        return Status{};
-      });
+  const auto status = WalkOverflowValue(pages, value.OverflowDescriptor(), ChainConstraints{},
+                                        [&output](page_id_t, std::span<const std::byte> payload) {
+                                          output.append(reinterpret_cast<const char *>(payload.data()), payload.size());
+                                          return Status{};
+                                        });
   if (!status.Ok()) {
     return std::unexpected(status);
   }
@@ -203,12 +198,11 @@ auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descr
   // partially retired transaction state. The caller still aborts on any later
   // allocator failure.
   auto page_ids = std::vector<page_id_t>{};
-  const auto status = WalkOverflowValue(
-      pages, descriptor, ChainConstraints{},
-      [&page_ids](page_id_t page_id, std::span<const std::byte>) {
-        page_ids.push_back(page_id);
-        return Status{};
-      });
+  const auto status = WalkOverflowValue(pages, descriptor, ChainConstraints{},
+                                        [&page_ids](page_id_t page_id, std::span<const std::byte>) {
+                                          page_ids.push_back(page_id);
+                                          return Status{};
+                                        });
   if (!status.Ok()) {
     return status;
   }
@@ -222,20 +216,18 @@ auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descr
 
 /* Join chain-local validation to the verifier's global page-ownership proof. */
 auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, page_id_t high_water_page_id,
-                           std::uint64_t maximum_page_lsn,
-                           const std::unordered_set<page_id_t> &free_pages,
+                           std::uint64_t maximum_page_lsn, const std::unordered_set<page_id_t> &free_pages,
                            const std::unordered_set<page_id_t> &allocator_pages,
                            std::unordered_set<page_id_t> *claimed_pages) -> Status {
-  return WalkOverflowValue(
-      pages, descriptor,
-      ChainConstraints{
-          .high_water_page_id = high_water_page_id,
-          .maximum_page_lsn = maximum_page_lsn,
-          .free_pages = &free_pages,
-          .allocator_pages = &allocator_pages,
-          .claimed_pages = claimed_pages,
-      },
-      [](page_id_t, std::span<const std::byte>) { return Status{}; });
+  return WalkOverflowValue(pages, descriptor,
+                           ChainConstraints{
+                               .high_water_page_id = high_water_page_id,
+                               .maximum_page_lsn = maximum_page_lsn,
+                               .free_pages = &free_pages,
+                               .allocator_pages = &allocator_pages,
+                               .claimed_pages = claimed_pages,
+                           },
+                           [](page_id_t, std::span<const std::byte>) { return Status{}; });
 }
 
 }  // namespace tinydb

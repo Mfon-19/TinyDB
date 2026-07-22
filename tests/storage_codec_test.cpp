@@ -105,6 +105,22 @@ TEST(Format, Encoding) {
   EXPECT_EQ(tinydb::storage::GetLittleEndian<std::uint64_t>(encoded, 9), std::nullopt);
 }
 
+TEST(Format, Crc32RemainsIEEECompatibleAcrossChunkBoundaries) {
+  constexpr auto check = std::string_view{"123456789"};
+  EXPECT_EQ(tinydb::Crc32(check.data(), check.size()), 0xCBF43926U);
+
+  auto bytes = std::array<std::byte, 257>{};
+  for (std::size_t index = 0; index < bytes.size(); ++index) {
+    bytes[index] = static_cast<std::byte>((index * 37U + 11U) & 0xFFU);
+  }
+  const auto expected = tinydb::Crc32(bytes);
+  auto fragmented = tinydb::Crc32Accumulator{};
+  fragmented.Update(std::span{bytes}.first(3));
+  fragmented.Update(std::span{bytes}.subspan(3, 127));
+  fragmented.Update(std::span{bytes}.subspan(130));
+  EXPECT_EQ(fragmented.Finish(), expected);
+}
+
 TEST(Format, Superblock) {
   auto wanted = Fixture();
   wanted.optional_features = 1ULL << 47U;
@@ -277,6 +293,7 @@ TEST(Format, Overflow) {
   const auto bytes = std::as_bytes(std::span{*encoded});
   const auto decoded = tinydb::storage::DecodeOverflowPage(bytes, 7);
   ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->page_lsn, 99U);
   EXPECT_EQ(decoded->owner_value_id, 7U);
   EXPECT_EQ(decoded->chunk_index, 3U);
   EXPECT_EQ(decoded->next_page_id, 8U);

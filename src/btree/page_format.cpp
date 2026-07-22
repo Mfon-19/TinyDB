@@ -1,5 +1,6 @@
 #include "btree/page_format.h"
 
+#include "btree/page_source.h"
 #include "storage/encoding.h"
 #include "txn/contract.h"
 
@@ -104,25 +105,12 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
   return {};
 }
 
-}  // namespace
-
-auto RawNodeType(const char *page) -> std::uint16_t {
-  // Zero is reserved for fresh-root detection and is never a valid page type.
-  return storage::GetLittleEndian<std::uint16_t>(PageSpan(page), storage::data_page_offset::TYPE).value_or(0);
-}
-
-auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status {
-  // Common framing and checksum validation always precede tree-local offsets.
+auto ValidateTreePayload(const char *page, const storage::DataPageHeader &common) -> Status {
   const auto bytes = PageSpan(page);
-  const auto common = storage::DecodeDataPageHeader(bytes, expected_page_id);
-  if (!common) {
-    return common.error();
-  }
-  if (common->type != storage::DataPageType::Leaf && common->type != storage::DataPageType::Internal) {
+  if (common.type != storage::DataPageType::Leaf && common.type != storage::DataPageType::Internal) {
     return Status::Corruption("page is not a B+ tree node");
   }
-  if (common->payload_bytes != PAGE_SIZE - storage::data_page_offset::HEADER_BYTES) {
-    // Tree pages own the complete payload, including their internal free space.
+  if (common.payload_bytes != PAGE_SIZE - storage::data_page_offset::HEADER_BYTES) {
     return Status::Corruption("tree page does not cover the complete page payload");
   }
 
@@ -134,15 +122,40 @@ auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status {
   if (!cell_count || !free_start || !free_end || !reserved || !link || *reserved != 0) {
     return Status::Corruption("truncated or invalid tree-page header");
   }
-  if (common->type == storage::DataPageType::Internal && *link < FIRST_DATA_PAGE_ID) {
-    // Internal LINK is a mandatory leftmost child.
+  if (common.type == storage::DataPageType::Internal && *link < FIRST_DATA_PAGE_ID) {
     return Status::Corruption("internal page has an invalid first child");
   }
-  if (common->type == storage::DataPageType::Leaf && *link != HEADER_PAGE_ID && *link < FIRST_DATA_PAGE_ID) {
-    // Leaf LINK may be zero only as the chain terminator.
+  if (common.type == storage::DataPageType::Leaf && *link != HEADER_PAGE_ID && *link < FIRST_DATA_PAGE_ID) {
     return Status::Corruption("leaf page has an invalid successor");
   }
-  return ValidateSlots(bytes, common->type, *cell_count, *free_start, *free_end);
+  return ValidateSlots(bytes, common.type, *cell_count, *free_start, *free_end);
+}
+
+}  // namespace
+
+auto RawNodeType(const char *page) -> std::uint16_t {
+  // Zero is reserved for fresh-root detection and is never a valid page type.
+  return storage::GetLittleEndian<std::uint16_t>(PageSpan(page), storage::data_page_offset::TYPE).value_or(0);
+}
+
+auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status {
+  // Common framing and checksum validation always precede tree-local offsets.
+  const auto common = storage::DecodeDataPageHeader(PageSpan(page), expected_page_id);
+  if (!common) {
+    return common.error();
+  }
+  return ValidateTreePayload(page, *common);
+}
+
+auto ValidateTreePage(const PageHandle &page) -> Status {
+  const auto *const common = page.ValidatedHeader();
+  if (common == nullptr) {
+    return ValidateTreePage(page.Data(), page.Id());
+  }
+  if (common->page_id != page.Id()) {
+    return Status::Corruption("validated page header changed identity");
+  }
+  return ValidateTreePayload(page.Data(), *common);
 }
 
 }  // namespace tinydb

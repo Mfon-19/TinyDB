@@ -3,8 +3,8 @@
 #include "btree/navigation.h"
 #include "txn/contract.h"
 
-#include "util/check.h"
 #include "storage/page.h"
+#include "util/check.h"
 
 #include <expected>
 #include <utility>
@@ -84,7 +84,7 @@ auto BTreeCursor::OpenLeaf(page_id_t page_id, std::size_t index) -> Status {
   if (!page) {
     return std::move(page).error();
   }
-  auto leaf = LeafPageView::Open(page->Data(), page->Id());
+  auto leaf = LeafPageView::Open(*page);
   if (!leaf) {
     return leaf.error();
   }

@@ -8,6 +8,10 @@
 
 namespace tinydb {
 
+namespace storage {
+struct DataPageHeader;
+}
+
 /*
 ** PAGE ACCESS BOUNDARY
 **
@@ -34,8 +38,14 @@ class PageHandle {
 
   // Immutable caches retain a frame through keepalive while release updates
   // frame-local pin accounting. No per-read wrapper allocation is required.
-  PageHandle(void *owner, page_id_t page_id, const char *data, Release release, std::shared_ptr<const void> keepalive)
-      : owner_(owner), page_id_(page_id), data_(data), release_(release), keepalive_(std::move(keepalive)) {}
+  PageHandle(void *owner, page_id_t page_id, const char *data, Release release, std::shared_ptr<const void> keepalive,
+             const storage::DataPageHeader *validated_header = nullptr)
+      : owner_(owner),
+        page_id_(page_id),
+        data_(data),
+        release_(release),
+        keepalive_(std::move(keepalive)),
+        validated_header_(validated_header) {}
 
   PageHandle(const PageHandle &) = delete;
   auto operator=(const PageHandle &) -> PageHandle & = delete;
@@ -55,6 +65,11 @@ class PageHandle {
   auto Id() const -> page_id_t { return page_id_; }
   auto Data() const -> const char * { return data_; }
 
+  // Immutable cache owners may retain the common-header proof produced when
+  // bytes first crossed the persistent validation boundary. The header and
+  // bytes share a lifetime. Mutable handles deliberately carry no proof.
+  auto ValidatedHeader() const noexcept -> const storage::DataPageHeader * { return validated_header_; }
+
   // Only Edit and Allocate may produce an editable handle.
   auto MutableData() -> char *;
   void MarkDirty();
@@ -70,6 +85,7 @@ class PageHandle {
   bool dirty_{false};
   Release release_{nullptr};
   std::shared_ptr<const void> keepalive_;
+  const storage::DataPageHeader *validated_header_{nullptr};
 };
 
 /* Read algorithms depend only on stable immutable leases. */

@@ -34,7 +34,7 @@ auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child
     }
     const auto type = RawNodeType(page->Data());
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
-      const auto leaf = LeafPageView::Open(page->Data(), page->Id());
+      const auto leaf = LeafPageView::Open(*page);
       if (!leaf) {
         return std::unexpected(leaf.error());
       }
@@ -43,7 +43,7 @@ auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child
     if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
       return std::unexpected(Status::Corruption("tree descent reached a non-tree page"));
     }
-    const auto internal = InternalPageView::Open(page->Data(), page->Id());
+    const auto internal = InternalPageView::Open(*page);
     if (!internal) {
       return std::unexpected(internal.error());
     }

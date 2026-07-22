@@ -3,6 +3,7 @@
 #include "util/check.h"
 
 #include "btree/page_format.h"
+#include "btree/page_source.h"
 #include "storage/encoding.h"
 #include "txn/contract.h"
 
@@ -26,6 +27,17 @@ auto LeafPageView::Open(const char *page, page_id_t expected_page_id) -> Result<
   if (auto status = ValidateTreePage(page, expected_page_id); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
+  return OpenValidated(page);
+}
+
+auto LeafPageView::Open(const PageHandle &page) -> Result<LeafPageView> {
+  if (auto status = ValidateTreePage(page); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
+  return OpenValidated(page.Data());
+}
+
+auto LeafPageView::OpenValidated(const char *page) -> Result<LeafPageView> {
   if (RawNodeType(page) != static_cast<std::uint16_t>(NodeType::Leaf)) {
     return std::unexpected(Status::Corruption("page is not a leaf node"));
   }
@@ -104,6 +116,17 @@ auto InternalPageView::Open(const char *page, page_id_t expected_page_id) -> Res
   if (auto status = ValidateTreePage(page, expected_page_id); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
+  return OpenValidated(page);
+}
+
+auto InternalPageView::Open(const PageHandle &page) -> Result<InternalPageView> {
+  if (auto status = ValidateTreePage(page); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
+  return OpenValidated(page.Data());
+}
+
+auto InternalPageView::OpenValidated(const char *page) -> Result<InternalPageView> {
   if (RawNodeType(page) != static_cast<std::uint16_t>(NodeType::Internal)) {
     return std::unexpected(Status::Corruption("page is not an internal node"));
   }

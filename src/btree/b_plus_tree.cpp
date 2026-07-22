@@ -67,7 +67,7 @@ auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view k
     if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
       return std::unexpected(Status::Corruption("tree descent reached a non-tree page"));
     }
-    const auto node = InternalPageView::Open(page->Data(), page->Id());
+    const auto node = InternalPageView::Open(*page);
     if (!node) {
       return std::unexpected(node.error());
     }
@@ -79,7 +79,7 @@ auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view k
 // Builders never decode raw bytes themselves. Opening the view first keeps
 // validation and interpretation in one implementation.
 auto LeafBuilder(PageHandle &page) -> Result<LeafPageBuilder> {
-  const auto view = LeafPageView::Open(page.Data(), page.Id());
+  const auto view = LeafPageView::Open(page);
   if (!view) {
     return std::unexpected(view.error());
   }
@@ -87,7 +87,7 @@ auto LeafBuilder(PageHandle &page) -> Result<LeafPageBuilder> {
 }
 
 auto InternalBuilder(PageHandle &page) -> Result<InternalPageBuilder> {
-  const auto view = InternalPageView::Open(page.Data(), page.Id());
+  const auto view = InternalPageView::Open(page);
   if (!view) {
     return std::unexpected(view.error());
   }
@@ -159,7 +159,7 @@ auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusT
     return std::unexpected(Status::Corruption("root page is not a b+ tree node"));
   }
   // Existing roots cross the full page-validation boundary before use.
-  if (auto status = ValidateTreePage(root_page->Data(), root_page->Id()); !status.Ok()) {
+  if (auto status = ValidateTreePage(*root_page); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   return BPlusTree(pages, root_page_id);
@@ -270,7 +270,7 @@ auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> 
   if (!leaf_page) {
     return std::unexpected(std::move(leaf_page).error());
   }
-  const auto leaf = LeafPageView::Open(leaf_page->Data(), leaf_page->Id());
+  const auto leaf = LeafPageView::Open(*leaf_page);
   if (!leaf) {
     return std::unexpected(leaf.error());
   }

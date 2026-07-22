@@ -1,7 +1,7 @@
 #pragma once
 
-#include "storage/page.h"
 #include <tinydb/status.h>
+#include "storage/page.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +11,8 @@
 #include "btree/value.h"
 
 namespace tinydb {
+
+class PageHandle;
 
 /*
 ** BORROWED PAGE VIEWS
@@ -27,6 +29,7 @@ namespace tinydb {
 class LeafPageView {
  public:
   static auto Open(const char *page, page_id_t expected_page_id) -> Result<LeafPageView>;
+  static auto Open(const PageHandle &page) -> Result<LeafPageView>;
 
   auto Count() const -> std::size_t { return cell_count_; }
   auto NextLeaf() const -> page_id_t { return next_leaf_; }
@@ -37,6 +40,8 @@ class LeafPageView {
   auto Get(std::string_view key) const -> std::optional<LeafValueView>;
 
  private:
+  static auto OpenValidated(const char *page) -> Result<LeafPageView>;
+
   LeafPageView(const char *page, std::uint16_t cell_count, page_id_t next_leaf)
       : page_(page), cell_count_(cell_count), next_leaf_(next_leaf) {}
 
@@ -51,6 +56,7 @@ class LeafPageView {
 class InternalPageView {
  public:
   static auto Open(const char *page, page_id_t expected_page_id) -> Result<InternalPageView>;
+  static auto Open(const PageHandle &page) -> Result<InternalPageView>;
 
   auto SeparatorCount() const -> std::size_t { return separator_count_; }
   auto KeyAt(std::size_t index) const -> std::string_view;
@@ -58,6 +64,8 @@ class InternalPageView {
   auto FindChildIndex(std::string_view key) const -> std::size_t;
 
  private:
+  static auto OpenValidated(const char *page) -> Result<InternalPageView>;
+
   InternalPageView(const char *page, std::uint16_t separator_count, page_id_t first_child)
       : page_(page), separator_count_(separator_count), first_child_(first_child) {}
 

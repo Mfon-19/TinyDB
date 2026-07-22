@@ -59,7 +59,13 @@ TEST(Cache, Lru) {
   WritePages(disk, 3);
   auto cache = tinydb::cache::CommittedPageCache(&disk, 2U * tinydb::PAGE_SIZE, 1);
 
-  ASSERT_TRUE(cache.Read(2).has_value());  // [2]
+  {
+    auto first = cache.Read(2);  // [2]
+    ASSERT_TRUE(first.has_value());
+    ASSERT_NE(first->ValidatedHeader(), nullptr);
+    EXPECT_EQ(first->ValidatedHeader()->page_id, 2U);
+    EXPECT_EQ(first->ValidatedHeader()->page_lsn, 1U);
+  }
   ASSERT_TRUE(cache.Read(3).has_value());  // [3, 2]
   ASSERT_TRUE(cache.Read(2).has_value());  // [2, 3]
   ASSERT_TRUE(cache.Read(4).has_value());  // evicts 3: [4, 2]

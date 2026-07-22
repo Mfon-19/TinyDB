@@ -1,7 +1,7 @@
 #pragma once
 
-#include "storage/page.h"
 #include <tinydb/status.h>
+#include "storage/page.h"
 
 #include <array>
 #include <cstddef>
@@ -95,6 +95,7 @@ struct FreeExtentPage {
 ** encoded page bytes alive while using payload.
 */
 struct OverflowPage {
+  std::uint64_t page_lsn;
   page_id_t owner_value_id;
   std::uint32_t chunk_index;
   page_id_t next_page_id;
@@ -118,12 +119,16 @@ inline constexpr std::size_t FREE_EXTENTS_PER_PAGE = 168;
 auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t next_page_id,
                           std::span<const FreeExtent> extents) -> Result<std::array<char, PAGE_SIZE>>;
 auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<FreeExtentPage>;
+auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_page_id,
+                          const DataPageHeader &validated_header) -> Result<FreeExtentPage>;
 
 inline constexpr std::size_t OVERFLOW_PAGE_PAYLOAD_BYTES = PAGE_SIZE - 60;
 
-auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t owner_value_id,
-                        std::uint32_t chunk_index, page_id_t next_page_id,
+auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t owner_value_id, std::uint32_t chunk_index,
+                        page_id_t next_page_id,
                         std::span<const std::byte> payload) -> Result<std::array<char, PAGE_SIZE>>;
 auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<OverflowPage>;
+auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id,
+                        const DataPageHeader &validated_header) -> Result<OverflowPage>;
 
 }  // namespace tinydb::storage
