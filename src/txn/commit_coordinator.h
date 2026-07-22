@@ -26,12 +26,11 @@ struct CommitTiming final {
 };
 
 /*
-** DURABLE COMMIT COORDINATOR
+** DURABLE COMMIT
 **
-** This class joins one frozen logical transaction to the three shared storage
-** domains it must update: WAL durability, committed-cache ownership, and
-** visible DatabaseState. It owns none of those layers and performs no tree
-** mutation itself.
+** Join one frozen logical transaction to WAL durability, committed-cache
+** ownership, and visible DatabaseState. The operation owns none of those
+** layers and performs no tree mutation itself.
 **
 ** Commit establishes the following boundary:
 **
@@ -42,18 +41,8 @@ struct CommitTiming final {
 ** IndeterminateCommit or NeedsRecovery means the caller must transition the
 ** database lifecycle before admitting another operation.
 */
-class CommitCoordinator final {
- public:
-  CommitCoordinator(Wal *wal, cache::CommittedPageCache *cache, ReaderGate *readers)
-      : wal_(wal), cache_(cache), readers_(readers) {}
-
-  auto Commit(TransactionPages &transaction, BPlusTree &tree, CommitTiming *timing = nullptr) -> Result<CommitInfo>;
-
- private:
-  Wal *wal_;
-  cache::CommittedPageCache *cache_;
-  ReaderGate *readers_;
-};
+auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &readers, TransactionPages &transaction,
+                       BPlusTree &tree, CommitTiming *timing = nullptr) -> Result<CommitInfo>;
 
 }  // namespace txn
 }  // namespace tinydb

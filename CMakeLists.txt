@@ -135,7 +135,6 @@ add_library(
   src/txn/reader_gate.h
   src/txn/read_snapshot.cpp
   src/txn/read_snapshot.h
-  src/txn/state.h
   src/txn/transaction_pages.cpp
   src/txn/transaction_pages.h
   src/util/check.h

@@ -1,11 +1,10 @@
 #pragma once
 
+#include <tinydb/options.h>
 #include <tinydb/status.h>
-#include "storage/page.h"
 
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -34,15 +33,6 @@ namespace checkpoint {
 ** write outage. The elapsed trigger is evaluated when the database next has an
 ** opportunity to run maintenance; TinyDB does not own a background thread.
 */
-struct Policy {
-  std::uint64_t wal_trigger_bytes{1U << 20U};
-  std::size_t dirty_trigger_bytes{32U * PAGE_SIZE};
-  std::uint64_t hard_wal_bytes{4U << 20U};
-  std::size_t hard_dirty_bytes{16U << 20U};
-  std::size_t failures_before_backpressure{2};
-  std::chrono::steady_clock::duration maximum_age{std::chrono::seconds(30)};
-};
-
 struct Stats {
   std::size_t consecutive_failures{0};
   bool checkpoint_requested{false};
@@ -53,11 +43,9 @@ struct Stats {
 /*
 ** IMMUTABLE CHECKPOINT MANAGER
 **
-** One manager serializes all database-file checkpoints. Capture briefly owns
-** the cache/state replacement lock and retains exact immutable cache frames
-** plus their DatabaseState. It releases that lock before file I/O, allowing
-** readers to proceed and later transactions to publish different versions of
-** the same page.
+** The database's writer permit serializes checkpoints with transactions.
+** Readers continue during checkpoint I/O because committed frames and their
+** DatabaseState are immutable.
 **
 ** Persistent order is:
 **
@@ -72,7 +60,8 @@ struct Stats {
 */
 class Manager final {
  public:
-  Manager(DiskManager *disk, cache::CommittedPageCache *cache, txn::ReaderGate *readers, Wal *wal, Policy policy = {});
+  Manager(DiskManager *disk, cache::CommittedPageCache *cache, txn::ReaderGate *readers, Wal *wal,
+          CheckpointOptions options = {});
 
   Manager(const Manager &) = delete;
   auto operator=(const Manager &) -> Manager & = delete;
@@ -83,17 +72,15 @@ class Manager final {
   auto GetStats() const -> Stats;
 
  private:
-  auto CheckpointLocked() -> Status;
   auto Record(Status status) -> Status;
 
   DiskManager *disk_;
   cache::CommittedPageCache *cache_;
   txn::ReaderGate *readers_;
   Wal *wal_;
-  Policy policy_;
+  CheckpointOptions options_;
 
-  mutable std::mutex checkpoint_mutex_;  // serializes capture through cleanup
-  mutable std::mutex state_mutex_;       // protects failure/time diagnostics
+  mutable std::mutex state_mutex_;  // protects failure/time diagnostics
   std::size_t consecutive_failures_{0};
   std::chrono::steady_clock::time_point last_success_{std::chrono::steady_clock::now()};
   std::optional<Status> last_failure_;

@@ -12,12 +12,16 @@
 
 namespace tinydb {
 
+namespace detail {
+class DatabaseCore;
+}
+
 /*
 ** EMBEDDED DATABASE HANDLE
 **
 ** Database owns one process-exclusive open of a database file. Its private
-** implementation owns every storage subsystem at stable addresses; public
-** transaction and cursor handles retain the core objects they borrow.
+** core owns every storage subsystem at stable addresses; public transaction
+** and cursor handles retain that core while they borrow it.
 ** Convenience reads and writes create the same transaction objects exposed to
 ** applications, so there is only one visibility and durability path.
 */
@@ -53,11 +57,9 @@ class Database final {
   auto Close() -> Status;
 
  private:
-  struct Impl;
-  explicit Database(std::unique_ptr<Impl> impl);
-  void CloseBestEffort() noexcept;
+  explicit Database(std::shared_ptr<detail::DatabaseCore> core);
 
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<detail::DatabaseCore> core_;
 };
 
 }  // namespace tinydb

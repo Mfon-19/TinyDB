@@ -34,12 +34,8 @@ class LeafPageBuilder {
   auto Erase(std::string_view key) -> bool;
   auto OverflowFor(std::string_view key) const -> std::optional<OverflowValueDescriptor>;
   auto Fits() const -> bool;
-  auto Underfull() const -> bool;
 
   auto Split(page_id_t right_page_id, bool tail_heavy) -> SplitResult;
-
-  // Appends an adjacent right range and bypasses it in the leaf chain.
-  void Absorb(LeafPageBuilder &&right);
 
   auto NextLeaf() const -> page_id_t { return next_leaf_; }
 

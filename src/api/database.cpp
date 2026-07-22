@@ -16,7 +16,6 @@
 #include "txn/database_state.h"
 #include "txn/read_snapshot.h"
 #include "txn/reader_gate.h"
-#include "txn/state.h"
 #include "txn/transaction_pages.h"
 #include "verify/verifier.h"
 #include "wal/wal_codec.h"
@@ -89,17 +88,6 @@ auto ValidateOptions(const Options &options) -> Status {
   return {};
 }
 
-auto CheckpointPolicy(const CheckpointOptions &options) -> checkpoint::Policy {
-  return checkpoint::Policy{
-      .wal_trigger_bytes = options.wal_trigger_bytes,
-      .dirty_trigger_bytes = options.dirty_trigger_bytes,
-      .hard_wal_bytes = options.hard_wal_bytes,
-      .hard_dirty_bytes = options.hard_dirty_bytes,
-      .failures_before_backpressure = options.failures_before_backpressure,
-      .maximum_age = options.maximum_age,
-  };
-}
-
 auto AcquireDatabaseLock(const std::filesystem::path &path) -> Result<UniqueFd> {
   // Ownership precedes recovery because replay and segment cleanup are writes.
   auto fd = UniqueFd(io::Open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
@@ -136,26 +124,20 @@ auto InitialState(const DiskManager &disk) -> std::shared_ptr<const txn::Databas
   });
 }
 
-auto LifecycleError(txn::DatabaseLifecycle lifecycle, txn::DatabaseOperation operation,
-                    std::size_t active_transactions = 0) -> Status {
-  const auto code = txn::StateStatus(lifecycle, operation, active_transactions);
-  switch (code) {
-    case StatusCode::Ok:
+enum class Lifecycle {
+  Open,
+  NeedsRecovery,
+  Closed,
+};
+
+auto LifecycleError(Lifecycle lifecycle, bool diagnostics = false) -> Status {
+  switch (lifecycle) {
+    case Lifecycle::Open:
       return {};
-    case StatusCode::Busy:
-      return Status::Busy("database has active transactions");
-    case StatusCode::NeedsRecovery:
-      return Status::NeedsRecovery("database must be reopened before further access");
-    case StatusCode::Corruption:
-      return Status::Corruption("database handle is in the corruption state");
-    case StatusCode::Closed:
+    case Lifecycle::NeedsRecovery:
+      return diagnostics ? Status{} : Status::NeedsRecovery("database must be reopened before further access");
+    case Lifecycle::Closed:
       return Status::Closed("operation on a closed database handle");
-    case StatusCode::IoError:
-    case StatusCode::UnsupportedFormat:
-    case StatusCode::InvalidArgument:
-    case StatusCode::ResourceExhausted:
-    case StatusCode::IndeterminateCommit:
-      TINYDB_CHECK(false, "database lifecycle produced a non-admission status");
   }
   TINYDB_CHECK(false, "unknown database lifecycle status");
 }
@@ -212,71 +194,30 @@ class DatabaseCore final {
                std::unique_ptr<cache::CommittedPageCache> page_cache, std::unique_ptr<txn::ReaderGate> reader_gate,
                std::unique_ptr<Wal> write_ahead_log, Options database_options)
       : path(std::move(database_path)),
-        options(std::move(database_options)),
+        write_transaction_bytes(database_options.max_write_transaction_bytes),
         lock_fd(std::move(database_lock)),
         disk(std::move(database_file)),
         cache(std::move(page_cache)),
         readers(std::move(reader_gate)),
         wal(std::move(write_ahead_log)),
         checkpoints(std::make_unique<checkpoint::Manager>(disk.get(), cache.get(), readers.get(), wal.get(),
-                                                          CheckpointPolicy(options.checkpoint))) {}
+                                                          database_options.checkpoint)) {}
 
   DatabaseCore(const DatabaseCore &) = delete;
   auto operator=(const DatabaseCore &) -> DatabaseCore & = delete;
 
   ~DatabaseCore() { ReleaseResources(); }
 
-  class MaintenancePermit final {
-   public:
-    MaintenancePermit(const MaintenancePermit &) = delete;
-    auto operator=(const MaintenancePermit &) -> MaintenancePermit & = delete;
-    MaintenancePermit(MaintenancePermit &&other) noexcept : core_(std::exchange(other.core_, nullptr)) {}
-    auto operator=(MaintenancePermit &&) -> MaintenancePermit & = delete;
-    ~MaintenancePermit() {
-      if (core_ != nullptr) {
-        core_->ReleaseMaintenance();
-      }
-    }
-
-   private:
-    explicit MaintenancePermit(DatabaseCore *core) : core_(core) {}
-    DatabaseCore *core_;
-
-    friend class DatabaseCore;
-  };
-
-  void ReleaseTransaction() noexcept {
-    auto lock = std::lock_guard(lifecycle_mutex);
-    TINYDB_CHECK(active_transactions != 0, "database transaction count underflow");
-    --active_transactions;
-  }
-
   void NeedsRecovery() noexcept {
     auto lock = std::lock_guard(lifecycle_mutex);
-    if (lifecycle == txn::DatabaseLifecycle::Open || lifecycle == txn::DatabaseLifecycle::CheckpointDegraded) {
-      lifecycle = txn::DatabaseLifecycle::NeedsRecovery;
+    if (lifecycle == Lifecycle::Open) {
+      lifecycle = Lifecycle::NeedsRecovery;
     }
-  }
-
-  void ReleaseMaintenance() noexcept {
-    auto lock = std::lock_guard(lifecycle_mutex);
-    TINYDB_CHECK(active_maintenance != 0, "database maintenance count underflow");
-    --active_maintenance;
-  }
-
-  auto AdmitMaintenance(txn::DatabaseOperation operation) -> Result<MaintenancePermit> {
-    auto lock = std::lock_guard(lifecycle_mutex);
-    if (auto status = LifecycleError(lifecycle, operation); !status.Ok()) {
-      return std::unexpected(std::move(status));
-    }
-    ++active_maintenance;
-    return MaintenancePermit(this);
   }
 
   auto Commit(txn::TransactionPages &transaction, BPlusTree &tree) -> Result<CommitInfo> {
-    auto coordinator = txn::CommitCoordinator(wal.get(), cache.get(), readers.get());
     auto timing = txn::CommitTiming{};
-    auto result = coordinator.Commit(transaction, tree, &timing);
+    auto result = txn::CommitTransaction(*wal, *cache, *readers, transaction, tree, &timing);
     {
       auto lock = std::lock_guard(operational_stats_mutex);
       ++operational_stats.write_attempts;
@@ -295,38 +236,17 @@ class DatabaseCore final {
   }
 
   auto Checkpoint() -> Status {
-    auto admission = AdmitMaintenance(txn::DatabaseOperation::Checkpoint);
-    if (!admission) {
-      return admission.error();
+    auto writer = std::unique_lock(writer_mutex, std::try_to_lock);
+    if (!writer.owns_lock()) {
+      return Status::Busy("database has an active write transaction");
     }
-
-    const auto status = checkpoints->Checkpoint();
-    ObserveCheckpoint(status);
-    return status;
-  }
-
-  void ObserveCheckpoint(const Status &status) noexcept {
-    auto lock = std::lock_guard(lifecycle_mutex);
-    if (lifecycle == txn::DatabaseLifecycle::Open || lifecycle == txn::DatabaseLifecycle::CheckpointDegraded) {
-      if (status.Code() == StatusCode::NeedsRecovery || status.Code() == StatusCode::IndeterminateCommit) {
-        lifecycle = txn::DatabaseLifecycle::NeedsRecovery;
-      } else if (status.Code() == StatusCode::Corruption) {
-        lifecycle = txn::DatabaseLifecycle::Corrupt;
-      } else {
-        lifecycle = status.Ok() ? txn::DatabaseLifecycle::Open : txn::DatabaseLifecycle::CheckpointDegraded;
-      }
-    }
-  }
-
-  auto MaybeCheckpoint() -> Status {
-    if (checkpoints->ShouldCheckpoint()) {
-      const auto status = Checkpoint();
-      if (status.Code() == StatusCode::NeedsRecovery || status.Code() == StatusCode::IndeterminateCommit ||
-          status.Code() == StatusCode::Corruption || status.Code() == StatusCode::Closed) {
+    {
+      auto lock = std::lock_guard(lifecycle_mutex);
+      if (auto status = LifecycleError(lifecycle); !status.Ok()) {
         return status;
       }
     }
-    return checkpoints->WriteAdmissionStatus();
+    return checkpoints->Checkpoint();
   }
 
   /*
@@ -336,12 +256,17 @@ class DatabaseCore final {
   ** environmental failure prevents a report from being produced.
   */
   auto Verify(VerifyOptions verify_options) -> Result<VerifyReport> {
-    auto admission = AdmitMaintenance(txn::DatabaseOperation::Verify);
-    if (!admission) {
-      return std::unexpected(admission.error());
+    auto snapshot = [&]() -> Result<txn::ReadSnapshot> {
+      auto lock = std::lock_guard(lifecycle_mutex);
+      if (auto status = LifecycleError(lifecycle); !status.Ok()) {
+        return std::unexpected(std::move(status));
+      }
+      return txn::ReadSnapshot::Begin(readers.get(), cache.get());
+    }();
+    if (!snapshot) {
+      return std::unexpected(snapshot.error());
     }
-    auto snapshot = txn::ReadSnapshot::Begin(readers.get(), cache.get());
-    return verify::Snapshot(cache.get(), snapshot.State(), options.max_write_transaction_bytes, verify_options);
+    return verify::Snapshot(cache.get(), snapshot->State(), write_transaction_bytes, verify_options);
   }
 
   /*
@@ -351,7 +276,7 @@ class DatabaseCore final {
   */
   auto Statistics() const -> Result<DatabaseStats> {
     auto lock = std::lock_guard(lifecycle_mutex);
-    if (auto status = LifecycleError(lifecycle, txn::DatabaseOperation::Stats); !status.Ok()) {
+    if (auto status = LifecycleError(lifecycle, true); !status.Ok()) {
       return std::unexpected(std::move(status));
     }
     const auto state = readers->CurrentState();
@@ -410,19 +335,18 @@ class DatabaseCore final {
       return Status::Busy("database has an active write transaction");
     }
     auto lifecycle_lock = std::unique_lock(lifecycle_mutex);
-    if (lifecycle == txn::DatabaseLifecycle::Closed) {
+    if (lifecycle == Lifecycle::Closed) {
       return {};
     }
-    if (active_transactions != 0 || active_maintenance != 0) {
-      return Status::Busy("database has active transactions or maintenance");
+    if (readers->Stats().active_readers != 0) {
+      return Status::Busy("database has active readers");
     }
-    if (lifecycle == txn::DatabaseLifecycle::Open || lifecycle == txn::DatabaseLifecycle::CheckpointDegraded) {
+    if (lifecycle == Lifecycle::Open) {
       if (auto status = checkpoints->Checkpoint(); !status.Ok()) {
-        lifecycle = txn::DatabaseLifecycle::CheckpointDegraded;
         return status;
       }
     }
-    lifecycle = txn::DatabaseLifecycle::Closed;
+    lifecycle = Lifecycle::Closed;
     ReleaseResources();
     return {};
   }
@@ -437,21 +361,19 @@ class DatabaseCore final {
   }
 
   std::filesystem::path path;
-  Options options;
+  std::size_t write_transaction_bytes;
 
   /*
   ** CORE LOCK ORDER
   **
   ** Code needing both the writer permit and lifecycle state acquires
   ** writer_mutex first. lifecycle_mutex protects admission counts and state;
-  ** writer_mutex protects exclusive write preparation. Close uses a
-  ** non-blocking writer acquisition, so an application-owned writer still
-  ** produces Busy rather than turning Close into a wait.
+  ** writer_mutex protects write preparation, commit, and checkpoint I/O.
+  ** Close and explicit Checkpoint use a non-blocking acquisition, so an
+  ** application-owned writer produces Busy rather than a wait or deadlock.
   */
   mutable std::mutex lifecycle_mutex;
-  txn::DatabaseLifecycle lifecycle{txn::DatabaseLifecycle::Open};
-  std::size_t active_transactions{0};
-  std::size_t active_maintenance{0};
+  Lifecycle lifecycle{Lifecycle::Open};
   std::mutex writer_mutex;
   mutable std::mutex operational_stats_mutex;
   OperationalStats operational_stats;
@@ -470,33 +392,17 @@ struct Cursor::Impl final {
   Impl(std::shared_ptr<detail::DatabaseCore> database, txn::SnapshotCursor snapshot_cursor, KeyRange key_range)
       : core(std::move(database)), cursor(std::move(snapshot_cursor)), range(std::move(key_range)) {}
 
-  ~Impl() { Release(); }
-
-  void Activate() noexcept { active = true; }
-
-  void Release() noexcept {
-    if (!active) {
-      return;
-    }
-    // Release the page lease and shared reader admission before taking the
-    // lifecycle mutex in ReleaseTransaction. This preserves the same lock
-    // ordering as ReadTransaction destruction.
-    cursor.reset();
-    active = false;
-    core->ReleaseTransaction();
-  }
-
   auto Valid() const -> bool {
-    if (!active || !cursor->Valid()) {
+    if (!cursor.Valid()) {
       return false;
     }
     const auto upper = range.Upper();
-    return !upper || txn::BytewiseLess{}(cursor->Key(), *upper);
+    return !upper || txn::BytewiseLess{}(cursor.Key(), *upper);
   }
 
   auto First() -> Status {
     const auto lower = range.Lower();
-    return lower ? cursor->Seek(*lower) : cursor->First();
+    return lower ? cursor.Seek(*lower) : cursor.First();
   }
 
   auto Seek(std::string_view key) -> Status {
@@ -504,37 +410,20 @@ struct Cursor::Impl final {
     if (lower && txn::BytewiseLess{}(key, *lower)) {
       key = *lower;
     }
-    return cursor->Seek(key);
+    return cursor.Seek(key);
   }
 
   std::shared_ptr<detail::DatabaseCore> core;
-  std::optional<txn::SnapshotCursor> cursor;
+  txn::SnapshotCursor cursor;
   KeyRange range;
-  bool active{false};
 };
 
 struct ReadTransaction::Impl final {
   Impl(std::shared_ptr<detail::DatabaseCore> database, txn::ReadSnapshot read_snapshot)
       : core(std::move(database)), snapshot(std::move(read_snapshot)) {}
 
-  ~Impl() { Release(); }
-
-  void Release() noexcept {
-    if (!active) {
-      return;
-    }
-    // Reader admission must be released before taking lifecycle_mutex. A new
-    // BeginRead may hold that mutex while waiting behind a pending publisher;
-    // reversing these two releases would make the publisher wait on us while
-    // we wait on the new reader.
-    snapshot.reset();
-    active = false;
-    core->ReleaseTransaction();
-  }
-
   std::shared_ptr<detail::DatabaseCore> core;
-  std::optional<txn::ReadSnapshot> snapshot;
-  bool active{true};
+  txn::ReadSnapshot snapshot;
 };
 
 struct WriteTransaction::Impl final {
@@ -548,23 +437,19 @@ struct WriteTransaction::Impl final {
   ~Impl() { Abort(); }
 
   void Release() noexcept {
-    if (!active) {
+    if (transaction == nullptr) {
       return;
     }
-    active = false;
+    tree.reset();
+    transaction.reset();
 
-    // Preserve the global writer-before-lifecycle order by dropping the writer
-    // before ReleaseTransaction takes lifecycle_mutex. This is safe because
-    // commit or abort has finished, while the lifetime reservation still keeps
-    // Close from reclaiming the core until the count is decremented.
     if (writer.owns_lock()) {
       writer.unlock();
     }
-    core->ReleaseTransaction();
   }
 
   void Abort() noexcept {
-    if (!active) {
+    if (transaction == nullptr) {
       return;
     }
     transaction->Abort();
@@ -575,7 +460,6 @@ struct WriteTransaction::Impl final {
   std::unique_lock<std::mutex> writer;
   std::unique_ptr<txn::TransactionPages> transaction;
   std::unique_ptr<BPlusTree> tree;
-  bool active{true};
 };
 
 ReadTransaction::ReadTransaction(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -583,30 +467,22 @@ ReadTransaction::ReadTransaction(ReadTransaction &&) noexcept = default;
 ReadTransaction::~ReadTransaction() = default;
 
 auto ReadTransaction::Get(BytesView key) -> Result<std::optional<Bytes>> {
-  if (impl_ == nullptr || !impl_->active) {
+  if (impl_ == nullptr) {
     return std::unexpected(Status::Closed("Get on an inactive read transaction"));
   }
-  return impl_->snapshot->Get(key);
+  return impl_->snapshot.Get(key);
 }
 
 auto ReadTransaction::Scan(KeyRange range) -> Result<Cursor> {
-  if (impl_ == nullptr || !impl_->active) {
+  if (impl_ == nullptr) {
     return std::unexpected(Status::Closed("Scan on an inactive read transaction"));
   }
-  auto snapshot_cursor = range.Lower() ? impl_->snapshot->Seek(*range.Lower()) : impl_->snapshot->First();
+  auto snapshot_cursor = range.Lower() ? impl_->snapshot.Seek(*range.Lower()) : impl_->snapshot.First();
   if (!snapshot_cursor) {
     return std::unexpected(snapshot_cursor.error());
   }
 
-  auto cursor_impl = std::make_unique<Cursor::Impl>(impl_->core, std::move(*snapshot_cursor), std::move(range));
-  {
-    auto lock = std::lock_guard(impl_->core->lifecycle_mutex);
-    TINYDB_CHECK(impl_->core->lifecycle != txn::DatabaseLifecycle::Closed,
-                 "active read transaction belongs to a closed database");
-    ++impl_->core->active_transactions;
-  }
-  cursor_impl->Activate();
-  return Cursor(std::move(cursor_impl));
+  return Cursor(std::make_unique<Cursor::Impl>(impl_->core, std::move(*snapshot_cursor), std::move(range)));
 }
 
 Cursor::Cursor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -614,46 +490,46 @@ Cursor::Cursor(Cursor &&) noexcept = default;
 Cursor::~Cursor() = default;
 
 auto Cursor::First() -> Status {
-  if (impl_ == nullptr || !impl_->active) {
+  if (impl_ == nullptr) {
     return Status::Closed("First on an inactive cursor");
   }
   return impl_->First();
 }
 
 auto Cursor::Seek(BytesView key) -> Status {
-  if (impl_ == nullptr || !impl_->active) {
+  if (impl_ == nullptr) {
     return Status::Closed("Seek on an inactive cursor");
   }
   return impl_->Seek(key);
 }
 
 auto Cursor::Next() -> Status {
-  if (impl_ == nullptr || !impl_->active) {
+  if (impl_ == nullptr) {
     return Status::Closed("Next on an inactive cursor");
   }
   if (!impl_->Valid()) {
     return Status::InvalidArgument("Next requires a valid cursor position");
   }
-  return impl_->cursor->Next();
+  return impl_->cursor.Next();
 }
 
 auto Cursor::Valid() const -> bool { return impl_ != nullptr && impl_->Valid(); }
 
 auto Cursor::Key() const -> BytesView {
   TINYDB_CHECK(Valid(), "Key requires a valid cursor position");
-  return impl_->cursor->Key();
+  return impl_->cursor.Key();
 }
 
 auto Cursor::ValueSize() const -> std::uint64_t {
   TINYDB_CHECK(Valid(), "ValueSize requires a valid cursor position");
-  return impl_->cursor->ValueSize();
+  return impl_->cursor.ValueSize();
 }
 
 auto Cursor::CopyValue() const -> Result<Bytes> {
   if (!Valid()) {
     return std::unexpected(Status::InvalidArgument("CopyValue requires a valid cursor position"));
   }
-  return impl_->cursor->CopyValue();
+  return impl_->cursor.CopyValue();
 }
 
 WriteTransaction::WriteTransaction(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -661,14 +537,14 @@ WriteTransaction::WriteTransaction(WriteTransaction &&) noexcept = default;
 WriteTransaction::~WriteTransaction() = default;
 
 auto WriteTransaction::Get(BytesView key) -> Result<std::optional<Bytes>> {
-  if (impl_ == nullptr || !impl_->active) {
+  if (impl_ == nullptr || impl_->transaction == nullptr) {
     return std::unexpected(Status::Closed("Get on an inactive write transaction"));
   }
   return impl_->tree->Get(key);
 }
 
 auto WriteTransaction::Put(BytesView key, BytesView value) -> Status {
-  if (impl_ == nullptr || !impl_->active) {
+  if (impl_ == nullptr || impl_->transaction == nullptr) {
     return Status::Closed("Put on an inactive write transaction");
   }
   if (txn::ValidateKeySize(key.size()) != StatusCode::Ok || txn::ValidateValueSize(value.size()) != StatusCode::Ok) {
@@ -685,7 +561,7 @@ auto WriteTransaction::Put(BytesView key, BytesView value) -> Status {
 }
 
 auto WriteTransaction::Delete(BytesView key) -> Status {
-  if (impl_ == nullptr || !impl_->active) {
+  if (impl_ == nullptr || impl_->transaction == nullptr) {
     return Status::Closed("Delete on an inactive write transaction");
   }
   if (txn::ValidateKeySize(key.size()) != StatusCode::Ok) {
@@ -699,7 +575,7 @@ auto WriteTransaction::Delete(BytesView key) -> Status {
 }
 
 auto WriteTransaction::Commit() && -> Result<CommitInfo> {
-  if (impl_ == nullptr || !impl_->active) {
+  if (impl_ == nullptr || impl_->transaction == nullptr) {
     return std::unexpected(Status::Closed("Commit on an inactive write transaction"));
   }
   auto result = impl_->core->Commit(*impl_->transaction, *impl_->tree);
@@ -713,13 +589,7 @@ void WriteTransaction::Abort() noexcept {
   }
 }
 
-struct Database::Impl final {
-  explicit Impl(std::shared_ptr<detail::DatabaseCore> database_core) : core(std::move(database_core)) {}
-
-  std::shared_ptr<detail::DatabaseCore> core;
-};
-
-Database::Database(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Database::Database(std::shared_ptr<detail::DatabaseCore> core) : core_(std::move(core)) {}
 Database::Database(Database &&) noexcept = default;
 
 auto Database::Open(const std::filesystem::path &path, Options options) -> Result<Database> {
@@ -757,7 +627,7 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
   auto wal = std::make_unique<Wal>(*std::move(wal_result));
   auto core = std::make_shared<detail::DatabaseCore>(path, std::move(*lock), std::move(disk), std::move(cache),
                                                      std::move(readers), std::move(wal), options);
-  auto database = Database(std::make_unique<Impl>(core));
+  auto database = Database(core);
 
   // Bootstrap allocates the first root through the same public write path as
   // every application transaction.
@@ -774,82 +644,60 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
   return database;
 }
 
-Database::~Database() { CloseBestEffort(); }
-
-void Database::CloseBestEffort() noexcept {
-  if (impl_ == nullptr) {
-    return;
-  }
-  if (const auto status = Close(); !status.Ok() && status.Code() != StatusCode::Busy) {
-    std::fprintf(stderr, "tinydb: failed to close %s: %s\n", impl_->core->path.c_str(), status.ToString().c_str());
+Database::~Database() {
+  if (core_ != nullptr) {
+    const auto status = Close();
+    if (status.Ok() || status.Code() == StatusCode::Busy) {
+      return;
+    }
+    std::fprintf(stderr, "tinydb: failed to close %s: %s\n", core_->path.c_str(), status.ToString().c_str());
   }
 }
 
 auto Database::BeginRead() -> Result<ReadTransaction> {
-  if (impl_ == nullptr) {
+  if (core_ == nullptr) {
     return std::unexpected(Status::Closed("BeginRead on a moved-from database"));
   }
-  const auto core = impl_->core;
+  const auto core = core_;
   auto lock = std::lock_guard(core->lifecycle_mutex);
-  if (auto status = LifecycleError(core->lifecycle, txn::DatabaseOperation::Read); !status.Ok()) {
+  if (auto status = LifecycleError(core->lifecycle); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   auto snapshot = txn::ReadSnapshot::Begin(core->readers.get(), core->cache.get());
   auto transaction = std::make_unique<ReadTransaction::Impl>(core, std::move(snapshot));
-  ++core->active_transactions;
   return ReadTransaction(std::move(transaction));
 }
 
 auto Database::BeginWrite() -> Result<WriteTransaction> {
-  if (impl_ == nullptr) {
+  if (core_ == nullptr) {
     return std::unexpected(Status::Closed("BeginWrite on a moved-from database"));
   }
-  const auto core = impl_->core;
-  {
-    auto lifecycle_lock = std::lock_guard(core->lifecycle_mutex);
-    if (auto status = LifecycleError(core->lifecycle, txn::DatabaseOperation::Write); !status.Ok()) {
-      return std::unexpected(std::move(status));
-    }
-    // Reserve lifetime before releasing lifecycle_mutex for checkpoint I/O.
-    // Close will report Busy instead of freeing the manager and cache between
-    // this admission check and construction of the transaction handle.
-    ++core->active_transactions;
-  }
-  struct PendingAdmission final {
-    std::shared_ptr<detail::DatabaseCore> core;
-    bool transferred{false};
-    ~PendingAdmission() {
-      if (!transferred) {
-        core->ReleaseTransaction();
-      }
-    }
-  } admission{.core = core};
-
-  /*
-  ** MAINTENANCE OPPORTUNITY
-  **
-  ** Checkpoint capture and I/O do not own the writer permit. A write may
-  ** therefore prepare and publish while another thread writes a retained
-  ** checkpoint snapshot. This admission path merely gives requested
-  ** maintenance one opportunity before applying hard-pressure backoff.
-  */
-  if (auto status = core->MaybeCheckpoint(); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
-
+  const auto core = core_;
   auto writer = std::unique_lock(core->writer_mutex, std::try_to_lock);
   if (!writer.owns_lock()) {
     return std::unexpected(Status::Busy("another write transaction is active"));
   }
-  auto lifecycle_lock = std::lock_guard(core->lifecycle_mutex);
-  if (auto status = LifecycleError(core->lifecycle, txn::DatabaseOperation::Write); !status.Ok()) {
-    return std::unexpected(std::move(status));
+  {
+    auto lifecycle_lock = std::lock_guard(core->lifecycle_mutex);
+    if (auto status = LifecycleError(core->lifecycle); !status.Ok()) {
+      return std::unexpected(std::move(status));
+    }
+  }
+
+  // The writer permit makes checkpoint capture, I/O, and frontier publication
+  // one simple maintenance phase before private transaction preparation.
+  if (core->checkpoints->ShouldCheckpoint()) {
+    const auto status = core->checkpoints->Checkpoint();
+    if (status.Code() == StatusCode::NeedsRecovery || status.Code() == StatusCode::IndeterminateCommit ||
+        status.Code() == StatusCode::Corruption || status.Code() == StatusCode::Closed) {
+      return std::unexpected(status);
+    }
   }
   if (auto status = core->checkpoints->WriteAdmissionStatus(); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   const auto base = core->readers->CurrentState();
-  auto transaction = txn::TransactionPages::Begin(core->cache.get(), *base, core->options.max_write_transaction_bytes);
+  auto transaction = txn::TransactionPages::Begin(core->cache.get(), *base, core->write_transaction_bytes);
   if (!transaction) {
     return std::unexpected(transaction.error());
   }
@@ -872,7 +720,6 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
   auto private_tree = std::make_unique<BPlusTree>(std::move(*tree));
   auto transaction_impl = std::make_unique<WriteTransaction::Impl>(core, std::move(writer), std::move(private_pages),
                                                                    std::move(private_tree));
-  admission.transferred = true;
   return WriteTransaction(std::move(transaction_impl));
 }
 
@@ -909,31 +756,31 @@ auto Database::Delete(BytesView key) -> Status {
 }
 
 auto Database::Checkpoint() -> Status {
-  if (impl_ == nullptr) {
+  if (core_ == nullptr) {
     return Status::Closed("Checkpoint on a moved-from database");
   }
-  return impl_->core->Checkpoint();
+  return core_->Checkpoint();
 }
 
 auto Database::Verify(VerifyOptions options) -> Result<VerifyReport> {
-  if (impl_ == nullptr) {
+  if (core_ == nullptr) {
     return std::unexpected(Status::Closed("Verify on a moved-from database"));
   }
-  return impl_->core->Verify(options);
+  return core_->Verify(options);
 }
 
 auto Database::Stats() const -> Result<DatabaseStats> {
-  if (impl_ == nullptr) {
+  if (core_ == nullptr) {
     return std::unexpected(Status::Closed("Stats on a moved-from database"));
   }
-  return impl_->core->Statistics();
+  return core_->Statistics();
 }
 
 auto Database::Close() -> Status {
-  if (impl_ == nullptr) {
+  if (core_ == nullptr) {
     return {};
   }
-  return impl_->core->Close();
+  return core_->Close();
 }
 
 }  // namespace tinydb

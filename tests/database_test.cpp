@@ -48,6 +48,7 @@ TEST(Database, Transactions) {
     ASSERT_TRUE(write.Put("doc/1", "body").Ok());
     ASSERT_TRUE(write.Put("tag/db/doc/1", "").Ok());
     EXPECT_EQ(write.Get("doc/1").value(), "body");
+    EXPECT_EQ(database.Checkpoint().Code(), tinydb::StatusCode::Busy);
     ASSERT_TRUE(std::move(write).Commit().has_value());
   }
   {
@@ -157,6 +158,7 @@ TEST(Database, Persistence) {
   EXPECT_EQ(tinydb::test::Rows(reopened).value().size(), 100U);
   EXPECT_EQ(reopened.Get(tinydb::test::Key(159)).value(), tinydb::test::Value(159, 300));
   EXPECT_EQ(reopened.Get(tinydb::test::Key(0)).value(), std::nullopt);
+  EXPECT_TRUE(reopened.Verify()->Ok());
   Cleanup(path);
 }
 
@@ -164,11 +166,14 @@ TEST(Database, Locking) {
   const auto path = tinydb::test::Path("locking");
   auto database = Fresh("locking").value();
   auto read = std::optional<tinydb::ReadTransaction>{database.BeginRead().value()};
+  auto cursor = std::optional<tinydb::Cursor>{read->Scan().value()};
   EXPECT_EQ(database.Close().Code(), tinydb::StatusCode::Busy);
   const auto second = tinydb::Database::Open(path);
   ASSERT_FALSE(second.has_value());
   EXPECT_EQ(second.error().Code(), tinydb::StatusCode::Busy);
   read.reset();
+  EXPECT_EQ(database.Close().Code(), tinydb::StatusCode::Busy);
+  cursor.reset();
   ASSERT_TRUE(database.Close().Ok());
   EXPECT_TRUE(tinydb::Database::Open(path).has_value());
   Cleanup(path);
@@ -237,6 +242,20 @@ TEST(Database, Health) {
   EXPECT_EQ(tinydb::test::ReadFile(path), before_database);
   EXPECT_EQ(tinydb::test::ReadFile(tinydb::Wal::PathFor(path)), before_wal);
   Cleanup(path);
+}
+
+TEST(Database, AutomaticCheckpoint) {
+  auto options = tinydb::Options{};
+  options.checkpoint.wal_trigger_bytes = 1;
+  auto database = Fresh("automatic_checkpoint", options).value();
+  const auto before = database.Stats().value();
+  ASSERT_TRUE(before.checkpoint_requested);
+
+  ASSERT_TRUE(database.Put("key", "value").Ok());
+  const auto after = database.Stats().value();
+  EXPECT_EQ(after.checkpoint_lsn, before.visible_lsn);
+  EXPECT_GT(after.visible_lsn, after.checkpoint_lsn);
+  Cleanup(tinydb::test::Path("automatic_checkpoint"));
 }
 
 TEST(Database, CrashCopy) {

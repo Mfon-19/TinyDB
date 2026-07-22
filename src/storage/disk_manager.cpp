@@ -11,22 +11,20 @@
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <expected>
 #include <filesystem>
 #include <limits>
 #include <random>
 #include <span>
-#include <string>
-#include <string_view>
-#include <system_error>
 #include <utility>
 
 namespace tinydb {
 namespace {
+
+using io::ErrnoStatus;
+using io::SyncParentDirectory;
 
 /*
 ** DATABASE FILE DURABILITY
@@ -43,30 +41,6 @@ namespace {
 ** authoritative until those writes and the next inactive superblock are
 ** synchronized.
 */
-auto ErrnoStatus(std::string_view operation) -> Status {
-  // Capture errno immediately at the syscall boundary; later library work can
-  // overwrite the thread-local value and produce a misleading status.
-  return Status::IoError(std::string(operation) + ": " + std::generic_category().message(errno));
-}
-
-// fsync(file) makes file contents durable, but creation also changes the
-// parent directory. Without this second fsync a power loss can forget the name
-// even though both superblock writes reached stable storage.
-auto SyncParentDirectory(const std::filesystem::path &path) -> Status {
-  auto parent = path.parent_path();
-  if (parent.empty()) {
-    parent = ".";
-  }
-  auto directory = UniqueFd(io::Open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-  if (!directory.Valid()) {
-    return ErrnoStatus("open directory");
-  }
-  if (io::Fsync(directory.Get()) < 0) {
-    return ErrnoStatus("fsync directory");
-  }
-  return {};
-}
-
 auto RandomUuid() -> DatabaseUuid {
   // std::random_device is used only for collision-resistant identity, not for
   // cryptographic authorization. A UUID collision could pair unrelated WAL
@@ -89,17 +63,17 @@ auto ReadWholePage(int fd, page_id_t page_id) -> Result<std::array<char, PAGE_SI
   // Persistent pages are atomic units at the storage abstraction even though
   // POSIX may return a short read. A short page cannot be safely decoded.
   auto page = std::array<char, PAGE_SIZE>{};
-  const auto bytes_read = io::Pread(fd, page.data(), page.size(), page_id * PAGE_SIZE);
-  if (bytes_read < 0) {
-    return std::unexpected(ErrnoStatus("pread"));
+  const auto bytes_read = io::FullPread(fd, page.data(), page.size(), page_id * PAGE_SIZE);
+  if (!bytes_read) {
+    return std::unexpected(bytes_read.error());
   }
-  if (static_cast<std::size_t>(bytes_read) != page.size()) {
+  if (*bytes_read != page.size()) {
     return std::unexpected(Status::Corruption("short read on a persistent page"));
   }
   return page;
 }
 
-auto WriteWholePage(int fd, page_id_t page_id, const std::array<char, PAGE_SIZE> &page) -> Status {
+auto WriteWholePage(int fd, page_id_t page_id, const storage::SuperblockPage &page) -> Status {
   // Checkpoint and superblock pages are logical 4 KiB writes even when POSIX
   // completes them through several short writes or an interrupted syscall.
   return io::FullPwrite(fd, page.data(), page.size(), page_id * PAGE_SIZE);
@@ -137,7 +111,7 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
     //   4. write and fsync B, establishing redundancy.
     // At every boundary either no valid database exists yet or at least one
     // complete superblock does.
-    disk.database_uuid_ = RandomUuid();
+    disk.selected_.value.database_uuid = RandomUuid();
     if (io::Ftruncate(disk.fd_.Get(), FIRST_DATA_PAGE_ID * PAGE_SIZE) < 0) {
       return ErrnoStatus("ftruncate");
     }
@@ -204,56 +178,26 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
 
   // Adopt the selected state only after both pages have been independently
   // decoded. No persistent mutation occurs on the existing-file open path.
-  disk.database_uuid_ = selected->value.database_uuid;
-  disk.generation_ = selected->value.generation;
-  disk.checkpoint_lsn_ = selected->value.checkpoint_lsn;
-  disk.transaction_id_ = selected->value.transaction_id;
-  disk.root_page_id_ = selected->value.root_page_id;
-  disk.high_water_page_id_ = selected->value.high_water_page_id;
-  disk.allocator_root_page_id_ = selected->value.allocator_root_page_id;
-  disk.active_superblock_page_id_ =
-      selected->slot == storage::SuperblockSlot::A ? SUPERBLOCK_A_PAGE_ID : SUPERBLOCK_B_PAGE_ID;
+  disk.selected_ = *selected;
 
   // The superblock may not claim pages beyond the physical file. It may claim
   // fewer pages because a failed checkpoint can leave harmless trailing data.
   const auto file_pages = static_cast<std::uint64_t>(file_stat.st_size) / PAGE_SIZE;
-  if (disk.high_water_page_id_ < FIRST_DATA_PAGE_ID || disk.high_water_page_id_ > file_pages) {
+  if (disk.HighWaterPageId() < FIRST_DATA_PAGE_ID || disk.HighWaterPageId() > file_pages) {
     return std::unexpected(Status::Corruption("superblock allocation frontier lies outside the database file"));
   }
   return disk;
 }
 
-auto DiskManager::GetRootPageId() const -> page_id_t { return root_page_id_; }
-auto DiskManager::GetAllocatorRootPageId() const -> page_id_t { return allocator_root_page_id_; }
-auto DiskManager::HighWaterPageId() const -> page_id_t { return high_water_page_id_; }
-auto DiskManager::TransactionId() const -> std::uint64_t { return transaction_id_; }
-auto DiskManager::CheckpointLsn() const -> std::uint64_t { return checkpoint_lsn_; }
-auto DiskManager::Uuid() const -> const DatabaseUuid & { return database_uuid_; }
+auto DiskManager::GetRootPageId() const -> page_id_t { return selected_.value.root_page_id; }
+auto DiskManager::GetAllocatorRootPageId() const -> page_id_t { return selected_.value.allocator_root_page_id; }
+auto DiskManager::HighWaterPageId() const -> page_id_t { return selected_.value.high_water_page_id; }
+auto DiskManager::TransactionId() const -> std::uint64_t { return selected_.value.transaction_id; }
+auto DiskManager::CheckpointLsn() const -> std::uint64_t { return selected_.value.checkpoint_lsn; }
+auto DiskManager::Uuid() const -> const DatabaseUuid & { return selected_.value.database_uuid; }
 
-auto DiskManager::EncodeSuperblock(page_id_t root_page_id, page_id_t allocator_root_page_id,
-                                   page_id_t high_water_page_id, std::uint64_t transaction_id,
-                                   std::uint64_t checkpoint_lsn,
-                                   std::uint64_t generation) const -> Result<std::array<char, PAGE_SIZE>> {
-  const auto encoded = storage::EncodeSuperblock(storage::Superblock{
-      .database_uuid = database_uuid_,
-      .generation = generation,
-      .checkpoint_lsn = checkpoint_lsn,
-      .transaction_id = transaction_id,
-      .root_page_id = root_page_id,
-      .allocator_root_page_id = allocator_root_page_id,
-      .high_water_page_id = high_water_page_id,
-  });
-  if (!encoded) {
-    return std::unexpected(encoded.error());
-  }
-  auto output = std::array<char, PAGE_SIZE>{};
-  std::memcpy(output.data(), encoded->data(), encoded->size());
-  return output;
-}
-
-auto DiskManager::EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE> {
-  const auto encoded = EncodeSuperblock(root_page_id_, allocator_root_page_id_, high_water_page_id_, transaction_id_,
-                                        checkpoint_lsn_, generation_);
+auto DiskManager::EncodeCurrentSuperblock() const -> storage::SuperblockPage {
+  const auto encoded = storage::EncodeSuperblock(selected_.value);
   TINYDB_CHECK(encoded.has_value(), "invalid durable superblock state");
   return *encoded;
 }
@@ -285,10 +229,10 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
                                    page_id_t high_water_page_id, std::uint64_t transaction_id,
                                    std::uint64_t checkpoint_lsn) -> Status {
   TINYDB_CHECK(fd_.Valid(), "checkpointing a closed disk manager");
-  if (checkpoint_lsn < checkpoint_lsn_) {
+  if (checkpoint_lsn < CheckpointLsn()) {
     return Status::InvalidArgument("checkpoint frontier moved backward");
   }
-  if (generation_ == std::numeric_limits<std::uint64_t>::max()) {
+  if (selected_.value.generation == std::numeric_limits<std::uint64_t>::max()) {
     return Status::ResourceExhausted("superblock generation space exhausted");
   }
 
@@ -296,18 +240,22 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
   ** SUPERBLOCK PUBLICATION
   **
   ** Data pages were synchronized by CheckpointManager before this call. Write
-  ** the slot not named by active_superblock_page_id_, then synchronize that
-  ** one new recovery root. The old slot is deliberately left untouched.
+  ** the inactive slot, then synchronize that one new recovery root. The old
+  ** slot is deliberately left untouched.
   ** In-memory metadata changes only after fsync succeeds.
   */
-  const auto next_generation = generation_ + 1U;
-  const auto encoded = EncodeSuperblock(root_page_id, allocator_root_page_id, high_water_page_id, transaction_id,
-                                        checkpoint_lsn, next_generation);
+  auto next = selected_.value;
+  ++next.generation;
+  next.checkpoint_lsn = checkpoint_lsn;
+  next.transaction_id = transaction_id;
+  next.root_page_id = root_page_id;
+  next.allocator_root_page_id = allocator_root_page_id;
+  next.high_water_page_id = high_water_page_id;
+  const auto encoded = storage::EncodeSuperblock(next);
   if (!encoded) {
     return encoded.error();
   }
-  const auto inactive =
-      active_superblock_page_id_ == SUPERBLOCK_A_PAGE_ID ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
+  const auto inactive = selected_.slot == storage::SuperblockSlot::A ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
   if (auto status = WriteWholePage(fd_.Get(), inactive, *encoded); !status.Ok()) {
     return status;
   }
@@ -315,13 +263,10 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
     return status;
   }
 
-  generation_ = next_generation;
-  checkpoint_lsn_ = checkpoint_lsn;
-  transaction_id_ = transaction_id;
-  root_page_id_ = root_page_id;
-  allocator_root_page_id_ = allocator_root_page_id;
-  high_water_page_id_ = high_water_page_id;
-  active_superblock_page_id_ = inactive;
+  selected_ = storage::SelectedSuperblock{
+      .value = std::move(next),
+      .slot = selected_.slot == storage::SuperblockSlot::A ? storage::SuperblockSlot::B : storage::SuperblockSlot::A,
+  };
   return {};
 }
 
@@ -335,16 +280,16 @@ auto DiskManager::Sync() const -> Status {
 
 auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> Status {
   TINYDB_CHECK(fd_.Valid(), "reading from a closed disk manager");
-  if (page_id < FIRST_DATA_PAGE_ID || page_id >= high_water_page_id_) {
+  if (page_id < FIRST_DATA_PAGE_ID || page_id >= HighWaterPageId()) {
     // Invalid requests are programming/API errors; short or malformed bytes
     // inside an allocated page are persistent corruption.
     return Status::InvalidArgument("reading a page that was never allocated");
   }
-  const auto bytes_read = io::Pread(fd_.Get(), data, PAGE_SIZE, page_id * PAGE_SIZE);
-  if (bytes_read < 0) {
-    return ErrnoStatus("pread");
+  const auto bytes_read = io::FullPread(fd_.Get(), data, PAGE_SIZE, page_id * PAGE_SIZE);
+  if (!bytes_read) {
+    return bytes_read.error();
   }
-  if (static_cast<std::size_t>(bytes_read) != PAGE_SIZE) {
+  if (*bytes_read != PAGE_SIZE) {
     return Status::Corruption("short read on a page");
   }
   return {};

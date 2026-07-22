@@ -12,13 +12,14 @@
 #include <chrono>
 #include <expected>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
 namespace tinydb::txn {
 
-auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
-                               CommitTiming *timing) -> Result<CommitInfo> {
+auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &readers, TransactionPages &transaction,
+                       BPlusTree &tree, CommitTiming *timing) -> Result<CommitInfo> {
   using Clock = std::chrono::steady_clock;
   const auto prepare_started = Clock::now();
   const auto record_prepare = [&] {
@@ -38,7 +39,7 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
     return CommitInfo{.transaction_id = state.transaction_id, .commit_lsn = state.visible_lsn};
   }
 
-  const auto commit_lsn = wal_->NextCommitLsn(transaction.FinalPageCount());
+  const auto commit_lsn = wal.NextCommitLsn(transaction.FinalPageCount());
   if (!commit_lsn) {
     record_prepare();
     transaction.Abort();
@@ -58,40 +59,46 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
   ** frame control blocks, retirement list, and encoded WAL transaction are all
   ** created while failure is still a definite abort.
   */
+  const auto state = transaction.ResultingState();
   const auto borrowed_images = transaction.PageImages();
+  auto wal_pages = std::vector<wal_format::PageImageView>{};
+  wal_pages.reserve(borrowed_images.size());
   for (const auto &[page_id, bytes] : borrowed_images) {
-    wal_->AppendPageImage(page_id, bytes);
+    wal_pages.push_back(wal_format::PageImageView{
+        .page_id = page_id,
+        .bytes = std::span<const char, PAGE_SIZE>{bytes, PAGE_SIZE},
+    });
   }
-  auto state = transaction.ResultingState();
+  auto prepared_wal = wal.Prepare(wal_pages, state);
+  if (!prepared_wal) {
+    record_prepare();
+    transaction.Abort();
+    return std::unexpected(prepared_wal.error());
+  }
   auto retired = std::vector<page_id_t>(transaction.RetiredPageIds().begin(), transaction.RetiredPageIds().end());
   auto committed_pages = transaction.TakePages();
   if (!committed_pages) {
     record_prepare();
-    wal_->DiscardPending();
     transaction.Abort();
     return std::unexpected(committed_pages.error());
   }
   auto publication_plan =
-      cache_->PreparePublication(std::move(*committed_pages), std::move(retired), state.high_water_page_id);
+      cache.PreparePublication(std::move(*committed_pages), std::move(retired), state.high_water_page_id);
   if (!publication_plan) {
     record_prepare();
-    wal_->DiscardPending();
     transaction.Abort();
     return std::unexpected(publication_plan.error());
   }
-  // This object remains private through WAL synchronization. Publication may
-  // raise its checkpoint frontier to one completed concurrently, which is a
-  // no-throw scalar update and does not change the WAL-authenticated mutation.
+  // This object remains private through WAL synchronization.
   auto published_state = std::make_shared<DatabaseState>(state);
   record_prepare();
 
   const auto wal_started = Clock::now();
-  const auto durable = wal_->Commit(state);
+  const auto durable = wal.Commit(std::move(*prepared_wal));
   if (timing != nullptr) {
     timing->wal_sync = Clock::now() - wal_started;
   }
   if (!durable) {
-    wal_->DiscardPending();
     transaction.Abort();
     return std::unexpected(durable.error());
   }
@@ -107,13 +114,11 @@ auto CommitCoordinator::Commit(TransactionPages &transaction, BPlusTree &tree,
   */
   {
     const auto publication_started = Clock::now();
-    auto publication = readers_->BeginPublication();
+    auto publication = readers.BeginPublication();
     if (timing != nullptr) {
       timing->publication_wait = Clock::now() - publication_started;
     }
-    published_state->checkpoint_lsn =
-        std::max(published_state->checkpoint_lsn, publication.CurrentState()->checkpoint_lsn);
-    cache_->Publish(std::move(*publication_plan));
+    cache.Publish(std::move(*publication_plan));
     publication.Publish(std::move(published_state));
   }
   return CommitInfo{.transaction_id = durable->transaction_id, .commit_lsn = durable->commit_lsn};

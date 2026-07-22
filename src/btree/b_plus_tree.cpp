@@ -1,10 +1,8 @@
 #include "btree/b_plus_tree.h"
 #include "util/check.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <expected>
 #include <optional>
 #include <string>
@@ -18,28 +16,28 @@
 #include "page_format.h"
 #include "page_source.h"
 #include "page_view.h"
-#include "value_storage.h"
 #include "txn/contract.h"
+#include "value_storage.h"
 
 /*
 ** CROSS-PAGE B+ TREE ALGORITHMS
 **
 ** Page views validate and search one encoded page. Page builders own one
 ** mutable logical page. This file establishes relationships between pages:
-** descent paths, split propagation, sibling repair, root replacement, leaf
-** chaining. Cross-page verification belongs to verify/verifier.cpp so normal
-** tree mutation and hostile persistent-byte inspection cannot diverge.
+** descent paths, split propagation, root replacement, and leaf chaining.
+** Cross-page verification belongs to verify/verifier.cpp so normal tree
+** mutation and hostile persistent-byte inspection cannot diverge.
 **
 ** Internal separators are inclusive lower bounds for their right child, so an
 ** equal key always routes right. Leaves contain all values and form a strictly
 ** increasing forward chain. Root identity is ordinary logical state: growth
-** allocates a new root above the old one, and collapse promotes the sole child.
+** allocates a new root above the old one.
 **
 ** Put writes the destination leaf, then carries at most one pending separator
 ** upward. Each ancestor absorbs that separator or splits and replaces it with
-** another. Remove first completes logical deletion. Occupancy repair is a
-** separate space policy: underfull pages remain correct, redistribution may
-** stop propagation, and only a merge removes a parent edge and continues up.
+** another. Remove repacks only the destination leaf. Sparse pages remain
+** correct because parent separators are inclusive lower bounds, not exact
+** copies of the current child minimum.
 **
 ** Pages are retired only after every handle to them leaves scope. PageSource,
 ** not the tree, decides when the retired physical ID may be reused.
@@ -48,20 +46,17 @@
 namespace tinydb {
 namespace {
 
-// child_index records the parent edge used to reach page_id. Put needs page_id
-// while propagating splits; delete repair needs both fields.
-struct PathStep {
-  page_id_t page_id;
-  std::size_t child_index;
-};
-
-auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key) -> Result<std::vector<PathStep>> {
+auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key) -> Result<std::vector<page_id_t>> {
   // Retain page ids, not page handles: each level is released before the next
-  // read. The visited set turns a corrupt child cycle into a finite error.
-  auto path = std::vector<PathStep>{{root_page_id, 0}};
-  auto visited = std::unordered_set<page_id_t>{root_page_id};
+  // read. Sixty-four levels exceed the representable page population at
+  // minimum fanout, so the bound also turns a corrupt child cycle into a
+  // finite error without a second allocation-bearing visited set.
+  auto path = std::vector<page_id_t>{root_page_id};
   for (;;) {
-    auto page = pages->Read(path.back().page_id);
+    if (path.size() > 64U) {
+      return std::unexpected(Status::Corruption("tree descent is too deep or cyclic"));
+    }
+    auto page = pages->Read(path.back());
     if (!page) {
       return std::unexpected(std::move(page).error());
     }
@@ -76,12 +71,8 @@ auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view k
     if (!node) {
       return std::unexpected(node.error());
     }
-    const auto child_index = node->FindChildIndex(key);
-    const auto child = node->ChildAt(child_index);
-    if (!visited.insert(child).second) {
-      return std::unexpected(Status::Corruption("tree descent contains a page cycle"));
-    }
-    path.push_back({child, child_index});
+    const auto child = node->ChildAt(node->FindChildIndex(key));
+    path.push_back(child);
   }
 }
 
@@ -143,265 +134,6 @@ auto SplitAndWrite(PageSource *pages, PageHandle &page, InternalPageBuilder &nod
   return PendingSeparator{std::move(split.separator), right_page->Id()};
 }
 
-auto RetirePage(PageSource *pages, page_id_t page_id) -> Status {
-  // Tree code declares reachability; the page source decides when reuse is safe.
-  return pages->Free(page_id);
-}
-
-auto RepairLeafOccupancy(PageSource *pages, page_id_t parent_id, const PathStep &child) -> Result<bool> {
-  // Pair with the left sibling when possible; otherwise use the right. The
-  // separator between that pair is the only parent record that can change.
-  auto parent_page = pages->Edit(parent_id);
-  if (!parent_page) {
-    return std::unexpected(std::move(parent_page).error());
-  }
-  auto parent_result = InternalBuilder(*parent_page);
-  if (!parent_result) {
-    return std::unexpected(parent_result.error());
-  }
-  auto parent = std::move(*parent_result);
-  if (parent.SeparatorCount() == 0) {
-    // A one-child parent has no sibling pair. Root collapse handles it later.
-    return false;
-  }
-
-  // Separator i lies between child i and child i+1.
-  const std::size_t sep_index = child.child_index > 0 ? child.child_index - 1 : 0;
-  const page_id_t left_id = parent.ChildAt(sep_index);
-  const page_id_t right_id = parent.ChildAt(sep_index + 1);
-
-  {
-    auto left_page = pages->Edit(left_id);
-    if (!left_page) {
-      return std::unexpected(std::move(left_page).error());
-    }
-    auto right_page = pages->Edit(right_id);
-    if (!right_page) {
-      return std::unexpected(std::move(right_page).error());
-    }
-    auto left_builder = LeafBuilder(*left_page);
-    if (!left_builder) {
-      return std::unexpected(left_builder.error());
-    }
-    auto right_builder = LeafBuilder(*right_page);
-    if (!right_builder) {
-      return std::unexpected(right_builder.error());
-    }
-    auto combined = std::move(*left_builder);
-    combined.Absorb(std::move(*right_builder));
-
-    if (!combined.Fits()) {
-      // The pages cannot merge, so repartition their combined bytes and update
-      // the right page's inclusive lower bound in the parent.
-      auto split = combined.Split(right_id, /*tail_heavy=*/false);
-      parent.SetSeparatorKey(sep_index, std::move(split.separator));
-      if (!parent.Fits()) {
-        // A larger replacement key can overflow the parent. No page has been
-        // stored yet, so leaving the child sparse is the safe result.
-        return false;
-      }
-      combined.Store(left_page->MutableData(), left_page->Id());
-      left_page->MarkDirty();
-      split.right.Store(right_page->MutableData(), right_page->Id());
-      right_page->MarkDirty();
-      parent.Store(parent_page->MutableData(), parent_page->Id());
-      parent_page->MarkDirty();
-      return false;
-    }
-
-    // A merge adopts the right leaf's successor before removing its parent edge.
-    combined.Store(left_page->MutableData(), left_page->Id());
-    left_page->MarkDirty();
-    parent.EraseSeparator(sep_index);
-    parent.Store(parent_page->MutableData(), parent_page->Id());
-    parent_page->MarkDirty();
-  }
-
-  // Both sibling handles ended with the block above; retirement cannot race a lease.
-  if (auto status = RetirePage(pages, right_id); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
-  return true;
-}
-
-// Internal repair uses the same pair selection and return contract as leaf
-// repair. Combining internal pages additionally pulls their parent separator
-// down between the two child arrays.
-auto RepairInternalOccupancy(PageSource *pages, page_id_t parent_id, const PathStep &child) -> Result<bool> {
-  auto parent_page = pages->Edit(parent_id);
-  if (!parent_page) {
-    return std::unexpected(std::move(parent_page).error());
-  }
-  auto parent_result = InternalBuilder(*parent_page);
-  if (!parent_result) {
-    return std::unexpected(parent_result.error());
-  }
-  auto parent = std::move(*parent_result);
-  if (parent.SeparatorCount() == 0) {
-    // A one-child parent has no sibling pair. Root collapse handles it later.
-    return false;
-  }
-
-  // Separator i lies between child i and child i+1.
-  const std::size_t sep_index = child.child_index > 0 ? child.child_index - 1 : 0;
-  const page_id_t left_id = parent.ChildAt(sep_index);
-  const page_id_t right_id = parent.ChildAt(sep_index + 1);
-
-  {
-    auto left_page = pages->Edit(left_id);
-    if (!left_page) {
-      return std::unexpected(std::move(left_page).error());
-    }
-    auto right_page = pages->Edit(right_id);
-    if (!right_page) {
-      return std::unexpected(std::move(right_page).error());
-    }
-    auto left_builder = InternalBuilder(*left_page);
-    if (!left_builder) {
-      return std::unexpected(left_builder.error());
-    }
-    auto right_builder = InternalBuilder(*right_page);
-    if (!right_builder) {
-      return std::unexpected(right_builder.error());
-    }
-    auto combined = std::move(*left_builder);
-    combined.Absorb(parent.SeparatorKeyAt(sep_index), std::move(*right_builder));
-
-    if (!combined.Fits()) {
-      auto split = combined.Split();
-      parent.SetSeparatorKey(sep_index, std::move(split.separator));
-      if (!parent.Fits()) {
-        return false;
-      }
-      combined.Store(left_page->MutableData(), left_page->Id());
-      left_page->MarkDirty();
-      split.right.Store(right_page->MutableData(), right_page->Id());
-      right_page->MarkDirty();
-      parent.Store(parent_page->MutableData(), parent_page->Id());
-      parent_page->MarkDirty();
-      return false;
-    }
-
-    combined.Store(left_page->MutableData(), left_page->Id());
-    left_page->MarkDirty();
-    parent.EraseSeparator(sep_index);
-    parent.Store(parent_page->MutableData(), parent_page->Id());
-    parent_page->MarkDirty();
-  }
-
-  // Both sibling handles ended with the block above; retirement cannot race a lease.
-  if (auto status = RetirePage(pages, right_id); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
-  return true;
-}
-
-// Remove redundant one-child root levels. This changes only root identity and
-// reachability; child contents do not need to be copied or rebuilt.
-auto CollapseRoot(PageSource *pages, page_id_t &root_page_id) -> Status {
-  for (;;) {
-    page_id_t child_id = HEADER_PAGE_ID;
-    const auto old_root_id = root_page_id;
-    {
-      auto root_page = pages->Read(root_page_id);
-      if (!root_page) {
-        return std::move(root_page).error();
-      }
-      if (RawNodeType(root_page->Data()) != static_cast<std::uint16_t>(NodeType::Internal)) {
-        return {};
-      }
-      const auto root = InternalPageView::Open(root_page->Data(), root_page->Id());
-      if (!root) {
-        return root.error();
-      }
-      if (root->SeparatorCount() > 0) {
-        return {};
-      }
-      child_id = root->ChildAt(0);
-      auto child_page = pages->Read(child_id);
-      if (!child_page) {
-        return std::move(child_page).error();
-      }
-      const auto child_type = RawNodeType(child_page->Data());
-      if (child_type != static_cast<std::uint16_t>(NodeType::Leaf) &&
-          child_type != static_cast<std::uint16_t>(NodeType::Internal)) {
-        return Status::Corruption("root child is not a tree node");
-      }
-      // The next iteration performs full validation if the promoted child is
-      // internal; normal leaf access validates it before reading records.
-      root_page_id = child_id;
-    }
-    // Release both reads before retiring the former root.
-    if (auto status = RetirePage(pages, old_root_id); !status.Ok()) {
-      return status;
-    }
-  }
-}
-
-struct EraseLeafResult {
-  bool removed{false};
-  bool underfull{false};
-  std::optional<OverflowValueDescriptor> retired_value;
-};
-
-// Delete correctness ends once the key is absent and the leaf is repacked.
-// Overflow ownership is returned to the caller for transactional retirement;
-// occupancy repair remains a separate policy phase.
-auto EraseLeaf(PageSource *pages, page_id_t leaf_id, std::string_view key, bool is_root) -> Result<EraseLeafResult> {
-  auto page = pages->Edit(leaf_id);
-  if (!page) {
-    return std::unexpected(std::move(page).error());
-  }
-  auto builder = LeafBuilder(*page);
-  if (!builder) {
-    return std::unexpected(builder.error());
-  }
-  const auto retired_value = builder->OverflowFor(key);
-  if (!builder->Erase(key)) {
-    return EraseLeafResult{};
-  }
-  builder->Store(page->MutableData(), page->Id());
-  page->MarkDirty();
-  return EraseLeafResult{
-      .removed = true,
-      .underfull = !is_root && builder->Underfull(),
-      .retired_value = retired_value,
-  };
-}
-
-// A merge removes one parent separator and can make that parent sparse, so only
-// merges propagate upward. Redistribution and skipped repair end the pass.
-auto RepairDeleteOccupancy(PageSource *pages, const std::vector<PathStep> &path, page_id_t &root_page_id) -> Status {
-  bool leaf_level = true;
-  for (std::size_t level = path.size() - 1; level > 0; --level) {
-    const auto merged = leaf_level ? RepairLeafOccupancy(pages, path[level - 1].page_id, path[level])
-                                   : RepairInternalOccupancy(pages, path[level - 1].page_id, path[level]);
-    if (!merged) {
-      return merged.error();
-    }
-    if (!*merged) {
-      return {};
-    }
-    leaf_level = false;
-
-    if (level - 1 == 0) {
-      break;
-    }
-    auto parent_page = pages->Read(path[level - 1].page_id);
-    if (!parent_page) {
-      return std::move(parent_page).error();
-    }
-    auto parent = InternalBuilder(*parent_page);
-    if (!parent) {
-      return parent.error();
-    }
-    if (!parent->Underfull()) {
-      return {};
-    }
-  }
-  return CollapseRoot(pages, root_page_id);
-}
-
 }  // namespace
 
 // Attach to a validated tree root. An all-zero allocated page is the sole
@@ -446,7 +178,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   std::optional<PendingSeparator> pending;
   std::optional<OverflowValueDescriptor> retired_value;
   {
-    auto leaf_page = pages_->Edit(path->back().page_id);
+    auto leaf_page = pages_->Edit(path->back());
     if (!leaf_page) {
       return std::move(leaf_page).error();
     }
@@ -490,7 +222,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   std::size_t level = path->size() - 1;
   while (pending.has_value() && level > 0) {
     --level;
-    auto page = pages_->Edit((*path)[level].page_id);
+    auto page = pages_->Edit((*path)[level]);
     if (!page) {
       return std::move(page).error();
     }
@@ -554,25 +286,33 @@ auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> 
 }
 
 auto BPlusTree::Remove(std::string_view key) -> Status {
-  // Logical deletion is complete before space repair starts. This separation
-  // keeps underfull pages valid and makes repair policy replaceable.
-  const auto path = DescendToLeaf(pages_, root_page_id_, key);
-  if (!path) {
-    return path.error();
+  const auto leaf_id = FindLeaf(pages_, root_page_id_, key);
+  if (!leaf_id) {
+    return leaf_id.error();
   }
-  const auto needs_repair = EraseLeaf(pages_, path->back().page_id, key, path->size() == 1);
-  if (!needs_repair) {
-    return needs_repair.error();
+  std::optional<OverflowValueDescriptor> retired_value;
+  {
+    auto page = pages_->Edit(*leaf_id);
+    if (!page) {
+      return std::move(page).error();
+    }
+    auto builder = LeafBuilder(*page);
+    if (!builder) {
+      return builder.error();
+    }
+    retired_value = builder->OverflowFor(key);
+    if (!builder->Erase(key)) {
+      return {};
+    }
+    builder->Store(page->MutableData(), page->Id());
+    page->MarkDirty();
   }
-  if (!needs_repair->removed) {
-    return {};
-  }
-  if (needs_repair->retired_value.has_value()) {
-    if (auto status = RetireOverflowValue(pages_, *needs_repair->retired_value); !status.Ok()) {
+  if (retired_value.has_value()) {
+    if (auto status = RetireOverflowValue(pages_, *retired_value); !status.Ok()) {
       return status;
     }
   }
-  return needs_repair->underfull ? RepairDeleteOccupancy(pages_, *path, root_page_id_) : Status{};
+  return {};
 }
 
 }  // namespace tinydb

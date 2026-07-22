@@ -142,10 +142,7 @@ TEST(Readers, Fairness) {
 
 TEST(Readers, Abandon) {
   auto gate = ReaderGate(State(4, 5));
-  {
-    auto publication = gate.BeginPublication();
-    EXPECT_EQ(publication.CurrentState()->transaction_id, 4U);
-  }
+  { const auto publication = gate.BeginPublication(); }
 
   auto reader = gate.BeginRead();
   EXPECT_EQ(reader.State().transaction_id, 4U);

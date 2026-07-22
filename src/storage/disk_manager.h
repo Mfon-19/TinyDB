@@ -2,10 +2,9 @@
 
 #include <tinydb/status.h>
 #include "io/unique_fd.h"
-#include "storage/database_uuid.h"
 #include "storage/page.h"
+#include "storage/superblock.h"
 
-#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <utility>
@@ -60,23 +59,10 @@ class DiskManager {
  private:
   explicit DiskManager(UniqueFd fd) : fd_(std::move(fd)) {}
 
-  auto EncodeSuperblock(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
-                        std::uint64_t transaction_id, std::uint64_t checkpoint_lsn,
-                        std::uint64_t generation) const -> Result<std::array<char, PAGE_SIZE>>;
-  auto EncodeCurrentSuperblock() const -> std::array<char, PAGE_SIZE>;
+  auto EncodeCurrentSuperblock() const -> storage::SuperblockPage;
 
   UniqueFd fd_;
-
-  // Logical metadata represented by the newest durable superblock. The
-  // allocator index itself lives in ordinary checkpointed pages rooted here.
-  DatabaseUuid database_uuid_{};
-  std::uint64_t generation_{1};
-  std::uint64_t checkpoint_lsn_{0};
-  std::uint64_t transaction_id_{0};
-  page_id_t root_page_id_{HEADER_PAGE_ID};
-  page_id_t high_water_page_id_{FIRST_DATA_PAGE_ID};
-  page_id_t allocator_root_page_id_{HEADER_PAGE_ID};
-  page_id_t active_superblock_page_id_{SUPERBLOCK_A_PAGE_ID};
+  storage::SelectedSuperblock selected_{};
 };
 
 }  // namespace tinydb

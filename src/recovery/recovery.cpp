@@ -1,9 +1,9 @@
 #include "recovery/recovery.h"
 
-#include "util/check.h"
+#include "io/unique_fd.h"
 #include "storage/database_uuid.h"
 #include "storage/page.h"
-#include "io/unique_fd.h"
+#include "util/check.h"
 
 #include "io/file_io.h"
 #include "io/syscalls.h"
@@ -77,10 +77,6 @@ struct LoadedLog {
   bool active_present{false};
   bool active_partial{false};
   bool cleanup_needed{false};
-};
-
-struct DatabaseBase {
-  storage::SelectedSuperblock selected;
 };
 
 struct RecoveryPlan {
@@ -201,7 +197,6 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
     if (!file.active && file.segment_id != header->segment_id) {
       return std::unexpected(Status::Corruption("WAL archive name disagrees with its segment header"));
     }
-    file.segment_id = header->segment_id;
     log.segments.push_back(LoadedSegment{.file = std::move(file), .header = *header, .bytes = std::move(bytes)});
   }
 
@@ -299,11 +294,11 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
 ** pair is corruption: WAL is a suffix and cannot establish which historical
 ** base pages are missing.
 */
-auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optional<DatabaseBase>> {
+auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optional<storage::SelectedSuperblock>> {
   auto fd = UniqueFd(io::Open(db_path, O_RDONLY | O_CLOEXEC));
   if (!fd.Valid()) {
     if (errno == ENOENT) {
-      return std::optional<DatabaseBase>{};
+      return std::optional<storage::SelectedSuperblock>{};
     }
     return std::unexpected(io::ErrnoStatus("open database"));
   }
@@ -312,7 +307,7 @@ auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optio
     return std::unexpected(io::ErrnoStatus("fstat database"));
   }
   if (file_stat.st_size == 0) {
-    return std::optional<DatabaseBase>{};
+    return std::optional<storage::SelectedSuperblock>{};
   }
   if (file_stat.st_size < static_cast<off_t>(FIRST_DATA_PAGE_ID * PAGE_SIZE)) {
     return std::unexpected(Status::UnsupportedFormat("database does not contain TinyDB dual superblocks"));
@@ -330,7 +325,7 @@ auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optio
     return std::unexpected(Status::Corruption("database superblocks are truncated"));
   }
   if (std::ranges::all_of(prefix, [](char byte) { return byte == 0; })) {
-    return std::optional<DatabaseBase>{};
+    return std::optional<storage::SelectedSuperblock>{};
   }
 
   const auto bytes = std::as_bytes(std::span{prefix});
@@ -345,24 +340,24 @@ auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optio
   if (selected->value.high_water_page_id > MAX_FILE_PAGES) {
     return std::unexpected(Status::Corruption("superblock allocation frontier exceeds the platform file limit"));
   }
-  return std::optional{DatabaseBase{.selected = *selected}};
+  return std::optional{*selected};
 }
 
 auto EncodeRecoveredSuperblock(const wal_format::DecodedTransaction &transaction,
-                               const DatabaseBase &base) -> Result<storage::SuperblockPage> {
-  if (base.selected.value.generation == std::numeric_limits<std::uint64_t>::max()) {
+                               const storage::SelectedSuperblock &base) -> Result<storage::SuperblockPage> {
+  if (base.value.generation == std::numeric_limits<std::uint64_t>::max()) {
     return std::unexpected(Status::ResourceExhausted("superblock generation space exhausted"));
   }
   return storage::EncodeSuperblock(storage::Superblock{
-      .database_uuid = base.selected.value.database_uuid,
-      .generation = base.selected.value.generation + 1U,
+      .database_uuid = base.value.database_uuid,
+      .generation = base.value.generation + 1U,
       .checkpoint_lsn = transaction.commit_lsn,
       .transaction_id = transaction.transaction_id,
       .root_page_id = transaction.state.root_page_id,
       .allocator_root_page_id = transaction.state.allocator_root_page_id,
       .high_water_page_id = transaction.state.high_water_page_id,
-      .required_features = base.selected.value.required_features,
-      .optional_features = base.selected.value.optional_features,
+      .required_features = base.value.required_features,
+      .optional_features = base.value.optional_features,
   });
 }
 
@@ -372,11 +367,11 @@ auto EncodeRecoveredSuperblock(const wal_format::DecodedTransaction &transaction
 ** opens the database read/write.  A final run without COMMIT is ignored only
 ** when an active (possibly partial) tail exists.
 */
-auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> {
-  if (base.selected.value.database_uuid != log.database_uuid) {
+auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result<RecoveryPlan> {
+  if (base.value.database_uuid != log.database_uuid) {
     return std::unexpected(Status::InvalidArgument("write-ahead log does not belong to this database"));
   }
-  if (base.selected.value.checkpoint_lsn == std::numeric_limits<std::uint64_t>::max()) {
+  if (base.value.checkpoint_lsn == std::numeric_limits<std::uint64_t>::max()) {
     return std::unexpected(Status::ResourceExhausted("checkpoint LSN space exhausted"));
   }
 
@@ -387,7 +382,7 @@ auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> 
       .superblock_page_id = SUPERBLOCK_A_PAGE_ID,
       .archive_paths = {},
       .active_segment_id = log.segments.back().header.segment_id,
-      .durable_next_lsn = std::max(log.segments.front().header.starting_lsn, base.selected.value.checkpoint_lsn + 1U),
+      .durable_next_lsn = std::max(log.segments.front().header.starting_lsn, base.value.checkpoint_lsn + 1U),
       .active_present = log.active_present,
       .cleanup_needed = log.cleanup_needed,
   };
@@ -403,17 +398,16 @@ auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> 
     }
   }
 
-  const auto checkpoint_lsn = base.selected.value.checkpoint_lsn;
+  const auto checkpoint_lsn = base.value.checkpoint_lsn;
   auto run = std::vector<char>{};
   auto run_first_lsn = log.segments.front().header.starting_lsn;
   auto previous_transaction_id = std::optional<std::uint64_t>{};
   auto previous_next_lsn = std::optional<std::uint64_t>{};
   auto saw_uncheckpointed_transaction = false;
   auto expected_live_lsn = checkpoint_lsn + 1U;
-  auto expected_live_transaction_id = base.selected.value.transaction_id == std::numeric_limits<std::uint64_t>::max()
-                                          ? 0
-                                          : base.selected.value.transaction_id + 1U;
-  auto previous_high_water = base.selected.value.high_water_page_id;
+  auto expected_live_transaction_id =
+      base.value.transaction_id == std::numeric_limits<std::uint64_t>::max() ? 0 : base.value.transaction_id + 1U;
+  auto previous_high_water = base.value.high_water_page_id;
   auto offset = std::size_t{0};
   while (offset < log.encoded_records.size()) {
     const auto remaining = std::as_bytes(std::span{log.encoded_records}).subspan(offset);
@@ -486,7 +480,7 @@ auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> 
       }
       previous_high_water = transaction->state.high_water_page_id;
       plan.transactions.push_back(std::move(*transaction));
-    } else if (transaction->transaction_id > base.selected.value.transaction_id) {
+    } else if (transaction->transaction_id > base.value.transaction_id) {
       return std::unexpected(Status::Corruption("covered WAL transaction is newer than the selected superblock"));
     }
     run.clear();
@@ -509,8 +503,7 @@ auto BuildPlan(LoadedLog log, const DatabaseBase &base) -> Result<RecoveryPlan> 
       return std::unexpected(encoded.error());
     }
     plan.recovered_superblock = std::move(*encoded);
-    plan.superblock_page_id =
-        base.selected.slot == storage::SuperblockSlot::A ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
+    plan.superblock_page_id = base.slot == storage::SuperblockSlot::A ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
   }
   return plan;
 }

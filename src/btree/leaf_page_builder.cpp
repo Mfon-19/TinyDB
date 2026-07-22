@@ -1,5 +1,5 @@
-#include "util/check.h"
 #include "storage/page.h"
+#include "util/check.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -35,10 +35,6 @@ namespace tinydb {
 namespace {
 
 constexpr std::size_t USABLE_BYTES = PAGE_SIZE - LEAF_HEADER_SIZE;
-
-// Occupancy is measured in encoded bytes because record sizes vary. Underfull
-// is a repair hint, not a page-validity requirement.
-constexpr std::size_t MIN_FILL_BYTES = USABLE_BYTES / 2;
 
 auto KeyIsBefore(const LeafPageBuilder::Record &record, std::string_view target) -> bool {
   return txn::BytewiseLess{}(record.key, target);
@@ -87,15 +83,15 @@ void LeafPageBuilder::Store(char *page, page_id_t page_id) const {
     std::copy_n(record.key.data(), record.key.size(), page + offset + LEAF_CELL_HEADER_SIZE);
     const auto value_offset = offset + LEAF_CELL_HEADER_SIZE + record.key.size();
     if (record.value.IsOverflow()) {
-      TINYDB_CHECK(storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES,
-                                            record.value.overflow.total_value_bytes) &&
-                       storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID,
-                                                record.value.overflow.first_page_id) &&
-                       storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM,
-                                                record.value.overflow.value_checksum) &&
-                       storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::RESERVED,
-                                                std::uint32_t{0}),
-                   "overflow descriptor exceeds leaf cell");
+      TINYDB_CHECK(
+          storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES,
+                                   record.value.overflow.total_value_bytes) &&
+              storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID,
+                                       record.value.overflow.first_page_id) &&
+              storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM,
+                                       record.value.overflow.value_checksum) &&
+              storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::RESERVED, std::uint32_t{0}),
+          "overflow descriptor exceeds leaf cell");
     } else {
       std::copy_n(record.value.inline_bytes.data(), record.value.inline_bytes.size(), page + value_offset);
     }
@@ -154,8 +150,6 @@ auto LeafPageBuilder::Bytes() const -> std::size_t {
 
 auto LeafPageBuilder::Fits() const -> bool { return Bytes() <= USABLE_BYTES; }
 
-auto LeafPageBuilder::Underfull() const -> bool { return Bytes() < MIN_FILL_BYTES; }
-
 // Choose the legal byte boundary with the smallest encoded-size imbalance.
 // Prefix sums make each candidate constant-time to score.
 auto LeafPageBuilder::ChooseSplitIndex() const -> std::size_t {
@@ -204,17 +198,6 @@ auto LeafPageBuilder::Split(page_id_t right_page_id, bool tail_heavy) -> SplitRe
   records_.erase(split_it, records_.end());
   next_leaf_ = right_page_id;  // right is inserted between this leaf and old_next
   return result;
-}
-
-void LeafPageBuilder::Absorb(LeafPageBuilder &&right) {
-  // Adjacent leaf ranges concatenate without sorting. Adopting right's link
-  // also removes it from the forward chain. The caller decides merge vs split.
-  TINYDB_CHECK(records_.empty() || right.records_.empty() ||
-                   txn::BytewiseLess{}(records_.back().key, right.records_.front().key),
-               "absorbed leaf does not sort after this one");
-  records_.insert(records_.end(), std::make_move_iterator(right.records_.begin()),
-                  std::make_move_iterator(right.records_.end()));
-  next_leaf_ = right.next_leaf_;
 }
 
 }  // namespace tinydb

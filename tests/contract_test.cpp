@@ -4,7 +4,6 @@
 #include <tinydb/status.h>
 
 #include "txn/contract.h"
-#include "txn/state.h"
 
 #include <array>
 #include <cstddef>
@@ -24,27 +23,6 @@ TEST(Contract, StatusNames) {
   EXPECT_EQ(tinydb::Status::Corruption("x").ToString(), "corruption: x");
   EXPECT_EQ(tinydb::Status::IndeterminateCommit("x").ToString(), "indeterminate commit: x");
   EXPECT_EQ(tinydb::Status::NeedsRecovery("x").ToString(), "needs recovery: x");
-}
-
-TEST(Contract, DatabaseStates) {
-  using enum tinydb::txn::DatabaseLifecycle;
-  using enum tinydb::txn::DatabaseOperation;
-  using tinydb::StatusCode;
-
-  EXPECT_TRUE(tinydb::txn::CanTransition(Open, CheckpointDegraded));
-  EXPECT_TRUE(tinydb::txn::CanTransition(Open, NeedsRecovery));
-  EXPECT_TRUE(tinydb::txn::CanTransition(Open, Corrupt));
-  EXPECT_TRUE(tinydb::txn::CanTransition(Open, Closed));
-  EXPECT_FALSE(tinydb::txn::CanTransition(Closed, Open));
-
-  EXPECT_EQ(tinydb::txn::StateStatus(Open, Write), StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::StateStatus(CheckpointDegraded, Read), StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::StateStatus(NeedsRecovery, Read), StatusCode::NeedsRecovery);
-  EXPECT_EQ(tinydb::txn::StateStatus(NeedsRecovery, Stats), StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::StateStatus(Corrupt, Verify), StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::StateStatus(Corrupt, Write), StatusCode::Corruption);
-  EXPECT_EQ(tinydb::txn::StateStatus(Closed, Close), StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::StateStatus(Open, Close, 1), StatusCode::Busy);
 }
 
 TEST(Contract, Limits) {

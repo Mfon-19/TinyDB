@@ -3,33 +3,28 @@
 #include <tinydb/status.h>
 #include "io/unique_fd.h"
 #include "storage/database_uuid.h"
-#include "storage/page.h"
+#include "wal/wal_codec.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <utility>
-#include <vector>
 
 namespace tinydb {
-
-namespace txn {
-struct DatabaseState;
-}
 
 /*
 ** SEGMENTED REDO WRITE-AHEAD LOG
 **
-** AppendPageImage collects final data-page images in memory. Commit adds the
-** resulting logical database state, encodes the complete transaction, appends
-** it once, and synchronizes once; that synchronization is the mutation
-** durability point. A transaction never crosses a segment: soft rotation
-** archives the current active file, synchronizes its directory entry, then
-** creates and synchronizes the next active header before append.
+** Prepare encodes final data-page images and their logical database state
+** without touching the filesystem. Commit appends that owned byte sequence
+** once and synchronizes once; that synchronization is the mutation durability
+** point. A transaction never crosses a segment: soft rotation archives the
+** current active file, synchronizes its directory entry, then creates and
+** synchronizes the next active header before append.
 **
 ** PathFor names the active segment. Immutable archives are sibling files named
 ** by SegmentPathFor. CleanupCheckpointed may delete only archives wholly
@@ -39,8 +34,6 @@ struct DatabaseState;
 */
 class Wal {
  public:
-  static constexpr std::uint64_t DEFAULT_SEGMENT_BYTES = 768U << 10U;
-
   struct CommitInfo {
     std::uint64_t transaction_id;
     std::uint64_t commit_lsn;
@@ -53,8 +46,8 @@ class Wal {
 
   // Creates or validates a clean header-only WAL bound to database_uuid.
   static auto Open(const std::filesystem::path &wal_path, const DatabaseUuid &database_uuid,
-                   std::uint64_t next_transaction_id = 1, std::uint64_t starting_lsn = 0,
-                   std::uint64_t max_segment_bytes = DEFAULT_SEGMENT_BYTES) -> Result<Wal>;
+                   std::uint64_t next_transaction_id, std::uint64_t starting_lsn,
+                   std::uint64_t max_segment_bytes) -> Result<Wal>;
 
   Wal(const Wal &) = delete;
   auto operator=(const Wal &) -> Wal & = delete;
@@ -63,13 +56,10 @@ class Wal {
   auto operator=(Wal &&) -> Wal & = delete;
   ~Wal() = default;
 
-  void AppendPageImage(page_id_t page_id, const char *data);
-
-  // Used when a mutation fails before commit. This drops only RAM bytes; it
-  // never removes previously committed records from the durable log.
-  void DiscardPending();
   auto NextCommitLsn(std::size_t page_count) const -> Result<std::uint64_t>;
-  auto Commit(txn::DatabaseState state) -> Result<CommitInfo>;
+  auto Prepare(std::span<const wal_format::PageImageView> pages,
+               txn::DatabaseState state) const -> Result<wal_format::EncodedTransaction>;
+  auto Commit(wal_format::EncodedTransaction transaction) -> Result<CommitInfo>;
 
   // Bytes still contributing to checkpoint pressure. A covered active segment
   // remains physically present but counts only as its logical header.
@@ -84,11 +74,6 @@ class Wal {
   auto CleanupCheckpointed(std::uint64_t checkpoint_lsn) -> Status;
 
  private:
-  struct PendingPageImage {
-    page_id_t page_id;
-    std::array<char, PAGE_SIZE> bytes;
-  };
-
   struct ArchivedSegment {
     std::filesystem::path path;
     std::uint64_t final_lsn{0};
@@ -116,25 +101,19 @@ class Wal {
   DatabaseUuid database_uuid_{};
   std::uint64_t segment_id_{1};
 
-  // Durable append offset, excluding pending_ until fsync succeeds. Retained
-  // bytes count immutable archives still present on the local filesystem.
+  // Durable append offset. It advances only after fsync succeeds.
   std::uint64_t size_bytes_{0};
-  std::uint64_t retained_size_bytes_{0};
 
   // Transaction IDs and LSNs continue across checkpoints. checkpoint_lsn_
   // removes covered history from pressure accounting without rewriting the
   // active append target.
   std::uint64_t next_transaction_id_{1};
   std::uint64_t next_lsn_{1};
-  std::uint64_t max_segment_bytes_{DEFAULT_SEGMENT_BYTES};
+  std::uint64_t max_segment_bytes_;
   std::uint64_t checkpoint_lsn_{0};
   bool needs_recovery_{false};
   bool cleanup_directory_dirty_{false};
   std::deque<ArchivedSegment> archived_segments_;
   std::unique_ptr<std::mutex> mutex_;
-
-  // Final page bytes are retained until Commit can encode PAGE_IMAGE,
-  // DATABASE_STATE, and COMMIT as one self-binding transaction.
-  std::vector<PendingPageImage> pending_;
 };
 }  // namespace tinydb

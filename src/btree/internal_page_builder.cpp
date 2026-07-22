@@ -1,5 +1,5 @@
-#include "util/check.h"
 #include "storage/page.h"
+#include "util/check.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -27,18 +27,13 @@
 **
 ** Store emits one complete canonical page. A split promotes one separator to
 ** the parent; the promoted key belongs to neither resulting child and its old
-** right child becomes the new right page's first child. Absorb performs the
-** inverse operation by pulling a parent separator between adjacent children.
+** right child becomes the new right page's first child.
 */
 
 namespace tinydb {
 namespace {
 
 constexpr std::size_t USABLE_BYTES = PAGE_SIZE - INTERNAL_HEADER_SIZE;
-
-// Occupancy is measured in encoded bytes. Pulling a parent separator into two
-// sparse internal pages can still exceed one page, so repair may redistribute.
-constexpr std::size_t MIN_FILL_BYTES = USABLE_BYTES / 2;
 
 auto KeyIsBefore(const InternalPageBuilder::Record &record, std::string_view target) -> bool {
   return txn::BytewiseLess{}(record.key, target);
@@ -105,29 +100,9 @@ void InternalPageBuilder::Store(char *page, page_id_t page_id) const {
       "failed to encode internal page");
 }
 
-auto InternalPageBuilder::ChildAt(std::size_t child_index) const -> page_id_t {
-  TINYDB_CHECK(child_index <= records_.size(), "child index out of range");
-  return child_index == 0 ? first_child_ : records_[child_index - 1].right_child;
-}
-
-auto InternalPageBuilder::SeparatorKeyAt(std::size_t index) const -> const std::string & {
-  TINYDB_CHECK(index < records_.size(), "separator index out of range");
-  return records_[index].key;
-}
-
-void InternalPageBuilder::SetSeparatorKey(std::size_t index, std::string key) {
-  TINYDB_CHECK(index < records_.size(), "separator index out of range");
-  records_[index].key = std::move(key);
-}
-
 void InternalPageBuilder::InsertSeparator(std::string key, page_id_t right_child) {
   const auto it = std::lower_bound(records_.begin(), records_.end(), key, KeyIsBefore);
   records_.insert(it, Record{std::move(key), right_child});
-}
-
-void InternalPageBuilder::EraseSeparator(std::size_t index) {
-  TINYDB_CHECK(index < records_.size(), "separator index out of range");
-  records_.erase(records_.begin() + static_cast<std::ptrdiff_t>(index));
 }
 
 auto InternalPageBuilder::Bytes() const -> std::size_t {
@@ -139,8 +114,6 @@ auto InternalPageBuilder::Bytes() const -> std::size_t {
 }
 
 auto InternalPageBuilder::Fits() const -> bool { return Bytes() <= USABLE_BYTES; }
-
-auto InternalPageBuilder::Underfull() const -> bool { return Bytes() < MIN_FILL_BYTES; }
 
 // Choose the legal promoted separator with the smallest encoded-size
 // imbalance. The candidate itself belongs to neither child.
@@ -187,16 +160,6 @@ auto InternalPageBuilder::Split() -> SplitResult {
   result.right.records_.assign(std::make_move_iterator(split_it + 1), std::make_move_iterator(records_.end()));
   records_.erase(split_it, records_.end());
   return result;
-}
-
-void InternalPageBuilder::Absorb(std::string separator, InternalPageBuilder &&right) {
-  // The parent separator bridges the siblings: its right child is the right
-  // page's former first child. The caller may keep this merge or split it again.
-  TINYDB_CHECK(records_.empty() || txn::BytewiseLess{}(records_.back().key, separator),
-               "separator does not sort after this node's keys");
-  records_.push_back(Record{std::move(separator), right.first_child_});
-  records_.insert(records_.end(), std::make_move_iterator(right.records_.begin()),
-                  std::make_move_iterator(right.records_.end()));
 }
 
 }  // namespace tinydb

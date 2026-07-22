@@ -1,5 +1,5 @@
-#include "util/check.h"
 #include "wal/wal.h"
+#include "util/check.h"
 
 #include "io/file_io.h"
 #include "io/syscalls.h"
@@ -14,7 +14,6 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <expected>
 #include <filesystem>
 #include <span>
@@ -191,7 +190,6 @@ auto Wal::RotateSegment() -> Status {
     return Status::NeedsRecovery("next WAL segment directory entry is indeterminate");
   }
 
-  retained_size_bytes_ += size_bytes_;
   archived_segments_.push_back(ArchivedSegment{
       .path = archive_path,
       .final_lsn = next_lsn_ - 1U,
@@ -201,19 +199,6 @@ auto Wal::RotateSegment() -> Status {
   segment_id_ = next_segment_id;
   size_bytes_ = wal_format::HEADER_BYTES;
   return {};
-}
-
-void Wal::AppendPageImage(page_id_t page_id, const char *data) {
-  TINYDB_CHECK(page_id >= FIRST_DATA_PAGE_ID, "logging a superblock as a WAL page image");
-  auto image = PendingPageImage{.page_id = page_id, .bytes = {}};
-  std::memcpy(image.bytes.data(), data, PAGE_SIZE);
-  pending_.push_back(std::move(image));
-}
-
-void Wal::DiscardPending() {
-  // Durable size and transaction ID do not advance. A retry/reopen therefore
-  // cannot mistake abandoned memory records for a committed transaction.
-  pending_.clear();
 }
 
 auto Wal::NextCommitLsn(std::size_t page_count) const -> Result<std::uint64_t> {
@@ -226,36 +211,36 @@ auto Wal::NextCommitLsn(std::size_t page_count) const -> Result<std::uint64_t> {
   return next_lsn_ + page_count + 1U;
 }
 
-auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
+auto Wal::Prepare(std::span<const wal_format::PageImageView> pages,
+                  txn::DatabaseState state) const -> Result<wal_format::EncodedTransaction> {
   auto lock = std::lock_guard(*mutex_);
-  TINYDB_CHECK(fd_.Valid(), "committing on a moved-from log");
-  TINYDB_CHECK(!pending_.empty(), "committing an operation that logged no page images");
+  TINYDB_CHECK(fd_.Valid(), "preparing through a moved-from log");
   if (needs_recovery_) {
     return std::unexpected(Status::NeedsRecovery("WAL tail is not trustworthy; reopen the database"));
   }
-  // A zero transaction ID asks the WAL to assign its current frontier. A
-  // nonzero ID was assigned by a higher-level coordinator and must agree
-  // before the first byte is appended; discovering disagreement after fsync
-  // would turn a programmer error into a durable, unpublished transaction.
   if (state.transaction_id != 0 && state.transaction_id != next_transaction_id_) {
     return std::unexpected(Status::InvalidArgument("database state has the wrong WAL transaction ID"));
   }
+  return wal_format::EncodeTransaction(next_transaction_id_, next_lsn_, pages, state);
+}
 
-  auto views = std::vector<wal_format::PageImageView>{};
-  views.reserve(pending_.size());
-  for (const auto &page : pending_) {
-    views.push_back(wal_format::PageImageView{.page_id = page.page_id, .bytes = page.bytes});
+auto Wal::Commit(wal_format::EncodedTransaction transaction) -> Result<CommitInfo> {
+  auto lock = std::lock_guard(*mutex_);
+  TINYDB_CHECK(fd_.Valid(), "committing on a moved-from log");
+  if (needs_recovery_) {
+    return std::unexpected(Status::NeedsRecovery("WAL tail is not trustworthy; reopen the database"));
   }
-  auto transaction = wal_format::EncodeTransaction(next_transaction_id_, next_lsn_, views, state);
-  if (!transaction) {
-    return std::unexpected(transaction.error());
+  // A prepared transaction can cross no other writer. Recheck its frontier
+  // before the first byte is appended so stale or foreign preparation remains
+  // a definite failure.
+  if (transaction.transaction_id != next_transaction_id_ || transaction.first_lsn != next_lsn_) {
+    return std::unexpected(Status::InvalidArgument("prepared WAL transaction has a stale identity"));
   }
 
   // Rotation is soft: a transaction larger than the configured target owns an
   // oversized empty segment rather than being split across files.
-  if (size_bytes_ > wal_format::HEADER_BYTES && size_bytes_ + transaction->bytes.size() > max_segment_bytes_) {
+  if (size_bytes_ > wal_format::HEADER_BYTES && size_bytes_ + transaction.bytes.size() > max_segment_bytes_) {
     if (auto status = RotateSegment(); !status.Ok()) {
-      pending_.clear();
       return std::unexpected(std::move(status));
     }
   }
@@ -267,7 +252,7 @@ auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
   ** exact point after which Database may acknowledge durability. Nothing
   ** below advances the known-good tail until that synchronization succeeds.
   */
-  if (auto status = FullPwrite(fd_.Get(), transaction->bytes.data(), transaction->bytes.size(), size_bytes_);
+  if (auto status = FullPwrite(fd_.Get(), transaction.bytes.data(), transaction.bytes.size(), size_bytes_);
       !status.Ok()) {
     /*
     ** A failed append cannot contain the complete final COMMIT record: the
@@ -278,10 +263,8 @@ auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
     */
     if (io::Ftruncate(fd_.Get(), size_bytes_) < 0) {
       needs_recovery_ = true;
-      pending_.clear();
       return std::unexpected(Status::NeedsRecovery("WAL append and known-good tail repair both failed"));
     }
-    pending_.clear();
     return std::unexpected(std::move(status));
   }
   if (io::Fsync(fd_.Get()) < 0) {
@@ -289,13 +272,11 @@ auto Wal::Commit(txn::DatabaseState state) -> Result<CommitInfo> {
     // live repair can turn that into a definite outcome without another
     // ambiguous durability boundary, so recovery must decide on reopen.
     needs_recovery_ = true;
-    pending_.clear();
     return std::unexpected(Status::IndeterminateCommit(ErrnoStatus("fsync").Message()));
   }
-  size_bytes_ += transaction->bytes.size();
-  next_lsn_ = transaction->next_lsn;
-  pending_.clear();
-  const auto result = CommitInfo{.transaction_id = next_transaction_id_, .commit_lsn = transaction->commit_lsn};
+  size_bytes_ += transaction.bytes.size();
+  next_lsn_ = transaction.next_lsn;
+  const auto result = CommitInfo{.transaction_id = transaction.transaction_id, .commit_lsn = transaction.commit_lsn};
   ++next_transaction_id_;
   return result;
 }
@@ -342,8 +323,6 @@ auto Wal::CleanupCheckpointed(std::uint64_t checkpoint_lsn) -> Status {
     if (io::Unlink(segment.path) < 0 && errno != ENOENT) {
       return io::ErrnoStatus("remove checkpointed WAL segment");
     }
-    TINYDB_CHECK(retained_size_bytes_ >= segment.size_bytes, "retained WAL byte count underflow");
-    retained_size_bytes_ -= segment.size_bytes;
     archived_segments_.pop_front();
     cleanup_directory_dirty_ = true;
   }
