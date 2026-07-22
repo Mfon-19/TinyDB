@@ -84,6 +84,16 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(target.assessment("higher", 0.03, 0.99, 1.01), "equivalent")
         self.assertEqual(target.assessment("higher", 0.03, 0.98, 1.04), "inconclusive")
 
+    def test_improvement_interval_uses_metric_direction(self) -> None:
+        effect, low, high = target.improvement_interval("higher", 1.2, 1.1, 1.3)
+        self.assertAlmostEqual(effect, 20.0)
+        self.assertAlmostEqual(low, 10.0)
+        self.assertAlmostEqual(high, 30.0)
+        effect, low, high = target.improvement_interval("lower", 0.7, 0.6, 0.8)
+        self.assertAlmostEqual(effect, 30.0)
+        self.assertAlmostEqual(low, 20.0)
+        self.assertAlmostEqual(high, 40.0)
+
     def test_noisy_interval_is_finite(self) -> None:
         interval = target.paired_log_interval([10, 11, 9, 10, 10], [10, 10, 10, 11, 9])
         self.assertIsNotNone(interval)

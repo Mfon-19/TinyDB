@@ -48,6 +48,27 @@ struct WriteObservation final {
   std::vector<double> commit_microseconds;
 };
 
+struct ReadDiagnostics final {
+  std::uint64_t streams_started{0};
+  std::uint64_t streams_activated{0};
+  std::uint64_t runs_queued{0};
+  std::uint64_t runs_submitted{0};
+  std::uint64_t pages_queued{0};
+  std::uint64_t pages_submitted{0};
+  std::uint64_t read_bytes{0};
+  std::uint64_t pages_ready{0};
+  std::uint64_t pages_waited{0};
+  std::uint64_t pages_bypassed{0};
+  std::uint64_t pages_unused{0};
+  std::uint64_t queue_drops{0};
+  std::uint64_t budget_drops{0};
+  std::uint64_t io_failures{0};
+  std::size_t staging_bytes{0};
+  std::size_t maximum_staging_bytes{0};
+  std::size_t maximum_in_flight_operations{0};
+  std::size_t maximum_in_flight_bytes{0};
+};
+
 struct ReadObservation final {
   double seconds{0};
   double operations_per_second{0};
@@ -56,6 +77,7 @@ struct ReadObservation final {
   std::uint64_t cache_resident_bytes{0};
   FileResidency residency;
   Resources resources;
+  ReadDiagnostics diagnostics;
 };
 
 struct LifecycleObservation final {
@@ -88,6 +110,7 @@ struct IoReadObservation final {
   ProcessMemory memory_before_open;
   ProcessMemory memory_endpoint;
   double logical_read_bytes{0};
+  ReadDiagnostics diagnostics;
 };
 
 enum class MixedValueState : std::uint8_t {
@@ -96,9 +119,7 @@ enum class MixedValueState : std::uint8_t {
   Missing,
 };
 
-auto StartResources() -> ResourceStart {
-  return ResourceStart{ObserveProcessUsage(), ObserveProcessIo()};
-}
+auto StartResources() -> ResourceStart { return ResourceStart{ObserveProcessUsage(), ObserveProcessIo()}; }
 
 auto FinishResources(const ResourceStart &start, ProcessMemory before_open) -> Resources {
   return Resources{
@@ -106,6 +127,44 @@ auto FinishResources(const ResourceStart &start, ProcessMemory before_open) -> R
       .io = SubtractProcessIo(ObserveProcessIo(), start.io),
       .memory_before_open = before_open,
       .memory_endpoint = ObserveProcessMemory(),
+  };
+}
+
+auto CounterDelta(std::uint64_t after, std::uint64_t before, std::string_view name) -> std::uint64_t {
+  if (after < before) {
+    Fail(std::string(name) + " counter moved backward");
+  }
+  return after - before;
+}
+
+auto CaptureReadDiagnostics(const DatabaseStats &before, const DatabaseStats &after) -> ReadDiagnostics {
+  return ReadDiagnostics{
+      .streams_started = CounterDelta(after.read_streams_started, before.read_streams_started, "read streams"),
+      .streams_activated =
+          CounterDelta(after.read_streams_activated, before.read_streams_activated, "activated read streams"),
+      .runs_queued = CounterDelta(after.readahead_runs_queued, before.readahead_runs_queued, "queued readahead runs"),
+      .runs_submitted =
+          CounterDelta(after.readahead_runs_submitted, before.readahead_runs_submitted, "submitted readahead runs"),
+      .pages_queued =
+          CounterDelta(after.readahead_pages_queued, before.readahead_pages_queued, "queued readahead pages"),
+      .pages_submitted =
+          CounterDelta(after.readahead_pages_submitted, before.readahead_pages_submitted, "submitted readahead pages"),
+      .read_bytes = CounterDelta(after.readahead_read_bytes, before.readahead_read_bytes, "readahead bytes"),
+      .pages_ready = CounterDelta(after.readahead_pages_ready, before.readahead_pages_ready, "ready readahead pages"),
+      .pages_waited =
+          CounterDelta(after.readahead_pages_waited, before.readahead_pages_waited, "waited readahead pages"),
+      .pages_bypassed =
+          CounterDelta(after.readahead_pages_bypassed, before.readahead_pages_bypassed, "bypassed readahead pages"),
+      .pages_unused =
+          CounterDelta(after.readahead_pages_unused, before.readahead_pages_unused, "unused readahead pages"),
+      .queue_drops = CounterDelta(after.readahead_queue_drops, before.readahead_queue_drops, "readahead queue drops"),
+      .budget_drops =
+          CounterDelta(after.readahead_budget_drops, before.readahead_budget_drops, "readahead budget drops"),
+      .io_failures = CounterDelta(after.readahead_io_failures, before.readahead_io_failures, "readahead I/O failures"),
+      .staging_bytes = after.readahead_staging_bytes,
+      .maximum_staging_bytes = after.readahead_maximum_staging_bytes,
+      .maximum_in_flight_operations = after.readahead_maximum_in_flight_operations,
+      .maximum_in_flight_bytes = after.readahead_maximum_in_flight_bytes,
   };
 }
 
@@ -125,10 +184,8 @@ void AddResources(const Scenario &scenario, Results &results, std::size_t trial,
   results.AddTrial(scenario, "system_cpu_time", "seconds", trial, resources.usage.system_seconds);
   results.AddTrial(scenario, "cpu_utilization", "cores", trial,
                    elapsed_seconds == 0.0 ? 0.0 : cpu_seconds / elapsed_seconds);
-  results.AddTrial(scenario, "minor_faults", "faults", trial,
-                   static_cast<double>(resources.usage.minor_faults));
-  results.AddTrial(scenario, "major_faults", "faults", trial,
-                   static_cast<double>(resources.usage.major_faults));
+  results.AddTrial(scenario, "minor_faults", "faults", trial, static_cast<double>(resources.usage.minor_faults));
+  results.AddTrial(scenario, "major_faults", "faults", trial, static_cast<double>(resources.usage.major_faults));
   results.AddTrial(scenario, "voluntary_context_switches", "switches", trial,
                    static_cast<double>(resources.usage.voluntary_context_switches));
   results.AddTrial(scenario, "involuntary_context_switches", "switches", trial,
@@ -137,10 +194,8 @@ void AddResources(const Scenario &scenario, Results &results, std::size_t trial,
                    static_cast<double>(resources.io.storage_read_bytes));
   results.AddTrial(scenario, "storage_write_bytes", "bytes", trial,
                    static_cast<double>(resources.io.storage_write_bytes));
-  results.AddTrial(scenario, "read_syscalls", "calls", trial,
-                   static_cast<double>(resources.io.read_syscalls));
-  results.AddTrial(scenario, "write_syscalls", "calls", trial,
-                   static_cast<double>(resources.io.write_syscalls));
+  results.AddTrial(scenario, "read_syscalls", "calls", trial, static_cast<double>(resources.io.read_syscalls));
+  results.AddTrial(scenario, "write_syscalls", "calls", trial, static_cast<double>(resources.io.write_syscalls));
   results.AddTrial(scenario, "process_rss_before_open", "bytes", trial,
                    static_cast<double>(resources.memory_before_open.resident_bytes));
   results.AddTrial(scenario, "process_rss_endpoint", "bytes", trial,
@@ -156,13 +211,42 @@ void AddResources(const Scenario &scenario, Results &results, std::size_t trial,
 
 void AddCache(const Scenario &scenario, Results &results, std::size_t trial, std::uint64_t cache_resident_bytes,
               const FileResidency &residency) {
-  results.AddTrial(scenario, "tinydb_cache_resident_bytes", "bytes", trial,
-                   static_cast<double>(cache_resident_bytes));
+  results.AddTrial(scenario, "tinydb_cache_resident_bytes", "bytes", trial, static_cast<double>(cache_resident_bytes));
   results.AddTrial(scenario, "database_file_resident_bytes", "bytes", trial,
                    static_cast<double>(residency.resident_bytes));
   results.AddTrial(scenario, "database_file_resident_ratio", "ratio", trial, residency.Ratio());
   results.AddTrial(scenario, "combined_cache_resident_bytes", "bytes", trial,
                    static_cast<double>(cache_resident_bytes + residency.resident_bytes));
+}
+
+void AddReadDiagnostics(const Scenario &scenario, Results &results, std::size_t trial,
+                        const ReadDiagnostics &diagnostics) {
+  results.AddTrial(scenario, "read_streams_started", "streams", trial,
+                   static_cast<double>(diagnostics.streams_started));
+  results.AddTrial(scenario, "read_streams_activated", "streams", trial,
+                   static_cast<double>(diagnostics.streams_activated));
+  results.AddTrial(scenario, "readahead_runs_queued", "runs", trial, static_cast<double>(diagnostics.runs_queued));
+  results.AddTrial(scenario, "readahead_runs_submitted", "runs", trial,
+                   static_cast<double>(diagnostics.runs_submitted));
+  results.AddTrial(scenario, "readahead_pages_queued", "pages", trial, static_cast<double>(diagnostics.pages_queued));
+  results.AddTrial(scenario, "readahead_pages_submitted", "pages", trial,
+                   static_cast<double>(diagnostics.pages_submitted));
+  results.AddTrial(scenario, "readahead_read_bytes", "bytes", trial, static_cast<double>(diagnostics.read_bytes));
+  results.AddTrial(scenario, "readahead_pages_ready", "pages", trial, static_cast<double>(diagnostics.pages_ready));
+  results.AddTrial(scenario, "readahead_pages_waited", "pages", trial, static_cast<double>(diagnostics.pages_waited));
+  results.AddTrial(scenario, "readahead_pages_bypassed", "pages", trial,
+                   static_cast<double>(diagnostics.pages_bypassed));
+  results.AddTrial(scenario, "readahead_pages_unused", "pages", trial, static_cast<double>(diagnostics.pages_unused));
+  results.AddTrial(scenario, "readahead_queue_drops", "pages", trial, static_cast<double>(diagnostics.queue_drops));
+  results.AddTrial(scenario, "readahead_budget_drops", "pages", trial, static_cast<double>(diagnostics.budget_drops));
+  results.AddTrial(scenario, "readahead_io_failures", "pages", trial, static_cast<double>(diagnostics.io_failures));
+  results.AddTrial(scenario, "readahead_staging_bytes", "bytes", trial, static_cast<double>(diagnostics.staging_bytes));
+  results.AddTrial(scenario, "readahead_maximum_staging_bytes", "bytes", trial,
+                   static_cast<double>(diagnostics.maximum_staging_bytes));
+  results.AddTrial(scenario, "readahead_maximum_in_flight_operations", "operations", trial,
+                   static_cast<double>(diagnostics.maximum_in_flight_operations));
+  results.AddTrial(scenario, "readahead_maximum_in_flight_bytes", "bytes", trial,
+                   static_cast<double>(diagnostics.maximum_in_flight_bytes));
 }
 
 void AddCommitLatencies(const Scenario &scenario, Results &results, std::size_t trial,
@@ -174,10 +258,43 @@ void AddCommitLatencies(const Scenario &scenario, Results &results, std::size_t 
   }
 }
 
-void PrepareWarmFileCache(const Scenario &scenario, const std::filesystem::path &path) {
-  if (scenario.cache_condition == CacheCondition::EngineHot || scenario.cache_condition == CacheCondition::Steady ||
-      scenario.cache_condition == CacheCondition::OsWarm) {
+auto DropAndRequireCold(const std::filesystem::path &path, std::string_view phase) -> FileResidency {
+  if (!AdviseDropFileCache(path)) {
+    Fail(std::string("Linux rejected the ") + std::string(phase) + " file-cache eviction request");
+  }
+  const auto residency = ObserveFileResidency(path);
+  const auto allowed = std::max<std::uint64_t>(64U << 10U, residency.file_bytes / 1'000U);
+  if (residency.resident_bytes > allowed) {
+    Fail(std::string(phase) + " file-cache residency exceeds the cold-trial limit");
+  }
+  return residency;
+}
+
+void PreparePreOpenCacheState(const Scenario &scenario, const std::filesystem::path &path) {
+  if (scenario.cache_condition == CacheCondition::OsWarm) {
     WarmDatabaseFamily(path);
+  } else {
+    (void)DropAndRequireCold(path, "pre-open");
+  }
+}
+
+void PrimeEngineReadState(Database &database, const Scenario &scenario, const Dataset &data) {
+  if (scenario.cache_condition != CacheCondition::EngineHot && scenario.cache_condition != CacheCondition::Steady) {
+    return;
+  }
+  auto read = Take(database.BeginRead(), "BeginRead cache priming");
+  auto cursor = Take(read.Scan(), "Scan cache priming");
+  auto row = std::size_t{0};
+  while (cursor.Valid()) {
+    if (row >= data.keys.size() || cursor.Key() != data.keys[row] ||
+        Take(cursor.CopyValue(), "Copy cache-priming value") != data.first_values[row]) {
+      Fail("cache-priming scan returned unexpected data");
+    }
+    ++row;
+    Check(cursor.Next(), "Advance cache-priming scan");
+  }
+  if (row != data.keys.size()) {
+    Fail("cache-priming scan did not visit the complete fixture");
   }
 }
 
@@ -193,6 +310,7 @@ auto MakeOrder(const Scenario &scenario, std::uint64_t seed) -> std::vector<std:
 
 auto ObserveWrite(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data,
                   std::uint64_t seed) -> WriteObservation {
+  PreparePreOpenCacheState(scenario, path);
   const auto memory_before_open = ObserveProcessMemory();
   auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open write benchmark");
   const auto order = MakeOrder(scenario, seed);
@@ -311,6 +429,7 @@ auto ObservePointReads(Database &database, const Scenario &scenario, const Datas
       .cache_resident_bytes = after.cache_resident_bytes,
       .residency = {},
       .resources = resources,
+      .diagnostics = CaptureReadDiagnostics(before, after),
   };
 }
 
@@ -341,9 +460,8 @@ auto MakeScanPlan(const Scenario &scenario, const Dataset &data, std::uint64_t s
   return plan;
 }
 
-auto ObserveScans(Database &database, const Scenario &scenario, const Dataset &data,
-                  const std::vector<ScanRange> &plan, std::chrono::milliseconds duration,
-                  ProcessMemory memory_before_open) -> ReadObservation {
+auto ObserveScans(Database &database, const Scenario &scenario, const Dataset &data, const std::vector<ScanRange> &plan,
+                  std::chrono::milliseconds duration, ProcessMemory memory_before_open) -> ReadObservation {
   const auto before = Take(database.Stats(), "Stats before scans");
   auto rows_seen = std::uint64_t{0};
   auto expected_rows = std::uint64_t{0};
@@ -390,6 +508,7 @@ auto ObserveScans(Database &database, const Scenario &scenario, const Dataset &d
       .cache_resident_bytes = after.cache_resident_bytes,
       .residency = {},
       .resources = resources,
+      .diagnostics = CaptureReadDiagnostics(before, after),
   };
 }
 
@@ -456,9 +575,8 @@ auto ObserveMixed(Database &database, const Scenario &scenario, const Dataset &d
   return WriteObservation{
       .seconds = seconds,
       .operations_per_second = static_cast<double>(scenario.commits * scenario.batch) / seconds,
-      .wal_amplification = logical_write_bytes == 0
-                               ? 0.0
-                               : static_cast<double>(wal_delta) / static_cast<double>(logical_write_bytes),
+      .wal_amplification =
+          logical_write_bytes == 0 ? 0.0 : static_cast<double>(wal_delta) / static_cast<double>(logical_write_bytes),
       .cache_resident_bytes = after.cache_resident_bytes,
       .residency = {},
       .resources = resources,
@@ -554,6 +672,7 @@ auto PrepareCheckpointWrites(Database &database, const Scenario &scenario, const
 
 auto ObserveCheckpoint(const std::filesystem::path &path, const Scenario &scenario,
                        const Dataset &data) -> LifecycleObservation {
+  PreparePreOpenCacheState(scenario, path);
   const auto memory_before_open = ObserveProcessMemory();
   auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open checkpoint benchmark");
   const auto updated_rows = PrepareCheckpointWrites(database, scenario, data);
@@ -604,7 +723,7 @@ void WaitForWriter(pid_t child) {
 
 auto ObserveRecovery(const std::filesystem::path &path, const Scenario &scenario,
                      const Dataset &data) -> LifecycleObservation {
-  WarmDatabaseFamily(path);
+  PreparePreOpenCacheState(scenario, path);
   const auto bytes = PersistentBytes(path);
   const auto memory_before_open = ObserveProcessMemory();
   const auto resources_started = StartResources();
@@ -628,18 +747,6 @@ auto ObserveRecovery(const std::filesystem::path &path, const Scenario &scenario
       .residency = ObserveFileResidency(path),
       .resources = resources,
   };
-}
-
-auto DropAndRequireCold(const std::filesystem::path &path, std::string_view phase) -> FileResidency {
-  if (!AdviseDropFileCache(path)) {
-    Fail(std::string("Linux rejected the ") + std::string(phase) + " file-cache eviction request");
-  }
-  const auto residency = ObserveFileResidency(path);
-  const auto allowed = std::max<std::uint64_t>(64U << 10U, residency.file_bytes / 1'000U);
-  if (residency.resident_bytes > allowed) {
-    Fail(std::string(phase) + " file-cache residency exceeds the cold-trial limit");
-  }
-  return residency;
 }
 
 auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data,
@@ -704,11 +811,12 @@ auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, 
       .workload_seconds = workload_seconds,
       .workload_milliseconds = workload_seconds * 1'000.0,
       .operations_per_second = static_cast<double>(operations) / workload_seconds,
-      .cache_hit_rate = [&] {
-        const auto hits = stats_after.cache_hits - stats_before.cache_hits;
-        const auto misses = stats_after.cache_misses - stats_before.cache_misses;
-        return hits + misses == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(hits + misses);
-      }(),
+      .cache_hit_rate =
+          [&] {
+            const auto hits = stats_after.cache_hits - stats_before.cache_hits;
+            const auto misses = stats_after.cache_misses - stats_before.cache_misses;
+            return hits + misses == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(hits + misses);
+          }(),
       .cache_resident_bytes = stats_after.cache_resident_bytes,
       .before_open_residency = before_open_residency,
       .before_workload_residency = before_workload_residency,
@@ -721,8 +829,9 @@ auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, 
       .workload_usage = workload_usage,
       .memory_before_open = memory_before_open,
       .memory_endpoint = memory_endpoint,
-      .logical_read_bytes = static_cast<double>(operations) *
-                            static_cast<double>(scenario.key_bytes + scenario.value_bytes),
+      .logical_read_bytes =
+          static_cast<double>(operations) * static_cast<double>(scenario.key_bytes + scenario.value_bytes),
+      .diagnostics = CaptureReadDiagnostics(stats_before, stats_after),
   };
 }
 
@@ -768,9 +877,9 @@ auto ChurnRound(Database &database, const Scenario &scenario, const Dataset &dat
   return std::chrono::duration<double>(Clock::now() - started).count();
 }
 
-void RunChurnTrial(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data,
-                   Results &results, std::size_t trial) {
-  PrepareWarmFileCache(scenario, path);
+void RunChurnTrial(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data, Results &results,
+                   std::size_t trial) {
+  PreparePreOpenCacheState(scenario, path);
   const auto memory_before_open = ObserveProcessMemory();
   auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open churn benchmark");
   for (std::size_t round = 0; round < scenario.churn_warmup_rounds; ++round) {
@@ -821,7 +930,9 @@ void RunChurnTrial(const std::filesystem::path &path, const Scenario &scenario, 
 
 void AddWriteResults(const Scenario &scenario, Results &results, std::size_t trial,
                      const WriteObservation &observation) {
-  results.AddTrial(scenario, "throughput", "updates/second", trial, observation.operations_per_second);
+  results.AddTrial(scenario, "throughput",
+                   scenario.workload == Workload::Mixed ? "operations/second" : "updates/second", trial,
+                   observation.operations_per_second);
   results.AddTrial(scenario, "wal_amplification", "bytes/byte", trial, observation.wal_amplification);
   if (observation.persistent_bytes != 0.0) {
     results.AddTrial(scenario, "persistent_size", "bytes", trial, observation.persistent_bytes);
@@ -833,30 +944,28 @@ void AddWriteResults(const Scenario &scenario, Results &results, std::size_t tri
   }
 }
 
-void AddReadResults(const Scenario &scenario, Results &results, std::size_t trial,
-                    const ReadObservation &observation, std::string_view unit) {
+void AddReadResults(const Scenario &scenario, Results &results, std::size_t trial, const ReadObservation &observation,
+                    std::string_view unit) {
   results.AddTrial(scenario, "throughput", unit, trial, observation.operations_per_second);
   results.AddTrial(scenario, "amortized_latency", "nanoseconds/operation", trial,
                    observation.nanoseconds_per_operation);
   results.AddTrial(scenario, "cache_hit_rate", "ratio", trial, observation.cache_hit_rate);
   AddResources(scenario, results, trial, observation.resources, observation.seconds);
   AddCache(scenario, results, trial, observation.cache_resident_bytes, observation.residency);
+  AddReadDiagnostics(scenario, results, trial, observation.diagnostics);
 }
 
 void AddLifecycleResults(const Scenario &scenario, Results &results, std::size_t trial,
                          const LifecycleObservation &observation, bool recovery) {
-  results.AddTrial(scenario, recovery ? "open_latency" : "latency", "milliseconds", trial,
-                   observation.milliseconds);
+  results.AddTrial(scenario, recovery ? "open_latency" : "latency", "milliseconds", trial, observation.milliseconds);
   results.AddTrial(scenario, recovery ? "replay_rate" : "dirty_transfer_rate", "MiB/second", trial,
                    observation.mebibytes_per_second);
-  results.AddTrial(scenario, recovery ? "persistent_size" : "database_size", "bytes", trial,
-                   observation.bytes);
+  results.AddTrial(scenario, recovery ? "persistent_size" : "database_size", "bytes", trial, observation.bytes);
   if (!recovery) {
     results.AddTrial(scenario, "storage_write_amplification", "bytes/dirty_byte", trial,
                      observation.dirty_bytes == 0.0
                          ? 0.0
-                         : static_cast<double>(observation.resources.io.storage_write_bytes) /
-                               observation.dirty_bytes);
+                         : static_cast<double>(observation.resources.io.storage_write_bytes) / observation.dirty_bytes);
   }
   AddResources(scenario, results, trial, observation.resources, observation.seconds);
   AddCache(scenario, results, trial, observation.cache_resident_bytes, observation.residency);
@@ -894,11 +1003,11 @@ void AddIoReadResults(const Scenario &scenario, Results &results, std::size_t tr
                    static_cast<double>(observation.close_io.storage_read_bytes));
   results.AddTrial(scenario, "close_storage_write_bytes", "bytes", trial,
                    static_cast<double>(observation.close_io.storage_write_bytes));
-  results.AddTrial(scenario, "workload_storage_read_amplification", "bytes/logical_byte", trial,
-                   observation.logical_read_bytes == 0.0
-                       ? 0.0
-                       : static_cast<double>(observation.workload_io.storage_read_bytes) /
-                             observation.logical_read_bytes);
+  results.AddTrial(
+      scenario, "workload_storage_read_amplification", "bytes/logical_byte", trial,
+      observation.logical_read_bytes == 0.0
+          ? 0.0
+          : static_cast<double>(observation.workload_io.storage_read_bytes) / observation.logical_read_bytes);
   const auto resources = Resources{
       .usage = observation.workload_usage,
       .io = observation.workload_io,
@@ -907,6 +1016,7 @@ void AddIoReadResults(const Scenario &scenario, Results &results, std::size_t tr
   };
   AddResources(scenario, results, trial, resources, observation.workload_seconds);
   AddCache(scenario, results, trial, observation.cache_resident_bytes, observation.pre_close_residency);
+  AddReadDiagnostics(scenario, results, trial, observation.diagnostics);
 }
 
 }  // namespace
@@ -957,13 +1067,13 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
 
   switch (scenario.workload) {
     case Workload::Put:
-      AddWriteResults(scenario, results, trial,
-                      ObserveWrite(path, scenario, data, config.seed ^ 0x5752495445ULL));
+      AddWriteResults(scenario, results, trial, ObserveWrite(path, scenario, data, config.seed ^ 0x5752495445ULL));
       return;
     case Workload::PointRead: {
-      PrepareWarmFileCache(scenario, path);
+      PreparePreOpenCacheState(scenario, path);
       const auto memory_before_open = ObserveProcessMemory();
       auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open point-read trial");
+      PrimeEngineReadState(database, scenario, data);
       const auto plan = MakeReadPlan(scenario, config.seed ^ 0x52454144ULL);
       if (scenario.warmup != std::chrono::milliseconds::zero()) {
         (void)ObservePointReads(database, scenario, data, plan, scenario.warmup, memory_before_open);
@@ -975,9 +1085,10 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
       return;
     }
     case Workload::Scan: {
-      PrepareWarmFileCache(scenario, path);
+      PreparePreOpenCacheState(scenario, path);
       const auto memory_before_open = ObserveProcessMemory();
       auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open scan trial");
+      PrimeEngineReadState(database, scenario, data);
       const auto plan = MakeScanPlan(scenario, data, config.seed ^ 0x5343414EULL);
       if (scenario.warmup != std::chrono::milliseconds::zero()) {
         (void)ObserveScans(database, scenario, data, plan, scenario.warmup, memory_before_open);
@@ -989,9 +1100,10 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
       return;
     }
     case Workload::Mixed: {
-      PrepareWarmFileCache(scenario, path);
+      PreparePreOpenCacheState(scenario, path);
       const auto memory_before_open = ObserveProcessMemory();
       auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open mixed trial");
+      PrimeEngineReadState(database, scenario, data);
       auto states = std::vector<MixedValueState>(scenario.rows, MixedValueState::First);
       for (std::size_t round = 0; round < scenario.preparation_rounds; ++round) {
         (void)ObserveMixed(database, scenario, data, states, round, config.seed ^ round, memory_before_open);
@@ -1005,9 +1117,10 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
       return;
     }
     case Workload::Concurrent: {
-      PrepareWarmFileCache(scenario, path);
+      PreparePreOpenCacheState(scenario, path);
       const auto memory_before_open = ObserveProcessMemory();
       auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open concurrent trial");
+      PrimeEngineReadState(database, scenario, data);
       for (std::size_t round = 0; round < scenario.preparation_rounds; ++round) {
         (void)ObserveConcurrent(database, scenario, data, config.seed ^ round, memory_before_open);
         Check(database.Checkpoint(), "Checkpoint concurrent preparation");
@@ -1016,8 +1129,7 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
           ObserveConcurrent(database, scenario, data, config.seed ^ 0x434F4E435552ULL, memory_before_open);
       const auto residency = ObserveFileResidency(path);
       Check(database.Close(), "Close concurrent trial");
-      results.AddTrial(scenario, "reader_throughput", "reads/second", trial,
-                       observation.reader_operations_per_second);
+      results.AddTrial(scenario, "reader_throughput", "reads/second", trial, observation.reader_operations_per_second);
       results.AddTrial(scenario, "writer_throughput", "updates/second", trial,
                        observation.writer_operations_per_second);
       AddCommitLatencies(scenario, results, trial, observation.commit_microseconds);

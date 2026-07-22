@@ -561,6 +561,12 @@ def assessment(direction: str, threshold: float, low: float, high: float) -> str
     return "inconclusive"
 
 
+def improvement_interval(direction: str, ratio: float, low: float, high: float) -> tuple[float, float, float]:
+    if direction == "lower":
+        return (1.0 - ratio) * 100.0, (1.0 - high) * 100.0, (1.0 - low) * 100.0
+    return (ratio - 1.0) * 100.0, (low - 1.0) * 100.0, (high - 1.0) * 100.0
+
+
 def write_comparison(
     root: pathlib.Path, rows: list[dict[str, str]], matrix: list[dict[str, str]]
 ) -> list[dict[str, object]]:
@@ -603,14 +609,8 @@ def write_comparison(
             direction = spec["primary_direction"] if primary else "neutral"
             threshold = float(spec["meaningful_difference"]) if primary else math.nan
             result = assessment(direction, threshold, low, high) if primary and interval else "diagnostic"
-            if primary and interval and direction == "lower":
-                improvement = (1.0 / ratio - 1.0) * 100.0
-                improvement_low = (1.0 / high - 1.0) * 100.0
-                improvement_high = (1.0 / low - 1.0) * 100.0
-            elif primary and interval:
-                improvement = (ratio - 1.0) * 100.0
-                improvement_low = (low - 1.0) * 100.0
-                improvement_high = (high - 1.0) * 100.0
+            if primary and interval:
+                improvement, improvement_low, improvement_high = improvement_interval(direction, ratio, low, high)
             else:
                 improvement = improvement_low = improvement_high = math.nan
             row = {
@@ -723,9 +723,50 @@ def write_report(
     lines.append("")
     if mode == "compare":
         lines.append("Primary confidence intervals use paired trial log-ratios.")
+    lines += ["Commit and churn observations remain nested diagnostics and are not treated as independent trials.", ""]
+    read_scenarios = [
+        scenario for scenario, spec in specs.items() if spec["workload"] in ("point_read", "scan", "io_read")
+    ]
+    if read_scenarios:
+        if mode == "run":
+            readahead_lookup = {
+                (str(row["scenario"]), str(row["metric"])): float(row["p50"]) for row in standalone
+            }
+            readahead_variant = "current"
+        else:
+            readahead_lookup = {
+                (str(row["scenario"]), str(row["metric"])): float(row["candidate_median"])
+                for row in comparisons
+            }
+            readahead_variant = "candidate"
+        lines += [
+            "## Read-ahead behavior",
+            "",
+            f"Values below describe the `{readahead_variant}` engine.",
+            "",
+            "| Scenario | Streams active/started | Pages submitted | Ready | Waited | Unused | Drops queue/budget | I/O failures | Peak staging |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    for scenario in read_scenarios:
+
+        def read_metric(metric: str) -> float:
+            return readahead_lookup[(scenario, metric)]
+
+        lines.append(
+            f"| `{scenario}` | {read_metric('read_streams_activated'):,.0f}/"
+            f"{read_metric('read_streams_started'):,.0f} | "
+            f"{read_metric('readahead_pages_submitted'):,.0f} | "
+            f"{read_metric('readahead_pages_ready'):,.0f} | "
+            f"{read_metric('readahead_pages_waited'):,.0f} | "
+            f"{read_metric('readahead_pages_unused'):,.0f} | "
+            f"{read_metric('readahead_queue_drops'):,.0f}/"
+            f"{read_metric('readahead_budget_drops'):,.0f} | "
+            f"{read_metric('readahead_io_failures'):,.0f} | "
+            f"{format_value(read_metric('readahead_maximum_staging_bytes'), 'bytes')} |"
+        )
+    if read_scenarios:
+        lines.append("")
     lines += [
-        "Commit and churn observations remain nested diagnostics and are not treated as independent trials.",
-        "",
         "## Runtime by scenario",
         "",
         "| Scenario | Fixture build | Trial execution | Total |",

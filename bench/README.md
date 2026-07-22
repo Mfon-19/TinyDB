@@ -27,9 +27,9 @@ make bench-compare BENCH_ARGS='--family cold_io'
 make bench BENCH_ARGS='--filter checkpoint'
 ```
 
-The default runtime targets are 8–12 minutes for one engine and 20–30 minutes
-for the paired comparison. Runtime depends on the storage device, especially
-for synchronous commits and cache-dropped random reads.
+On the reference development host the full paired comparison takes roughly
+8–12 minutes; a standalone run is shorter. Runtime depends on the storage
+device, especially for synchronous commits and cache-dropped random reads.
 
 ## Matrix
 
@@ -71,11 +71,15 @@ The Python runner owns all repetition and A/B orchestration. Every trial:
 4. measures exactly one independent trial; and
 5. writes scalar trial metrics plus explicitly nested observations.
 
-Engine-hot reads warm the same database handle that is measured. Steady-state
-mixed, concurrent, and churn trials prepare their own private copy before the
-measurement. Cold trials require Linux to accept `POSIX_FADV_DONTNEED` and
-require `mincore` residency below the declared cold limit; an invalid trial is
-an error rather than a row that must be inspected manually.
+Every copied fixture except an explicitly OS-warm recovery fixture begins with
+its file pages evicted and verified cold. Engine-hot and steady read workloads
+are then primed through TinyDB's public read API, so buffered I/O naturally
+populates Linux's page cache while direct I/O does not inherit irrelevant pages
+from fixture copying. Mixed, concurrent, and churn trials also prepare their
+own private state before measurement. Cold trials repeat the eviction at the
+measurement boundary. Linux must accept `POSIX_FADV_DONTNEED`, and `mincore`
+residency must remain below the declared cold limit; an invalid trial is an
+error rather than a row that must be inspected manually.
 
 The harness is built from the current tree against each engine source tree.
 Consequently both binaries have identical scenario and measurement code even
@@ -102,6 +106,9 @@ and temporal drift that independent runs cannot control.
 The independent experimental unit is a trial pair. For positive scalar
 metrics, the report computes the geometric mean of paired candidate/baseline
 ratios and a 95% Student interval over their logarithms.
+
+Reported effects preserve the primary metric's units: higher-is-better effects
+are throughput gains, while lower-is-better effects are latency reductions.
 
 Only the declared primary metric receives an assessment:
 
@@ -136,7 +143,10 @@ runs/                     per-trial samples, metadata, and copy audits
 Measurements include wall throughput, latency, CPU time, faults and context
 switches, `/proc/self/io` bytes and syscall counts, RSS/PSS, TinyDB cache
 residency, database-file page-cache residency, persistent size, and read/write
-amplification where applicable.
+amplification where applicable. Read scenarios additionally report streams,
+submitted, ready, waited, bypassed and unused readahead pages, queue and budget
+drops, failures, staging memory, and peak in-flight work. Buffered builds emit
+the same schema with zero readahead activity.
 
 ## Measurement hygiene
 
