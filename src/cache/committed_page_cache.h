@@ -81,10 +81,12 @@ struct CommittedCacheStats {
 
 /*
 ** Thread-safe cache for latest committed versions. Its mutex protects the
-** dense page table and the intrusive checkpointed-page LRU queue. A frame's
-** shared ownership is also its exact pin count: the table owns one reference
-** and each PageHandle owns another. Pinned pages remain in the queue and
-** eviction skips them, so a hot handle release needs no callback or cache lock.
+** dense page table, load-capacity reservations, and intrusive checkpointed-page
+** LRU queue; physical reads and page validation run without that mutex. A
+** frame's shared ownership is also its exact pin count: the table owns one
+** reference and each PageHandle owns another. Pinned pages remain in the queue
+** and eviction skips them, so a hot handle release needs no callback or cache
+** lock.
 */
 class CommittedPageCache final : public PageReader {
  public:

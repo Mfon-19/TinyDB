@@ -5,8 +5,12 @@
 #include "storage/page_codec.h"
 #include "support/test_files.h"
 
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -119,6 +123,135 @@ TEST(Cache, PinnedLruTailDoesNotBlockAnotherVictim) {
   EXPECT_EQ(stats.resident_pages, 2U);
   EXPECT_EQ(stats.pinned_pages, 1U);
   EXPECT_TRUE(cache.Read(2).has_value());
+  tinydb::test::Remove(path);
+}
+
+TEST(Cache, DifferentMissesLoadConcurrently) {
+  using namespace std::chrono_literals;
+
+  const auto path = Path("cache_parallel_misses");
+  tinydb::test::Remove(path);
+  auto disk = tinydb::DiskManager::Open(path).value();
+  WritePages(disk, 2);
+  auto cache = tinydb::cache::CommittedPageCache(&disk, 2U * tinydb::PAGE_SIZE, 1);
+
+  auto page2_entered = std::promise<void>{};
+  auto page3_entered = std::promise<void>{};
+  auto release = std::promise<void>{};
+  auto page2_ready = page2_entered.get_future();
+  auto page3_ready = page3_entered.get_future();
+  const auto released = release.get_future().share();
+  auto saw_page2 = std::atomic{false};
+  auto saw_page3 = std::atomic{false};
+
+  tinydb::test::WithHook(
+      [&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+        if (call.syscall != tinydb::io::Syscall::Pread || call.path != path) {
+          return std::nullopt;
+        }
+        if (call.offset == 2U * tinydb::PAGE_SIZE && !saw_page2.exchange(true)) {
+          page2_entered.set_value();
+          released.wait();
+        } else if (call.offset == 3U * tinydb::PAGE_SIZE && !saw_page3.exchange(true)) {
+          page3_entered.set_value();
+          released.wait();
+        }
+        return std::nullopt;
+      },
+      [&] {
+        auto first = std::async(std::launch::async, [&] { return cache.Read(2); });
+        EXPECT_EQ(page2_ready.wait_for(2s), std::future_status::ready);
+        auto second = std::async(std::launch::async, [&] { return cache.Read(3); });
+
+        // Page 2 remains blocked inside pread. Reaching page 3's hook proves
+        // its miss did not wait for the first miss to release the cache mutex.
+        const auto second_entered_while_first_blocked = page3_ready.wait_for(2s) == std::future_status::ready;
+        release.set_value();
+
+        EXPECT_TRUE(second_entered_while_first_blocked);
+        EXPECT_TRUE(first.get().has_value());
+        EXPECT_TRUE(second.get().has_value());
+      });
+
+  const auto stats = cache.Stats();
+  EXPECT_EQ(stats.misses, 2U);
+  EXPECT_EQ(stats.resident_pages, 2U);
+  tinydb::test::Remove(path);
+}
+
+TEST(Cache, ActiveLoadReservesCapacity) {
+  using namespace std::chrono_literals;
+
+  const auto path = Path("cache_load_capacity");
+  tinydb::test::Remove(path);
+  auto disk = tinydb::DiskManager::Open(path).value();
+  WritePages(disk, 2);
+  auto cache = tinydb::cache::CommittedPageCache(&disk, tinydb::PAGE_SIZE, 1);
+
+  auto load_entered = std::promise<void>{};
+  auto release = std::promise<void>{};
+  auto entered = load_entered.get_future();
+  const auto released = release.get_future().share();
+  auto saw_load = std::atomic{false};
+  auto page3_reads = std::atomic<std::size_t>{0};
+
+  tinydb::test::WithHook(
+      [&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+        if (call.syscall != tinydb::io::Syscall::Pread || call.path != path) {
+          return std::nullopt;
+        }
+        if (call.offset == 2U * tinydb::PAGE_SIZE && !saw_load.exchange(true)) {
+          load_entered.set_value();
+          released.wait();
+        } else if (call.offset == 3U * tinydb::PAGE_SIZE) {
+          ++page3_reads;
+        }
+        return std::nullopt;
+      },
+      [&] {
+        auto first = std::async(std::launch::async, [&] { return cache.Read(2); });
+        const auto first_entered = entered.wait_for(2s) == std::future_status::ready;
+        EXPECT_TRUE(first_entered);
+
+        const auto blocked = cache.Read(3);
+        EXPECT_FALSE(blocked.has_value());
+        if (!blocked) {
+          EXPECT_EQ(blocked.error().Code(), tinydb::StatusCode::ResourceExhausted);
+        }
+        EXPECT_EQ(page3_reads.load(), 0U);
+
+        release.set_value();
+        EXPECT_TRUE(first.get().has_value());
+      });
+
+  const auto stats = cache.Stats();
+  EXPECT_EQ(stats.resident_pages, 1U);
+  tinydb::test::Remove(path);
+}
+
+TEST(Cache, FailedLoadReleasesCapacity) {
+  const auto path = Path("cache_failed_load_capacity");
+  tinydb::test::Remove(path);
+  auto disk = tinydb::DiskManager::Open(path).value();
+  WritePages(disk, 2);
+  auto cache = tinydb::cache::CommittedPageCache(&disk, tinydb::PAGE_SIZE, 1);
+
+  tinydb::test::WithHook(
+      [&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+        if (call.syscall == tinydb::io::Syscall::Pread && call.path == path && call.offset == 2U * tinydb::PAGE_SIZE) {
+          return tinydb::io::Fault{.error = EIO};
+        }
+        return std::nullopt;
+      },
+      [&] {
+        const auto failed = cache.Read(2);
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error().Code(), tinydb::StatusCode::IoError);
+      });
+
+  // The failed read must return its in-flight capacity reservation.
+  EXPECT_TRUE(cache.Read(3).has_value());
+  EXPECT_EQ(cache.Stats().resident_pages, 1U);
   tinydb::test::Remove(path);
 }
 

@@ -9,6 +9,8 @@
 
 #include <expected>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <utility>
 
 namespace tinydb::cache {
@@ -66,6 +68,7 @@ struct CommittedPageCache::Impl final {
   mutable std::mutex mutex;  // protects every field below
   std::vector<std::shared_ptr<CommittedFrame>> pages;
   std::size_t resident_pages{0};
+  std::size_t loading_pages{0};
   std::size_t dirty_pages{0};
   CommittedFrame *most_recent{nullptr};
   CommittedFrame *least_recent{nullptr};
@@ -156,7 +159,7 @@ struct CommittedPageCache::Impl final {
   }
 
   void TrimToTarget() {
-    while (resident_pages * PAGE_SIZE > target_bytes) {
+    while (resident_pages + loading_pages > target_bytes / PAGE_SIZE) {
       if (TakeEvictionCandidate() == nullptr) {
         break;
       }
@@ -165,7 +168,7 @@ struct CommittedPageCache::Impl final {
 
   auto MakeRoomForRead() -> std::shared_ptr<CommittedFrame> {
     auto reusable = std::shared_ptr<CommittedFrame>{};
-    while ((resident_pages + 1) * PAGE_SIZE > target_bytes) {
+    while (resident_pages + loading_pages >= target_bytes / PAGE_SIZE) {
       auto frame = TakeEvictionCandidate();
       if (frame == nullptr) {
         break;
@@ -175,6 +178,53 @@ struct CommittedPageCache::Impl final {
       }
     }
     return reusable;
+  }
+
+  auto HasRoomForRead() const -> bool { return resident_pages + loading_pages < target_bytes / PAGE_SIZE; }
+
+  /*
+  ** Every blocking and page-sized operation in a physical miss happens here,
+  ** outside mutex. An unobserved eviction victim supplies its existing aligned
+  ** buffer, avoiding allocator churn in steady-state scans and random reads.
+  */
+  auto LoadFrame(page_id_t page_id,
+                 std::shared_ptr<CommittedFrame> frame) const -> Result<std::shared_ptr<CommittedFrame>> {
+    try {
+      auto new_bytes = std::unique_ptr<PageBytes>{};
+      if (frame == nullptr) {
+        new_bytes = std::make_unique<PageBytes>();
+      }
+      auto *const bytes = frame != nullptr ? frame->bytes.get() : new_bytes.get();
+      if (auto status = disk->ReadPage(page_id, bytes->data()); !status.Ok()) {
+        if (status.Code() == StatusCode::InvalidArgument) {
+          return std::unexpected(Status::Corruption("tree references a page outside the allocated database"));
+        }
+        return std::unexpected(std::move(status));
+      }
+      const auto header =
+          storage::DecodeDataPageHeader(std::as_bytes(std::span<const char, PAGE_SIZE>(*bytes)), page_id);
+      if (!header) {
+        return std::unexpected(header.error());
+      }
+      const auto tree_page =
+          header->type == storage::DataPageType::Leaf || header->type == storage::DataPageType::Internal;
+      if (tree_page) {
+        if (auto status = ValidateTreePagePayload(bytes->data(), *header); !status.Ok()) {
+          return std::unexpected(std::move(status));
+        }
+      }
+
+      if (frame != nullptr) {
+        frame->header = *header;
+        frame->tree_payload_validated = tree_page;
+        frame->checkpointed = true;
+      } else {
+        frame = std::make_shared<CommittedFrame>(*header, std::move(new_bytes), tree_page, true);
+      }
+      return frame;
+    } catch (const std::bad_alloc &) {
+      return std::unexpected(Status::ResourceExhausted("committed page load allocation failed"));
+    }
   }
 };
 
@@ -187,64 +237,55 @@ CommittedPageCache::CommittedPageCache(DiskManager *disk, std::size_t target_byt
 CommittedPageCache::~CommittedPageCache() = default;
 
 auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageHandle> {
-  auto lock = std::lock_guard(impl_->mutex);
+  auto reusable = std::shared_ptr<CommittedFrame>{};
+  {
+    auto lock = std::unique_lock(impl_->mutex);
+    if (page_id < impl_->pages.size() && impl_->pages[page_id] != nullptr) {
+      ++impl_->hits;
+      impl_->RecordAccess(impl_->pages[page_id]);
+      return Lease(impl_->pages[page_id]);
+    }
+    ++impl_->misses;
+
+    // A loading page consumes the same hard capacity as a resident page.
+    // Publication alone may temporarily exceed the target with dirty pages.
+    reusable = impl_->MakeRoomForRead();
+    if (!impl_->HasRoomForRead()) {
+      return std::unexpected(
+          Status::ResourceExhausted("committed cache is full of pinned, loading, or uncheckpointed pages"));
+    }
+    ++impl_->loading_pages;
+  }
+
+  auto loaded = impl_->LoadFrame(page_id, std::move(reusable));
+  auto lock = std::unique_lock(impl_->mutex);
+  TINYDB_CHECK(impl_->loading_pages != 0, "committed-page loading count underflow");
+  --impl_->loading_pages;
+
+  // A racing miss for the same page may have installed first. Reuse that
+  // immutable version and discard this duplicate read instead of replacing it.
   if (page_id < impl_->pages.size() && impl_->pages[page_id] != nullptr) {
-    ++impl_->hits;
     impl_->RecordAccess(impl_->pages[page_id]);
     return Lease(impl_->pages[page_id]);
   }
-  ++impl_->misses;
-
-  // Disk reads obey the hard target. Unlike publication, a cache miss has no
-  // already-approved transaction overage and may fail if every frame is pinned
-  // or waiting for checkpoint.
-  auto frame = impl_->MakeRoomForRead();
-  if ((impl_->resident_pages + 1) * PAGE_SIZE > impl_->target_bytes) {
-    return std::unexpected(Status::ResourceExhausted("committed cache is full of pinned or uncheckpointed pages"));
-  }
-
-  // The cache mutex remains held across I/O. This deliberately serializes a
-  // miss so a second reader cannot load and install a duplicate frame.
-  // An unpinned victim has no observer, so its frame and aligned page buffer
-  // can become the miss destination. This removes allocator/control-block
-  // churn from steady-state scans and random reads without weakening leases.
-  auto new_bytes = std::unique_ptr<PageBytes>{};
-  if (frame == nullptr) {
-    new_bytes = std::make_unique<PageBytes>();
-  }
-  auto *const bytes = frame != nullptr ? frame->bytes.get() : new_bytes.get();
-  if (auto status = impl_->disk->ReadPage(page_id, bytes->data()); !status.Ok()) {
-    if (status.Code() == StatusCode::InvalidArgument) {
-      return std::unexpected(Status::Corruption("tree references a page outside the allocated database"));
-    }
-    return std::unexpected(std::move(status));
-  }
-  const auto header = storage::DecodeDataPageHeader(std::as_bytes(std::span<const char, PAGE_SIZE>(*bytes)), page_id);
-  if (!header) {
-    return std::unexpected(header.error());
-  }
-  const auto tree_page = header->type == storage::DataPageType::Leaf || header->type == storage::DataPageType::Internal;
-  if (tree_page) {
-    if (auto status = ValidateTreePagePayload(bytes->data(), *header); !status.Ok()) {
-      return std::unexpected(std::move(status));
-    }
-  }
-
-  if (frame != nullptr) {
-    frame->header = *header;
-    frame->tree_payload_validated = tree_page;
-    frame->checkpointed = true;
-  } else {
-    frame = std::make_shared<CommittedFrame>(*header, std::move(new_bytes), tree_page, true);
+  if (!loaded) {
+    lock.unlock();
+    return std::unexpected(std::move(loaded.error()));
   }
   if (page_id >= impl_->pages.size()) {
-    impl_->pages.resize(page_id + 1);
+    try {
+      impl_->pages.resize(page_id + 1);
+    } catch (const std::bad_alloc &) {
+      return std::unexpected(Status::ResourceExhausted("committed cache page table allocation failed"));
+    } catch (const std::length_error &) {
+      return std::unexpected(Status::ResourceExhausted("committed cache page table exceeds container limits"));
+    }
   }
-  TINYDB_CHECK(impl_->pages[page_id] == nullptr, "cache miss raced with an existing page under its mutex");
-  impl_->pages[page_id] = frame;
+  auto &current = impl_->pages[page_id];
+  current = std::move(*loaded);
   ++impl_->resident_pages;
-  impl_->LinkMostRecent(frame.get());
-  return Lease(std::move(frame));
+  impl_->LinkMostRecent(current.get());
+  return Lease(current);
 }
 
 auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> images, std::vector<page_id_t> retired,
