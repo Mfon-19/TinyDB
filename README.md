@@ -223,64 +223,32 @@ tinydb_dump <database>
 
 ## Benchmarking
 
-The benchmark excludes fixture construction from timed regions, discards
-warmups, uses deterministic access order, validates
-every workload, and summarizes repeated samples with mean, sample deviation,
-minimum, p50, p95, p99, and maximum.
+The benchmark worker has one operation protocol, result schema, metrics
+implementation, and runner. Its portable workloads use db_bench conventions
+and native YCSB A-F mixes; backend adapters let the same code measure TinyDB,
+SQLite, LevelDB, and RocksDB. TinyDB builds additionally expose cold-I/O,
+checkpoint, recovery, churn, and concurrent-reader qualification workloads.
+
+Measure the current checkout or compare buffered and direct I/O:
 
 ```sh
-cmake -S . -B build/bench -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_TESTING=OFF -DTINYDB_BUILD_BENCHMARKS=ON
-cmake --build build/bench --target TinyDB_bench
-build/bench/TinyDB_bench
+make bench
+make bench-compare
 ```
 
-The CSV workloads cover insert and overwrite commits, hot point reads,
-metadata-only and value-copy cursor scans, checkpoints, process-restart
-recovery, and space reuse under churn. Run one family or lengthen CPU-bound
-trials with:
+Both commands build Release workers and replace
+`/tmp/tinydb-benchmark-latest` only after a complete successful run. Fixture
+construction is outside timed regions. Every trial receives a private verified
+copy, and compatible buffered/direct workers consume identical persistent
+bytes. Reports include paired confidence intervals, call latency, CPU, PSS,
+database-file residency, physical I/O, persistent size, and TinyDB prefetch
+diagnostics. Each result is just `report.md`, raw `results.csv`, and
+`metadata.json`; fixture and trial files are deleted when the run completes.
 
-```sh
-build/bench/TinyDB_bench --workload reads --minimum-trial-ms 1000
-```
-
-### Reference results
-
-The following results are from a complete run. They
-describe this machine and build; they are a reproducible reference, not a
-performance guarantee for other systems.
-
-| Component | Configuration |
-|---|---|
-| CPU | Intel Core i5-1135G7, 4 cores / 8 threads, 2.4 GHz base and 4.2 GHz maximum |
-| Memory | 7.5 GiB |
-| Storage | Intel SSDPEKNW512G8 NVMe SSD; ext4 on an LVM logical volume |
-| Operating system | Linux 6.17.0-29-generic, x86-64 |
-| Compiler | GCC 13.3.0, Release build |
-
-The run used 5,000 rows, 128-byte values, a 16 MiB cache, 64 transactions of
-16 writes each, seven measured trials after two warmups, a 250 ms minimum for
-CPU-bound trials, and deterministic seed `92673823818818`. Put throughput
-counts individual key updates; the corresponding transaction rate is shown in
-parentheses.
-
-| Workload | Median result | Tail and storage details |
-|---|---:|---|
-| Insert new keys | 6,519 updates/s (407 transactions/s) | Commit p50 1.607 ms, p95 2.182 ms, p99 2.580 ms; WAL amplification 3.95× |
-| Overwrite keys | 7,202 updates/s (450 transactions/s) | Commit p50 1.500 ms, p95 1.946 ms, p99 2.301 ms; WAL amplification 4.09× |
-| Hot `Database::Get` | 28,963 reads/s | 34.53 µs/read; 100% TinyDB cache-hit rate |
-| Hot `ReadTransaction::Get` | 29,044 reads/s | 34.43 µs/read; 100% TinyDB cache-hit rate |
-| Cursor metadata scan | 2.837 million rows/s | 352.5 ns/row |
-| Cursor value-copy scan | 2.690 million rows/s | 371.8 ns/row |
-| Checkpoint | 3.208 ms | 235.0 MiB/s dirty-page transfer; p95 3.639 ms |
-| Process-restart recovery | 22.346 ms | 42.41 MiB/s replay; p95 23.741 ms |
-| Three-round churn | 22,539 operations/s | 1.107× file amplification; 819,200-byte final database file |
-
-Process-restart recovery is filesystem-cache-warm: the writer exits without a
-TinyDB close, but the harness does not evict the operating system's page cache.
-The insert run also recorded one 16.276 ms commit outlier; its p99 remained
-2.580 ms. The machine was not otherwise isolated from normal operating-system
-activity.
+See [the benchmark guide](bench/README.md) for profiles, focused commands,
+workload semantics, cache control, and artifacts. Published reference numbers
+should be regenerated with this unified matrix; results from the retired
+TinyDB-only CRUD matrix are not directly comparable.
 
 ## Repository
 

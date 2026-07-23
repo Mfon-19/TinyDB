@@ -6,20 +6,17 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
   set(CMAKE_CXX_EXTENSIONS OFF)
 
-  set(TINYDB_ENGINE_SOURCE_DIR "" CACHE PATH "TinyDB engine source tree")
-  if(NOT TINYDB_ENGINE_SOURCE_DIR)
-    message(FATAL_ERROR "TINYDB_ENGINE_SOURCE_DIR is required")
-  endif()
-  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-  set(TINYDB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-  add_subdirectory("${TINYDB_ENGINE_SOURCE_DIR}" engine)
+  set(KVBENCH_BACKEND "tinydb" CACHE STRING
+      "Benchmark backend: tinydb, sqlite, leveldb, or rocksdb")
 endif()
 
-if(NOT TINYDB_ENGINE_SOURCE_DIR)
-  set(TINYDB_ENGINE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
+if(NOT KVBENCH_BACKEND)
+  set(KVBENCH_BACKEND "tinydb")
 endif()
-get_filename_component(TINYDB_ENGINE_SOURCE_DIR "${TINYDB_ENGINE_SOURCE_DIR}" ABSOLUTE)
+set(KVBENCH_ENGINE_REVISION "" CACHE STRING
+    "Exact external backend version recorded in benchmark metadata")
 get_filename_component(TINYDB_HARNESS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+find_package(Threads REQUIRED)
 
 function(tinydb_git_identity source prefix)
   execute_process(
@@ -44,19 +41,60 @@ function(tinydb_git_identity source prefix)
   set(${prefix}_DIRTY "${dirty}" PARENT_SCOPE)
 endfunction()
 
-tinydb_git_identity("${TINYDB_ENGINE_SOURCE_DIR}" TINYDB_ENGINE)
 tinydb_git_identity("${TINYDB_HARNESS_SOURCE_DIR}" TINYDB_HARNESS)
 
 add_executable(
   TinyDB_bench
+  backend.cpp
+  benchmark.cpp
   benchmark.h
-  main.cpp
-  support.cpp
-  system_metrics.cpp
-  system_metrics.h
-  workloads.cpp)
-target_link_libraries(TinyDB_bench PRIVATE TinyDB::TinyDB)
-target_include_directories(TinyDB_bench PRIVATE "${TINYDB_ENGINE_SOURCE_DIR}/src")
+  metrics.cpp
+  portable.cpp)
+
+if(KVBENCH_BACKEND STREQUAL "tinydb")
+  if(NOT TINYDB_ENGINE_SOURCE_DIR)
+    set(TINYDB_ENGINE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  endif()
+  get_filename_component(TINYDB_ENGINE_SOURCE_DIR "${TINYDB_ENGINE_SOURCE_DIR}" ABSOLUTE)
+  if(NOT TARGET TinyDB::TinyDB)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(TINYDB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${TINYDB_ENGINE_SOURCE_DIR}" engine)
+  endif()
+  tinydb_git_identity("${TINYDB_ENGINE_SOURCE_DIR}" TINYDB_ENGINE)
+  target_sources(
+    TinyDB_bench
+    PRIVATE tinydb.cpp)
+  target_compile_definitions(TinyDB_bench PRIVATE KVBENCH_TINYDB=1)
+  target_include_directories(TinyDB_bench PRIVATE "${TINYDB_ENGINE_SOURCE_DIR}/src")
+  target_link_libraries(TinyDB_bench PRIVATE TinyDB::TinyDB)
+elseif(KVBENCH_BACKEND STREQUAL "sqlite")
+  find_package(SQLite3 REQUIRED)
+  target_compile_definitions(TinyDB_bench PRIVATE KVBENCH_SQLITE=1)
+  target_link_libraries(TinyDB_bench PRIVATE SQLite::SQLite3)
+  set(TINYDB_ENGINE_COMMIT "system-sqlite")
+  set(TINYDB_ENGINE_DIRTY false)
+elseif(KVBENCH_BACKEND STREQUAL "leveldb")
+  find_package(leveldb CONFIG REQUIRED)
+  target_compile_definitions(TinyDB_bench PRIVATE KVBENCH_LEVELDB=1)
+  target_link_libraries(TinyDB_bench PRIVATE leveldb::leveldb)
+  set(TINYDB_ENGINE_COMMIT "leveldb")
+  set(TINYDB_ENGINE_DIRTY false)
+elseif(KVBENCH_BACKEND STREQUAL "rocksdb")
+  find_package(RocksDB CONFIG REQUIRED)
+  target_compile_definitions(TinyDB_bench PRIVATE KVBENCH_ROCKSDB=1)
+  target_link_libraries(TinyDB_bench PRIVATE RocksDB::rocksdb)
+  set(TINYDB_ENGINE_COMMIT "rocksdb")
+  set(TINYDB_ENGINE_DIRTY false)
+else()
+  message(FATAL_ERROR
+          "KVBENCH_BACKEND must be tinydb, sqlite, leveldb, or rocksdb")
+endif()
+
+if(KVBENCH_ENGINE_REVISION)
+  set(TINYDB_ENGINE_COMMIT "${KVBENCH_ENGINE_REVISION}")
+endif()
+
 target_compile_definitions(
   TinyDB_bench
   PRIVATE TINYDB_BENCH_ENGINE_GIT_COMMIT="${TINYDB_ENGINE_COMMIT}"

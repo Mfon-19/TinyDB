@@ -1,177 +1,110 @@
 # TinyDB benchmarks
 
-The benchmark suite answers one question: what does a TinyDB engine revision
-cost in throughput, latency, CPU, memory, and storage behavior? It is a
-regression and design-comparison tool, not a cross-database ranking.
+The benchmark has two parts:
+
+- a C++ worker that runs workloads against one backend; and
+- `runner.py`, which builds fixtures, repeats trials, compares results, and
+  writes the report.
+
+The same worker sources build against TinyDB, SQLite, LevelDB, or RocksDB.
+TinyDB builds also include a small engine-specific qualification suite.
 
 ## Commands
-
-From `main`, the complete public interface is:
 
 ```sh
 make bench
 make bench-compare
 ```
 
-`make bench` measures the current working tree. `make bench-compare` performs a
-paired comparison between that tree and the revision named by
-`DIRECT_IO_REVISION`, which defaults to `direct-io`.
+`make bench` measures the current checkout. `make bench-compare` compares it
+with `direct-io` (override that with `DIRECT_IO_REVISION`).
 
-The two default commands share `/tmp/tinydb-benchmark-latest`. A successful
-run replaces the previous successful default result, so ordinary use retains
-only one result. The replacement happens after the new report is complete.
-
-Named archives and focused investigations use Make variables:
+Useful focused runs:
 
 ```sh
-make bench BENCH_OUTPUT=/tmp/buffered-results
-make bench-compare COMPARISON_OUTPUT=/tmp/buffered-vs-direct
-make bench-compare BASELINE_CACHE_MIB=16
-make bench-compare DIRECT_CACHE_MIB=32
-make bench-compare BENCH_ARGS='--family cold_io'
-make bench BENCH_ARGS='--filter checkpoint'
+make bench BENCH_PROFILE=smoke BENCH_ARGS='--family db_bench'
+make bench BENCH_ARGS='--family ycsb'
+make bench-compare BENCH_ARGS='--filter readrandom'
+make bench-compare CACHE_MIB=8
+make bench BENCH_OUTPUT=/tmp/tinydb-buffered
 ```
 
-The default comparison gives the direct-I/O candidate its production 16 MiB
-page cache while the buffered baseline retains each scenario's declared 8 MiB
-setting. `BASELINE_CACHE_MIB` and `DIRECT_CACHE_MIB` override only their named
-engine. Use `BASELINE_CACHE_MIB=16` for an equal 16 MiB comparison, or
-`DIRECT_CACHE_MIB=8` for an equal 8 MiB comparison.
+The normal TinyDB cache is 16 MiB. `CACHE_MIB` overrides both sides of a
+comparison; `BASELINE_CACHE_MIB` and `DIRECT_CACHE_MIB` override one side.
 
-An explicitly named output is never replaced; choose a new path or remove the
-old archive deliberately.
+## Workloads
 
-On the reference development host the full paired comparison takes roughly
-8–12 minutes; a standalone run is shorter. Runtime depends on the storage
-device, especially for synchronous commits and cache-dropped random reads.
+The default portable family uses the familiar db_bench names:
 
-## Matrix
+- sequential, random, and batch fill;
+- overwrite;
+- random point reads, sequential reads, and random seeks; and
+- random delete.
 
-The fixed representative matrix contains sixteen scenarios:
+YCSB A-F are available with `--family ycsb`. They use the standard read,
+update, insert, short-scan, and read-modify-write mixes with a Zipfian key
+distribution. These are native C++ workloads, not RocksDB's executable or a
+Java YCSB client, so every backend pays the same harness cost.
 
-- sequential single-row inserts, random batched inserts, random overwrites,
-  and 64 KiB values;
-- engine-hot and eviction-heavy point reads;
-- short value-copying range scans;
-- a uniform 80% read / 12% update / 4% insert / 4% delete workload;
-- one writer with four readers;
-- 64 MiB checkpoint and OS-warm recovery;
-- bounded delete/reinsert churn; and
-- cache-dropped full scans, random reads, and both shared-layout compatibility
-  and native-layout large-value scans.
+Portable sizes come from `--profile`:
 
-This is intentionally not a Cartesian product. Variants that previously
-repeated the same conclusion were removed. Long endurance questions are
-targeted experiments, not a larger version of the whole suite.
+| Profile | db writes | db read records / operations | YCSB records / operations | Trials |
+|---|---:|---:|---:|---:|
+| `smoke` | 2,000 | 2,000 / 5,000 | 2,000 / 2,000 | 1 |
+| `standard` | 20,000 | 250,000 / 250,000 | 50,000 / 50,000 | 3 |
+| `soak` | 200,000 | 2,000,000 / 2,000,000 | 500,000 / 1,000,000 | 5 |
 
-Each scenario declares its fixture policy, trial count, cache condition,
-primary metric, preferred direction, and meaningful-effect threshold. Stable
-workloads use five trials. Cold I/O, lifecycle, and churn use three more
-expensive trials.
+TinyDB qualification adds the behavior a generic key/value interface cannot
+measure:
 
-## One trial contract
+- hot-cache, eviction-heavy, range, and large-value cases;
+- concurrent readers with a writer;
+- checkpoint, WAL recovery, and delete/reinsert churn;
+- verified-cold sequential, random, and overflow-value reads; and
+- direct-I/O prefetch activity, usefulness, drops, failures, and memory.
 
-The C++ executable has only three operations:
+## Fair comparisons
+
+Each scenario is built once per compatible on-disk format. Buffered and direct
+TinyDB therefore start from byte-identical canonical files. Other engines get
+the same logical keys and values in their own format. Every trial receives a
+private byte-for-byte copy, which is hashed before use and deleted afterwards.
+
+Engines run sequentially in balanced rotating order. Scenario order, operation
+plans, and trial seeds are deterministic. Setup, cache priming, and validation
+are outside the timed region.
+
+`durable` is the default: TinyDB keeps its normal commit boundary, SQLite uses
+`synchronous=FULL`, and LevelDB/RocksDB synchronize measured writes.
+`--semantics native` uses each external engine's normal asynchronous setting
+and must not be read as an equal-durability comparison.
+
+The report uses paired trial ratios. Positive metrics receive a 95% Student
+interval over log ratios; only a scenario's declared primary metric receives a
+verdict. A one-trial smoke run has a point estimate but no confidence interval.
+
+## Results
+
+A successful run contains only:
 
 ```text
-list scenarios
-build one canonical fixture
-run one trial from an existing fixture
+report.md       human-readable tables
+results.csv     every raw trial and nested observation
+metadata.json  provenance, matrix, ordering, seeds, and fixture hashes
 ```
 
-The Python runner owns all repetition and A/B orchestration. Every trial:
+Fixtures and trial copies are temporary. Workers are not copied into the
+result; their resolved paths, SHA-256 hashes, exact revisions, dirty state,
+compiler, and build type are recorded, and the runner verifies that no binary
+changed during the run.
 
-1. receives a private userspace copy of an immutable canonical database family;
-2. performs its scenario-specific preparation outside the timer;
-3. establishes and verifies the declared cache condition;
-4. measures exactly one independent trial; and
-5. writes scalar trial metrics plus explicitly nested observations.
+`results.csv` is the source of truth. Every median, effect, and confidence
+interval in `report.md` can be recomputed from it; there are no duplicate
+summary CSVs.
 
-Every copied fixture except an explicitly OS-warm recovery fixture begins with
-its file pages evicted and verified cold. Engine-hot and steady read workloads
-are then primed through TinyDB's public read API, so buffered I/O naturally
-populates Linux's page cache while direct I/O does not inherit irrelevant pages
-from fixture copying. Mixed, concurrent, and churn trials also prepare their
-own private state before measurement. Cold trials repeat the eviction at the
-measurement boundary. Linux must accept `POSIX_FADV_DONTNEED`, and `mincore`
-residency must remain below the declared cold limit; an invalid trial is an
-error rather than a row that must be inspected manually.
+The default result is `/tmp/tinydb-benchmark-latest`. It replaces the previous
+result only after all three files are complete. Use `--output` (or the Make
+variables above) to retain a named result.
 
-The harness is built from the current tree against each engine source tree.
-Consequently both binaries have identical scenario and measurement code even
-when the engine revisions live on different branches.
-
-## Paired comparison
-
-Baseline and candidate never run concurrently. Shared-layout scenarios give
-both variants the same baseline-built persistent bytes. Native-layout scenarios
-let each variant build the same deterministic logical dataset using its own
-allocator and format. Every trial pair shares one logical dataset ID and trial
-seed, then runs consecutively. First position is randomized in balanced
-`AB`/`BA` blocks, and scenario order is randomized once per run.
-
-Every canonical physical family and working copy consists of regular,
-single-link files. Each family has its own content-derived ID. Copies use an
-explicit read/write loop, are hashed while copied, are synced, and are rejected
-if FIEMAP reports shared extents. Trials validate the declared logical dataset
-through TinyDB reads before emitting paired results. The exact executables are
-also copied and hashed into the result directory before use.
-
-Do not compare two independent `make bench` directories to infer a small
-performance difference. The paired runner controls fixture, plan, ordering,
-and temporal drift that independent runs cannot control.
-
-## Statistics
-
-The independent experimental unit is a trial pair. For positive scalar
-metrics, the report computes the geometric mean of paired candidate/baseline
-ratios and a 95% Student interval over their logarithms.
-
-Reported effects preserve the primary metric's units: higher-is-better effects
-are throughput gains, while lower-is-better effects are latency reductions.
-
-Only the declared primary metric receives an assessment:
-
-- `improved`: the complete interval exceeds the meaningful threshold;
-- `regressed`: the complete interval exceeds it in the wrong direction;
-- `equivalent`: the complete interval lies inside the equivalence band; or
-- `inconclusive`: more targeted evidence is required.
-
-Commit latencies and churn rounds remain nested observations. Their p50 and
-p95 are first reduced to one scalar per trial before any comparison; raw
-observations remain available but are never treated as independent trials.
-Secondary memory, CPU, I/O, amplification, and size metrics are diagnostic and
-do not generate hundreds of multiple-comparison verdicts.
-
-## Artifacts
-
-Every result directory contains:
-
-```text
-report.md                 human-readable primary and diagnostic scorecard
-samples.csv               all scalar and nested samples
-observations.csv          nested commit and churn observations
-observation-summary.csv  descriptive nested distributions by variant
-summary.csv               standalone trial summaries, for `make bench`
-comparison.csv            paired effects and intervals, for `make bench-compare`
-metadata.json             binaries, environment, matrix, order, and fixtures
-binaries/                 exact archived executables
-fixtures/                 immutable canonical database families
-runs/                     per-trial samples, metadata, and copy audits
-```
-
-Measurements include wall throughput, latency, CPU time, faults and context
-switches, `/proc/self/io` bytes and syscall counts, RSS/PSS, TinyDB cache
-residency, database-file page-cache residency, persistent size, and read/write
-amplification where applicable. Read scenarios additionally report streams,
-submitted, ready, waited, bypassed and unused readahead pages, queue and budget
-drops, failures, staging memory, and peak in-flight work. Buffered builds emit
-the same schema with zero readahead activity.
-
-## Measurement hygiene
-
-Use Release builds on an otherwise idle machine. Keep both variants on the
-same filesystem and storage device, hold the CPU power policy stable, and avoid
-mixing runs taken under materially different thermal or background-load
-conditions. The metadata records the binaries, commits, dirty state, compiler,
-kernel, CPU, governor, memory, filesystem, scenario order, and trial seeds.
+For cross-engine runs, the ignored `build/local-crossbench/run` launcher builds
+the backend workers and delegates to this same runner.

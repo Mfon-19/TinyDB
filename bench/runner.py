@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 
-"""Run TinyDB's representative suite with one or two engine revisions."""
+"""Run and compare TinyDB's unified benchmark workloads."""
 
 from __future__ import annotations
 
 import argparse
 import atexit
 import csv
+import datetime
 import errno
-import fcntl
 import hashlib
 import json
 import math
 import os
 import pathlib
+import platform
 import random
 import shutil
 import statistics
-import struct
 import subprocess
 import tempfile
 import time
@@ -38,13 +38,6 @@ CHILD_FIELDS = (
     "value",
 )
 RAW_FIELDS = ("variant", *CHILD_FIELDS)
-
-FS_IOC_FIEMAP = 0xC020660B
-FIEMAP_FLAG_SYNC = 0x00000001
-FIEMAP_EXTENT_LAST = 0x00000001
-FIEMAP_EXTENT_SHARED = 0x00002000
-FIEMAP_HEADER = struct.Struct("=QQIIII")
-FIEMAP_EXTENT = struct.Struct("=QQQQQIIII")
 
 T_CRITICAL_95 = {
     1: 12.706,
@@ -87,6 +80,15 @@ def positive_integer(value: str) -> int:
     return parsed
 
 
+def engine_argument(value: str) -> tuple[str, pathlib.Path]:
+    label, separator, binary = value.partition("=")
+    if not separator or not label or not binary:
+        raise argparse.ArgumentTypeError("must be LABEL=/path/to/binary")
+    if any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in label):
+        raise argparse.ArgumentTypeError("engine label contains unsupported characters")
+    return label, pathlib.Path(binary)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -100,25 +102,119 @@ def parse_args() -> argparse.Namespace:
     compare.add_argument("--baseline-cache-mib", type=positive_integer)
     compare.add_argument("--candidate-cache-mib", type=positive_integer)
 
-    for subparser in (run, compare):
+    cross = subparsers.add_parser("cross", help="compare two or more backend workers")
+    cross.add_argument(
+        "--engine",
+        action="append",
+        type=engine_argument,
+        required=True,
+        help="repeat LABEL=/path/to/binary for each engine",
+    )
+    cross.add_argument("--baseline", required=True, help="engine label used as the report baseline")
+
+    for subparser in (run, compare, cross):
         subparser.add_argument("--output", type=pathlib.Path)
-        subparser.add_argument("--family")
+        subparser.add_argument("--family", action="append")
         subparser.add_argument("--filter")
+        subparser.add_argument(
+            "--cache-mib",
+            type=positive_integer,
+            help="override the page cache for every measured engine",
+        )
+        subparser.add_argument(
+            "--profile",
+            choices=("smoke", "standard", "soak"),
+            default="standard",
+        )
+        subparser.add_argument(
+            "--semantics",
+            choices=("durable", "native"),
+            default="durable",
+        )
+        subparser.add_argument("--trials", type=positive_integer)
         subparser.add_argument("--seed", type=int, default=0x54494E594442)
     return parser.parse_args()
 
 
+def selected_binaries(args: argparse.Namespace) -> tuple[dict[str, pathlib.Path], str | None]:
+    if args.mode == "run":
+        return {"current": args.binary}, None
+    if args.mode == "compare":
+        return {"baseline": args.baseline, "candidate": args.candidate}, "baseline"
+    binaries = dict(args.engine)
+    if len(binaries) != len(args.engine):
+        raise ValueError("engine labels must be unique")
+    if len(binaries) < 2:
+        raise ValueError("cross comparison requires at least two engines")
+    if args.baseline not in binaries:
+        raise ValueError(f"unknown baseline engine {args.baseline!r}")
+    return binaries, args.baseline
+
+
+def resolve_page_cache_overrides(args: argparse.Namespace) -> dict[str, int | None]:
+    common = args.cache_mib << 20 if args.cache_mib is not None else None
+    if args.mode == "run":
+        return {"current": common}
+    if args.mode == "cross":
+        return {label: common for label, _ in args.engine}
+    return {
+        "baseline": args.baseline_cache_mib << 20 if args.baseline_cache_mib is not None else common,
+        "candidate": args.candidate_cache_mib << 20 if args.candidate_cache_mib is not None else common,
+    }
+
+
 def scenario_matrix(binary: pathlib.Path, args: argparse.Namespace) -> list[dict[str, str]]:
-    command = [str(binary), "--list"]
+    command = [str(binary), "--list", "--profile", args.profile]
     if args.family:
-        command += ["--family", args.family]
+        for family in args.family:
+            command += ["--family", family]
     if args.filter:
         command += ["--filter", args.filter]
     result = subprocess.run(command, check=True, text=True, capture_output=True)
     rows = list(csv.DictReader(result.stdout.splitlines()))
+    if args.trials is not None:
+        for row in rows:
+            row["trials"] = str(args.trials)
     if not rows:
         raise ValueError("benchmark binary exposed no selected scenarios")
     return rows
+
+
+def engine_identity(binary: pathlib.Path) -> dict[str, object]:
+    result = subprocess.run(
+        [str(binary), "--describe"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    identity = json.loads(result.stdout)
+    if (
+        set(identity)
+        != {
+            "backend",
+            "format_family",
+            "tinydb_qualification",
+            "always_durable",
+            "engine_revision",
+            "engine_dirty",
+            "harness_revision",
+            "harness_dirty",
+            "build_type",
+            "compiler",
+        }
+        or not isinstance(identity["backend"], str)
+        or not isinstance(identity["format_family"], str)
+        or not isinstance(identity["tinydb_qualification"], bool)
+        or not isinstance(identity["always_durable"], bool)
+        or not isinstance(identity["engine_revision"], str)
+        or not isinstance(identity["engine_dirty"], (bool, type(None)))
+        or not isinstance(identity["harness_revision"], str)
+        or not isinstance(identity["harness_dirty"], (bool, type(None)))
+        or not isinstance(identity["build_type"], str)
+        or not isinstance(identity["compiler"], str)
+    ):
+        raise ValueError(f"invalid worker identity from {binary}")
+    return identity
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -164,89 +260,26 @@ def stream_copy(source: pathlib.Path, destination: pathlib.Path, mode: int) -> s
     return digest.hexdigest()
 
 
-def archive_binary(source: pathlib.Path, variant: str, root: pathlib.Path) -> tuple[pathlib.Path, dict[str, object]]:
-    source = source.resolve(strict=True)
-    status = source.stat()
-    before = sha256(source)
-    destination = (root / "binaries" / variant / "TinyDB_bench").resolve()
-    destination.parent.mkdir(parents=True, exist_ok=False)
-    copied = stream_copy(source, destination, status.st_mode & 0o777)
-    after = sha256(source)
-    if copied != before or after != before:
-        raise ValueError(f"benchmark binary changed while archiving {source}")
-    destination_status = destination.stat()
-    if destination_status.st_nlink != 1:
-        raise ValueError("archived benchmark binary must have one link")
-    fsync_directory(destination.parent)
-    return destination, {
-        "original_path": str(source),
-        "archived_path": str(destination),
-        "sha256": copied,
-        "size": destination_status.st_size,
-    }
-
-
-def fiemap(path: pathlib.Path) -> dict[str, object]:
-    extent_capacity = 512
-    start = 0
-    extent_count = 0
-    shared_extents = 0
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-        try:
-            while True:
-                buffer = bytearray(FIEMAP_HEADER.size + extent_capacity * FIEMAP_EXTENT.size)
-                FIEMAP_HEADER.pack_into(
-                    buffer, 0, start, (1 << 64) - 1 - start, FIEMAP_FLAG_SYNC, 0, extent_capacity, 0
-                )
-                fcntl.ioctl(descriptor, FS_IOC_FIEMAP, buffer, True)
-                _, _, _, mapped, _, _ = FIEMAP_HEADER.unpack_from(buffer)
-                if mapped == 0:
-                    break
-                final_logical = start
-                final_flags = 0
-                for index in range(mapped):
-                    extent = FIEMAP_EXTENT.unpack_from(
-                        buffer, FIEMAP_HEADER.size + index * FIEMAP_EXTENT.size
-                    )
-                    logical, _, length, _, _, flags, _, _, _ = extent
-                    extent_count += 1
-                    shared_extents += int(bool(flags & FIEMAP_EXTENT_SHARED))
-                    final_logical = logical + length
-                    final_flags = flags
-                if final_flags & FIEMAP_EXTENT_LAST:
-                    break
-                if final_logical <= start:
-                    raise OSError(errno.EIO, "FIEMAP did not advance")
-                start = final_logical
-        finally:
-            os.close(descriptor)
-    except OSError as error:
-        if error.errno not in (errno.EINVAL, errno.ENOTTY, errno.EOPNOTSUPP, errno.ENOSYS):
-            raise
-        return {"available": False, "reason": str(error), "extent_count": None, "shared_extents": None}
+def binary_record(path: pathlib.Path, identity: dict[str, object]) -> dict[str, object]:
+    path = path.resolve(strict=True)
+    status = path.stat()
     return {
-        "available": True,
-        "reason": None,
-        "extent_count": extent_count,
-        "shared_extents": shared_extents,
+        "path": str(path),
+        "sha256": sha256(path),
+        "size": status.st_size,
+        **identity,
     }
 
 
-def family_members(database: pathlib.Path) -> list[pathlib.Path]:
-    members: list[pathlib.Path] = []
-    wal_name = database.name + "-wal"
-    archive_prefix = wal_name + "."
-    for entry in database.parent.iterdir():
-        if entry.name == database.name or entry.name == wal_name:
-            members.append(entry)
-        elif entry.name.startswith(archive_prefix) and entry.name.endswith(".segment"):
-            generation = entry.name[len(archive_prefix) : -len(".segment")]
-            if generation.isdecimal():
-                members.append(entry)
-    if database not in members:
-        raise ValueError(f"fixture has no database file: {database}")
-    return sorted(members, key=lambda path: path.name)
+def family_members(root: pathlib.Path) -> list[pathlib.Path]:
+    members = [
+        entry
+        for entry in root.rglob("*")
+        if entry.is_file() and not entry.is_symlink()
+    ]
+    if not members:
+        raise ValueError(f"fixture has no database files: {root}")
+    return sorted(members, key=lambda path: path.relative_to(root).as_posix())
 
 
 def family_manifest(database: pathlib.Path) -> dict[str, object]:
@@ -259,73 +292,69 @@ def family_manifest(database: pathlib.Path) -> dict[str, object]:
         if status.st_nlink != 1:
             raise ValueError(f"fixture member has {status.st_nlink} links: {member}")
         content_hash = sha256(member)
+        name = member.relative_to(database).as_posix()
         record = {
-            "name": member.name,
+            "name": name,
             "size": status.st_size,
             "sha256": content_hash,
-            "allocated_bytes": status.st_blocks * 512,
-            "fiemap": fiemap(member),
         }
         files.append(record)
-        identity.update(member.name.encode())
+        identity.update(name.encode())
         identity.update(b"\0")
         identity.update(str(status.st_size).encode())
         identity.update(b"\0")
         identity.update(content_hash.encode())
         identity.update(b"\n")
-    return {"family_id": identity.hexdigest(), "database": database.name, "files": files}
+    return {"family_id": identity.hexdigest(), "files": files}
 
 
 def freeze_fixture(database: pathlib.Path, manifest: dict[str, object]) -> None:
     for record in manifest["files"]:
-        os.chmod(database.parent / str(record["name"]), 0o400)
-    fsync_directory(database.parent)
+        os.chmod(database / str(record["name"]), 0o400)
+    fsync_directory(database)
 
 
-def copy_fixture(source: pathlib.Path, destination: pathlib.Path, manifest: dict[str, object]) -> dict[str, object]:
-    destination.parent.mkdir(parents=True, exist_ok=False)
-    copied_files = []
+def copy_fixture(
+    source: pathlib.Path, destination: pathlib.Path, manifest: dict[str, object]
+) -> None:
+    destination.mkdir(parents=True, exist_ok=False)
     for record in manifest["files"]:
         name = str(record["name"])
-        source_member = source.parent / name
-        destination_member = destination.parent / name
+        source_member = source / name
+        destination_member = destination / name
+        destination_member.parent.mkdir(parents=True, exist_ok=True)
         digest = stream_copy(source_member, destination_member, 0o600)
         if digest != record["sha256"]:
             raise ValueError(f"canonical fixture changed while copying {source_member}")
         status = destination_member.stat(follow_symlinks=False)
         if status.st_size != record["size"] or status.st_nlink != 1:
             raise ValueError(f"working fixture metadata differs for {destination_member}")
-        extent = fiemap(destination_member)
-        if extent["available"] and extent["shared_extents"]:
-            raise ValueError(f"working fixture contains shared extents: {destination_member}")
-        copied_files.append(
-            {
-                "name": name,
-                "size": status.st_size,
-                "sha256": digest,
-                "allocated_bytes": status.st_blocks * 512,
-                "fiemap": extent,
-            }
-        )
-    fsync_directory(destination.parent)
-    return {"family_id": manifest["family_id"], "files": copied_files}
-
-
-def remove_working_directory(directory: pathlib.Path) -> None:
-    for path in sorted(directory.rglob("*"), reverse=True):
-        if path.is_dir():
-            path.rmdir()
-        else:
-            path.unlink()
-    directory.rmdir()
+    fsync_directory(destination)
 
 
 def build_fixture(
-    binary: pathlib.Path, database: pathlib.Path, scenario: str, seed: int
+    binary: pathlib.Path,
+    database: pathlib.Path,
+    scenario: str,
+    seed: int,
+    profile: str,
+    semantics: str,
 ) -> dict[str, object]:
     database.parent.mkdir(parents=True, exist_ok=False)
     subprocess.run(
-        [str(binary), "--scenario", scenario, "--build-fixture", str(database), "--seed", str(seed)],
+        [
+            str(binary),
+            "--scenario",
+            scenario,
+            "--build-fixture",
+            str(database),
+            "--seed",
+            str(seed),
+            "--profile",
+            profile,
+            "--semantics",
+            semantics,
+        ],
         check=True,
         stdout=subprocess.DEVNULL,
     )
@@ -348,19 +377,30 @@ def dataset_id(scenario: dict[str, str], seed: int) -> str:
     return identity.hexdigest()
 
 
-def balanced_orders(trials: int, scenario_index: int, generator: random.Random) -> list[list[str]]:
-    baseline_first = (trials + (1 if scenario_index % 2 == 0 else 0)) // 2
-    orders = [["baseline", "candidate"]] * baseline_first
-    orders += [["candidate", "baseline"]] * (trials - baseline_first)
-    generator.shuffle(orders)
+def balanced_orders(
+    variants: list[str],
+    trials: int,
+    scenario_index: int,
+    generator: random.Random,
+) -> list[list[str]]:
+    if len(variants) == 1:
+        return [variants.copy() for _ in range(trials)]
+    base = variants.copy()
+    generator.shuffle(base)
+    orders: list[list[str]] = []
+    for trial in range(trials):
+        offset = (scenario_index + trial) % len(base)
+        order = base[offset:] + base[:offset]
+        if (trial // len(base)) % 2:
+            order.reverse()
+        orders.append(order)
     return orders
 
 
-def read_child_rows(destination: pathlib.Path) -> list[dict[str, str]]:
-    with (destination / "samples.csv").open(newline="") as source:
-        rows = list(csv.DictReader(source))
+def read_child_rows(output: str) -> list[dict[str, str]]:
+    rows = list(csv.DictReader(output.splitlines()))
     if not rows:
-        raise ValueError(f"trial emitted no samples: {destination}")
+        raise ValueError("trial emitted no samples")
     return rows
 
 
@@ -373,13 +413,14 @@ def run_trial(
     fixture: pathlib.Path,
     manifest: dict[str, object],
     logical_dataset_id: str,
-    root: pathlib.Path,
+    workspace: pathlib.Path,
     page_cache_bytes: int | None,
-) -> tuple[list[dict[str, str]], dict[str, object], dict[str, object]]:
-    destination = root / "runs" / variant / scenario / f"trial-{trial:02d}"
-    working_directory = root / "working" / variant / scenario / f"trial-{trial:02d}"
-    working_database = working_directory / fixture.name
-    audit = copy_fixture(fixture, working_database, manifest)
+    profile: str,
+    semantics: str,
+) -> list[dict[str, str]]:
+    working_directory = workspace / "trials" / variant / scenario / f"trial-{trial:02d}"
+    working_database = working_directory / "database"
+    copy_fixture(fixture, working_database, manifest)
     print(f"[{variant} {trial + 1}] {scenario}", flush=True)
     command = [
         str(binary),
@@ -393,13 +434,17 @@ def run_trial(
         str(trial_seed),
         "--trial-index",
         str(trial),
-        "--output",
-        str(destination),
+        "--profile",
+        profile,
+        "--semantics",
+        semantics,
     ]
     if page_cache_bytes is not None:
         command += ["--page-cache-bytes", str(page_cache_bytes)]
-    subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
-    rows = read_child_rows(destination)
+    completed = subprocess.run(
+        command, check=True, text=True, stdout=subprocess.PIPE
+    )
+    rows = read_child_rows(completed.stdout)
     for row in rows:
         if set(row) != set(CHILD_FIELDS):
             raise ValueError(f"unexpected child sample schema: {sorted(row)}")
@@ -418,10 +463,8 @@ def run_trial(
         if not math.isfinite(value):
             raise ValueError(f"non-finite sample for {scenario}.{row['metric']}")
         row["variant"] = variant
-    (destination / "fixture-audit.json").write_text(json.dumps(audit, indent=2) + "\n")
-    child_metadata = json.loads((destination / "metadata.json").read_text())
-    remove_working_directory(working_directory)
-    return rows, audit, child_metadata
+    shutil.rmtree(working_directory)
+    return rows
 
 
 def nearest_rank(values: Iterable[float], percentile: float) -> float:
@@ -434,91 +477,56 @@ def nearest_rank(values: Iterable[float], percentile: float) -> float:
 def summarize_values(values: list[float]) -> dict[str, float | int]:
     return {
         "samples": len(values),
-        "mean": statistics.fmean(values),
-        "stddev": statistics.stdev(values) if len(values) > 1 else 0.0,
-        "minimum": min(values),
         "p50": statistics.median(values),
         "p95": nearest_rank(values, 0.95),
-        "p99": nearest_rank(values, 0.99),
-        "maximum": max(values),
     }
 
 
-def write_raw(root: pathlib.Path, rows: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    with (root / "samples.csv").open("w", newline="") as destination:
+def write_results(
+    root: pathlib.Path, rows: list[dict[str, str]]
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    with (root / "results.csv").open("w", newline="") as destination:
         writer = csv.DictWriter(destination, fieldnames=RAW_FIELDS)
         writer.writeheader()
         writer.writerows({field: row[field] for field in RAW_FIELDS} for row in rows)
-    trial_rows = [row for row in rows if row["scope"] == "trial"]
-    observation_rows = [row for row in rows if row["scope"] == "observation"]
-    with (root / "observations.csv").open("w", newline="") as destination:
-        writer = csv.DictWriter(destination, fieldnames=RAW_FIELDS)
-        writer.writeheader()
-        writer.writerows({field: row[field] for field in RAW_FIELDS} for row in observation_rows)
-    return trial_rows, observation_rows
-
-
-def write_observation_summary(root: pathlib.Path, rows: list[dict[str, str]]) -> None:
-    groups: dict[tuple[str, str, str, str], list[float]] = defaultdict(list)
-    for row in rows:
-        groups[(row["variant"], row["scenario"], row["metric"], row["unit"])].append(float(row["value"]))
-    fields = ("variant", "scenario", "metric", "unit", "samples", "mean", "p50", "p95", "p99")
-    with (root / "observation-summary.csv").open("w", newline="") as destination:
-        writer = csv.DictWriter(destination, fieldnames=fields)
-        writer.writeheader()
-        for (variant, scenario, metric, unit), values in sorted(groups.items()):
-            summary = summarize_values(values)
-            writer.writerow(
-                {
-                    "variant": variant,
-                    "scenario": scenario,
-                    "metric": metric,
-                    "unit": unit,
-                    "samples": summary["samples"],
-                    "mean": summary["mean"],
-                    "p50": summary["p50"],
-                    "p95": summary["p95"],
-                    "p99": summary["p99"],
-                }
-            )
-
-
-def write_standalone_summary(root: pathlib.Path, rows: list[dict[str, str]]) -> list[dict[str, object]]:
-    groups: dict[tuple[str, str, str, str], list[float]] = defaultdict(list)
-    for row in rows:
-        groups[(row["family"], row["scenario"], row["metric"], row["unit"])].append(float(row["value"]))
-    fields = (
-        "family",
-        "scenario",
-        "metric",
-        "unit",
-        "samples",
-        "mean",
-        "stddev",
-        "minimum",
-        "p50",
-        "p95",
-        "p99",
-        "maximum",
+    return (
+        [row for row in rows if row["scope"] == "trial"],
+        [row for row in rows if row["scope"] == "observation"],
     )
+
+
+def summarize_trials(rows: list[dict[str, str]]) -> list[dict[str, object]]:
+    groups: dict[tuple[str, str, str, str, str], list[float]] = defaultdict(list)
+    for row in rows:
+        groups[
+            (
+                row["variant"],
+                row["family"],
+                row["scenario"],
+                row["metric"],
+                row["unit"],
+            )
+        ].append(float(row["value"]))
     output: list[dict[str, object]] = []
-    with (root / "summary.csv").open("w", newline="") as destination:
-        writer = csv.DictWriter(destination, fieldnames=fields)
-        writer.writeheader()
-        for (family, scenario, metric, unit), values in sorted(groups.items()):
-            row: dict[str, object] = {
+    for (variant, family, scenario, metric, unit), values in sorted(
+        groups.items()
+    ):
+        output.append(
+            {
+                "variant": variant,
                 "family": family,
                 "scenario": scenario,
                 "metric": metric,
                 "unit": unit,
                 **summarize_values(values),
             }
-            writer.writerow(row)
-            output.append(row)
+        )
     return output
 
 
-def pair_trial_samples(rows: list[dict[str, str]]) -> list[tuple[tuple[str, ...], float, float]]:
+def pair_trial_samples(
+    rows: list[dict[str, str]], baseline: str, candidate: str
+) -> list[tuple[tuple[str, ...], float, float]]:
     fields = ("scenario", "trial_seed", "dataset_id", "metric", "unit", "trial")
     pending: dict[tuple[str, ...], dict[str, float]] = defaultdict(dict)
     for row in rows:
@@ -529,10 +537,11 @@ def pair_trial_samples(rows: list[dict[str, str]]) -> list[tuple[tuple[str, ...]
         pending[key][variant] = float(row["value"])
     pairs = []
     for key, variants in pending.items():
-        if variants.keys() != {"baseline", "candidate"}:
-            missing = {"baseline", "candidate"} - variants.keys()
+        selected = {name: value for name, value in variants.items() if name in (baseline, candidate)}
+        if selected.keys() != {baseline, candidate}:
+            missing = {baseline, candidate} - selected.keys()
             raise ValueError(f"missing {', '.join(sorted(missing))} trial sample for {key}")
-        pairs.append((key, variants["baseline"], variants["candidate"]))
+        pairs.append((key, selected[baseline], selected[candidate]))
     return pairs
 
 
@@ -590,53 +599,78 @@ def improvement_interval(direction: str, ratio: float, low: float, high: float) 
     return (ratio - 1.0) * 100.0, (low - 1.0) * 100.0, (high - 1.0) * 100.0
 
 
-def write_comparison(
-    root: pathlib.Path, rows: list[dict[str, str]], matrix: list[dict[str, str]]
+def compare_trials(
+    rows: list[dict[str, str]],
+    matrix: list[dict[str, str]],
+    baseline_variant: str,
+    candidate_variants: list[str],
 ) -> list[dict[str, object]]:
     scenario_specs = {row["scenario"]: row for row in matrix}
-    groups: dict[tuple[str, str, str], tuple[list[float], list[float]]] = {}
-    for key, baseline, candidate in pair_trial_samples(rows):
-        identity = (key[0], key[3], key[4])
-        if identity not in groups:
-            groups[identity] = ([], [])
-        groups[identity][0].append(baseline)
-        groups[identity][1].append(candidate)
+    groups: dict[
+        tuple[str, str, str, str], tuple[list[float], list[float]]
+    ] = {}
+    for candidate_variant in candidate_variants:
+        for key, baseline, candidate in pair_trial_samples(
+            rows, baseline_variant, candidate_variant
+        ):
+            identity = (candidate_variant, key[0], key[3], key[4])
+            if identity not in groups:
+                groups[identity] = ([], [])
+            groups[identity][0].append(baseline)
+            groups[identity][1].append(candidate)
 
-    fields = (
-        "scenario",
-        "metric",
-        "unit",
-        "role",
-        "direction",
-        "meaningful_difference",
-        "assessment",
-        "paired_trials",
-        "baseline_median",
-        "candidate_median",
-        "paired_ratio_geomean",
-        "ratio_ci95_low",
-        "ratio_ci95_high",
-        "improvement_percent",
-        "improvement_ci95_low",
-        "improvement_ci95_high",
-    )
     output: list[dict[str, object]] = []
-    with (root / "comparison.csv").open("w", newline="") as destination:
-        writer = csv.DictWriter(destination, fieldnames=fields)
-        writer.writeheader()
-        for (scenario, metric, unit), (baseline, candidate) in sorted(groups.items()):
-            spec = scenario_specs[scenario]
-            primary = metric == spec["primary_metric"]
-            interval = paired_log_interval(baseline, candidate)
-            ratio, low, high = interval if interval else (math.nan, math.nan, math.nan)
-            direction = spec["primary_direction"] if primary else "neutral"
-            threshold = float(spec["meaningful_difference"]) if primary else math.nan
-            result = assessment(direction, threshold, low, high) if primary and interval else "diagnostic"
-            if primary and interval:
-                improvement, improvement_low, improvement_high = improvement_interval(direction, ratio, low, high)
-            else:
-                improvement = improvement_low = improvement_high = math.nan
-            row = {
+    for (candidate_variant, scenario, metric, unit), (
+        baseline,
+        candidate,
+    ) in sorted(groups.items()):
+        spec = scenario_specs[scenario]
+        primary = metric == spec["primary_metric"]
+        interval = paired_log_interval(baseline, candidate)
+        ratio, low, high = (
+            interval
+            if interval
+            else (
+                math.exp(
+                    statistics.fmean(
+                        math.log(candidate_value / baseline_value)
+                        for baseline_value, candidate_value in zip(
+                            baseline, candidate
+                        )
+                    )
+                )
+                if all(value > 0 for value in baseline + candidate)
+                else math.nan,
+                math.nan,
+                math.nan,
+            )
+        )
+        direction = spec["primary_direction"] if primary else "neutral"
+        threshold = float(spec["meaningful_difference"]) if primary else math.nan
+        result = (
+            assessment(direction, threshold, low, high)
+            if primary and interval
+            else "insufficient"
+            if primary
+            else "diagnostic"
+        )
+        if primary and interval:
+            improvement, improvement_low, improvement_high = improvement_interval(
+                direction, ratio, low, high
+            )
+        elif primary and math.isfinite(ratio):
+            improvement = (
+                (1.0 - ratio) * 100.0
+                if direction == "lower"
+                else (ratio - 1.0) * 100.0
+            )
+            improvement_low = improvement_high = math.nan
+        else:
+            improvement = improvement_low = improvement_high = math.nan
+        output.append(
+            {
+                "baseline": baseline_variant,
+                "candidate": candidate_variant,
                 "scenario": scenario,
                 "metric": metric,
                 "unit": unit,
@@ -654,8 +688,7 @@ def write_comparison(
                 "improvement_ci95_low": improvement_low,
                 "improvement_ci95_high": improvement_high,
             }
-            writer.writerow(row)
-            output.append(row)
+        )
     return output
 
 
@@ -682,42 +715,67 @@ def write_report(
     root: pathlib.Path,
     mode: str,
     matrix: list[dict[str, str]],
-    standalone: list[dict[str, object]],
+    variant_summary: list[dict[str, object]],
     comparisons: list[dict[str, object]],
     scenario_timings: list[dict[str, object]],
     elapsed: float,
-    baseline_cache_bytes: int | None,
-    candidate_cache_bytes: int | None,
+    page_cache_overrides: dict[str, int | None],
+    comparison_baseline: str | None,
+    profile: str,
+    semantics: str,
 ) -> None:
-    lines = ["# TinyDB benchmark report", "", f"Mode: `{mode}`  ", f"Wall time: {elapsed / 60.0:.1f} minutes", ""]
+    title = (
+        "# TinyDB cross-engine benchmark report"
+        if mode == "cross"
+        else "# TinyDB benchmark report"
+    )
+    lines = [
+        title,
+        "",
+        f"Mode: `{mode}`  ",
+        f"Profile: `{profile}`  ",
+        f"Semantics: `{semantics}`  ",
+        f"Wall time: {elapsed / 60.0:.1f} minutes",
+        "",
+    ]
     specs = {row["scenario"]: row for row in matrix}
-    declared_cache_bytes = sorted({int(row["cache_bytes"]) for row in matrix})
+    declared_cache_bytes = sorted({int(row["page_cache_bytes"]) for row in matrix})
     declared_cache = ", ".join(format_value(value, "bytes") for value in declared_cache_bytes)
-    if mode == "compare" and (baseline_cache_bytes is not None or candidate_cache_bytes is not None):
-        baseline_cache = (
-            f"{format_value(baseline_cache_bytes, 'bytes')} (override)"
-            if baseline_cache_bytes is not None
-            else f"{declared_cache} (scenario setting)"
+
+    def cache_description(variant: str) -> str:
+        override = page_cache_overrides[variant]
+        return (
+            f"{format_value(override, 'bytes')} (override)"
+            if override is not None
+            else f"{declared_cache} (standard matrix)"
         )
-        candidate_cache = (
-            f"{format_value(candidate_cache_bytes, 'bytes')} (override)"
-            if candidate_cache_bytes is not None
-            else f"{declared_cache} (scenario setting)"
-        )
+
+    if mode == "compare":
         lines += [
-            f"Page cache: baseline {baseline_cache}; candidate {candidate_cache}",
+            f"Page cache: baseline {cache_description('baseline')}; "
+            f"candidate {cache_description('candidate')}",
+            "",
+        ]
+    elif mode == "cross":
+        lines += [
+            "Engine configuration: backend factory defaults. A common cache "
+            "override, when supplied, applies only to backends that expose one.",
             "",
         ]
     else:
-        lines += [f"Page cache: {declared_cache} (scenario setting)", ""]
-    if mode == "compare" and any(row["fixture_policy"] == "native" for row in matrix):
+        lines += [f"Page cache: {cache_description('current')}", ""]
+    if mode != "run" and any(row["fixture_policy"] == "native" for row in matrix):
         lines += [
-            "Fixture layouts: `shared` uses one baseline-built database family; "
-            "`native` uses a logically identical family built by each variant.",
+            "Fixture layouts: `shared` uses one canonical database family per "
+            "compatible format; `native` uses a logically identical family "
+            "built by each variant.",
             "",
         ]
     if mode == "run":
-        lookup = {(str(row["scenario"]), str(row["metric"])): row for row in standalone}
+        lookup = {
+            (str(row["scenario"]), str(row["metric"])): row
+            for row in variant_summary
+        }
         lines += ["## Primary results", "", "| Scenario | Median | p95 | Trials |", "|---|---:|---:|---:|"]
         for scenario, spec in specs.items():
             row = lookup[(scenario, spec["primary_metric"])]
@@ -730,65 +788,162 @@ def write_report(
         lines += [
             "## Primary comparison",
             "",
-            "| Scenario | Baseline | Candidate | Effect (95% CI) | Result |",
-            "|---|---:|---:|---:|---|",
+            f"Effects are paired against `{comparison_baseline}`.",
+            "",
+            "| Scenario | Candidate | Baseline | Candidate result | Effect (95% CI) | Result |",
+            "|---|---|---:|---:|---:|---|",
         ]
         for row in primary:
             effect = float(row["improvement_percent"])
             low = float(row["improvement_ci95_low"])
             high = float(row["improvement_ci95_high"])
+            effect_text = (
+                f"{effect:+.1f}% ({low:+.1f}% to {high:+.1f}%)"
+                if math.isfinite(low) and math.isfinite(high)
+                else f"{effect:+.1f}% (one trial; no CI)"
+            )
             lines.append(
-                f"| `{row['scenario']}` | {format_value(float(row['baseline_median']), str(row['unit']))} | "
+                f"| `{row['scenario']}` | `{row['candidate']}` | "
+                f"{format_value(float(row['baseline_median']), str(row['unit']))} | "
                 f"{format_value(float(row['candidate_median']), str(row['unit']))} | "
-                f"{effect:+.1f}% ({low:+.1f}% to {high:+.1f}%) | **{row['assessment']}** |"
+                f"{effect_text} | **{row['assessment']}** |"
             )
 
+    portable_scenarios = [
+        scenario
+        for scenario, spec in specs.items()
+        if spec["workload"] == "portable"
+    ]
+    if mode == "cross" and portable_scenarios:
+        values = {
+            (str(row["variant"]), str(row["scenario"]), str(row["metric"])): float(
+                row["p50"]
+            )
+            for row in variant_summary
+        }
+        ratio_lookup = {
+            (str(row["candidate"]), str(row["scenario"])): float(
+                row["paired_ratio_geomean"]
+            )
+            for row in comparisons
+            if row["role"] == "primary"
+        }
+        variants = list(dict.fromkeys(str(row["variant"]) for row in variant_summary))
+        lines += [
+            "",
+            "## Portable workload scorecard",
+            "",
+            "| Scenario | Engine | ops/s | vs baseline | p50 call µs | p99 call µs | "
+            "CPU | engine PSS | file cache | total observed | DB size | storage read/write |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for scenario in portable_scenarios:
+            for variant in variants:
+                def metric(name: str) -> float:
+                    return values[(variant, scenario, name)]
+
+                ratio = (
+                    1.0
+                    if variant == comparison_baseline
+                    else ratio_lookup[(variant, scenario)]
+                )
+                lines.append(
+                    f"| `{scenario}` | `{variant}` | "
+                    f"{metric('throughput'):,.0f} | {ratio:.2f}× | "
+                    f"{metric('call_latency_p50'):,.2f} | "
+                    f"{metric('call_latency_p99'):,.2f} | "
+                    f"{metric('cpu_utilization') * 100.0:.0f}% | "
+                    f"{format_value(metric('engine_pss_bytes'), 'bytes')} | "
+                    f"{format_value(metric('database_file_resident_bytes'), 'bytes')} | "
+                    f"{format_value(metric('combined_observed_memory'), 'bytes')} | "
+                    f"{format_value(metric('database_size'), 'bytes')} | "
+                    f"{format_value(metric('storage_read_bytes'), 'bytes')}/"
+                    f"{format_value(metric('storage_write_bytes'), 'bytes')} |"
+                )
+
     diagnostic_names = {
+        "call_latency_p99",
         "commit_latency_p95",
+        "engine_pss_bytes",
         "wal_amplification",
         "combined_cache_resident_bytes",
+        "combined_observed_memory",
+        "database_file_resident_bytes",
+        "database_size",
         "storage_read_bytes",
         "storage_write_bytes",
         "workload_storage_read_amplification",
         "process_rss_growth",
     }
-    lines += ["", "## Memory, I/O, and latency diagnostics", ""]
     if mode == "run":
-        diagnostic = [row for row in standalone if row["metric"] in diagnostic_names]
-        lines += ["| Scenario | Metric | Median |", "|---|---|---:|"]
-        for row in diagnostic:
-            lines.append(
-                f"| `{row['scenario']}` | `{row['metric']}` | "
-                f"{format_value(float(row['p50']), str(row['unit']))} |"
-            )
+        diagnostic = [
+            row for row in variant_summary if row["metric"] in diagnostic_names
+        ]
+        if diagnostic:
+            lines += [
+                "",
+                "## Memory, I/O, and latency diagnostics",
+                "",
+                "| Scenario | Metric | Median |",
+                "|---|---|---:|",
+            ]
+            for row in diagnostic:
+                lines.append(
+                    f"| `{row['scenario']}` | `{row['metric']}` | "
+                    f"{format_value(float(row['p50']), str(row['unit']))} |"
+                )
     else:
-        diagnostic = [row for row in comparisons if row["metric"] in diagnostic_names]
-        lines += ["| Scenario | Metric | Baseline | Candidate |", "|---|---|---:|---:|"]
-        for row in diagnostic:
-            lines.append(
-                f"| `{row['scenario']}` | `{row['metric']}` | "
-                f"{format_value(float(row['baseline_median']), str(row['unit']))} | "
-                f"{format_value(float(row['candidate_median']), str(row['unit']))} |"
+        diagnostic = [
+            row
+            for row in comparisons
+            if row["metric"] in diagnostic_names
+            and not (
+                mode == "cross"
+                and specs[str(row["scenario"])]["workload"] == "portable"
             )
-    lines.append("")
-    if mode == "compare":
+        ]
+        if diagnostic:
+            lines += [
+                "",
+                "## Memory, I/O, and latency diagnostics",
+                "",
+                "| Scenario | Candidate | Metric | Baseline | Candidate result |",
+                "|---|---|---|---:|---:|",
+            ]
+            for row in diagnostic:
+                lines.append(
+                    f"| `{row['scenario']}` | `{row['candidate']}` | "
+                    f"`{row['metric']}` | "
+                    f"{format_value(float(row['baseline_median']), str(row['unit']))} | "
+                    f"{format_value(float(row['candidate_median']), str(row['unit']))} |"
+                )
+    if diagnostic:
+        lines.append("")
+    if mode != "run":
         lines.append("Primary confidence intervals use paired trial log-ratios.")
     lines += ["Commit and churn observations remain nested diagnostics and are not treated as independent trials.", ""]
     read_scenarios = [
-        scenario for scenario, spec in specs.items() if spec["workload"] in ("point_read", "scan", "io_read")
+        scenario for scenario, spec in specs.items() if spec["workload"] == "io_read"
     ]
     if read_scenarios:
         if mode == "run":
             readahead_lookup = {
-                (str(row["scenario"]), str(row["metric"])): float(row["p50"]) for row in standalone
+                (str(row["scenario"]), str(row["metric"])): float(row["p50"])
+                for row in variant_summary
             }
             readahead_variant = "current"
         else:
+            readahead_candidate = next(
+                str(row["candidate"])
+                for row in comparisons
+                if row["role"] == "primary"
+            )
             readahead_lookup = {
                 (str(row["scenario"]), str(row["metric"])): float(row["candidate_median"])
                 for row in comparisons
+                if row["candidate"] == readahead_candidate
             }
-            readahead_variant = "candidate"
+            readahead_variant = readahead_candidate
         lines += [
             "## Read-ahead behavior",
             "",
@@ -831,37 +986,28 @@ def write_report(
     (root / "report.md").write_text("\n".join(lines))
 
 
-def estimate_fixture_bytes(matrix: list[dict[str, str]], mode: str) -> int:
-    total = 0
+def estimate_fixture_bytes(
+    matrix: list[dict[str, str]], identities: dict[str, dict[str, object]]
+) -> int:
+    formats = {
+        str(identity["format_family"]) for identity in identities.values()
+    }
     maximum = 0
     for row in matrix:
         logical = int(row["rows"]) * (int(row["key_bytes"]) + int(row["value_bytes"]) + 32)
         size = max(logical, int(row["target_bytes"]))
-        copies = 2 if mode == "compare" and row["fixture_policy"] == "native" else 1
-        total += copies * size
-        maximum = max(maximum, size)
-    return total + 2 * maximum + (512 << 20)
+        copies = (
+            len(identities)
+            if row["fixture_policy"] == "native"
+            else len(formats)
+        )
+        maximum = max(maximum, (copies + 1) * size)
+    return maximum + (512 << 20)
 
 
-def default_output() -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / "tinydb-benchmark-latest"
-
-
-def rebase_output_paths(value: object, source: pathlib.Path, destination: pathlib.Path) -> object:
-    """Rewrite paths recorded while a managed result lived in its staging directory."""
-
-    source_text = os.fspath(source)
-    if isinstance(value, str):
-        if value == source_text or value.startswith(source_text + os.sep):
-            return os.fspath(destination) + value[len(source_text) :]
-        return value
-    if isinstance(value, list):
-        return [rebase_output_paths(item, source, destination) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: rebase_output_paths(item, source, destination) for key, item in value.items()
-        }
-    return value
+def default_output(mode: str) -> pathlib.Path:
+    name = "tinydb-crossbench-latest" if mode == "cross" else "tinydb-benchmark-latest"
+    return pathlib.Path(tempfile.gettempdir()) / name
 
 
 class ManagedOutput:
@@ -880,10 +1026,6 @@ class ManagedOutput:
             self.active = False
 
     def publish(self) -> pathlib.Path:
-        for metadata_path in self.path.rglob("*.json"):
-            metadata = json.loads(metadata_path.read_text())
-            metadata = rebase_output_paths(metadata, self.path, self.destination)
-            metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
         if self.destination.exists():
             if (
                 self.destination.is_symlink()
@@ -899,37 +1041,75 @@ class ManagedOutput:
         return self.destination
 
 
+def text_value(path: pathlib.Path, prefix: str | None = None) -> str:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return "unknown"
+    for line in lines:
+        if prefix is None:
+            return line.strip() or "unknown"
+        if line.startswith(prefix):
+            return line.partition(":")[2].strip() or "unknown"
+    return "unknown"
+
+
+def host_record(root: pathlib.Path) -> dict[str, object]:
+    system = platform.uname()
+    storage = os.statvfs(root)
+    return {
+        "hostname": system.node,
+        "kernel": system.release,
+        "architecture": system.machine,
+        "cpu": text_value(pathlib.Path("/proc/cpuinfo"), "model name"),
+        "cpu_governor": text_value(
+            pathlib.Path(
+                "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+            )
+        ),
+        "memory": text_value(pathlib.Path("/proc/meminfo"), "MemTotal"),
+        "hardware_threads": os.cpu_count(),
+        "storage_block_bytes": storage.f_frsize,
+        "storage_available_bytes": storage.f_bavail * storage.f_frsize,
+    }
+
+
 def main() -> None:
     args = parse_args()
     started = time.monotonic()
-    managed_output = ManagedOutput(default_output()) if args.output is None else None
+    started_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    source_binaries, comparison_baseline = selected_binaries(args)
+    managed_output = (
+        ManagedOutput(default_output(args.mode)) if args.output is None else None
+    )
     root = managed_output.path if managed_output is not None else args.output
-    baseline_cache_bytes = (
-        args.baseline_cache_mib << 20
-        if args.mode == "compare" and args.baseline_cache_mib is not None
-        else None
-    )
-    candidate_cache_bytes = (
-        args.candidate_cache_mib << 20
-        if args.mode == "compare" and args.candidate_cache_mib is not None
-        else None
-    )
+    page_cache_overrides = resolve_page_cache_overrides(args)
     if managed_output is None:
         root.mkdir(parents=True, exist_ok=False)
+    workspace = root / ".work"
+    workspace.mkdir()
 
-    binaries: dict[str, pathlib.Path] = {}
-    artifacts: dict[str, dict[str, object]] = {}
-    if args.mode == "run":
-        binaries["current"], artifacts["current"] = archive_binary(args.binary, "current", root)
-    else:
-        binaries["baseline"], artifacts["baseline"] = archive_binary(args.baseline, "baseline", root)
-        binaries["candidate"], artifacts["candidate"] = archive_binary(args.candidate, "candidate", root)
+    binaries = {
+        variant: source.resolve(strict=True)
+        for variant, source in source_binaries.items()
+    }
+    identities = {
+        variant: engine_identity(binary) for variant, binary in binaries.items()
+    }
+    engines = {
+        variant: binary_record(binary, identities[variant])
+        for variant, binary in binaries.items()
+    }
+    for variant, record in engines.items():
+        record["effective_durable"] = bool(
+            record["always_durable"] or args.semantics == "durable"
+        )
 
     matrices = {variant: scenario_matrix(binary, args) for variant, binary in binaries.items()}
     matrix = next(iter(matrices.values()))
     if any(candidate != matrix for candidate in matrices.values()):
         raise SystemExit("engine revisions expose different benchmark matrices")
-    required_free = estimate_fixture_bytes(matrix, args.mode)
+    required_free = estimate_fixture_bytes(matrix, identities)
     available_free = shutil.disk_usage(root).free
     if available_free < required_free:
         raise SystemExit(
@@ -941,10 +1121,9 @@ def main() -> None:
     scenarios = matrix.copy()
     generator.shuffle(scenarios)
     rows: list[dict[str, str]] = []
-    fixtures: list[dict[str, object]] = []
+    fixture_families: list[dict[str, object]] = []
     execution: list[dict[str, object]] = []
     scenario_timings: list[dict[str, object]] = []
-    child_metadata: dict[str, dict[str, object]] = {}
 
     for scenario_index, scenario_row in enumerate(scenarios):
         scenario_started = time.monotonic()
@@ -954,41 +1133,64 @@ def main() -> None:
             raise ValueError(f"unknown fixture policy {fixture_policy!r} for {scenario}")
         logical_dataset_id = dataset_id(scenario_row, args.seed)
         fixture_started = time.monotonic()
-        if args.mode == "run":
-            fixture_builders = {"current": "current"}
-        elif fixture_policy == "native":
+        if fixture_policy == "native":
             fixture_builders = {variant: variant for variant in binaries}
         else:
-            fixture_builders = {"shared": "baseline"}
+            format_groups: dict[str, list[str]] = defaultdict(list)
+            for variant, identity in identities.items():
+                format_groups[str(identity["format_family"])].append(variant)
+            fixture_builders = {}
+            for format_family, variants in sorted(format_groups.items()):
+                layout = "shared-" + hashlib.sha256(
+                    format_family.encode()
+                ).hexdigest()[:12]
+                builder = (
+                    comparison_baseline
+                    if comparison_baseline in variants
+                    else variants[0]
+                )
+                fixture_builders[layout] = builder
 
         physical_fixtures: dict[str, tuple[pathlib.Path, dict[str, object]]] = {}
         for layout, builder_variant in fixture_builders.items():
-            fixture = root / "fixtures" / scenario / layout / "database.db"
-            manifest = build_fixture(binaries[builder_variant], fixture, scenario, args.seed)
+            fixture = workspace / "fixtures" / scenario / layout / "database"
+            manifest = build_fixture(
+                binaries[builder_variant],
+                fixture,
+                scenario,
+                args.seed,
+                args.profile,
+                args.semantics,
+            )
             physical_fixtures[layout] = (fixture, manifest)
-            fixtures.append(
+            fixture_families.append(
                 {
                     "scenario": scenario,
                     "fixture_policy": fixture_policy,
                     "dataset_id": logical_dataset_id,
                     "layout": layout,
                     "builder_variant": builder_variant,
-                    "path": str(fixture),
-                    "manifest": manifest,
+                    "family_id": manifest["family_id"],
+                    "files": len(manifest["files"]),
+                    "bytes": sum(
+                        int(file["size"]) for file in manifest["files"]
+                    ),
                 }
             )
-        if args.mode == "run":
-            fixtures_by_variant = {"current": physical_fixtures["current"]}
-        elif fixture_policy == "native":
+        if fixture_policy == "native":
             fixtures_by_variant = {variant: physical_fixtures[variant] for variant in binaries}
         else:
-            fixtures_by_variant = {variant: physical_fixtures["shared"] for variant in binaries}
+            fixtures_by_variant = {}
+            for variant, identity in identities.items():
+                layout = "shared-" + hashlib.sha256(
+                    str(identity["format_family"]).encode()
+                ).hexdigest()[:12]
+                fixtures_by_variant[variant] = physical_fixtures[layout]
         fixture_seconds = time.monotonic() - fixture_started
         trials = int(scenario_row["trials"])
-        if args.mode == "run":
-            orders = [["current"] for _ in range(trials)]
-        else:
-            orders = balanced_orders(trials, scenario_index, generator)
+        orders = balanced_orders(
+            list(binaries), trials, scenario_index, generator
+        )
         for trial, order in enumerate(orders):
             seed = derive_trial_seed(args.seed, scenario, trial)
             trial_record: dict[str, object] = {
@@ -998,13 +1200,13 @@ def main() -> None:
                 "trial": trial,
                 "trial_seed": seed,
                 "order": order,
-                "runs": [],
+                "seconds": {},
             }
             execution.append(trial_record)
             for variant in order:
                 fixture, manifest = fixtures_by_variant[variant]
                 run_started = time.monotonic()
-                emitted, audit, metadata = run_trial(
+                emitted = run_trial(
                     binaries[variant],
                     variant,
                     scenario,
@@ -1013,19 +1215,15 @@ def main() -> None:
                     fixture,
                     manifest,
                     logical_dataset_id,
-                    root,
-                    baseline_cache_bytes if variant == "baseline" else candidate_cache_bytes,
+                    workspace,
+                    page_cache_overrides[variant],
+                    args.profile,
+                    args.semantics,
                 )
-                trial_record["runs"].append(
-                    {
-                        "variant": variant,
-                        "family_id": audit["family_id"],
-                        "runner_seconds": time.monotonic() - run_started,
-                        "benchmark_seconds": metadata.get("elapsed_seconds"),
-                    }
+                trial_record["seconds"][variant] = (
+                    time.monotonic() - run_started
                 )
                 rows.extend(emitted)
-                child_metadata.setdefault(variant, metadata)
         total_seconds = time.monotonic() - scenario_started
         scenario_timings.append(
             {
@@ -1035,66 +1233,63 @@ def main() -> None:
                 "total_seconds": total_seconds,
             }
         )
+        shutil.rmtree(workspace / "fixtures" / scenario)
 
-    trial_rows, observation_rows = write_raw(root, rows)
+    trial_rows, observation_rows = write_results(root, rows)
     validate_primary_samples(trial_rows, matrix, binaries)
-    write_observation_summary(root, observation_rows)
-    standalone: list[dict[str, object]] = []
+    variant_summary = summarize_trials(trial_rows)
     comparisons: list[dict[str, object]] = []
-    if args.mode == "run":
-        standalone = write_standalone_summary(root, trial_rows)
-    else:
-        comparisons = write_comparison(root, trial_rows, matrix)
+    if args.mode != "run":
+        assert comparison_baseline is not None
+        comparisons = compare_trials(
+            trial_rows,
+            matrix,
+            comparison_baseline,
+            [
+                variant
+                for variant in binaries
+                if variant != comparison_baseline
+            ],
+        )
 
     elapsed = time.monotonic() - started
     write_report(
         root,
         args.mode,
         matrix,
-        standalone,
+        variant_summary,
         comparisons,
         scenario_timings,
         elapsed,
-        baseline_cache_bytes,
-        candidate_cache_bytes,
+        page_cache_overrides,
+        comparison_baseline,
+        args.profile,
+        args.semantics,
     )
-    for variant, metadata in child_metadata.items():
-        artifacts[variant]["reported_build"] = {
-            field: metadata[field]
-            for field in (
-                "engine_git_commit",
-                "engine_git_dirty",
-                "harness_git_commit",
-                "harness_git_dirty",
-                "build_type",
-                "compiler",
-            )
-        }
+    for variant, binary in binaries.items():
+        if sha256(binary) != engines[variant]["sha256"]:
+            raise ValueError(f"benchmark binary changed during the run: {binary}")
     metadata = {
-        "suite_version": 9,
+        "suite_version": 12,
         "mode": args.mode,
+        "profile": args.profile,
+        "semantics": args.semantics,
+        "comparison_baseline": comparison_baseline,
         "seed": args.seed,
-        "baseline_page_cache_override_bytes": baseline_cache_bytes,
-        "candidate_page_cache_override_bytes": candidate_cache_bytes,
+        "started_utc": started_utc,
+        "page_cache_overrides_bytes": page_cache_overrides,
         "elapsed_seconds": elapsed,
-        "binaries": artifacts,
-        "system": next(iter(child_metadata.values()))["system"],
-        "fixture_storage": next(iter(child_metadata.values()))["fixture_storage"],
+        "engines": engines,
+        "host": host_record(root),
         "scenario_matrix": matrix,
         "execution": execution,
         "scenario_timings": scenario_timings,
-        "fixtures": fixtures,
+        "fixture_families": fixture_families,
         "trial_samples": len(trial_rows),
         "nested_observations": len(observation_rows),
-        "note": (
-            "Every trial used a private userspace copy of an immutable canonical fixture. Shared-layout "
-            "scenarios use one baseline-built family for both variants; native-layout scenarios use each "
-            "variant's own physical family under one validated logical dataset identity. "
-            "A/B confidence intervals use paired trial log-ratios; nested commit and churn observations "
-            "are descriptive only."
-        ),
     }
     (root / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    shutil.rmtree(workspace)
     if managed_output is not None:
         root = managed_output.publish()
     print(f"Benchmark report: {root / 'report.md'}")

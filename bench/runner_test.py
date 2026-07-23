@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Unit tests for TinyDB benchmark pairing and inference."""
+"""Unit tests for benchmark orchestration and paired inference."""
 
 import math
 import pathlib
@@ -56,6 +56,36 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(args.baseline_cache_mib, 16)
         self.assertEqual(args.candidate_cache_mib, 32)
 
+    def test_common_cache_override_applies_to_standalone_run(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["runner.py", "run", "buffered", "--cache-mib", "8"],
+        ):
+            args = target.parse_args()
+        self.assertEqual(target.resolve_page_cache_overrides(args), {"current": 8 << 20})
+
+    def test_variant_cache_override_takes_precedence_over_common_value(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "runner.py",
+                "compare",
+                "buffered",
+                "direct",
+                "--cache-mib",
+                "8",
+                "--candidate-cache-mib",
+                "32",
+            ],
+        ):
+            args = target.parse_args()
+        self.assertEqual(
+            target.resolve_page_cache_overrides(args),
+            {"baseline": 8 << 20, "candidate": 32 << 20},
+        )
+
     def test_managed_output_replaces_only_a_completed_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             destination = pathlib.Path(directory) / "latest"
@@ -66,23 +96,14 @@ class RunnerTest(unittest.TestCase):
             output = target.ManagedOutput(destination)
             self.assertEqual((destination / "report.md").read_text(), "old report")
             (output.path / "report.md").write_text("new report")
-            staging_path = str(output.path)
-            metadata = {
-                "binary": f"{staging_path}/binaries/current/TinyDB_bench",
-                "arguments": [staging_path, "unchanged"],
-                "nested": {"directory": f"{staging_path}/working/trial-00"},
-            }
-            (output.path / "metadata.json").write_text(target.json.dumps(metadata))
+            (output.path / "results.csv").write_text("value\n1\n")
+            (output.path / "metadata.json").write_text("{}")
 
             self.assertEqual(output.publish(), destination)
             self.assertEqual((destination / "report.md").read_text(), "new report")
-            published = target.json.loads((destination / "metadata.json").read_text())
             self.assertEqual(
-                published["binary"], str(destination / "binaries/current/TinyDB_bench")
-            )
-            self.assertEqual(published["arguments"], [str(destination), "unchanged"])
-            self.assertEqual(
-                published["nested"]["directory"], str(destination / "working/trial-00")
+                {path.name for path in destination.iterdir()},
+                {"report.md", "results.csv", "metadata.json"},
             )
 
     def test_managed_output_refuses_an_unrecognized_destination(self) -> None:
@@ -98,12 +119,23 @@ class RunnerTest(unittest.TestCase):
             output.cleanup()
 
     def test_balanced_orders(self) -> None:
-        even = target.balanced_orders(5, 0, random.Random(1))
-        odd = target.balanced_orders(5, 1, random.Random(1))
-        self.assertEqual(sum(order[0] == "baseline" for order in even), 3)
-        self.assertEqual(sum(order[0] == "candidate" for order in even), 2)
-        self.assertEqual(sum(order[0] == "baseline" for order in odd), 2)
-        self.assertEqual(sum(order[0] == "candidate" for order in odd), 3)
+        even = target.balanced_orders(
+            ["baseline", "candidate"], 5, 0, random.Random(1)
+        )
+        odd = target.balanced_orders(
+            ["baseline", "candidate"], 5, 1, random.Random(1)
+        )
+        even_baseline_first = sum(order[0] == "baseline" for order in even)
+        odd_baseline_first = sum(order[0] == "baseline" for order in odd)
+        self.assertIn(even_baseline_first, (2, 3))
+        self.assertIn(odd_baseline_first, (2, 3))
+        self.assertEqual(even_baseline_first + odd_baseline_first, 5)
+
+    def test_multi_engine_orders_rotate_every_engine(self) -> None:
+        variants = ["tinydb", "sqlite", "leveldb", "rocksdb"]
+        orders = target.balanced_orders(variants, 4, 0, random.Random(3))
+        self.assertEqual({order[0] for order in orders}, set(variants))
+        self.assertTrue(all(sorted(order) == sorted(variants) for order in orders))
 
     def test_trial_seeds_are_stable_and_distinct(self) -> None:
         first = target.derive_trial_seed(7, "read.engine_hot", 0)
@@ -125,28 +157,98 @@ class RunnerTest(unittest.TestCase):
             "fixture_policy": "shared",
         }
         native = {**shared, "fixture_policy": "native"}
-        overhead = 2 * 64 + (512 << 20)
-        self.assertEqual(target.estimate_fixture_bytes([shared], "compare"), 64 + overhead)
-        self.assertEqual(target.estimate_fixture_bytes([native], "compare"), 128 + overhead)
+        overhead = 512 << 20
+        identities = {
+            "baseline": {"format_family": "tinydb"},
+            "candidate": {"format_family": "tinydb"},
+        }
+        self.assertEqual(
+            target.estimate_fixture_bytes([shared], identities), 2 * 64 + overhead
+        )
+        self.assertEqual(
+            target.estimate_fixture_bytes([native], identities), 3 * 64 + overhead
+        )
+
+    def test_cross_engine_fixture_estimate_counts_formats(self) -> None:
+        scenario = {
+            "rows": "1",
+            "key_bytes": "16",
+            "value_bytes": "16",
+            "target_bytes": "0",
+            "fixture_policy": "shared",
+        }
+        identities = {
+            "buffered": {"format_family": "tinydb"},
+            "direct": {"format_family": "tinydb"},
+            "sqlite": {"format_family": "sqlite"},
+        }
+        overhead = 512 << 20
+        self.assertEqual(
+            target.estimate_fixture_bytes([scenario], identities),
+            3 * 64 + overhead,
+        )
 
     def test_exact_pairing(self) -> None:
-        pairs = target.pair_trial_samples([sample("candidate", 2.0), sample("baseline", 1.0)])
+        pairs = target.pair_trial_samples(
+            [sample("candidate", 2.0), sample("baseline", 1.0)],
+            "baseline",
+            "candidate",
+        )
         self.assertEqual(len(pairs), 1)
         self.assertEqual(pairs[0][1:], (1.0, 2.0))
 
     def test_missing_partner_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing candidate"):
-            target.pair_trial_samples([sample("baseline")])
+            target.pair_trial_samples(
+                [sample("baseline")], "baseline", "candidate"
+            )
 
     def test_duplicate_partner_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "duplicate baseline"):
-            target.pair_trial_samples([sample("baseline"), sample("baseline")])
+            target.pair_trial_samples(
+                [sample("baseline"), sample("baseline")],
+                "baseline",
+                "candidate",
+            )
 
     def test_pair_identity_includes_dataset(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing"):
             target.pair_trial_samples(
-                [sample("baseline"), sample("candidate", dataset_id="dataset-b")]
+                [sample("baseline"), sample("candidate", dataset_id="dataset-b")],
+                "baseline",
+                "candidate",
             )
+
+    def test_cross_engine_selection(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "runner.py",
+                "cross",
+                "--engine",
+                "tinydb=buffered",
+                "--engine",
+                "sqlite=sqlite-worker",
+                "--baseline",
+                "tinydb",
+                "--family",
+                "db_bench",
+                "--family",
+                "ycsb",
+            ],
+        ):
+            args = target.parse_args()
+        binaries, baseline = target.selected_binaries(args)
+        self.assertEqual(
+            binaries,
+            {
+                "tinydb": pathlib.Path("buffered"),
+                "sqlite": pathlib.Path("sqlite-worker"),
+            },
+        )
+        self.assertEqual(baseline, "tinydb")
+        self.assertEqual(args.family, ["db_bench", "ycsb"])
 
     def test_primary_sample_count_is_enforced(self) -> None:
         matrix = [{"scenario": "read.engine_hot", "primary_metric": "throughput", "trials": "1"}]

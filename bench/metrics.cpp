@@ -1,4 +1,4 @@
-#include "system_metrics.h"
+#include "benchmark.h"
 
 #include "benchmark.h"
 
@@ -69,15 +69,14 @@ auto Seconds(const timeval &value) -> double {
   return static_cast<double>(value.tv_sec) + static_cast<double>(value.tv_usec) / 1'000'000.0;
 }
 
-auto FamilyMembers(const std::filesystem::path &database) -> std::vector<std::filesystem::path> {
-  auto members = std::vector<std::filesystem::path>{};
-  const auto wal_name = database.filename().string() + "-wal";
-  const auto archive_prefix = wal_name + '.';
+auto RegularFiles(const std::filesystem::path &root) -> std::vector<std::filesystem::path> {
   auto error = std::error_code{};
-  for (const auto &entry : std::filesystem::directory_iterator(database.parent_path(), error)) {
-    const auto name = entry.path().filename().string();
-    if (name == database.filename() || name == wal_name ||
-        (name.starts_with(archive_prefix) && name.ends_with(".segment"))) {
+  if (std::filesystem::is_regular_file(root, error)) {
+    return {root};
+  }
+  auto members = std::vector<std::filesystem::path>{};
+  for (const auto &entry : std::filesystem::recursive_directory_iterator(root, error)) {
+    if (entry.is_regular_file(error) && !entry.is_symlink(error)) {
       members.push_back(entry.path());
     }
   }
@@ -87,13 +86,7 @@ auto FamilyMembers(const std::filesystem::path &database) -> std::vector<std::fi
   return members;
 }
 
-}  // namespace
-
-auto FileResidency::Ratio() const -> double {
-  return pages == 0 ? 0.0 : static_cast<double>(resident_pages) / static_cast<double>(pages);
-}
-
-auto ObserveFileResidency(const std::filesystem::path &path) -> FileResidency {
+auto ObserveSingleFileResidency(const std::filesystem::path &path) -> FileResidency {
   const auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     Fail("cannot open database file for a residency observation");
@@ -122,10 +115,6 @@ auto ObserveFileResidency(const std::filesystem::path &path) -> FileResidency {
     Fail("database file is too large for a residency observation");
   }
 
-  /*
-  ** Mapping with PROT_NONE creates page-table metadata but does not read file
-  ** contents.  mincore then reports residency that existed before the probe.
-  */
   auto *mapping = ::mmap(nullptr, static_cast<std::size_t>(file_bytes), PROT_NONE, MAP_SHARED, fd, 0);
   ::close(fd);
   if (mapping == MAP_FAILED) {
@@ -150,14 +139,48 @@ auto ObserveFileResidency(const std::filesystem::path &path) -> FileResidency {
   };
 }
 
-auto AdviseDropFileCache(const std::filesystem::path &path) -> bool {
-  const auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    Fail("cannot open database file for cache eviction advice");
+}  // namespace
+
+auto FileResidency::Ratio() const -> double {
+  return pages == 0 ? 0.0 : static_cast<double>(resident_pages) / static_cast<double>(pages);
+}
+
+auto ObserveFileResidency(const std::filesystem::path &path) -> FileResidency {
+  auto result = FileResidency{};
+  for (const auto &file : RegularFiles(path)) {
+    const auto observed = ObserveSingleFileResidency(file);
+    result.file_bytes += observed.file_bytes;
+    result.pages += observed.pages;
+    result.resident_pages += observed.resident_pages;
+    result.resident_bytes += observed.resident_bytes;
   }
-  const auto result = ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-  ::close(fd);
-  return result == 0;
+  return result;
+}
+
+auto ObserveStorageUsage(const std::filesystem::path &root) -> StorageUsage {
+  auto result = StorageUsage{};
+  for (const auto &file : RegularFiles(root)) {
+    auto error = std::error_code{};
+    result.bytes += std::filesystem::file_size(file, error);
+    if (error) {
+      Fail("cannot measure database file size");
+    }
+  }
+  result.residency = ObserveFileResidency(root);
+  return result;
+}
+
+auto AdviseDropFileCache(const std::filesystem::path &path) -> bool {
+  auto accepted = true;
+  for (const auto &file : RegularFiles(path)) {
+    const auto fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      Fail("cannot open database file for cache eviction advice");
+    }
+    accepted = ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0 && accepted;
+    ::close(fd);
+  }
+  return accepted;
 }
 
 auto ObserveProcessIo() -> ProcessIo {
@@ -171,30 +194,21 @@ auto ObserveProcessIo() -> ProcessIo {
   auto line = std::string{};
   while (std::getline(input, line)) {
     const auto view = std::string_view{line};
-    if (view.starts_with("rchar:")) {
-      result.characters_read = ParseCounter(view, "rchar");
-      fields |= 1U << 0U;
-    } else if (view.starts_with("wchar:")) {
-      result.characters_written = ParseCounter(view, "wchar");
-      fields |= 1U << 1U;
-    } else if (view.starts_with("syscr:")) {
+    if (view.starts_with("syscr:")) {
       result.read_syscalls = ParseCounter(view, "syscr");
-      fields |= 1U << 2U;
+      fields |= 1U << 0U;
     } else if (view.starts_with("syscw:")) {
       result.write_syscalls = ParseCounter(view, "syscw");
-      fields |= 1U << 3U;
+      fields |= 1U << 1U;
     } else if (view.starts_with("read_bytes:")) {
       result.storage_read_bytes = ParseCounter(view, "read_bytes");
-      fields |= 1U << 4U;
+      fields |= 1U << 2U;
     } else if (view.starts_with("write_bytes:")) {
       result.storage_write_bytes = ParseCounter(view, "write_bytes");
-      fields |= 1U << 5U;
-    } else if (view.starts_with("cancelled_write_bytes:")) {
-      result.cancelled_write_bytes = ParseCounter(view, "cancelled_write_bytes");
-      fields |= 1U << 6U;
+      fields |= 1U << 3U;
     }
   }
-  if (fields != (1U << 7U) - 1U) {
+  if (fields != (1U << 4U) - 1U) {
     Fail("/proc/self/io did not expose every required counter");
   }
   return result;
@@ -202,13 +216,10 @@ auto ObserveProcessIo() -> ProcessIo {
 
 auto SubtractProcessIo(const ProcessIo &after, const ProcessIo &before) -> ProcessIo {
   return ProcessIo{
-      .characters_read = CounterDelta(after.characters_read, before.characters_read),
-      .characters_written = CounterDelta(after.characters_written, before.characters_written),
       .read_syscalls = CounterDelta(after.read_syscalls, before.read_syscalls),
       .write_syscalls = CounterDelta(after.write_syscalls, before.write_syscalls),
       .storage_read_bytes = CounterDelta(after.storage_read_bytes, before.storage_read_bytes),
       .storage_write_bytes = CounterDelta(after.storage_write_bytes, before.storage_write_bytes),
-      .cancelled_write_bytes = CounterDelta(after.cancelled_write_bytes, before.cancelled_write_bytes),
   };
 }
 
@@ -233,8 +244,7 @@ auto SubtractProcessUsage(const ProcessUsage &after, const ProcessUsage &before)
       .system_seconds = std::max(0.0, after.system_seconds - before.system_seconds),
       .minor_faults = CounterDelta(after.minor_faults, before.minor_faults),
       .major_faults = CounterDelta(after.major_faults, before.major_faults),
-      .voluntary_context_switches =
-          CounterDelta(after.voluntary_context_switches, before.voluntary_context_switches),
+      .voluntary_context_switches = CounterDelta(after.voluntary_context_switches, before.voluntary_context_switches),
       .involuntary_context_switches =
           CounterDelta(after.involuntary_context_switches, before.involuntary_context_switches),
   };
@@ -266,7 +276,7 @@ auto ObserveProcessMemory() -> ProcessMemory {
 
 void WarmDatabaseFamily(const std::filesystem::path &database) {
   auto buffer = std::array<std::byte, 1U << 20U>{};
-  for (const auto &path : FamilyMembers(database)) {
+  for (const auto &path : RegularFiles(database)) {
     const auto descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (descriptor < 0) {
       Fail("cannot open database-family member for cache warming");

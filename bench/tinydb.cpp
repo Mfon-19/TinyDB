@@ -1,7 +1,8 @@
 #include "benchmark.h"
-#include "system_metrics.h"
 
 #include "api/database_test_access.h"
+
+#include <tinydb/database.h>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -13,15 +14,100 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace tinydb::bench {
+
 namespace {
+
+auto CheckedMultiply(std::size_t left, std::size_t right, std::string_view description) -> std::size_t {
+  if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
+    Fail(std::string(description) + " is too large");
+  }
+  return left * right;
+}
+
+template <typename T>
+auto Take(Result<T> result, std::string_view operation) -> T {
+  if (!result) {
+    Fail(std::string(operation) + ": " + result.error().ToString());
+  }
+  return std::move(*result);
+}
+
+void Check(const Status &status, std::string_view operation) {
+  if (!status.Ok()) {
+    Fail(std::string(operation) + ": " + status.ToString());
+  }
+}
+
+auto DatabasePath(const std::filesystem::path &root) -> std::filesystem::path { return root / "database.db"; }
+
+auto DatabaseFileBytes(const std::filesystem::path &root) -> std::uint64_t {
+  auto ignored = std::error_code{};
+  const auto path = DatabasePath(root);
+  return std::filesystem::exists(path, ignored) ? std::filesystem::file_size(path, ignored) : 0;
+}
+
+auto PersistentBytes(const std::filesystem::path &root) -> std::uint64_t {
+  const auto path = DatabasePath(root);
+  auto bytes = DatabaseFileBytes(root);
+  auto ignored = std::error_code{};
+  const auto wal_prefix = path.filename().string() + "-wal";
+  if (!std::filesystem::exists(root, ignored)) {
+    return bytes;
+  }
+  for (const auto &entry : std::filesystem::directory_iterator(root, ignored)) {
+    if (entry.path().filename().string().starts_with(wal_prefix) && entry.is_regular_file(ignored)) {
+      bytes += entry.file_size(ignored);
+    }
+  }
+  return bytes;
+}
+
+auto BenchmarkOptions(const Scenario &scenario, std::optional<std::size_t> page_cache_bytes = std::nullopt) -> Options {
+  auto options = Options{};
+  options.page_cache_bytes = page_cache_bytes.value_or(scenario.page_cache_bytes);
+  const auto transaction_payload =
+      CheckedMultiply(scenario.batch, scenario.key_bytes + scenario.value_bytes, "transaction payload");
+  options.max_write_transaction_bytes = std::max<std::size_t>(32U << 20U, transaction_payload * 3U);
+  options.wal_segment_bytes = 64U << 20U;
+  options.checkpoint.wal_trigger_bytes = std::numeric_limits<std::uint64_t>::max();
+  options.checkpoint.dirty_trigger_bytes = std::numeric_limits<std::size_t>::max();
+  options.checkpoint.hard_wal_bytes = std::numeric_limits<std::uint64_t>::max();
+  options.checkpoint.hard_dirty_bytes = std::numeric_limits<std::size_t>::max();
+  options.checkpoint.maximum_age = std::chrono::hours(24);
+  return options;
+}
+
+void StoreDataset(Database &database, const Dataset &data, bool second, const Scenario &scenario) {
+  const auto &values = second ? data.second_values : data.first_values;
+  const auto row_bytes = std::max<std::size_t>(1, scenario.key_bytes + scenario.value_bytes);
+  const auto batch = std::max<std::size_t>(1, std::min<std::size_t>(256, (4U << 20U) / row_bytes));
+  for (std::size_t first = 0; first < data.keys.size(); first += batch) {
+    auto write = Take(database.BeginWrite(), "BeginWrite fixture");
+    for (std::size_t row = first; row < std::min(first + batch, data.keys.size()); ++row) {
+      Check(write.Put(data.keys[row], values[row]), "Put fixture");
+    }
+    (void)Take(std::move(write).Commit(), "Commit fixture");
+  }
+}
+
+auto ValueDigest(std::string_view value) -> std::uint64_t {
+  if (value.empty()) {
+    return 0;
+  }
+  return static_cast<std::uint64_t>(value.size()) * 131U + static_cast<unsigned char>(value.front()) * 17U +
+         static_cast<unsigned char>(value.back());
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -35,17 +121,6 @@ struct Resources final {
 struct ResourceStart final {
   ProcessUsage usage;
   ProcessIo io;
-};
-
-struct WriteObservation final {
-  double seconds{0};
-  double operations_per_second{0};
-  double wal_amplification{0};
-  double persistent_bytes{0};
-  std::uint64_t cache_resident_bytes{0};
-  FileResidency residency;
-  Resources resources;
-  std::vector<double> commit_microseconds;
 };
 
 struct ReadDiagnostics final {
@@ -67,17 +142,6 @@ struct ReadDiagnostics final {
   std::size_t maximum_staging_bytes{0};
   std::size_t maximum_in_flight_operations{0};
   std::size_t maximum_in_flight_bytes{0};
-};
-
-struct ReadObservation final {
-  double seconds{0};
-  double operations_per_second{0};
-  double nanoseconds_per_operation{0};
-  double cache_hit_rate{0};
-  std::uint64_t cache_resident_bytes{0};
-  FileResidency residency;
-  Resources resources;
-  ReadDiagnostics diagnostics;
 };
 
 struct LifecycleObservation final {
@@ -111,12 +175,6 @@ struct IoReadObservation final {
   ProcessMemory memory_endpoint;
   double logical_read_bytes{0};
   ReadDiagnostics diagnostics;
-};
-
-enum class MixedValueState : std::uint8_t {
-  First,
-  Second,
-  Missing,
 };
 
 auto StartResources() -> ResourceStart { return ResourceStart{ObserveProcessUsage(), ObserveProcessIo()}; }
@@ -304,292 +362,6 @@ void PrimeEngineReadState(Database &database, const Scenario &scenario, const Da
   }
 }
 
-auto MakeOrder(const Scenario &scenario, std::uint64_t seed) -> std::vector<std::size_t> {
-  auto order = std::vector<std::size_t>(scenario.rows);
-  std::iota(order.begin(), order.end(), 0U);
-  if (scenario.random_write_order) {
-    auto generator = std::mt19937_64{seed};
-    std::ranges::shuffle(order, generator);
-  }
-  return order;
-}
-
-auto ObserveWrite(const std::filesystem::path &path, const Scenario &scenario, const Dataset &data,
-                  const Options &options, std::uint64_t seed) -> WriteObservation {
-  PreparePreOpenCacheState(scenario, path);
-  const auto memory_before_open = ObserveProcessMemory();
-  auto database = Take(Database::Open(path, options), "Open write benchmark");
-  const auto order = MakeOrder(scenario, seed);
-  const auto before = Take(database.Stats(), "Stats before writes");
-  auto latencies = std::vector<double>{};
-  latencies.reserve(scenario.commits);
-  const auto resources_started = StartResources();
-  const auto started = Clock::now();
-  for (std::size_t transaction = 0; transaction < scenario.commits; ++transaction) {
-    auto write = Take(database.BeginWrite(), "BeginWrite measured");
-    for (std::size_t item = 0; item < scenario.batch; ++item) {
-      const auto row = order[transaction * scenario.batch + item];
-      const auto &value = scenario.overwrite ? data.second_values[row] : data.first_values[row];
-      Check(write.Put(data.keys[row], value), "Put measured");
-    }
-    const auto commit_started = Clock::now();
-    (void)Take(std::move(write).Commit(), "Commit measured");
-    latencies.push_back(std::chrono::duration<double, std::micro>(Clock::now() - commit_started).count());
-  }
-  const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
-  const auto after = Take(database.Stats(), "Stats after writes");
-  auto resources = FinishResources(resources_started, memory_before_open);
-
-  {
-    auto read = Take(database.BeginRead(), "BeginRead write validation");
-    for (std::size_t row = 0; row < data.keys.size(); ++row) {
-      const auto value = Take(read.Get(data.keys[row]), "Get written value");
-      const auto &expected = scenario.overwrite ? data.second_values[row] : data.first_values[row];
-      if (!value || *value != expected) {
-        Fail("write validation failed");
-      }
-    }
-  }
-  const auto bytes = PersistentBytes(path);
-  const auto residency = ObserveFileResidency(path);
-  Check(database.Close(), "Close write benchmark");
-  const auto wal_delta = after.wal_bytes >= before.wal_bytes ? after.wal_bytes - before.wal_bytes : 0;
-  return WriteObservation{
-      .seconds = seconds,
-      .operations_per_second = static_cast<double>(scenario.commits * scenario.batch) / seconds,
-      .wal_amplification = static_cast<double>(wal_delta) / static_cast<double>(data.logical_bytes),
-      .persistent_bytes = static_cast<double>(bytes),
-      .cache_resident_bytes = after.cache_resident_bytes,
-      .residency = residency,
-      .resources = resources,
-      .commit_microseconds = std::move(latencies),
-  };
-}
-
-struct PointAccess final {
-  std::size_t row;
-};
-
-auto MakeReadPlan(const Scenario &scenario, std::uint64_t seed) -> std::vector<PointAccess> {
-  auto plan = std::vector<PointAccess>{};
-  plan.reserve(scenario.rows);
-  auto generator = std::mt19937_64{seed};
-  const auto hot_rows = std::max<std::size_t>(1, scenario.rows / 10U);
-  for (std::size_t operation = 0; operation < scenario.rows; ++operation) {
-    if (scenario.access == AccessPattern::Sequential) {
-      plan.push_back(PointAccess{operation});
-    } else if (scenario.access == AccessPattern::Hotspot && operation % 10U != 0) {
-      plan.push_back(PointAccess{static_cast<std::size_t>(generator() % hot_rows)});
-    } else {
-      plan.push_back(PointAccess{static_cast<std::size_t>(generator() % scenario.rows)});
-    }
-  }
-  return plan;
-}
-
-auto ObservePointReads(Database &database, const Scenario &scenario, const Dataset &data,
-                       const std::vector<PointAccess> &plan, std::chrono::milliseconds duration,
-                       ProcessMemory memory_before_open) -> ReadObservation {
-  const auto before = Take(database.Stats(), "Stats before point reads");
-  auto operations = std::uint64_t{0};
-  auto digest = std::uint64_t{0};
-  auto expected_digest = std::uint64_t{0};
-  auto position = std::size_t{0};
-  const auto resources_started = StartResources();
-  const auto started = Clock::now();
-  const auto read_until_complete = [&](auto &reader) {
-    constexpr auto clock_check_interval = std::size_t{256};
-    do {
-      for (std::size_t operation = 0; operation < clock_check_interval; ++operation) {
-        const auto row = plan[position].row;
-        const auto value = Take(reader.Get(data.keys[row]), "Get measured");
-        if (!value) {
-          Fail("point read missed a present key");
-        }
-        digest += ValueDigest(*value);
-        expected_digest += ValueDigest(data.first_values[row]);
-        position = (position + 1U) % plan.size();
-        operations += 1;
-      }
-    } while (Clock::now() - started < duration);
-  };
-  if (scenario.transaction_scoped_reads) {
-    auto read = Take(database.BeginRead(), "BeginRead point benchmark");
-    read_until_complete(read);
-  } else {
-    read_until_complete(database);
-  }
-  const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
-  if (digest != expected_digest) {
-    Fail("point-read value validation failed");
-  }
-  const auto after = Take(database.Stats(), "Stats after point reads");
-  const auto resources = FinishResources(resources_started, memory_before_open);
-  const auto hits = after.cache_hits - before.cache_hits;
-  const auto misses = after.cache_misses - before.cache_misses;
-  return ReadObservation{
-      .seconds = seconds,
-      .operations_per_second = static_cast<double>(operations) / seconds,
-      .nanoseconds_per_operation = seconds * 1'000'000'000.0 / static_cast<double>(operations),
-      .cache_hit_rate = hits + misses == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(hits + misses),
-      .cache_resident_bytes = after.cache_resident_bytes,
-      .residency = {},
-      .resources = resources,
-      .diagnostics = CaptureReadDiagnostics(before, after),
-  };
-}
-
-struct ScanRange final {
-  std::size_t first;
-  std::size_t rows;
-  std::uint64_t expected_digest;
-};
-
-auto MakeScanPlan(const Scenario &scenario, const Dataset &data, std::uint64_t seed) -> std::vector<ScanRange> {
-  const auto plan_size = scenario.scan_rows == 0 ? std::size_t{1} : std::size_t{1'024};
-  auto plan = std::vector<ScanRange>{};
-  plan.reserve(plan_size);
-  auto generator = std::mt19937_64{seed};
-  const auto rows = scenario.scan_rows == 0 ? scenario.rows : std::min(scenario.scan_rows, scenario.rows);
-  for (std::size_t index = 0; index < plan_size; ++index) {
-    auto first = std::size_t{0};
-    if (rows != scenario.rows) {
-      first = index == 0 ? scenario.rows - rows : static_cast<std::size_t>(generator() % (scenario.rows - rows + 1U));
-    }
-    auto digest = std::uint64_t{0};
-    for (std::size_t row = first; row < first + rows; ++row) {
-      digest += data.keys[row].size() * 257U;
-      digest += scenario.copy_values ? ValueDigest(data.first_values[row]) : data.first_values[row].size();
-    }
-    plan.push_back(ScanRange{first, rows, digest});
-  }
-  return plan;
-}
-
-auto ObserveScans(Database &database, const Scenario &scenario, const Dataset &data, const std::vector<ScanRange> &plan,
-                  std::chrono::milliseconds duration, ProcessMemory memory_before_open) -> ReadObservation {
-  const auto before = Take(database.Stats(), "Stats before scans");
-  auto rows_seen = std::uint64_t{0};
-  auto expected_rows = std::uint64_t{0};
-  auto digest = std::uint64_t{0};
-  auto expected_digest = std::uint64_t{0};
-  const auto resources_started = StartResources();
-  const auto started = Clock::now();
-  do {
-    for (const auto &range : plan) {
-      auto read = Take(database.BeginRead(), "BeginRead scan");
-      auto cursor = [&]() -> Cursor {
-        if (range.rows == scenario.rows) {
-          return Take(read.Scan(), "Scan full measured");
-        }
-        if (range.first + range.rows == scenario.rows) {
-          return Take(read.Scan(KeyRange::From(data.keys[range.first])), "Scan final range measured");
-        }
-        return Take(read.Scan(KeyRange::Between(data.keys[range.first], data.keys[range.first + range.rows])),
-                    "Scan range measured");
-      }();
-      while (cursor.Valid()) {
-        digest += cursor.Key().size() * 257U;
-        digest += scenario.copy_values ? ValueDigest(Take(cursor.CopyValue(), "Copy scan value")) : cursor.ValueSize();
-        rows_seen += 1;
-        Check(cursor.Next(), "Cursor Next measured");
-      }
-      expected_rows += range.rows;
-      expected_digest += range.expected_digest;
-    }
-  } while (Clock::now() - started < duration);
-  const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
-  if (rows_seen != expected_rows || digest != expected_digest) {
-    Fail("scan validation failed");
-  }
-  const auto after = Take(database.Stats(), "Stats after scans");
-  const auto resources = FinishResources(resources_started, memory_before_open);
-  const auto hits = after.cache_hits - before.cache_hits;
-  const auto misses = after.cache_misses - before.cache_misses;
-  return ReadObservation{
-      .seconds = seconds,
-      .operations_per_second = static_cast<double>(rows_seen) / seconds,
-      .nanoseconds_per_operation = seconds * 1'000'000'000.0 / static_cast<double>(rows_seen),
-      .cache_hit_rate = hits + misses == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(hits + misses),
-      .cache_resident_bytes = after.cache_resident_bytes,
-      .residency = {},
-      .resources = resources,
-      .diagnostics = CaptureReadDiagnostics(before, after),
-  };
-}
-
-auto MixedRow(const Scenario &scenario, std::mt19937_64 &generator) -> std::size_t {
-  if (scenario.access == AccessPattern::Hotspot && generator() % 10U != 0) {
-    return static_cast<std::size_t>(generator() % std::max<std::size_t>(1, scenario.rows / 10U));
-  }
-  return static_cast<std::size_t>(generator() % scenario.rows);
-}
-
-auto ObserveMixed(Database &database, const Scenario &scenario, const Dataset &data,
-                  std::vector<MixedValueState> &states, std::size_t generation, std::uint64_t seed,
-                  ProcessMemory memory_before_open) -> WriteObservation {
-  auto generator = std::mt19937_64{seed};
-  const auto before = Take(database.Stats(), "Stats before mixed workload");
-  auto latencies = std::vector<double>{};
-  latencies.reserve(scenario.commits);
-  auto logical_write_bytes = std::uint64_t{0};
-  const auto resources_started = StartResources();
-  const auto started = Clock::now();
-  for (std::size_t transaction = 0; transaction < scenario.commits; ++transaction) {
-    auto write = Take(database.BeginWrite(), "BeginWrite mixed");
-    for (std::size_t operation = 0; operation < scenario.batch; ++operation) {
-      const auto selector = operation % 25U;
-      const auto row = MixedRow(scenario, generator);
-      if (selector < 20U) {
-        const auto value = Take(write.Get(data.keys[row]), "Get mixed");
-        if (states[row] == MixedValueState::Missing) {
-          if (value) {
-            Fail("mixed read found a deleted key");
-          }
-        } else {
-          const auto &expected =
-              states[row] == MixedValueState::First ? data.first_values[row] : data.second_values[row];
-          if (!value || *value != expected) {
-            Fail("mixed read returned the wrong value");
-          }
-        }
-      } else if (selector < 23U) {
-        Check(write.Put(data.keys[row], data.second_values[row]), "Update mixed");
-        states[row] = MixedValueState::Second;
-        logical_write_bytes += data.keys[row].size() + data.second_values[row].size();
-      } else if (selector == 23U) {
-        const auto insert_row =
-            scenario.rows + generation * scenario.commits * scenario.batch + transaction * scenario.batch + operation;
-        const auto key = MakeKey(insert_row, scenario.key_bytes);
-        const auto value = MakeValue(insert_row, scenario.value_bytes, 0);
-        Check(write.Put(key, value), "Insert mixed");
-        logical_write_bytes += key.size() + value.size();
-      } else {
-        Check(write.Delete(data.keys[row]), "Delete mixed");
-        states[row] = MixedValueState::Missing;
-        logical_write_bytes += data.keys[row].size();
-      }
-    }
-    const auto commit_started = Clock::now();
-    (void)Take(std::move(write).Commit(), "Commit mixed");
-    latencies.push_back(std::chrono::duration<double, std::micro>(Clock::now() - commit_started).count());
-  }
-  const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
-  const auto after = Take(database.Stats(), "Stats after mixed workload");
-  const auto resources = FinishResources(resources_started, memory_before_open);
-  const auto wal_delta = after.wal_bytes >= before.wal_bytes ? after.wal_bytes - before.wal_bytes : 0;
-  return WriteObservation{
-      .seconds = seconds,
-      .operations_per_second = static_cast<double>(scenario.commits * scenario.batch) / seconds,
-      .wal_amplification =
-          logical_write_bytes == 0 ? 0.0 : static_cast<double>(wal_delta) / static_cast<double>(logical_write_bytes),
-      .cache_resident_bytes = after.cache_resident_bytes,
-      .residency = {},
-      .resources = resources,
-      .commit_microseconds = std::move(latencies),
-  };
-}
-
 struct ConcurrentObservation final {
   double seconds{0};
   double reader_operations_per_second{0};
@@ -664,7 +436,7 @@ auto ObserveConcurrent(Database &database, const Scenario &scenario, const Datas
 
 auto PrepareCheckpointWrites(Database &database, const Scenario &scenario, const Dataset &data) -> std::size_t {
   const auto row_bytes = scenario.key_bytes + scenario.value_bytes + 64U;
-  const auto rows = std::min(data.keys.size(), std::max<std::size_t>(1, scenario.cache_bytes / (4U * row_bytes)));
+  const auto rows = std::min(data.keys.size(), std::max<std::size_t>(1, scenario.page_cache_bytes / (4U * row_bytes)));
   constexpr auto batch = std::size_t{256};
   for (std::size_t first = 0; first < rows; first += batch) {
     auto write = Take(database.BeginWrite(), "BeginWrite checkpoint setup");
@@ -680,7 +452,7 @@ auto ObserveCheckpoint(const std::filesystem::path &path, const Scenario &scenar
                        const Options &options) -> LifecycleObservation {
   PreparePreOpenCacheState(scenario, path);
   const auto memory_before_open = ObserveProcessMemory();
-  auto database = Take(Database::Open(path, options), "Open checkpoint benchmark");
+  auto database = Take(Database::Open(DatabasePath(path), options), "Open checkpoint benchmark");
   const auto updated_rows = PrepareCheckpointWrites(database, scenario, data);
   const auto before = Take(database.Stats(), "Stats before checkpoint");
   if (before.dirty_bytes == 0) {
@@ -715,7 +487,7 @@ auto ObserveCheckpoint(const std::filesystem::path &path, const Scenario &scenar
 }
 
 [[noreturn]] void RecoveryWriter(const std::filesystem::path &path, const Dataset &data, const Scenario &scenario) {
-  auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open recovery writer");
+  auto database = Take(Database::Open(DatabasePath(path), BenchmarkOptions(scenario)), "Open recovery writer");
   StoreDataset(database, data, false, scenario);
   ::_exit(0);
 }
@@ -734,7 +506,7 @@ auto ObserveRecovery(const std::filesystem::path &path, const Scenario &scenario
   const auto memory_before_open = ObserveProcessMemory();
   const auto resources_started = StartResources();
   const auto started = Clock::now();
-  auto database = Take(Database::Open(path, options), "Open measured recovery");
+  auto database = Take(Database::Open(DatabasePath(path), options), "Open measured recovery");
   const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
   const auto stats = Take(database.Stats(), "Stats after recovery");
   auto resources = FinishResources(resources_started, memory_before_open);
@@ -763,7 +535,7 @@ auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, 
   const auto process_io_before = ObserveProcessIo();
   const auto open_io_before = ObserveProcessIo();
   const auto open_started = Clock::now();
-  auto database = Take(Database::Open(path, options), "Open cold-I/O benchmark");
+  auto database = Take(Database::Open(DatabasePath(path), options), "Open cold-I/O benchmark");
   const auto open_seconds = std::chrono::duration<double>(Clock::now() - open_started).count();
   DatabaseTestAccess::WaitForReadQuiescence(database);
   const auto open_io = SubtractProcessIo(ObserveProcessIo(), open_io_before);
@@ -844,7 +616,7 @@ auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, 
 void ChurnDeletePhase(Database &database, const Scenario &scenario, const Dataset &data) {
   constexpr auto transaction_rows = std::size_t{256};
   const auto row_bytes = scenario.key_bytes + scenario.value_bytes + 64U;
-  const auto checkpoint_rows = std::max<std::size_t>(transaction_rows, scenario.cache_bytes / (4U * row_bytes));
+  const auto checkpoint_rows = std::max<std::size_t>(transaction_rows, scenario.page_cache_bytes / (4U * row_bytes));
   for (std::size_t checkpoint_first = 0; checkpoint_first < data.keys.size(); checkpoint_first += checkpoint_rows) {
     const auto checkpoint_end = std::min(checkpoint_first + checkpoint_rows, data.keys.size());
     for (std::size_t first = checkpoint_first; first < checkpoint_end; first += transaction_rows) {
@@ -861,7 +633,7 @@ void ChurnDeletePhase(Database &database, const Scenario &scenario, const Datase
 void ChurnStorePhase(Database &database, const Scenario &scenario, const Dataset &data, bool second) {
   constexpr auto transaction_rows = std::size_t{256};
   const auto row_bytes = scenario.key_bytes + scenario.value_bytes + 64U;
-  const auto checkpoint_rows = std::max<std::size_t>(transaction_rows, scenario.cache_bytes / (4U * row_bytes));
+  const auto checkpoint_rows = std::max<std::size_t>(transaction_rows, scenario.page_cache_bytes / (4U * row_bytes));
   const auto &values = second ? data.second_values : data.first_values;
   for (std::size_t checkpoint_first = 0; checkpoint_first < data.keys.size(); checkpoint_first += checkpoint_rows) {
     const auto checkpoint_end = std::min(checkpoint_first + checkpoint_rows, data.keys.size());
@@ -887,7 +659,7 @@ void RunChurnTrial(const std::filesystem::path &path, const Scenario &scenario, 
                    const Options &options, std::size_t trial) {
   PreparePreOpenCacheState(scenario, path);
   const auto memory_before_open = ObserveProcessMemory();
-  auto database = Take(Database::Open(path, options), "Open churn benchmark");
+  auto database = Take(Database::Open(DatabasePath(path), options), "Open churn benchmark");
   for (std::size_t round = 0; round < scenario.churn_warmup_rounds; ++round) {
     (void)ChurnRound(database, scenario, data, round % 2U == 0);
   }
@@ -932,33 +704,6 @@ void RunChurnTrial(const std::filesystem::path &path, const Scenario &scenario, 
                        static_cast<double>(std::max<std::size_t>(1, scenario.churn_measured_rounds - 1U)));
   AddResources(scenario, results, trial, resources, measured_seconds);
   AddCache(scenario, results, trial, stats.cache_resident_bytes, residency);
-}
-
-void AddWriteResults(const Scenario &scenario, Results &results, std::size_t trial,
-                     const WriteObservation &observation) {
-  results.AddTrial(scenario, "throughput",
-                   scenario.workload == Workload::Mixed ? "operations/second" : "updates/second", trial,
-                   observation.operations_per_second);
-  results.AddTrial(scenario, "wal_amplification", "bytes/byte", trial, observation.wal_amplification);
-  if (observation.persistent_bytes != 0.0) {
-    results.AddTrial(scenario, "persistent_size", "bytes", trial, observation.persistent_bytes);
-  }
-  AddCommitLatencies(scenario, results, trial, observation.commit_microseconds);
-  AddResources(scenario, results, trial, observation.resources, observation.seconds);
-  if (observation.residency.file_bytes != 0) {
-    AddCache(scenario, results, trial, observation.cache_resident_bytes, observation.residency);
-  }
-}
-
-void AddReadResults(const Scenario &scenario, Results &results, std::size_t trial, const ReadObservation &observation,
-                    std::string_view unit) {
-  results.AddTrial(scenario, "throughput", unit, trial, observation.operations_per_second);
-  results.AddTrial(scenario, "amortized_latency", "nanoseconds/operation", trial,
-                   observation.nanoseconds_per_operation);
-  results.AddTrial(scenario, "cache_hit_rate", "ratio", trial, observation.cache_hit_rate);
-  AddResources(scenario, results, trial, observation.resources, observation.seconds);
-  AddCache(scenario, results, trial, observation.cache_resident_bytes, observation.residency);
-  AddReadDiagnostics(scenario, results, trial, observation.diagnostics);
 }
 
 void AddLifecycleResults(const Scenario &scenario, Results &results, std::size_t trial,
@@ -1027,7 +772,7 @@ void AddIoReadResults(const Scenario &scenario, Results &results, std::size_t tr
 
 }  // namespace
 
-void BuildScenarioFixture(const std::filesystem::path &path, const Scenario &scenario) {
+void BuildTinyDbFixture(const std::filesystem::path &path, const Scenario &scenario) {
   auto error = std::error_code{};
   if (std::filesystem::exists(path, error) || PersistentBytes(path) != 0) {
     Fail("fixture database family already exists");
@@ -1036,6 +781,10 @@ void BuildScenarioFixture(const std::filesystem::path &path, const Scenario &sce
     Fail("cannot inspect fixture database path: " + error.message());
   }
 
+  std::filesystem::create_directories(path, error);
+  if (error) {
+    Fail("cannot create fixture root: " + error.message());
+  }
   const auto data = MakeDataset(scenario.rows, scenario.key_bytes, scenario.value_bytes);
   if (scenario.workload == Workload::Recovery) {
     const auto child = ::fork();
@@ -1046,24 +795,23 @@ void BuildScenarioFixture(const std::filesystem::path &path, const Scenario &sce
       Fail("fork failed");
     }
     WaitForWriter(child);
-    if (!std::filesystem::exists(path, error) || PersistentBytes(path) <= DatabaseFileBytes(path)) {
+    if (!std::filesystem::exists(DatabasePath(path), error) || PersistentBytes(path) <= DatabaseFileBytes(path)) {
       Fail("recovery fixture did not preserve committed WAL");
     }
     return;
   }
 
-  auto database = Take(Database::Open(path, BenchmarkOptions(scenario)), "Open fixture database");
-  if (scenario.workload != Workload::Put || scenario.overwrite) {
-    StoreDataset(database, data, false, scenario);
-  }
+  auto database = Take(Database::Open(DatabasePath(path), BenchmarkOptions(scenario)), "Open fixture database");
+  StoreDataset(database, data, false, scenario);
   Check(database.Checkpoint(), "Checkpoint fixture");
   Check(database.Close(), "Close fixture database");
 }
 
-void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const Config &config, Results &results) {
+void RunTinyDbTrial(const std::filesystem::path &path, const Scenario &scenario, const Config &config,
+                    Results &results) {
   auto error = std::error_code{};
-  if (!std::filesystem::is_regular_file(path, error)) {
-    Fail("trial requires an existing regular database file");
+  if (!std::filesystem::is_directory(path, error) || !std::filesystem::is_regular_file(DatabasePath(path), error)) {
+    Fail("trial requires an existing database fixture root");
   }
   if (error) {
     Fail("cannot inspect trial fixture: " + error.message());
@@ -1073,61 +821,12 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
   const auto options = BenchmarkOptions(scenario, config.page_cache_bytes);
 
   switch (scenario.workload) {
-    case Workload::Put:
-      AddWriteResults(scenario, results, trial,
-                      ObserveWrite(path, scenario, data, options, config.seed ^ 0x5752495445ULL));
-      return;
-    case Workload::PointRead: {
-      PreparePreOpenCacheState(scenario, path);
-      const auto memory_before_open = ObserveProcessMemory();
-      auto database = Take(Database::Open(path, options), "Open point-read trial");
-      PrimeEngineReadState(database, scenario, data);
-      const auto plan = MakeReadPlan(scenario, config.seed ^ 0x52454144ULL);
-      if (scenario.warmup != std::chrono::milliseconds::zero()) {
-        (void)ObservePointReads(database, scenario, data, plan, scenario.warmup, memory_before_open);
-      }
-      auto observation = ObservePointReads(database, scenario, data, plan, scenario.measurement, memory_before_open);
-      observation.residency = ObserveFileResidency(path);
-      Check(database.Close(), "Close point-read trial");
-      AddReadResults(scenario, results, trial, observation, "reads/second");
-      return;
-    }
-    case Workload::Scan: {
-      PreparePreOpenCacheState(scenario, path);
-      const auto memory_before_open = ObserveProcessMemory();
-      auto database = Take(Database::Open(path, options), "Open scan trial");
-      PrimeEngineReadState(database, scenario, data);
-      const auto plan = MakeScanPlan(scenario, data, config.seed ^ 0x5343414EULL);
-      if (scenario.warmup != std::chrono::milliseconds::zero()) {
-        (void)ObserveScans(database, scenario, data, plan, scenario.warmup, memory_before_open);
-      }
-      auto observation = ObserveScans(database, scenario, data, plan, scenario.measurement, memory_before_open);
-      observation.residency = ObserveFileResidency(path);
-      Check(database.Close(), "Close scan trial");
-      AddReadResults(scenario, results, trial, observation, "rows/second");
-      return;
-    }
-    case Workload::Mixed: {
-      PreparePreOpenCacheState(scenario, path);
-      const auto memory_before_open = ObserveProcessMemory();
-      auto database = Take(Database::Open(path, options), "Open mixed trial");
-      PrimeEngineReadState(database, scenario, data);
-      auto states = std::vector<MixedValueState>(scenario.rows, MixedValueState::First);
-      for (std::size_t round = 0; round < scenario.preparation_rounds; ++round) {
-        (void)ObserveMixed(database, scenario, data, states, round, config.seed ^ round, memory_before_open);
-        Check(database.Checkpoint(), "Checkpoint mixed preparation");
-      }
-      auto observation = ObserveMixed(database, scenario, data, states, scenario.preparation_rounds,
-                                      config.seed ^ 0x4D49584544ULL, memory_before_open);
-      observation.residency = ObserveFileResidency(path);
-      Check(database.Close(), "Close mixed trial");
-      AddWriteResults(scenario, results, trial, observation);
-      return;
-    }
+    case Workload::Portable:
+      Fail("portable workload reached TinyDB qualification dispatcher");
     case Workload::Concurrent: {
       PreparePreOpenCacheState(scenario, path);
       const auto memory_before_open = ObserveProcessMemory();
-      auto database = Take(Database::Open(path, options), "Open concurrent trial");
+      auto database = Take(Database::Open(DatabasePath(path), options), "Open concurrent trial");
       PrimeEngineReadState(database, scenario, data);
       for (std::size_t round = 0; round < scenario.preparation_rounds; ++round) {
         (void)ObserveConcurrent(database, scenario, data, config.seed ^ round, memory_before_open);

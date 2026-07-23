@@ -6,22 +6,32 @@ PYTHON ?= python3
 JOBS ?= $(shell nproc)
 
 DIRECT_IO_REVISION ?= direct-io
-DIRECT_IO_COMMIT := $(shell git rev-parse $(DIRECT_IO_REVISION))
-DIRECT_IO_SHORT := $(shell git rev-parse --short=12 $(DIRECT_IO_COMMIT))
+DIRECT_IO_COMMIT = $(shell git rev-parse $(DIRECT_IO_REVISION))
+DIRECT_IO_SHORT = $(shell git rev-parse --short=12 $(DIRECT_IO_COMMIT))
 
 WORKTREE_ROOT ?= /tmp/tinydb-benchmark-worktrees
 
 CURRENT_BUILD ?= build/bench-current
 DIRECT_IO_BUILD ?= build/bench-direct-$(DIRECT_IO_SHORT)
-DIRECT_IO_ROOT := $(WORKTREE_ROOT)/direct-io-$(DIRECT_IO_SHORT)
+DIRECT_IO_ROOT = $(WORKTREE_ROOT)/direct-io-$(DIRECT_IO_SHORT)
 CURRENT_BENCH := $(CURRENT_BUILD)/TinyDB_bench
-DIRECT_IO_BENCH := $(DIRECT_IO_BUILD)/TinyDB_bench
+DIRECT_IO_BENCH = $(DIRECT_IO_BUILD)/TinyDB_bench
 
 BENCH_OUTPUT ?=
 COMPARISON_OUTPUT ?=
+BENCH_PROFILE ?= standard
+BENCH_SEMANTICS ?= durable
+CACHE_MIB ?=
 BASELINE_CACHE_MIB ?=
-DIRECT_CACHE_MIB ?= 16
+DIRECT_CACHE_MIB ?=
 BENCH_ARGS ?=
+
+CACHE_ARG = $(if $(strip $(CACHE_MIB)),--cache-mib "$(CACHE_MIB)")
+BASELINE_CACHE_ARG = $(if $(strip $(BASELINE_CACHE_MIB)),--baseline-cache-mib "$(BASELINE_CACHE_MIB)")
+DIRECT_CACHE_ARG = $(if $(strip $(DIRECT_CACHE_MIB)),--candidate-cache-mib "$(DIRECT_CACHE_MIB)")
+BENCH_OUTPUT_ARG = $(if $(strip $(BENCH_OUTPUT)),--output "$(BENCH_OUTPUT)")
+COMPARISON_OUTPUT_ARG = $(if $(strip $(COMPARISON_OUTPUT)),--output "$(COMPARISON_OUTPUT)")
+BENCH_COMMON_ARGS = --profile "$(BENCH_PROFILE)" --semantics "$(BENCH_SEMANTICS)"
 
 .PHONY: help bench bench-compare bench-build bench-direct-build
 
@@ -31,32 +41,30 @@ help:
 	@echo "  make bench          Measure the current tree"
 	@echo "  make bench-compare  Compare the current tree with direct I/O"
 	@echo
-	@echo "Use BENCH_ARGS='--family reads' or BENCH_ARGS='--filter cold' for a focused run."
-	@echo "Use BASELINE_CACHE_MIB=16 to override buffered I/O's scenario cache size."
-	@echo "Direct I/O uses a 16 MiB cache by default; use DIRECT_CACHE_MIB=32 to override it."
+	@echo "Use BENCH_ARGS='--family db_bench' or BENCH_ARGS='--family cold_io' for a focused run."
+	@echo "Use BENCH_PROFILE=smoke or BENCH_PROFILE=soak for portable workload scale."
+	@echo "Both engines use the standard 16 MiB page cache."
+	@echo "Use CACHE_MIB=8 for an equal cache-pressure run."
+	@echo "BASELINE_CACHE_MIB and DIRECT_CACHE_MIB are optional per-engine overrides."
 	@echo "The latest default result replaces its predecessor; set BENCH_OUTPUT or COMPARISON_OUTPUT to archive one."
 	@echo "Override DIRECT_IO_REVISION or JOBS as needed."
 
 bench: bench-build
-	@$(PYTHON) bench/runner.py run "$(CURRENT_BENCH)" \
-		$(if $(strip $(BENCH_OUTPUT)),--output "$(BENCH_OUTPUT)") $(BENCH_ARGS)
+	@$(PYTHON) bench/runner.py run "$(CURRENT_BENCH)" $(BENCH_COMMON_ARGS) $(CACHE_ARG) $(BENCH_OUTPUT_ARG) $(BENCH_ARGS)
 
 bench-compare: bench-build bench-direct-build
-	@$(PYTHON) bench/runner.py compare "$(CURRENT_BENCH)" "$(DIRECT_IO_BENCH)" \
-		$(if $(strip $(BASELINE_CACHE_MIB)),--baseline-cache-mib "$(BASELINE_CACHE_MIB)") \
-		$(if $(strip $(DIRECT_CACHE_MIB)),--candidate-cache-mib "$(DIRECT_CACHE_MIB)") \
-		$(if $(strip $(COMPARISON_OUTPUT)),--output "$(COMPARISON_OUTPUT)") $(BENCH_ARGS)
+	@$(PYTHON) bench/runner.py compare "$(CURRENT_BENCH)" "$(DIRECT_IO_BENCH)" $(BENCH_COMMON_ARGS) $(CACHE_ARG) $(BASELINE_CACHE_ARG) $(DIRECT_CACHE_ARG) $(COMPARISON_OUTPUT_ARG) $(BENCH_ARGS)
 
 bench-build:
 	@$(CMAKE) -S bench -B "$(CURRENT_BUILD)" -G Ninja \
-		-DCMAKE_BUILD_TYPE=Release -DTINYDB_ENGINE_SOURCE_DIR="$(CURDIR)"
+		-DCMAKE_BUILD_TYPE=Release -DKVBENCH_BACKEND=tinydb -DTINYDB_ENGINE_SOURCE_DIR="$(CURDIR)"
 	@$(CMAKE) --build "$(CURRENT_BUILD)" --target TinyDB_bench --parallel "$(JOBS)"
 
-bench-direct-build: $(DIRECT_IO_ROOT)/.git
-	@$(CMAKE) -S bench -B "$(DIRECT_IO_BUILD)" -G Ninja \
-		-DCMAKE_BUILD_TYPE=Release -DTINYDB_ENGINE_SOURCE_DIR="$(DIRECT_IO_ROOT)"
-	@$(CMAKE) --build "$(DIRECT_IO_BUILD)" --target TinyDB_bench --parallel "$(JOBS)"
-
-$(DIRECT_IO_ROOT)/.git:
+bench-direct-build:
 	@mkdir -p "$(WORKTREE_ROOT)"
-	@git worktree add --detach "$(DIRECT_IO_ROOT)" "$(DIRECT_IO_COMMIT)"
+	@if [[ ! -e "$(DIRECT_IO_ROOT)/.git" ]]; then \
+		git worktree add --detach "$(DIRECT_IO_ROOT)" "$(DIRECT_IO_COMMIT)"; \
+	fi
+	@$(CMAKE) -S bench -B "$(DIRECT_IO_BUILD)" -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release -DKVBENCH_BACKEND=tinydb -DTINYDB_ENGINE_SOURCE_DIR="$(DIRECT_IO_ROOT)"
+	@$(CMAKE) --build "$(DIRECT_IO_BUILD)" --target TinyDB_bench --parallel "$(JOBS)"
