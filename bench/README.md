@@ -31,10 +31,11 @@ make bench-compare BENCH_ARGS='--family cold_io'
 make bench BENCH_ARGS='--filter checkpoint'
 ```
 
-`DIRECT_CACHE_MIB` changes only the direct-I/O candidate's page cache. The
-buffered baseline, fixture construction, workload sizes, and scenario matrix
-retain their declared 8 MiB setting, which makes cache-size experiments
-comparable.
+The default comparison gives the direct-I/O candidate its production 16 MiB
+page cache. `DIRECT_CACHE_MIB` changes only that candidate cache. The buffered
+baseline, fixture construction, workload sizes, and scenario matrix retain
+their declared 8 MiB setting. For an equal-cache comparison, use
+`DIRECT_CACHE_MIB=8`; other values support explicit cache-size experiments.
 
 An explicitly named output is never replaced; choose a new path or remove the
 old archive deliberately.
