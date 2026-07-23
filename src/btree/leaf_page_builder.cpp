@@ -166,6 +166,10 @@ auto LeafPageBuilder::Upsert(std::string_view key, LeafValueView value) -> Upser
   const bool at_tail = it == records_.end();
   auto replaced_overflow = std::optional<OverflowValueDescriptor>{};
   if (!at_tail && txn::BytewiseCompare(Key(*it), key) == 0) {
+    const auto stored = Value(*it);
+    if (!stored.IsOverflow() && !value.IsOverflow() && stored.InlineBytes() == value.InlineBytes()) {
+      return UpsertResult{.changed = false, .at_tail = false, .replaced_overflow = std::nullopt};
+    }
     encoded_bytes_ -= RecordFootprint(*it);
     if (it->kind == LeafValueKind::Overflow) {
       replaced_overflow = it->overflow;
@@ -178,6 +182,7 @@ auto LeafPageBuilder::Upsert(std::string_view key, LeafValueView value) -> Upser
     records_.insert(it, record);
   }
   return UpsertResult{
+      .changed = true,
       .at_tail = at_tail,
       .replaced_overflow = replaced_overflow,
   };

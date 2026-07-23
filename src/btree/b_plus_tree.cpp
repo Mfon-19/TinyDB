@@ -218,6 +218,9 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
       return prepared_value.error();
     }
     const auto upsert = node.Upsert(key, *prepared_value);
+    if (!upsert.changed) {
+      return {};
+    }
     retired_value = upsert.replaced_overflow;
 
     if (node.Fits()) {

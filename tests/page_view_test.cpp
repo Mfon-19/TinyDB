@@ -68,6 +68,13 @@ TEST(Page, LeafSearch) {
   EXPECT_LT(value.InlineBytes().data(), page.data() + page.size());
 }
 
+TEST(Page, LeafUpsertReportsNoOp) {
+  auto builder = tinydb::LeafPageBuilder{};
+  EXPECT_TRUE(builder.Upsert("key", tinydb::LeafValueView::Inline("value")).changed);
+  EXPECT_FALSE(builder.Upsert("key", tinydb::LeafValueView::Inline("value")).changed);
+  EXPECT_TRUE(builder.Upsert("key", tinydb::LeafValueView::Inline("different")).changed);
+}
+
 TEST(Page, ByteOrder) {
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};

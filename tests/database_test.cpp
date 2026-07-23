@@ -66,6 +66,28 @@ TEST(Database, Transactions) {
   Cleanup(path);
 }
 
+TEST(Database, IdenticalPutDoesNotAdvanceDurabilityState) {
+  const auto path = tinydb::test::Path("identical_put");
+  auto database = Fresh("identical_put").value();
+  ASSERT_TRUE(database.Put("key", "value").Ok());
+  const auto before = database.Stats().value();
+
+  auto write = database.BeginWrite().value();
+  ASSERT_TRUE(write.Put("key", "value").Ok());
+  const auto committed = std::move(write).Commit();
+  ASSERT_TRUE(committed.has_value());
+  EXPECT_EQ(committed->transaction_id, before.transaction_id);
+  EXPECT_EQ(committed->commit_lsn, before.visible_lsn);
+
+  const auto after = database.Stats().value();
+  EXPECT_EQ(after.transaction_id, before.transaction_id);
+  EXPECT_EQ(after.visible_lsn, before.visible_lsn);
+  EXPECT_EQ(after.wal_bytes, before.wal_bytes);
+  EXPECT_EQ(after.dirty_pages, before.dirty_pages);
+  EXPECT_EQ(database.Get("key").value(), "value");
+  Cleanup(path);
+}
+
 TEST(Database, Ranges) {
   const auto path = tinydb::test::Path("ranges");
   auto database = Fresh("ranges").value();

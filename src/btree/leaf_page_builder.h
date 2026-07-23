@@ -17,6 +17,7 @@ namespace tinydb {
 class LeafPageBuilder {
  public:
   struct UpsertResult {
+    bool changed;
     bool at_tail;
     std::optional<OverflowValueDescriptor> replaced_overflow;
   };
