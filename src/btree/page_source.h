@@ -2,6 +2,7 @@
 
 #include <tinydb/status.h>
 #include "storage/page.h"
+#include "util/check.h"
 
 #include <memory>
 #include <utility>
@@ -21,9 +22,9 @@ struct DataPageHeader;
 **
 ** Every successful operation returns a move-only PageHandle. While the handle
 ** lives, its byte address and page identity are stable. A source may not reuse
-** or destroy the underlying page until the handle invokes its release
-** callback. Read handles are immutable. Edit and Allocate handles accumulate
-** a sticky dirty bit that is returned to their source exactly once.
+** or destroy the underlying page until the handle releases its lease. Read
+** handles are immutable. Edit and Allocate handles accumulate a sticky dirty
+** bit that is returned to their source exactly once.
 **
 ** The opaque owner and function pointer type-erase release without allocating
 ** a wrapper on the ordinary read path.
@@ -34,16 +35,14 @@ class PageHandle {
 
   PageHandle() = default;
   PageHandle(void *owner, page_id_t page_id, char *data, bool editable, Release release)
-      : owner_(owner), page_id_(page_id), data_(data), mutable_data_(editable ? data : nullptr), release_(release) {}
+      : owner_(owner), page_id_(page_id), data_(data), release_(release), editable_(editable) {}
 
-  // Immutable caches retain a frame through keepalive while release updates
-  // frame-local pin accounting. No per-read wrapper allocation is required.
-  PageHandle(void *owner, page_id_t page_id, const char *data, Release release, std::shared_ptr<const void> keepalive,
+  // Immutable caches retain a frame through keepalive. Its shared ownership is
+  // also the exact eviction pin, so release needs no owner callback.
+  PageHandle(page_id_t page_id, const char *data, std::shared_ptr<const void> keepalive,
              const storage::DataPageHeader *validated_header = nullptr, bool tree_payload_validated = false)
-      : owner_(owner),
-        page_id_(page_id),
+      : page_id_(page_id),
         data_(data),
-        release_(release),
         keepalive_(std::move(keepalive)),
         validated_header_(validated_header),
         tree_payload_validated_(tree_payload_validated) {}
@@ -73,21 +72,61 @@ class PageHandle {
   auto TreePayloadValidated() const noexcept -> bool { return tree_payload_validated_; }
 
   // Only Edit and Allocate may produce an editable handle.
-  auto MutableData() -> char *;
-  void MarkDirty();
+  auto MutableData() -> char * {
+    TINYDB_CHECK(editable_, "mutable access through a read-only page handle");
+    return const_cast<char *>(data_);
+  }
+
+  void MarkDirty() {
+    TINYDB_CHECK(editable_, "marking a read-only page handle dirty");
+    dirty_ = true;
+  }
 
  private:
-  void Reset() noexcept;
-  void Take(PageHandle &&other) noexcept;
+  void Reset() noexcept {
+    // The source receives the accumulated dirty bit exactly once.
+    if (release_ != nullptr) {
+      release_(owner_, page_id_, dirty_);
+    }
+    owner_ = nullptr;
+    data_ = nullptr;
+    editable_ = false;
+    release_ = nullptr;
+    keepalive_.reset();
+    validated_header_ = nullptr;
+    tree_payload_validated_ = false;
+  }
+
+  void Take(PageHandle &&other) noexcept {
+    // Page bytes do not move; only responsibility for the lease does.
+    owner_ = other.owner_;
+    page_id_ = other.page_id_;
+    data_ = other.data_;
+    editable_ = other.editable_;
+    dirty_ = other.dirty_;
+    release_ = other.release_;
+    keepalive_ = std::move(other.keepalive_);
+    validated_header_ = other.validated_header_;
+    tree_payload_validated_ = other.tree_payload_validated_;
+
+    // Ownership moves with the callback; the source object must release nothing.
+    other.owner_ = nullptr;
+    other.data_ = nullptr;
+    other.editable_ = false;
+    other.release_ = nullptr;
+    other.dirty_ = false;
+    other.validated_header_ = nullptr;
+    other.tree_payload_validated_ = false;
+  }
 
   void *owner_{nullptr};
   page_id_t page_id_{HEADER_PAGE_ID};
   const char *data_{nullptr};
-  char *mutable_data_{nullptr};
-  bool dirty_{false};
   Release release_{nullptr};
   std::shared_ptr<const void> keepalive_;
   const storage::DataPageHeader *validated_header_{nullptr};
+  bool editable_{false};
+  bool dirty_{false};
   bool tree_payload_validated_{false};
 };
 

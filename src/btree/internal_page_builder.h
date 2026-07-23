@@ -37,11 +37,11 @@ class InternalPageBuilder {
   auto Split() -> SplitResult;
 
  private:
-  auto Bytes() const -> std::size_t;
   auto ChooseSplitIndex() const -> std::size_t;
 
   page_id_t first_child_{HEADER_PAGE_ID};
   std::vector<Record> records_;
+  std::size_t encoded_bytes_{0};
 };
 
 struct InternalPageBuilder::SplitResult {

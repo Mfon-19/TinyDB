@@ -433,6 +433,11 @@ TEST(Format, Transaction) {
   EXPECT_EQ(decoded->pages[1].page_id, 3U);
   EXPECT_EQ(decoded->pages[1].bytes, second);
 
+  const auto unordered_pages = std::array{pages[1], pages[0]};
+  const auto unordered = tinydb::wal_format::EncodeTransaction(10, 100, unordered_pages, encoded->state);
+  ASSERT_FALSE(unordered.has_value());
+  EXPECT_EQ(unordered.error().Code(), StatusCode::InvalidArgument);
+
   const auto exhausted = tinydb::wal_format::EncodeTransaction(
       10, std::numeric_limits<std::uint64_t>::max() - 2, std::span{pages}.first<1>(), tinydb::txn::DatabaseState{});
   ASSERT_FALSE(exhausted.has_value());

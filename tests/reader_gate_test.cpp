@@ -101,6 +101,37 @@ TEST(Readers, Lifetime) {
   EXPECT_EQ(gate.Stats().active_readers, 0U);
 }
 
+TEST(Readers, ScopedLifetime) {
+  auto gate = ReaderGate(State(3, 7));
+  {
+    auto snapshot = tinydb::txn::ScopedSnapshotToken{};
+    gate.BeginRead(snapshot);
+    EXPECT_EQ(snapshot.State().transaction_id, 3U);
+    EXPECT_EQ(snapshot.State().root_page_id, 7U);
+    EXPECT_EQ(gate.Stats().active_readers, 1U);
+    EXPECT_TRUE(gate.Stats().oldest_reader_age.has_value());
+
+    // Checkpoint publication may advance while readers are active. The scoped
+    // admission must retain the exact state it captured, just like a shared
+    // transaction token.
+    gate.AdvanceCheckpoint(30);
+    EXPECT_EQ(snapshot.State().checkpoint_lsn, 20U);
+    EXPECT_EQ(gate.CurrentState()->checkpoint_lsn, 30U);
+  }
+  EXPECT_EQ(gate.Stats().active_readers, 0U);
+  EXPECT_FALSE(gate.Stats().oldest_reader_age.has_value());
+}
+
+TEST(Readers, ScopedAdmissionRetainsGateState) {
+  auto snapshot = tinydb::txn::ScopedSnapshotToken{};
+  {
+    auto gate = ReaderGate(State(5, 9));
+    gate.BeginRead(snapshot);
+  }
+  EXPECT_EQ(snapshot.State().transaction_id, 5U);
+  EXPECT_EQ(snapshot.State().root_page_id, 9U);
+}
+
 TEST(Readers, Fairness) {
   auto gate = ReaderGate(State(1, 3));
   auto old_reader = gate.BeginRead();

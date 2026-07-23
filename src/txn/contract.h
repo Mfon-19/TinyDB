@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <string_view>
 
 namespace tinydb::txn {
@@ -25,13 +26,24 @@ constexpr auto ValidateValueSize(std::size_t size) noexcept -> StatusCode {
   return size <= MAX_VALUE_BYTES ? StatusCode::Ok : StatusCode::InvalidArgument;
 }
 
+inline auto BytewiseCompare(std::string_view left, std::string_view right) noexcept -> int {
+  const auto common_bytes = std::min(left.size(), right.size());
+  if (common_bytes != 0) {
+    const auto order = std::memcmp(left.data(), right.data(), common_bytes);
+    if (order != 0) {
+      // memcmp compares bytes as unsigned char, exactly matching the
+      // persistent key-order contract.
+      return order;
+    }
+  }
+  return static_cast<int>(left.size() > right.size()) - static_cast<int>(left.size() < right.size());
+}
+
 struct BytewiseLess {
   using is_transparent = void;
 
-  constexpr auto operator()(std::string_view left, std::string_view right) const noexcept -> bool {
-    return std::lexicographical_compare(left.begin(), left.end(), right.begin(), right.end(), [](char lhs, char rhs) {
-      return static_cast<unsigned char>(lhs) < static_cast<unsigned char>(rhs);
-    });
+  auto operator()(std::string_view left, std::string_view right) const noexcept -> bool {
+    return BytewiseCompare(left, right) < 0;
   }
 };
 

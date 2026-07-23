@@ -9,7 +9,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 #include "internal_page_builder.h"
 #include "page_format.h"
@@ -49,7 +48,9 @@ auto RecordFootprint(const InternalPageBuilder::Record &record) -> std::size_t {
 // Construct the minimal internal page used when a split creates a new root.
 InternalPageBuilder::InternalPageBuilder(page_id_t first_child, std::string separator, page_id_t right_child)
     : first_child_(first_child) {
-  records_.push_back(Record{std::move(separator), right_child});
+  auto record = Record{std::move(separator), right_child};
+  encoded_bytes_ = RecordFootprint(record);
+  records_.push_back(std::move(record));
 }
 
 // Copy only through view accessors so builders cannot become a second decoder.
@@ -58,7 +59,9 @@ auto InternalPageBuilder::From(const InternalPageView &page) -> InternalPageBuil
   builder.first_child_ = page.ChildAt(0);
   builder.records_.reserve(page.SeparatorCount());
   for (std::size_t index = 0; index < page.SeparatorCount(); ++index) {
-    builder.records_.push_back(Record{std::string(page.KeyAt(index)), page.ChildAt(index + 1)});
+    auto record = Record{std::string(page.KeyAt(index)), page.ChildAt(index + 1)};
+    builder.encoded_bytes_ += RecordFootprint(record);
+    builder.records_.push_back(std::move(record));
   }
   return builder;
 }
@@ -102,18 +105,12 @@ void InternalPageBuilder::Store(char *page, page_id_t page_id) const {
 
 void InternalPageBuilder::InsertSeparator(std::string key, page_id_t right_child) {
   const auto it = std::lower_bound(records_.begin(), records_.end(), key, KeyIsBefore);
-  records_.insert(it, Record{std::move(key), right_child});
+  auto record = Record{std::move(key), right_child};
+  encoded_bytes_ += RecordFootprint(record);
+  records_.insert(it, std::move(record));
 }
 
-auto InternalPageBuilder::Bytes() const -> std::size_t {
-  std::size_t total = 0;
-  for (const auto &record : records_) {
-    total += RecordFootprint(record);
-  }
-  return total;
-}
-
-auto InternalPageBuilder::Fits() const -> bool { return Bytes() <= USABLE_BYTES; }
+auto InternalPageBuilder::Fits() const -> bool { return encoded_bytes_ <= USABLE_BYTES; }
 
 // Choose the legal promoted separator with the smallest encoded-size
 // imbalance. The candidate itself belongs to neither child.
@@ -121,20 +118,17 @@ auto InternalPageBuilder::ChooseSplitIndex() const -> std::size_t {
   const std::size_t count = records_.size();
   TINYDB_CHECK(count >= 3, "too few records to split");
 
-  auto prefix = std::vector<std::size_t>(count + 1, 0);
-  for (std::size_t i = 0; i < count; ++i) {
-    prefix[i + 1] = prefix[i] + RecordFootprint(records_[i]);
-  }
-
   // The first and last separators cannot be promoted because each resulting
-  // internal page must retain at least one routing record.
+  // internal page must retain at least one routing record. Keep the left size
+  // incrementally instead of allocating a prefix array.
   std::size_t best_split = 0;
   std::size_t best_imbalance = 0;
+  std::size_t left = RecordFootprint(records_.front());
   bool found = false;
   for (std::size_t split = 1; split + 1 < count; ++split) {
-    const std::size_t left = prefix[split];
-    const std::size_t right = prefix[count] - prefix[split + 1];
+    const std::size_t right = encoded_bytes_ - left - RecordFootprint(records_[split]);
     if (left > USABLE_BYTES || right > USABLE_BYTES) {
+      left += RecordFootprint(records_[split]);
       continue;
     }
     const std::size_t imbalance = left > right ? left - right : right - left;
@@ -143,6 +137,7 @@ auto InternalPageBuilder::ChooseSplitIndex() const -> std::size_t {
       best_split = split;
       best_imbalance = imbalance;
     }
+    left += RecordFootprint(records_[split]);
   }
   TINYDB_CHECK(found, "no valid split point; entry size cap violated");
   return best_split;
@@ -153,11 +148,18 @@ auto InternalPageBuilder::Split() -> SplitResult {
   // becomes the right page's first child, preserving every subtree edge.
   const std::size_t split = ChooseSplitIndex();
   const auto split_it = records_.begin() + static_cast<std::ptrdiff_t>(split);
+  const auto promoted_bytes = RecordFootprint(records_[split]);
 
   SplitResult result;
   result.separator = std::move(records_[split].key);
   result.right.first_child_ = records_[split].right_child;
   result.right.records_.assign(std::make_move_iterator(split_it + 1), std::make_move_iterator(records_.end()));
+  for (const auto &record : result.right.records_) {
+    result.right.encoded_bytes_ += RecordFootprint(record);
+  }
+  TINYDB_CHECK(encoded_bytes_ >= promoted_bytes + result.right.encoded_bytes_,
+               "internal split byte accounting underflow");
+  encoded_bytes_ -= promoted_bytes + result.right.encoded_bytes_;
   records_.erase(split_it, records_.end());
   return result;
 }

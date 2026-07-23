@@ -1,19 +1,19 @@
 #pragma once
 
 #include <tinydb/bytes.h>
-#include "storage/page.h"
 #include <tinydb/status.h>
+#include "storage/page.h"
 
 #include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 namespace tinydb {
 
 class PageSource;
+class PageReader;
 
 /*
 ** Ordered-map algorithms over a caller-supplied page universe. BPlusTree owns
@@ -25,6 +25,8 @@ class BPlusTree {
  public:
   // Existing roots are validated; a zero-filled allocated root becomes a leaf.
   static auto Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusTree>;
+  static auto Read(PageReader *pages, page_id_t root_page_id,
+                   std::string_view key) -> Result<std::optional<std::string>>;
 
   auto Put(std::string_view key, std::string_view value) -> Status;
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;

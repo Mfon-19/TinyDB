@@ -40,4 +40,10 @@ TEST(Contract, ByteOrder) {
   EXPECT_TRUE(less("", "a"));
   EXPECT_TRUE(less(low, high));
   EXPECT_FALSE(less(high, low));
+  EXPECT_TRUE(less(std::string{"a\0", 2}, std::string{"a\1", 2}));
+  EXPECT_TRUE(less("prefix", "prefix-longer"));
+  EXPECT_FALSE(less("prefix-longer", "prefix"));
+  EXPECT_LT(tinydb::txn::BytewiseCompare(low, high), 0);
+  EXPECT_EQ(tinydb::txn::BytewiseCompare(std::string{"a\0b", 3}, std::string{"a\0b", 3}), 0);
+  EXPECT_GT(tinydb::txn::BytewiseCompare("prefix-longer", "prefix"), 0);
 }

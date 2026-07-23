@@ -23,8 +23,9 @@ class DatabaseCore;
 ** Database owns one process-exclusive open of a database file. Its private
 ** core owns every storage subsystem at stable addresses; public transaction
 ** and cursor handles retain that core while they borrow it.
-** Convenience reads and writes create the same transaction objects exposed to
-** applications, so there is only one visibility and durability path.
+** Convenience reads and writes use the same snapshot and commit paths exposed
+** through transaction objects, so there is only one visibility and durability
+** protocol.
 */
 class Database final {
  public:

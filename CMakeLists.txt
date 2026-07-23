@@ -98,7 +98,6 @@ add_library(
   src/btree/navigation.h
   src/btree/page_format.cpp
   src/btree/page_format.h
-  src/btree/page_source.cpp
   src/btree/page_source.h
   src/btree/page_view.cpp
   src/btree/page_view.h

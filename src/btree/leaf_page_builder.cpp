@@ -10,7 +10,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 #include "leaf_page_builder.h"
 #include "page_format.h"
@@ -53,7 +52,9 @@ auto LeafPageBuilder::From(const LeafPageView &page) -> LeafPageBuilder {
   builder.next_leaf_ = page.NextLeaf();
   builder.records_.reserve(page.Count());
   for (std::size_t index = 0; index < page.Count(); ++index) {
-    builder.records_.push_back(Record{std::string(page.KeyAt(index)), LeafValue::Copy(page.ValueAt(index))});
+    auto record = Record{std::string(page.KeyAt(index)), LeafValue::Copy(page.ValueAt(index))};
+    builder.encoded_bytes_ += RecordFootprint(record);
+    builder.records_.push_back(std::move(record));
   }
   return builder;
 }
@@ -72,28 +73,32 @@ void LeafPageBuilder::Store(char *page, page_id_t page_id) const {
   std::size_t free_end = PAGE_SIZE;
   for (std::size_t i = 0; i < records_.size(); ++i) {
     const auto &record = records_[i];
-    const std::size_t cell_size = LEAF_CELL_HEADER_SIZE + record.key.size() + record.value.EncodedBytes();
+    const auto value_bytes = record.value.EncodedBytes();
+    const std::size_t cell_size = LEAF_CELL_HEADER_SIZE + record.key.size() + value_bytes;
     const std::size_t offset = free_end - cell_size;
     TINYDB_CHECK(storage::PutLittleEndian(bytes, offset + leaf_cell_offset::KEY_BYTES,
                                           static_cast<std::uint16_t>(record.key.size())) &&
                      storage::PutLittleEndian(bytes, offset + leaf_cell_offset::VALUE_BYTES,
-                                              static_cast<std::uint16_t>(record.value.EncodedBytes())),
+                                              static_cast<std::uint16_t>(value_bytes)),
                  "leaf cell header exceeds page");
-    bytes[offset + leaf_cell_offset::VALUE_KIND] = static_cast<std::byte>(record.value.kind);
+    bytes[offset + leaf_cell_offset::VALUE_KIND] =
+        static_cast<std::byte>(record.value.IsOverflow() ? LeafValueKind::Overflow : LeafValueKind::Inline);
     std::copy_n(record.key.data(), record.key.size(), page + offset + LEAF_CELL_HEADER_SIZE);
     const auto value_offset = offset + LEAF_CELL_HEADER_SIZE + record.key.size();
     if (record.value.IsOverflow()) {
+      const auto &descriptor = record.value.OverflowDescriptor();
       TINYDB_CHECK(
           storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES,
-                                   record.value.overflow.total_value_bytes) &&
+                                   descriptor.total_value_bytes) &&
               storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID,
-                                       record.value.overflow.first_page_id) &&
+                                       descriptor.first_page_id) &&
               storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM,
-                                       record.value.overflow.value_checksum) &&
+                                       descriptor.value_checksum) &&
               storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::RESERVED, std::uint32_t{0}),
           "overflow descriptor exceeds leaf cell");
     } else {
-      std::copy_n(record.value.inline_bytes.data(), record.value.inline_bytes.size(), page + value_offset);
+      const auto inline_bytes = record.value.InlineBytes();
+      std::copy_n(inline_bytes.data(), inline_bytes.size(), page + value_offset);
     }
     TINYDB_CHECK(storage::PutLittleEndian(bytes, LEAF_HEADER_SIZE + i * SLOT_SIZE, static_cast<slot_t>(offset)),
                  "leaf slot exceeds page");
@@ -110,65 +115,64 @@ void LeafPageBuilder::Store(char *page, page_id_t page_id) const {
       "failed to encode leaf page");
 }
 
-auto LeafPageBuilder::Upsert(std::string_view key, LeafValue value) -> bool {
-  // The bool means "key is at the right edge", not "new record". Put combines
+auto LeafPageBuilder::Upsert(std::string_view key, LeafValue value) -> UpsertResult {
+  // at_tail means "key is at the right edge", not "new record". Put combines
   // it with the successor sentinel to select the sequential-load split policy.
   const auto it = std::lower_bound(records_.begin(), records_.end(), key, KeyIsBefore);
   const bool at_tail = it == records_.end();
+  auto replaced_overflow = std::optional<OverflowValueDescriptor>{};
   if (!at_tail && it->key == key) {
+    encoded_bytes_ -= RecordFootprint(*it);
+    if (it->value.IsOverflow()) {
+      replaced_overflow = it->value.OverflowDescriptor();
+    }
     it->value = std::move(value);
+    encoded_bytes_ += RecordFootprint(*it);
   } else {
-    records_.insert(it, Record{std::string(key), std::move(value)});
+    auto record = Record{std::string(key), std::move(value)};
+    encoded_bytes_ += RecordFootprint(record);
+    records_.insert(it, std::move(record));
   }
-  return at_tail;
+  return UpsertResult{
+      .at_tail = at_tail,
+      .replaced_overflow = replaced_overflow,
+  };
 }
 
-auto LeafPageBuilder::OverflowFor(std::string_view key) const -> std::optional<OverflowValueDescriptor> {
-  const auto it = std::lower_bound(records_.begin(), records_.end(), key, KeyIsBefore);
-  if (it == records_.end() || it->key != key || !it->value.IsOverflow()) {
-    return std::nullopt;
-  }
-  return it->value.overflow;
-}
-
-auto LeafPageBuilder::Erase(std::string_view key) -> bool {
+auto LeafPageBuilder::Erase(std::string_view key) -> EraseResult {
   const auto it = std::lower_bound(records_.begin(), records_.end(), key, KeyIsBefore);
   if (it == records_.end() || it->key != key) {
-    return false;
+    return EraseResult{.erased = false, .removed_overflow = std::nullopt};
   }
+  auto removed_overflow = std::optional<OverflowValueDescriptor>{};
+  if (it->value.IsOverflow()) {
+    removed_overflow = it->value.OverflowDescriptor();
+  }
+  encoded_bytes_ -= RecordFootprint(*it);
   records_.erase(it);
-  return true;
+  return EraseResult{
+      .erased = true,
+      .removed_overflow = removed_overflow,
+  };
 }
 
-auto LeafPageBuilder::Bytes() const -> std::size_t {
-  std::size_t total = 0;
-  for (const auto &record : records_) {
-    total += RecordFootprint(record);
-  }
-  return total;
-}
-
-auto LeafPageBuilder::Fits() const -> bool { return Bytes() <= USABLE_BYTES; }
+auto LeafPageBuilder::Fits() const -> bool { return encoded_bytes_ <= USABLE_BYTES; }
 
 // Choose the legal byte boundary with the smallest encoded-size imbalance.
-// Prefix sums make each candidate constant-time to score.
 auto LeafPageBuilder::ChooseSplitIndex() const -> std::size_t {
   const std::size_t count = records_.size();
   TINYDB_CHECK(count >= 2, "too few records to split");
 
-  auto prefix = std::vector<std::size_t>(count + 1, 0);
-  for (std::size_t i = 0; i < count; ++i) {
-    prefix[i + 1] = prefix[i] + RecordFootprint(records_[i]);
-  }
-
   // Only boundaries where both encoded halves fit are candidates. Among
-  // those, prefer the smallest byte imbalance to stabilize occupancy.
+  // those, prefer the smallest byte imbalance to stabilize occupancy. A
+  // running left size avoids allocating a prefix array for this one pass.
   std::size_t best_split = 0;
   std::size_t best_imbalance = 0;
+  std::size_t left = 0;
   bool found = false;
   for (std::size_t split = 1; split < count; ++split) {
-    const std::size_t left = prefix[split];
-    const std::size_t right = prefix[count] - prefix[split];
+    left += RecordFootprint(records_[split - 1]);
+    const std::size_t right = encoded_bytes_ - left;
     if (left > USABLE_BYTES || right > USABLE_BYTES) {
       continue;
     }
@@ -194,6 +198,11 @@ auto LeafPageBuilder::Split(page_id_t right_page_id, bool tail_heavy) -> SplitRe
   SplitResult result;
   result.separator = records_[split].key;
   result.right.records_.assign(std::make_move_iterator(split_it), std::make_move_iterator(records_.end()));
+  for (const auto &record : result.right.records_) {
+    result.right.encoded_bytes_ += RecordFootprint(record);
+  }
+  TINYDB_CHECK(encoded_bytes_ >= result.right.encoded_bytes_, "leaf split byte accounting underflow");
+  encoded_bytes_ -= result.right.encoded_bytes_;
   result.right.next_leaf_ = next_leaf_;
   records_.erase(split_it, records_.end());
   next_leaf_ = right_page_id;  // right is inserted between this leaf and old_next

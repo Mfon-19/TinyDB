@@ -428,17 +428,14 @@ struct ReadTransaction::Impl final {
 };
 
 struct WriteTransaction::Impl final {
-  Impl(std::shared_ptr<detail::DatabaseCore> database, std::unique_lock<std::mutex> writer_permit,
-       std::unique_ptr<txn::TransactionPages> private_pages, std::unique_ptr<BPlusTree> private_tree)
-      : core(std::move(database)),
-        writer(std::move(writer_permit)),
-        transaction(std::move(private_pages)),
-        tree(std::move(private_tree)) {}
+  Impl(std::shared_ptr<detail::DatabaseCore> database, std::unique_lock<std::mutex> &&writer_permit,
+       txn::TransactionPages &&private_pages)
+      : core(std::move(database)), writer(std::move(writer_permit)), transaction(std::move(private_pages)) {}
 
   ~Impl() { Abort(); }
 
   void Release() noexcept {
-    if (transaction == nullptr) {
+    if (!transaction.has_value()) {
       return;
     }
     tree.reset();
@@ -450,7 +447,7 @@ struct WriteTransaction::Impl final {
   }
 
   void Abort() noexcept {
-    if (transaction == nullptr) {
+    if (!transaction.has_value()) {
       return;
     }
     transaction->Abort();
@@ -459,8 +456,8 @@ struct WriteTransaction::Impl final {
 
   std::shared_ptr<detail::DatabaseCore> core;
   std::unique_lock<std::mutex> writer;
-  std::unique_ptr<txn::TransactionPages> transaction;
-  std::unique_ptr<BPlusTree> tree;
+  std::optional<txn::TransactionPages> transaction;
+  std::optional<BPlusTree> tree;
 };
 
 ReadTransaction::ReadTransaction(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -538,14 +535,14 @@ WriteTransaction::WriteTransaction(WriteTransaction &&) noexcept = default;
 WriteTransaction::~WriteTransaction() = default;
 
 auto WriteTransaction::Get(BytesView key) -> Result<std::optional<Bytes>> {
-  if (impl_ == nullptr || impl_->transaction == nullptr) {
+  if (impl_ == nullptr || !impl_->transaction.has_value()) {
     return std::unexpected(Status::Closed("Get on an inactive write transaction"));
   }
   return impl_->tree->Get(key);
 }
 
 auto WriteTransaction::Put(BytesView key, BytesView value) -> Status {
-  if (impl_ == nullptr || impl_->transaction == nullptr) {
+  if (impl_ == nullptr || !impl_->transaction.has_value()) {
     return Status::Closed("Put on an inactive write transaction");
   }
   if (txn::ValidateKeySize(key.size()) != StatusCode::Ok || txn::ValidateValueSize(value.size()) != StatusCode::Ok) {
@@ -562,7 +559,7 @@ auto WriteTransaction::Put(BytesView key, BytesView value) -> Status {
 }
 
 auto WriteTransaction::Delete(BytesView key) -> Status {
-  if (impl_ == nullptr || impl_->transaction == nullptr) {
+  if (impl_ == nullptr || !impl_->transaction.has_value()) {
     return Status::Closed("Delete on an inactive write transaction");
   }
   if (txn::ValidateKeySize(key.size()) != StatusCode::Ok) {
@@ -576,7 +573,7 @@ auto WriteTransaction::Delete(BytesView key) -> Status {
 }
 
 auto WriteTransaction::Commit() && -> Result<CommitInfo> {
-  if (impl_ == nullptr || impl_->transaction == nullptr) {
+  if (impl_ == nullptr || !impl_->transaction.has_value()) {
     return std::unexpected(Status::Closed("Commit on an inactive write transaction"));
   }
   auto result = impl_->core->Commit(*impl_->transaction, *impl_->tree);
@@ -707,25 +704,23 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
   if (!transaction) {
     return std::unexpected(transaction.error());
   }
-  auto private_pages = std::make_unique<txn::TransactionPages>(std::move(*transaction));
+  auto transaction_impl = std::make_unique<WriteTransaction::Impl>(core, std::move(writer), std::move(*transaction));
   auto root_page_id = base->root_page_id;
   if (root_page_id == HEADER_PAGE_ID) {
-    auto root = private_pages->Allocate();
+    auto root = transaction_impl->transaction->Allocate();
     if (!root) {
-      private_pages->Abort();
+      transaction_impl->Abort();
       return std::unexpected(root.error());
     }
     root_page_id = root->Id();
     root = PageHandle{};
   }
-  auto tree = BPlusTree::Open(private_pages.get(), root_page_id);
+  auto tree = BPlusTree::Open(&*transaction_impl->transaction, root_page_id);
   if (!tree) {
-    private_pages->Abort();
+    transaction_impl->Abort();
     return std::unexpected(tree.error());
   }
-  auto private_tree = std::make_unique<BPlusTree>(std::move(*tree));
-  auto transaction_impl = std::make_unique<WriteTransaction::Impl>(core, std::move(writer), std::move(private_pages),
-                                                                   std::move(private_tree));
+  transaction_impl->tree.emplace(std::move(*tree));
   return WriteTransaction(std::move(transaction_impl));
 }
 
@@ -742,11 +737,24 @@ auto Database::Put(BytesView key, BytesView value) -> Status {
 }
 
 auto Database::Get(BytesView key) -> Result<std::optional<Bytes>> {
-  auto transaction = BeginRead();
-  if (!transaction) {
-    return std::unexpected(transaction.error());
+  if (core_ == nullptr) {
+    return std::unexpected(Status::Closed("Get on a moved-from database"));
   }
-  return transaction->Get(key);
+  // The Database object retains its core even after Close. The lifecycle lock
+  // below linearizes subsystem admission with resource release, so this
+  // non-escaping call needs no extra shared-owner increment.
+  auto *const core = core_.get();
+  auto snapshot = txn::ScopedSnapshotToken{};
+  {
+    auto lock = std::lock_guard(core->lifecycle_mutex);
+    if (auto status = LifecycleError(core->lifecycle); !status.Ok()) {
+      return std::unexpected(std::move(status));
+    }
+    core->readers->BeginRead(snapshot);
+  }
+  // A point result owns its value, so it does not need the heap-backed public
+  // transaction wrapper or the shared admission used by escaping cursors.
+  return BPlusTree::Read(core->cache.get(), snapshot.State().root_page_id, key);
 }
 
 auto Database::Delete(BytesView key) -> Status {

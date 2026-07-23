@@ -21,6 +21,16 @@ class LeafPageBuilder {
     LeafValue value;
   };
 
+  struct UpsertResult {
+    bool at_tail;
+    std::optional<OverflowValueDescriptor> replaced_overflow;
+  };
+
+  struct EraseResult {
+    bool erased;
+    std::optional<OverflowValueDescriptor> removed_overflow;
+  };
+
   struct SplitResult;
 
   LeafPageBuilder() = default;
@@ -30,9 +40,8 @@ class LeafPageBuilder {
   // Emits a complete canonical page whose encoded identity is page_id.
   void Store(char *page, page_id_t page_id) const;
 
-  auto Upsert(std::string_view key, LeafValue value) -> bool;
-  auto Erase(std::string_view key) -> bool;
-  auto OverflowFor(std::string_view key) const -> std::optional<OverflowValueDescriptor>;
+  auto Upsert(std::string_view key, LeafValue value) -> UpsertResult;
+  auto Erase(std::string_view key) -> EraseResult;
   auto Fits() const -> bool;
 
   auto Split(page_id_t right_page_id, bool tail_heavy) -> SplitResult;
@@ -40,11 +49,11 @@ class LeafPageBuilder {
   auto NextLeaf() const -> page_id_t { return next_leaf_; }
 
  private:
-  auto Bytes() const -> std::size_t;
   auto ChooseSplitIndex() const -> std::size_t;
 
   page_id_t next_leaf_{HEADER_PAGE_ID};
   std::vector<Record> records_;
+  std::size_t encoded_bytes_{0};
 };
 
 struct LeafPageBuilder::SplitResult {

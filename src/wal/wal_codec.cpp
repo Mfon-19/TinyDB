@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <limits>
 #include <span>
-#include <unordered_set>
 #include <utility>
 
 namespace tinydb::wal_format {
@@ -96,13 +95,15 @@ auto DecodeDatabaseState(std::span<const std::byte> payload) -> Result<txn::Data
   return state;
 }
 
-auto AppendRecord(std::vector<char> &destination, RecordType type, std::uint64_t transaction_id, std::uint64_t lsn,
-                  std::uint32_t record_sequence, std::span<const std::byte> payload) -> Status {
+template <typename EncodePayload>
+auto AppendEncodedRecord(std::vector<char> &destination, RecordType type, std::uint64_t transaction_id,
+                         std::uint64_t lsn, std::uint32_t record_sequence, std::size_t payload_bytes,
+                         EncodePayload encode_payload) -> Status {
   if (!KnownRecordType(type) || transaction_id == 0 || lsn == 0 ||
-      payload.size() > std::numeric_limits<std::uint32_t>::max() - RECORD_HEADER_BYTES) {
+      payload_bytes > std::numeric_limits<std::uint32_t>::max() - RECORD_HEADER_BYTES) {
     return Status::InvalidArgument("invalid WAL record metadata");
   }
-  const auto total_bytes = RECORD_HEADER_BYTES + payload.size();
+  const auto total_bytes = RECORD_HEADER_BYTES + payload_bytes;
   const auto offset = destination.size();
   destination.resize(offset + total_bytes, 0);
   auto bytes = std::as_writable_bytes(std::span{destination}).subspan(offset, total_bytes);
@@ -115,13 +116,21 @@ auto AppendRecord(std::vector<char> &destination, RecordType type, std::uint64_t
       storage::PutLittleEndian(bytes, record_offset::RECORD_SEQUENCE, record_sequence) &&
       storage::PutLittleEndian(bytes, record_offset::CHECKSUM, std::uint32_t{0}) &&
       storage::PutLittleEndian(bytes, record_offset::RESERVED, std::uint64_t{0}) &&
-      storage::PutBytes(bytes, record_offset::PAYLOAD, payload);
+      encode_payload(bytes.subspan(record_offset::PAYLOAD, payload_bytes));
   if (!encoded || !storage::PutLittleEndian(bytes, record_offset::CHECKSUM,
                                             ChecksumWithZeroedField(bytes, record_offset::CHECKSUM))) {
     destination.resize(offset);
     return Status::Corruption("internal WAL record layout exceeds its buffer");
   }
   return {};
+}
+
+auto AppendRecord(std::vector<char> &destination, RecordType type, std::uint64_t transaction_id, std::uint64_t lsn,
+                  std::uint32_t record_sequence, std::span<const std::byte> payload) -> Status {
+  return AppendEncodedRecord(destination, type, transaction_id, lsn, record_sequence, payload.size(),
+                             [payload](std::span<std::byte> destination_payload) {
+                               return storage::PutBytes(destination_payload, 0, payload);
+                             });
 }
 
 }  // namespace
@@ -273,24 +282,28 @@ auto EncodeTransaction(std::uint64_t transaction_id, std::uint64_t first_lsn, st
   auto output = std::vector<char>{};
   output.reserve(pages.size() * (RECORD_HEADER_BYTES + PAGE_IMAGE_PAYLOAD_BYTES) + RECORD_HEADER_BYTES +
                  DATABASE_STATE_PAYLOAD_BYTES + RECORD_HEADER_BYTES + COMMIT_PAYLOAD_BYTES);
-  auto seen_pages = std::unordered_set<page_id_t>{};
   auto sequence = std::uint32_t{0};
+  auto previous_page_id = HEADER_PAGE_ID;
 
   for (const auto &page : pages) {
-    if (page.page_id < FIRST_DATA_PAGE_ID || !seen_pages.insert(page.page_id).second) {
-      return std::unexpected(Status::InvalidArgument("WAL transaction contains an invalid or duplicate page ID"));
+    // Commit preparation supplies the transaction overlay's canonical page-ID
+    // order. Checking adjacency proves both order and uniqueness without a
+    // hash-table allocation on every commit.
+    if (page.page_id < FIRST_DATA_PAGE_ID || page.page_id <= previous_page_id) {
+      return std::unexpected(
+          Status::InvalidArgument("WAL transaction contains unordered, invalid, or duplicate page IDs"));
     }
+    previous_page_id = page.page_id;
     const auto decoded = storage::DecodeDataPageHeader(std::as_bytes(page.bytes), page.page_id);
     if (!decoded) {
       return std::unexpected(decoded.error());
     }
-    auto payload = std::array<std::byte, PAGE_IMAGE_PAYLOAD_BYTES>{};
-    if (!storage::PutLittleEndian(payload, PAGE_IMAGE_PAGE_ID_OFFSET, page.page_id) ||
-        !storage::PutBytes(payload, PAGE_IMAGE_DATA_OFFSET, std::as_bytes(page.bytes))) {
-      return std::unexpected(Status::Corruption("internal WAL page-image layout exceeds its buffer"));
-    }
-    if (auto status =
-            AppendRecord(output, RecordType::PageImage, transaction_id, first_lsn + sequence, sequence, payload);
+    if (auto status = AppendEncodedRecord(
+            output, RecordType::PageImage, transaction_id, first_lsn + sequence, sequence, PAGE_IMAGE_PAYLOAD_BYTES,
+            [&page](std::span<std::byte> payload) {
+              return storage::PutLittleEndian(payload, PAGE_IMAGE_PAGE_ID_OFFSET, page.page_id) &&
+                     storage::PutBytes(payload, PAGE_IMAGE_DATA_OFFSET, std::as_bytes(page.bytes));
+            });
         !status.Ok()) {
       return std::unexpected(std::move(status));
     }
@@ -349,7 +362,7 @@ auto DecodeTransaction(std::span<const std::byte> bytes,
   auto expected_sequence = std::uint32_t{0};
   auto offset = std::size_t{0};
   auto state_payload = std::span<const std::byte>{};
-  auto seen_pages = std::unordered_set<page_id_t>{};
+  auto previous_page_id = HEADER_PAGE_ID;
 
   while (offset < bytes.size()) {
     if (bytes.size() - offset < RECORD_HEADER_BYTES) {
@@ -377,9 +390,10 @@ auto DecodeTransaction(std::span<const std::byte> bytes,
         return std::unexpected(Status::Corruption("WAL page image appears after database state"));
       }
       const auto page_id = storage::GetLittleEndian<page_id_t>(record->payload, PAGE_IMAGE_PAGE_ID_OFFSET);
-      if (!page_id || *page_id < FIRST_DATA_PAGE_ID || !seen_pages.insert(*page_id).second) {
-        return std::unexpected(Status::Corruption("invalid or duplicate WAL page-image ID"));
+      if (!page_id || *page_id < FIRST_DATA_PAGE_ID || *page_id <= previous_page_id) {
+        return std::unexpected(Status::Corruption("unordered, invalid, or duplicate WAL page-image ID"));
       }
+      previous_page_id = *page_id;
       auto page = DecodedPageImage{.page_id = *page_id, .bytes = {}};
       std::ranges::copy(std::span{record->payload}.subspan(PAGE_IMAGE_DATA_OFFSET),
                         reinterpret_cast<std::byte *>(page.bytes.data()));

@@ -1,8 +1,6 @@
 #include "txn/read_snapshot.h"
 
-#include "btree/navigation.h"
-#include "btree/page_source.h"
-#include "btree/page_view.h"
+#include "btree/b_plus_tree.h"
 #include "btree/value_storage.h"
 
 #include <expected>
@@ -19,29 +17,8 @@ auto ReadSnapshot::Begin(ReaderGate *gate, PageReader *pages) -> ReadSnapshot {
   return ReadSnapshot(gate->BeginRead(), pages);
 }
 
-/*
-** Find the leaf from the captured root, validate its persistent bytes, and
-** copy a matching value before releasing the page lease. A missing key is a
-** successful optional result rather than an error.
-*/
 auto ReadSnapshot::Get(std::string_view key) -> Result<std::optional<std::string>> {
-  auto page = FindLeaf(pages_, State().root_page_id, key);
-  if (!page) {
-    return std::unexpected(std::move(page).error());
-  }
-  const auto leaf = LeafPageView::Open(*page);
-  if (!leaf) {
-    return std::unexpected(leaf.error());
-  }
-  const auto value = leaf->Get(key);
-  if (!value) {
-    return std::nullopt;
-  }
-  auto copied = tinydb::CopyValue(pages_, *value);
-  if (!copied) {
-    return std::unexpected(copied.error());
-  }
-  return std::optional<std::string>{std::move(*copied)};
+  return BPlusTree::Read(pages_, State().root_page_id, key);
 }
 
 auto SnapshotCursor::CopyValue() const -> Result<std::string> { return tinydb::CopyValue(pages_, cursor_.Value()); }

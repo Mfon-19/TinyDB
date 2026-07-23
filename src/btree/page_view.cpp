@@ -4,22 +4,14 @@
 
 #include "btree/page_format.h"
 #include "btree/page_source.h"
-#include "storage/encoding.h"
 #include "txn/contract.h"
 
 #include <cstddef>
 #include <cstdint>
-#include <span>
 #include <string_view>
 #include <utility>
 
 namespace tinydb {
-namespace {
-
-// Fixed-width fields use byte spans; record access returns char-based views.
-auto PageSpan(const char *page) -> std::span<const std::byte> { return std::as_bytes(std::span{page, PAGE_SIZE}); }
-
-}  // namespace
 
 auto LeafPageView::Open(const char *page, page_id_t expected_page_id) -> Result<LeafPageView> {
   // One full validation makes later accessors branch-free with respect to
@@ -27,64 +19,24 @@ auto LeafPageView::Open(const char *page, page_id_t expected_page_id) -> Result<
   if (auto status = ValidateTreePage(page, expected_page_id); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  return OpenValidated(page);
+  return OpenValidated(page, RawNodeType(page));
 }
 
 auto LeafPageView::Open(const PageHandle &page) -> Result<LeafPageView> {
   if (auto status = ValidateTreePage(page); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  return OpenValidated(page.Data());
+  return OpenValidated(page.Data(), RawNodeType(page));
 }
 
-auto LeafPageView::OpenValidated(const char *page) -> Result<LeafPageView> {
-  if (RawNodeType(page) != static_cast<std::uint16_t>(NodeType::Leaf)) {
+auto LeafPageView::OpenValidated(const char *page, std::uint16_t raw_type) -> Result<LeafPageView> {
+  if (raw_type != static_cast<std::uint16_t>(NodeType::Leaf)) {
     return std::unexpected(Status::Corruption("page is not a leaf node"));
   }
 
-  const auto bytes = PageSpan(page);
-  const auto cell_count = storage::GetLittleEndian<std::uint16_t>(bytes, node_page_offset::CELL_COUNT);
-  const auto next_leaf = storage::GetLittleEndian<page_id_t>(bytes, node_page_offset::LINK);
-  // Missing fields now imply the supposedly immutable page changed after validation.
-  TINYDB_CHECK(cell_count.has_value() && next_leaf.has_value(), "validated leaf header became unreadable");
-  return LeafPageView(page, *cell_count, *next_leaf);
-}
-
-auto LeafPageView::CellOffset(std::size_t index) const -> std::size_t {
-  TINYDB_CHECK(index < cell_count_, "leaf record index out of range");
-  return *storage::GetLittleEndian<slot_t>(PageSpan(page_), LEAF_HEADER_SIZE + index * SLOT_SIZE);
-}
-
-auto LeafPageView::KeyAt(std::size_t index) const -> std::string_view {
-  const auto offset = CellOffset(index);
-  const auto key_bytes =
-      *storage::GetLittleEndian<std::uint16_t>(PageSpan(page_), offset + leaf_cell_offset::KEY_BYTES);
-  // The owning PageHandle bounds the returned slice's lifetime.
-  return {page_ + offset + LEAF_CELL_HEADER_SIZE, key_bytes};
-}
-
-auto LeafPageView::ValueAt(std::size_t index) const -> LeafValueView {
-  const auto offset = CellOffset(index);
-  const auto bytes = PageSpan(page_);
-  const auto key_bytes = *storage::GetLittleEndian<std::uint16_t>(bytes, offset + leaf_cell_offset::KEY_BYTES);
-  const auto value_bytes = *storage::GetLittleEndian<std::uint16_t>(bytes, offset + leaf_cell_offset::VALUE_BYTES);
-  const auto value_offset = offset + LEAF_CELL_HEADER_SIZE + key_bytes;
-  const auto kind = static_cast<LeafValueKind>(page_[offset + leaf_cell_offset::VALUE_KIND]);
-  if (kind == LeafValueKind::Inline) {
-    return LeafValueView::Inline(std::string_view{page_ + value_offset, value_bytes});
-  }
-
-  const auto total =
-      *storage::GetLittleEndian<std::uint64_t>(bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES);
-  const auto first =
-      *storage::GetLittleEndian<page_id_t>(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID);
-  const auto checksum =
-      *storage::GetLittleEndian<std::uint32_t>(bytes, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM);
-  return LeafValueView::Overflow(OverflowValueDescriptor{
-      .total_value_bytes = total,
-      .first_page_id = first,
-      .value_checksum = checksum,
-  });
+  const auto cell_count = page_view_detail::LoadLittleEndian<std::uint16_t>(page, node_page_offset::CELL_COUNT);
+  const auto next_leaf = page_view_detail::LoadLittleEndian<page_id_t>(page, node_page_offset::LINK);
+  return LeafPageView(page, cell_count, next_leaf);
 }
 
 auto LeafPageView::LowerBound(std::string_view key) const -> std::size_t {
@@ -104,75 +56,64 @@ auto LeafPageView::LowerBound(std::string_view key) const -> std::size_t {
 }
 
 auto LeafPageView::Get(std::string_view key) const -> std::optional<LeafValueView> {
-  // LowerBound identifies the sole possible match.
-  const auto index = LowerBound(key);
-  if (index == cell_count_ || KeyAt(index) != key) {
-    return std::nullopt;
+  // Point reads can stop on equality instead of completing lower_bound and
+  // comparing the candidate a second time.
+  auto first = std::size_t{0};
+  auto last = static_cast<std::size_t>(cell_count_);
+  while (first < last) {
+    const auto middle = first + (last - first) / 2;
+    const auto order = txn::BytewiseCompare(KeyAt(middle), key);
+    if (order < 0) {
+      first = middle + 1;
+    } else if (order > 0) {
+      last = middle;
+    } else {
+      return ValueAt(middle);
+    }
   }
-  return ValueAt(index);
+  return std::nullopt;
 }
 
 auto InternalPageView::Open(const char *page, page_id_t expected_page_id) -> Result<InternalPageView> {
   if (auto status = ValidateTreePage(page, expected_page_id); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  return OpenValidated(page);
+  return OpenValidated(page, RawNodeType(page));
 }
 
 auto InternalPageView::Open(const PageHandle &page) -> Result<InternalPageView> {
   if (auto status = ValidateTreePage(page); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  return OpenValidated(page.Data());
+  return OpenValidated(page.Data(), RawNodeType(page));
 }
 
-auto InternalPageView::OpenValidated(const char *page) -> Result<InternalPageView> {
-  if (RawNodeType(page) != static_cast<std::uint16_t>(NodeType::Internal)) {
+auto InternalPageView::OpenValidated(const char *page, std::uint16_t raw_type) -> Result<InternalPageView> {
+  if (raw_type != static_cast<std::uint16_t>(NodeType::Internal)) {
     return std::unexpected(Status::Corruption("page is not an internal node"));
   }
 
-  const auto bytes = PageSpan(page);
-  const auto separator_count = storage::GetLittleEndian<std::uint16_t>(bytes, node_page_offset::CELL_COUNT);
-  const auto first_child = storage::GetLittleEndian<page_id_t>(bytes, node_page_offset::LINK);
-  TINYDB_CHECK(separator_count.has_value() && first_child.has_value(), "validated internal header became unreadable");
-  return InternalPageView(page, *separator_count, *first_child);
-}
-
-auto InternalPageView::CellOffset(std::size_t index) const -> std::size_t {
-  TINYDB_CHECK(index < separator_count_, "internal separator index out of range");
-  return *storage::GetLittleEndian<slot_t>(PageSpan(page_), INTERNAL_HEADER_SIZE + index * SLOT_SIZE);
-}
-
-auto InternalPageView::KeyAt(std::size_t index) const -> std::string_view {
-  const auto offset = CellOffset(index);
-  const auto key_bytes =
-      *storage::GetLittleEndian<std::uint16_t>(PageSpan(page_), offset + internal_cell_offset::KEY_BYTES);
-  return {page_ + offset + INTERNAL_CELL_HEADER_SIZE, key_bytes};
-}
-
-auto InternalPageView::RightChildAt(std::size_t index) const -> page_id_t {
-  const auto offset = CellOffset(index);
-  return *storage::GetLittleEndian<page_id_t>(PageSpan(page_), offset + internal_cell_offset::RIGHT_CHILD);
-}
-
-auto InternalPageView::ChildAt(std::size_t child_index) const -> page_id_t {
-  // Child zero is LINK; child i>0 belongs to separator i-1.
-  TINYDB_CHECK(child_index <= separator_count_, "internal child index out of range");
-  return child_index == 0 ? first_child_ : RightChildAt(child_index - 1);
+  const auto separator_count = page_view_detail::LoadLittleEndian<std::uint16_t>(page, node_page_offset::CELL_COUNT);
+  const auto first_child = page_view_detail::LoadLittleEndian<page_id_t>(page, node_page_offset::LINK);
+  return InternalPageView(page, separator_count, first_child);
 }
 
 auto InternalPageView::FindChildIndex(std::string_view key) const -> std::size_t {
   // upper_bound implements the inclusive lower bound of every right child:
   // child i owns [separator i-1, separator i).
-  const auto less = txn::BytewiseLess{};
   auto first = std::size_t{0};
   auto last = static_cast<std::size_t>(separator_count_);
   while (first < last) {
     const auto middle = first + (last - first) / 2;
-    if (!less(key, KeyAt(middle))) {
+    const auto order = txn::BytewiseCompare(key, KeyAt(middle));
+    if (order > 0) {
       first = middle + 1;
-    } else {
+    } else if (order < 0) {
       last = middle;
+    } else {
+      // Separators are unique. Equality therefore identifies upper_bound
+      // exactly, and the matching key belongs to the child on its right.
+      return middle + 1;
     }
   }
   return first;

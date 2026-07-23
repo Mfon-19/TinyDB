@@ -22,55 +22,83 @@ struct ReaderGateControl final {
   std::shared_ptr<const DatabaseState> state;
   bool publication_pending{false};  // admission is closed when true
 
-  // Admissions append in clock order. Intrusive links live in the lease's
-  // existing shared allocation, avoiding a second allocation per reader just
-  // to report the oldest-reader diagnostic.
-  SnapshotLease *oldest_reader{nullptr};
-  SnapshotLease *newest_reader{nullptr};
+  // Admissions append in clock order. Intrusive links live either in the
+  // shared cursor lease or in a point read's stack token, avoiding a separate
+  // diagnostic allocation.
+  ReaderGateAdmission *oldest_reader{nullptr};
+  ReaderGateAdmission *newest_reader{nullptr};
   std::size_t active_readers{0};
 };
 
 struct SnapshotLease final {
-  std::shared_ptr<ReaderGateControl> control;
-  std::shared_ptr<const DatabaseState> state;
-  Clock::time_point started_at{};
-  SnapshotLease *previous{nullptr};
-  SnapshotLease *next{nullptr};
-  bool admitted{false};
-
-  ~SnapshotLease() {
-    if (!admitted) {
-      return;
-    }
-
-    /*
-    ** The final shared token owns the one unlink. Count and oldest age change
-    ** under the same mutex, so diagnostics always describe one population.
-    */
-    auto lock = std::lock_guard(control->mutex);
-    TINYDB_CHECK(control->active_readers != 0, "reader gate active count underflow");
-    if (previous != nullptr) {
-      previous->next = next;
-    } else {
-      TINYDB_CHECK(control->oldest_reader == this, "reader gate lost its oldest reader");
-      control->oldest_reader = next;
-    }
-    if (next != nullptr) {
-      next->previous = previous;
-    } else {
-      TINYDB_CHECK(control->newest_reader == this, "reader gate lost its newest reader");
-      control->newest_reader = previous;
-    }
-    --control->active_readers;
-    if (control->active_readers == 0) {
-      control->changed.notify_all();
-    }
-  }
+  ReaderGateAdmission admission;
 };
+
+ReaderGateAdmission::~ReaderGateAdmission() {
+  if (!admitted) {
+    return;
+  }
+
+  /*
+  ** The owner of this admission performs the one unlink. Count and oldest age
+  ** change under the same mutex, so diagnostics always describe one population.
+  */
+  auto lock = std::lock_guard(control->mutex);
+  TINYDB_CHECK(control->active_readers != 0, "reader gate active count underflow");
+  if (previous != nullptr) {
+    previous->next = next;
+  } else {
+    TINYDB_CHECK(control->oldest_reader == this, "reader gate lost its oldest reader");
+    control->oldest_reader = next;
+  }
+  if (next != nullptr) {
+    next->previous = previous;
+  } else {
+    TINYDB_CHECK(control->newest_reader == this, "reader gate lost its newest reader");
+    control->newest_reader = previous;
+  }
+  --control->active_readers;
+  if (control->active_readers == 0) {
+    control->changed.notify_all();
+  }
+}
+
+namespace {
+
+void Admit(std::shared_ptr<ReaderGateControl> control, ReaderGateAdmission *admission) {
+  TINYDB_CHECK(control != nullptr && admission != nullptr && !admission->admitted,
+               "reader gate received an invalid admission");
+  admission->control = std::move(control);
+  auto *const gate = admission->control.get();
+
+  auto lock = std::unique_lock(gate->mutex);
+  gate->changed.wait(lock, [gate] { return !gate->publication_pending; });
+
+  // Capture the state and join the active set in one critical section. A
+  // publisher can therefore order this reader wholly before or after itself.
+  admission->state = gate->state;
+  admission->started_at = Clock::now();
+  admission->previous = gate->newest_reader;
+  if (gate->newest_reader != nullptr) {
+    gate->newest_reader->next = admission;
+  } else {
+    gate->oldest_reader = admission;
+  }
+  gate->newest_reader = admission;
+  ++gate->active_readers;
+  admission->admitted = true;
+}
+
+}  // namespace
 
 auto SnapshotToken::State() const -> const DatabaseState & {
   TINYDB_CHECK(lease_ != nullptr, "reading an empty snapshot token");
-  return *lease_->state;
+  return *lease_->admission.state;
+}
+
+auto ScopedSnapshotToken::State() const -> const DatabaseState & {
+  TINYDB_CHECK(admission_.admitted, "reading an empty scoped snapshot token");
+  return *admission_.state;
 }
 
 ReaderGate::ReaderGate(std::shared_ptr<const DatabaseState> initial_state)
@@ -83,26 +111,11 @@ auto ReaderGate::BeginRead() -> SnapshotToken {
   // Allocate the shared lease before admission. If allocation fails, the gate
   // has not incremented its reader count and needs no rollback.
   auto lease = std::make_shared<SnapshotLease>();
-  lease->control = control_;
-
-  auto lock = std::unique_lock(control_->mutex);
-  control_->changed.wait(lock, [this] { return !control_->publication_pending; });
-
-  // Capture the state and join the active set in one critical section. A
-  // publisher can therefore order this reader wholly before or after itself.
-  lease->state = control_->state;
-  lease->started_at = Clock::now();
-  lease->previous = control_->newest_reader;
-  if (control_->newest_reader != nullptr) {
-    control_->newest_reader->next = lease.get();
-  } else {
-    control_->oldest_reader = lease.get();
-  }
-  control_->newest_reader = lease.get();
-  ++control_->active_readers;
-  lease->admitted = true;
+  Admit(control_, &lease->admission);
   return SnapshotToken(std::move(lease));
 }
+
+void ReaderGate::BeginRead(ScopedSnapshotToken &snapshot) { Admit(control_, &snapshot.admission_); }
 
 auto ReaderGate::BeginPublication() noexcept -> PublicationGuard { return PublicationGuard(control_); }
 

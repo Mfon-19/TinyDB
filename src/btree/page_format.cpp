@@ -147,20 +147,6 @@ auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status {
   return ValidateTreePayload(page, *common);
 }
 
-auto ValidateTreePage(const PageHandle &page) -> Status {
-  const auto *const common = page.ValidatedHeader();
-  if (common == nullptr) {
-    return ValidateTreePage(page.Data(), page.Id());
-  }
-  if (common->page_id != page.Id()) {
-    return Status::Corruption("validated page header changed identity");
-  }
-  if (page.TreePayloadValidated()) {
-    return {};
-  }
-  return ValidateTreePayload(page.Data(), *common);
-}
-
 auto ValidateTreePagePayload(const char *page, const storage::DataPageHeader &validated_header) -> Status {
   return ValidateTreePayload(page, validated_header);
 }

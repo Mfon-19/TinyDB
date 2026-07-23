@@ -62,11 +62,11 @@ class SnapshotCursor final {
 
 /*
 ** Internal read-transaction core. PageReader is owned by DatabaseCore. Public
-** ReadTransaction holds this object for its full lifetime, and convenience
-** reads construct the same transaction temporarily. Returned point values are
-** owning copies. Cursor keys borrow the current page; value copies cross a
-** Result boundary now so overflow-chain I/O and corruption can use the same
-** API later without changing public ownership semantics.
+** ReadTransaction holds this object for its full lifetime. Database's
+** convenience point read uses a scoped admission without allocating the public
+** transaction wrapper. Returned point values are owning copies. Cursor keys
+** borrow the current page; value copies cross a Result boundary so overflow-
+** chain I/O and corruption retain the same ownership semantics.
 */
 class ReadSnapshot final {
  public:

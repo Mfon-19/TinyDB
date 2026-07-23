@@ -1,18 +1,43 @@
 #pragma once
 
+#include "btree/page_format.h"
+#include "util/check.h"
+
 #include <tinydb/status.h>
 #include "storage/page.h"
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string_view>
+#include <type_traits>
 
 #include "btree/value.h"
 
 namespace tinydb {
 
-class PageHandle;
+namespace page_view_detail {
+
+/*
+** PageView::Open has already proved every fixed field below lies inside its
+** immutable page. Keep hot accessors free of repeated bounds/optional work.
+*/
+template <typename Integer>
+auto LoadLittleEndian(const char *page, std::size_t offset) noexcept -> Integer {
+  static_assert(std::is_unsigned_v<Integer>);
+  auto value = Integer{};
+  std::memcpy(&value, page + offset, sizeof(value));
+  if constexpr (std::endian::native == std::endian::big) {
+    return std::byteswap(value);
+  } else {
+    static_assert(std::endian::native == std::endian::little);
+    return value;
+  }
+}
+
+}  // namespace page_view_detail
 
 /*
 ** BORROWED PAGE VIEWS
@@ -34,18 +59,48 @@ class LeafPageView {
   auto Count() const -> std::size_t { return cell_count_; }
   auto NextLeaf() const -> page_id_t { return next_leaf_; }
 
-  auto KeyAt(std::size_t index) const -> std::string_view;
-  auto ValueAt(std::size_t index) const -> LeafValueView;
+  auto KeyAt(std::size_t index) const -> std::string_view {
+    const auto offset = CellOffset(index);
+    const auto key_bytes =
+        page_view_detail::LoadLittleEndian<std::uint16_t>(page_, offset + leaf_cell_offset::KEY_BYTES);
+    return {page_ + offset + LEAF_CELL_HEADER_SIZE, key_bytes};
+  }
+
+  auto ValueAt(std::size_t index) const -> LeafValueView {
+    const auto offset = CellOffset(index);
+    const auto key_bytes =
+        page_view_detail::LoadLittleEndian<std::uint16_t>(page_, offset + leaf_cell_offset::KEY_BYTES);
+    const auto value_bytes =
+        page_view_detail::LoadLittleEndian<std::uint16_t>(page_, offset + leaf_cell_offset::VALUE_BYTES);
+    const auto value_offset = offset + LEAF_CELL_HEADER_SIZE + key_bytes;
+    const auto kind = static_cast<LeafValueKind>(page_[offset + leaf_cell_offset::VALUE_KIND]);
+    if (kind == LeafValueKind::Inline) {
+      return LeafValueView::Inline(std::string_view{page_ + value_offset, value_bytes});
+    }
+
+    return LeafValueView::Overflow(OverflowValueDescriptor{
+        .total_value_bytes = page_view_detail::LoadLittleEndian<std::uint64_t>(
+            page_, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES),
+        .first_page_id = page_view_detail::LoadLittleEndian<page_id_t>(
+            page_, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID),
+        .value_checksum = page_view_detail::LoadLittleEndian<std::uint32_t>(
+            page_, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM),
+    });
+  }
+
   auto LowerBound(std::string_view key) const -> std::size_t;
   auto Get(std::string_view key) const -> std::optional<LeafValueView>;
 
  private:
-  static auto OpenValidated(const char *page) -> Result<LeafPageView>;
+  static auto OpenValidated(const char *page, std::uint16_t raw_type) -> Result<LeafPageView>;
 
   LeafPageView(const char *page, std::uint16_t cell_count, page_id_t next_leaf)
       : page_(page), cell_count_(cell_count), next_leaf_(next_leaf) {}
 
-  auto CellOffset(std::size_t index) const -> std::size_t;
+  auto CellOffset(std::size_t index) const -> std::size_t {
+    TINYDB_CHECK(index < cell_count_, "leaf record index out of range");
+    return page_view_detail::LoadLittleEndian<slot_t>(page_, LEAF_HEADER_SIZE + index * SLOT_SIZE);
+  }
 
   const char *page_;
   std::uint16_t cell_count_;
@@ -59,18 +114,37 @@ class InternalPageView {
   static auto Open(const PageHandle &page) -> Result<InternalPageView>;
 
   auto SeparatorCount() const -> std::size_t { return separator_count_; }
-  auto KeyAt(std::size_t index) const -> std::string_view;
-  auto ChildAt(std::size_t child_index) const -> page_id_t;
+
+  auto KeyAt(std::size_t index) const -> std::string_view {
+    const auto offset = CellOffset(index);
+    const auto key_bytes =
+        page_view_detail::LoadLittleEndian<std::uint16_t>(page_, offset + internal_cell_offset::KEY_BYTES);
+    return {page_ + offset + INTERNAL_CELL_HEADER_SIZE, key_bytes};
+  }
+
+  auto ChildAt(std::size_t child_index) const -> page_id_t {
+    // Child zero is LINK; child i>0 belongs to separator i-1.
+    TINYDB_CHECK(child_index <= separator_count_, "internal child index out of range");
+    return child_index == 0 ? first_child_ : RightChildAt(child_index - 1);
+  }
+
   auto FindChildIndex(std::string_view key) const -> std::size_t;
 
  private:
-  static auto OpenValidated(const char *page) -> Result<InternalPageView>;
+  static auto OpenValidated(const char *page, std::uint16_t raw_type) -> Result<InternalPageView>;
 
   InternalPageView(const char *page, std::uint16_t separator_count, page_id_t first_child)
       : page_(page), separator_count_(separator_count), first_child_(first_child) {}
 
-  auto CellOffset(std::size_t index) const -> std::size_t;
-  auto RightChildAt(std::size_t index) const -> page_id_t;
+  auto CellOffset(std::size_t index) const -> std::size_t {
+    TINYDB_CHECK(index < separator_count_, "internal separator index out of range");
+    return page_view_detail::LoadLittleEndian<slot_t>(page_, INTERNAL_HEADER_SIZE + index * SLOT_SIZE);
+  }
+
+  auto RightChildAt(std::size_t index) const -> page_id_t {
+    const auto offset = CellOffset(index);
+    return page_view_detail::LoadLittleEndian<page_id_t>(page_, offset + internal_cell_offset::RIGHT_CHILD);
+  }
 
   const char *page_;
   std::uint16_t separator_count_;

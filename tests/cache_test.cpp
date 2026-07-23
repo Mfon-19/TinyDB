@@ -102,6 +102,26 @@ TEST(Cache, Pins) {
   tinydb::test::Remove(path);
 }
 
+TEST(Cache, PinnedLruTailDoesNotBlockAnotherVictim) {
+  const auto path = Path("cache_pinned_lru_tail");
+  tinydb::test::Remove(path);
+  auto disk = tinydb::DiskManager::Open(path).value();
+  WritePages(disk, 3);
+  auto cache = tinydb::cache::CommittedPageCache(&disk, 2U * tinydb::PAGE_SIZE, 1);
+
+  auto pinned = cache.Read(2);
+  ASSERT_TRUE(pinned.has_value());
+  ASSERT_TRUE(cache.Read(3).has_value());
+  ASSERT_TRUE(cache.Read(4).has_value());
+
+  const auto stats = cache.Stats();
+  EXPECT_EQ(stats.evictions, 1U);
+  EXPECT_EQ(stats.resident_pages, 2U);
+  EXPECT_EQ(stats.pinned_pages, 1U);
+  EXPECT_TRUE(cache.Read(2).has_value());
+  tinydb::test::Remove(path);
+}
+
 TEST(Cache, Checkpoint) {
   const auto path = Path("cache_checkpoint");
   tinydb::test::Remove(path);

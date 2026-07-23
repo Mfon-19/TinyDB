@@ -181,7 +181,7 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
       return std::unexpected(page.error());
     }
     ++report.pages_checked;
-    const auto type = RawNodeType(page->Data());
+    const auto type = RawNodeType(*page);
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
       const auto leaf = LeafPageView::Open(*page);
       if (!leaf) {

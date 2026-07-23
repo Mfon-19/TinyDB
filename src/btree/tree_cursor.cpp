@@ -58,26 +58,6 @@ auto BTreeCursor::Seek(PageReader *pages, page_id_t root_page_id, page_id_t high
   return cursor;
 }
 
-auto BTreeCursor::Key() const -> std::string_view {
-  TINYDB_CHECK(Valid(), "reading key from an invalid tree cursor");
-  return leaf_->KeyAt(index_);
-}
-
-auto BTreeCursor::Value() const -> LeafValueView {
-  TINYDB_CHECK(Valid(), "reading value from an invalid tree cursor");
-  return leaf_->ValueAt(index_);
-}
-
-auto BTreeCursor::Next() -> Status {
-  TINYDB_CHECK(Valid(), "advancing an invalid tree cursor");
-  ++index_;
-  if (index_ < leaf_->Count()) {
-    return {};
-  }
-
-  return AdvanceToNonEmptyLeaf(leaf_->NextLeaf());
-}
-
 auto BTreeCursor::OpenInitialLeaf(PageHandle page, std::size_t index) -> Status {
   if (auto status = ValidateLeafId(page.Id()); !status.Ok()) {
     return status;

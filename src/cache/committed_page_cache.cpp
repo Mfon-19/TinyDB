@@ -8,9 +8,7 @@
 #include "storage/page_codec.h"
 
 #include <algorithm>
-#include <atomic>
 #include <expected>
-#include <limits>
 #include <mutex>
 #include <utility>
 
@@ -23,70 +21,41 @@ namespace tinydb::cache {
 ** eviction eligibility, not visibility.
 */
 struct CommittedFrame final {
-  using LastUnpin = void (*)(void *owner, CommittedFrame *frame) noexcept;
-
   CommittedFrame(storage::DataPageHeader initial_header, std::unique_ptr<PageBytes> initial_bytes,
-                 bool initial_tree_payload_validated, bool initially_checkpointed, void *initial_eviction_owner,
-                 LastUnpin initial_last_unpin)
-      : page_id(initial_header.page_id),
-        header(std::move(initial_header)),
+                 bool initial_tree_payload_validated, bool initially_checkpointed)
+      : header(std::move(initial_header)),
         bytes(std::move(initial_bytes)),
         tree_payload_validated(initial_tree_payload_validated),
-        checkpointed(initially_checkpointed),
-        eviction_owner(initial_eviction_owner),
-        last_unpin(initial_last_unpin) {}
+        checkpointed(initially_checkpointed) {}
 
-  void ReleasePin() noexcept {
-    const auto previous = pin_count.fetch_sub(1, std::memory_order_acq_rel);
-    TINYDB_CHECK(previous != 0, "committed-page pin count underflow");
-    // Dirty frames are not candidates. If checkpointing races this release,
-    // either MarkCheckpointed observes zero pins and links the frame itself,
-    // or this acquire observes its newly published checkpoint flag.
-    if (previous == 1 && checkpointed.load(std::memory_order_acquire)) {
-      last_unpin(eviction_owner, this);
-    }
-  }
-
-  page_id_t page_id;                 // physical page identity
   storage::DataPageHeader header;    // checksum-authenticated common fields
   std::unique_ptr<PageBytes> bytes;  // immutable after construction
   bool tree_payload_validated;       // complete slot/cell proof for tree pages
 
-  // Pins and checkpoint status are cache metadata, not page contents. The
-  // encoded bytes remain const after this object is constructed.
-  mutable std::atomic<std::size_t> pin_count{0};
-  std::atomic<bool> checkpointed{false};
+  // Shared ownership supplies the pin count. The table owns one reference and
+  // every PageHandle keepalive owns one more.
+  bool checkpointed{false};
 
   /*
-  ** EVICTABLE LRU LINKS
+  ** CHECKPOINTED LRU LINKS
   **
-  ** Only current, checkpointed, unpinned frames belong to this intrusive
-  ** list.  newer points toward the MRU end and older toward the LRU end. The
-  ** links live in the frame, so touching, pinning, unpinning, replacement,
-  ** and victim removal never allocate.
+  ** Every current checkpointed frame belongs to this intrusive list, including
+  ** a temporarily pinned one. newer points toward the MRU end and older toward
+  ** the LRU end. Eviction skips pins; release therefore only drops shared
+  ** ownership and never reacquires the cache mutex.
   */
   CommittedFrame *newer{nullptr};
   CommittedFrame *older{nullptr};
-  bool evictable{false};
-
-  // PageHandle releases without knowing the cache's private Impl type.
-  void *eviction_owner;
-  LastUnpin last_unpin;
+  bool in_lru{false};
 };
 
 namespace {
 
 auto Lease(std::shared_ptr<CommittedFrame> frame) -> PageHandle {
   TINYDB_CHECK(frame != nullptr, "leasing a null committed frame");
-  auto keeper = std::static_pointer_cast<const void>(frame);
   auto *const leased = frame.get();
-  const auto release = [](void *owner, page_id_t page_id, bool dirty) {
-    auto *const released = static_cast<CommittedFrame *>(owner);
-    TINYDB_CHECK(released->page_id == page_id, "committed-page lease changed identity");
-    TINYDB_CHECK(!dirty, "immutable committed page was marked dirty");
-    released->ReleasePin();
-  };
-  return PageHandle(leased, leased->page_id, leased->bytes->data(), release, std::move(keeper), &leased->header,
+  auto keeper = std::static_pointer_cast<const void>(std::move(frame));
+  return PageHandle(leased->header.page_id, leased->bytes->data(), std::move(keeper), &leased->header,
                     leased->tree_payload_validated);
 }
 
@@ -109,16 +78,10 @@ struct CommittedPageCache::Impl final {
   Impl(DiskManager *database_file, std::size_t byte_target, std::uint64_t initial_checkpoint_lsn)
       : disk(database_file), target_bytes(byte_target), checkpoint_lsn(initial_checkpoint_lsn) {}
 
-  static void LastUnpin(void *owner, CommittedFrame *frame) noexcept {
-    static_cast<Impl *>(owner)->MakeEvictableAfterUnpin(frame);
-  }
-
   void LinkMostRecent(CommittedFrame *frame) {
-    TINYDB_CHECK(frame != nullptr && !frame->evictable && frame->newer == nullptr && frame->older == nullptr,
-                 "linking a page already present in the eviction queue");
-    TINYDB_CHECK(
-        frame->pin_count.load(std::memory_order_acquire) == 0 && frame->checkpointed.load(std::memory_order_acquire),
-        "linking a pinned or uncheckpointed eviction candidate");
+    TINYDB_CHECK(frame != nullptr && !frame->in_lru && frame->newer == nullptr && frame->older == nullptr,
+                 "linking a page already present in the LRU");
+    TINYDB_CHECK(frame->checkpointed, "linking an uncheckpointed eviction candidate");
 
     frame->older = most_recent;
     if (most_recent != nullptr) {
@@ -127,11 +90,11 @@ struct CommittedPageCache::Impl final {
       least_recent = frame;
     }
     most_recent = frame;
-    frame->evictable = true;
+    frame->in_lru = true;
   }
 
   void Unlink(CommittedFrame *frame) {
-    TINYDB_CHECK(frame != nullptr && frame->evictable, "unlinking a page absent from the eviction queue");
+    TINYDB_CHECK(frame != nullptr && frame->in_lru, "unlinking a page absent from the LRU");
     if (frame->newer != nullptr) {
       frame->newer->older = frame->older;
     } else {
@@ -146,40 +109,43 @@ struct CommittedPageCache::Impl final {
     }
     frame->newer = nullptr;
     frame->older = nullptr;
-    frame->evictable = false;
+    frame->in_lru = false;
   }
 
-  void Pin(const std::shared_ptr<CommittedFrame> &frame) {
-    // A first pin removes the frame from the victim queue. Further pins need
-    // no queue work; the final release adds the current frame back at MRU.
-    const auto previous = frame->pin_count.fetch_add(1, std::memory_order_acq_rel);
-    if (previous == 0 && frame->evictable) {
-      Unlink(frame.get());
-    }
-    TINYDB_CHECK(previous != std::numeric_limits<std::size_t>::max(), "committed-page pin count overflow");
-  }
-
-  void MakeEvictableAfterUnpin(CommittedFrame *frame) noexcept {
-    auto lock = std::lock_guard(mutex);
-    if (frame->pin_count.load(std::memory_order_acquire) != 0 || frame->evictable ||
-        !frame->checkpointed.load(std::memory_order_acquire) || frame->page_id >= pages.size() ||
-        pages[frame->page_id].get() != frame) {
+  void Touch(CommittedFrame *frame) {
+    TINYDB_CHECK(frame != nullptr && frame->in_lru, "touching a page absent from the LRU");
+    if (frame == most_recent) {
       return;
     }
+    Unlink(frame);
     LinkMostRecent(frame);
   }
 
+  void RecordAccess(const std::shared_ptr<CommittedFrame> &frame) {
+    if (frame->in_lru) {
+      Touch(frame.get());
+    }
+  }
+
   auto TryEvictOne() -> bool {
-    // Queue membership is the eligibility test. The tail is therefore a
-    // complete victim decision rather than the beginning of a page-table scan.
-    auto *const victim = least_recent;
+    // Pinned frames remain linked so their final release needs no mutex. In
+    // ordinary use they are near the MRU end, leaving victim selection O(1);
+    // a long-lived reader may require a short walk past its pinned frames.
+    auto *victim = least_recent;
+    while (victim != nullptr) {
+      const auto page_id = victim->header.page_id;
+      TINYDB_CHECK(page_id < pages.size() && pages[page_id].get() == victim, "LRU contains a stale frame");
+      if (pages[page_id].use_count() == 1) {
+        break;
+      }
+      victim = victim->newer;
+    }
     if (victim == nullptr) {
       return false;
     }
-    TINYDB_CHECK(victim->page_id < pages.size() && pages[victim->page_id].get() == victim,
-                 "eviction queue contains a stale frame");
+    const auto victim_page_id = victim->header.page_id;
     Unlink(victim);
-    pages[victim->page_id].reset();
+    pages[victim_page_id].reset();
     --resident_pages;
     ++evictions;
     return true;
@@ -208,7 +174,7 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageHandle> {
   auto lock = std::lock_guard(impl_->mutex);
   if (page_id < impl_->pages.size() && impl_->pages[page_id] != nullptr) {
     ++impl_->hits;
-    impl_->Pin(impl_->pages[page_id]);
+    impl_->RecordAccess(impl_->pages[page_id]);
     return Lease(impl_->pages[page_id]);
   }
   ++impl_->misses;
@@ -241,15 +207,14 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageHandle> {
     }
   }
 
-  auto frame =
-      std::make_shared<CommittedFrame>(*header, std::move(bytes), tree_page, true, impl_.get(), &Impl::LastUnpin);
+  auto frame = std::make_shared<CommittedFrame>(*header, std::move(bytes), tree_page, true);
   if (page_id >= impl_->pages.size()) {
     impl_->pages.resize(page_id + 1);
   }
   TINYDB_CHECK(impl_->pages[page_id] == nullptr, "cache miss raced with an existing page under its mutex");
   impl_->pages[page_id] = frame;
   ++impl_->resident_pages;
-  impl_->Pin(frame);
+  impl_->LinkMostRecent(frame.get());
   return Lease(std::move(frame));
 }
 
@@ -300,8 +265,7 @@ auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> imag
       return std::unexpected(Status::InvalidArgument("committed page version moves backward"));
     }
     frames.push_back(std::make_shared<CommittedFrame>(*header, std::move(image.bytes), tree_page,
-                                                      image.page_lsn <= impl_->checkpoint_lsn, impl_.get(),
-                                                      &Impl::LastUnpin));
+                                                      image.page_lsn <= impl_->checkpoint_lsn));
   }
   previous_page_id = HEADER_PAGE_ID;
   auto image_index = std::size_t{0};
@@ -326,31 +290,29 @@ void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
     if (impl_->pages[page_id] == nullptr) {
       continue;
     }
-    TINYDB_CHECK(impl_->pages[page_id]->pin_count.load(std::memory_order_acquire) == 0,
-                 "retiring a pinned committed page");
-    if (impl_->pages[page_id]->evictable) {
+    TINYDB_CHECK(impl_->pages[page_id].use_count() == 1, "retiring a pinned committed page");
+    if (impl_->pages[page_id]->in_lru) {
       impl_->Unlink(impl_->pages[page_id].get());
     }
-    impl_->dirty_pages -= !impl_->pages[page_id]->checkpointed.load(std::memory_order_acquire) ? 1U : 0U;
+    impl_->dirty_pages -= !impl_->pages[page_id]->checkpointed ? 1U : 0U;
     impl_->pages[page_id].reset();
     --impl_->resident_pages;
   }
   for (auto &frame : plan.frames_) {
-    auto &current = impl_->pages[frame->page_id];
+    auto &current = impl_->pages[frame->header.page_id];
     TINYDB_CHECK(current == nullptr || current->header.page_lsn <= frame->header.page_lsn,
                  "prepared publication regressed a page version");
     if (current == nullptr) {
       ++impl_->resident_pages;
     } else {
-      impl_->dirty_pages -= !current->checkpointed.load(std::memory_order_acquire) ? 1U : 0U;
-      if (current->evictable) {
+      impl_->dirty_pages -= !current->checkpointed ? 1U : 0U;
+      if (current->in_lru) {
         impl_->Unlink(current.get());
       }
     }
     current = std::move(frame);
-    impl_->dirty_pages += !current->checkpointed.load(std::memory_order_acquire) ? 1U : 0U;
-    if (current->checkpointed.load(std::memory_order_acquire) &&
-        current->pin_count.load(std::memory_order_acquire) == 0) {
+    impl_->dirty_pages += !current->checkpointed ? 1U : 0U;
+    if (current->checkpointed) {
       impl_->LinkMostRecent(current.get());
     }
   }
@@ -365,12 +327,11 @@ void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
   // Only versions at or below the new frontier are now reproducible from the
   // database file. Later committed versions remain WAL-backed and non-evictable.
   for (const auto &page : impl_->pages) {
-    if (page != nullptr && !page->checkpointed.load(std::memory_order_acquire) &&
-        page->header.page_lsn <= checkpoint_lsn) {
-      page->checkpointed.store(true, std::memory_order_release);
+    if (page != nullptr && !page->checkpointed && page->header.page_lsn <= checkpoint_lsn) {
+      page->checkpointed = true;
       TINYDB_CHECK(impl_->dirty_pages != 0, "committed cache dirty-page count underflow");
       --impl_->dirty_pages;
-      if (page->pin_count.load(std::memory_order_acquire) == 0 && !page->evictable) {
+      if (!page->in_lru) {
         impl_->LinkMostRecent(page.get());
       }
     }
@@ -389,7 +350,7 @@ auto CommittedPageCache::CaptureCheckpointPages(std::uint64_t checkpoint_lsn,
   result.reserve(impl_->dirty_pages);
   for (const auto &page : impl_->pages) {
     if (page != nullptr && page->header.page_lsn > checkpoint_lsn && page->header.page_lsn <= target_lsn) {
-      impl_->Pin(page);
+      impl_->RecordAccess(page);
       result.push_back(Lease(page));
     }
   }
@@ -408,7 +369,7 @@ auto CommittedPageCache::Stats() const -> CommittedCacheStats {
     if (page == nullptr) {
       continue;
     }
-    pinned_pages += page->pin_count.load(std::memory_order_acquire) != 0 ? 1U : 0U;
+    pinned_pages += page.use_count() > 1 ? 1U : 0U;
   }
   return CommittedCacheStats{
       .target_bytes = impl_->target_bytes,

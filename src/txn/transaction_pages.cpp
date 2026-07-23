@@ -167,9 +167,10 @@ auto TransactionPages::AllocateHighWaterPage() -> Result<PrivateFrame *> {
   if (resulting_state_.high_water_page_id == std::numeric_limits<page_id_t>::max()) {
     return std::unexpected(Status::ResourceExhausted("page ID space exhausted"));
   }
-  // This is logical growth only. DiskManager extends the file after commit.
+  // This is logical growth only. The high-water mark lives in DatabaseState,
+  // so extending it does not require rewriting an unchanged free-extent index.
+  // DiskManager extends the physical file after commit.
   const auto page_id = resulting_state_.high_water_page_id++;
-  allocator_dirty_ = true;
   auto page = CreatePrivatePage(page_id, true);
   if (!page) {
     --resulting_state_.high_water_page_id;
@@ -247,8 +248,8 @@ auto TransactionPages::ChargeValueBytes(std::size_t bytes) -> Status {
 auto TransactionPages::LoadFreeExtents() -> Status {
   auto page_id = base_state_.allocator_root_page_id;
   auto visited = std::unordered_set<page_id_t>{};
-  // Bounds, cycles, and global ordering are proven before any extent becomes
-  // available to Allocate.
+  // Bounds, cycles, and global extent ordering are proven before any extent
+  // becomes available to Allocate.
   while (page_id != HEADER_PAGE_ID) {
     if (page_id >= base_state_.high_water_page_id || !visited.insert(page_id).second) {
       return Status::Corruption("free-extent index contains an invalid link");
@@ -291,25 +292,26 @@ auto TransactionPages::LoadFreeExtents() -> Status {
 ** can never permit reuse too early.
 */
 void TransactionPages::AddRetiredExtents(std::uint64_t retire_lsn) {
-  auto retired = std::vector<page_id_t>(retired_page_ids_.begin(), retired_page_ids_.end());
-  std::ranges::sort(retired);
-  for (const auto page_id : retired) {
+  free_extents_.reserve(free_extents_.size() + retired_page_ids_.size());
+  for (const auto page_id : retired_page_ids_) {
     free_extents_.push_back(storage::FreeExtent{.first_page_id = page_id, .page_count = 1, .retire_lsn = retire_lsn});
   }
   std::ranges::sort(free_extents_, {}, &storage::FreeExtent::first_page_id);
 
   // Adjacent extents inherit the newer retirement LSN. Delayed reuse is safe;
-  // early reuse would not be.
-  auto coalesced = std::vector<storage::FreeExtent>{};
-  for (const auto &extent : free_extents_) {
-    if (!coalesced.empty() && coalesced.back().first_page_id + coalesced.back().page_count == extent.first_page_id) {
-      coalesced.back().page_count += extent.page_count;
-      coalesced.back().retire_lsn = std::max(coalesced.back().retire_lsn, extent.retire_lsn);
+  // early reuse would not be. Compact in place because the input is no longer
+  // needed after sorting.
+  auto output = std::size_t{0};
+  for (const auto extent : free_extents_) {
+    if (output != 0 &&
+        free_extents_[output - 1].first_page_id + free_extents_[output - 1].page_count == extent.first_page_id) {
+      free_extents_[output - 1].page_count += extent.page_count;
+      free_extents_[output - 1].retire_lsn = std::max(free_extents_[output - 1].retire_lsn, extent.retire_lsn);
     } else {
-      coalesced.push_back(extent);
+      free_extents_[output++] = extent;
     }
   }
-  free_extents_ = std::move(coalesced);
+  free_extents_.resize(output);
 }
 
 auto TransactionPages::StoreFreeExtentIndex(std::uint64_t page_lsn) -> Status {

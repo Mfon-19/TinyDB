@@ -3,6 +3,7 @@
 #include <tinydb/bytes.h>
 #include <tinydb/status.h>
 
+#include "btree/page_source.h"
 #include "btree/value.h"
 #include "storage/page_codec.h"
 #include "txn/contract.h"
@@ -11,8 +12,6 @@
 #include <cstdint>
 
 namespace tinydb {
-
-class PageHandle;
 
 /*
 ** B+ TREE PAGE FORMAT
@@ -89,13 +88,33 @@ inline constexpr std::size_t INTERNAL_CELL_HEADER_SIZE = internal_cell_offset::H
 
 auto RawNodeType(const char *page) -> std::uint16_t;
 
+inline auto RawNodeType(const PageHandle &page) -> std::uint16_t {
+  if (const auto *const common = page.ValidatedHeader(); common != nullptr) {
+    return static_cast<std::uint16_t>(common->type);
+  }
+  return RawNodeType(page.Data());
+}
+
 // Validates the common header plus all tree-local structural invariants.
 auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status;
-auto ValidateTreePage(const PageHandle &page) -> Status;
 
 // Validate tree-local bytes using an already authenticated common header.
 // Immutable caches use this once at admission and retain the resulting proof.
 auto ValidateTreePagePayload(const char *page, const storage::DataPageHeader &validated_header) -> Status;
+
+inline auto ValidateTreePage(const PageHandle &page) -> Status {
+  const auto *const common = page.ValidatedHeader();
+  if (common == nullptr) {
+    return ValidateTreePage(page.Data(), page.Id());
+  }
+  if (common->page_id != page.Id()) {
+    return Status::Corruption("validated page header changed identity");
+  }
+  if (page.TreePayloadValidated()) {
+    return {};
+  }
+  return ValidateTreePagePayload(page.Data(), *common);
+}
 
 // One record at or below half the usable bytes guarantees that every
 // overflowing builder has a legal split boundary. Overflow descriptors keep a

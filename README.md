@@ -158,7 +158,7 @@ transaction paths as the explicit API.
 | Maximum key | 1,024 bytes |
 | Maximum value | 4 MiB |
 | Persistent page size | 4,096 bytes |
-| Default committed-page cache target | 256 KiB, configurable |
+| Default committed-page cache target | 16 MiB, configurable |
 | Default write-transaction memory limit | 16 MiB, configurable |
 | Concurrent owning processes | 1 |
 | Concurrent write transactions | 1 |

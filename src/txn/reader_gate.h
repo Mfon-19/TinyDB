@@ -15,6 +15,30 @@ struct ReaderGateControl;
 struct SnapshotLease;
 
 /*
+** One admitted reader node. Shared SnapshotTokens place it in SnapshotLease;
+** a convenience point read places it directly on its stack. Its address may
+** not change while admitted because the gate's diagnostic list is intrusive.
+*/
+struct ReaderGateAdmission final {
+  ReaderGateAdmission() = default;
+  ReaderGateAdmission(const ReaderGateAdmission &) = delete;
+  auto operator=(const ReaderGateAdmission &) -> ReaderGateAdmission & = delete;
+  ReaderGateAdmission(ReaderGateAdmission &&) = delete;
+  auto operator=(ReaderGateAdmission &&) -> ReaderGateAdmission & = delete;
+  ~ReaderGateAdmission();
+
+  // Retaining the control makes destruction safe even if the ReaderGate owner
+  // itself has gone away. The pointer does not allocate; it shares the gate's
+  // existing control block.
+  std::shared_ptr<ReaderGateControl> control;
+  std::shared_ptr<const DatabaseState> state;
+  std::chrono::steady_clock::time_point started_at{};
+  ReaderGateAdmission *previous{nullptr};
+  ReaderGateAdmission *next{nullptr};
+  bool admitted{false};
+};
+
+/*
 ** READER ADMISSION AND PUBLICATION
 **
 ** The gate gives many readers one immutable DatabaseState while allowing one
@@ -50,6 +74,28 @@ class SnapshotToken final {
   friend class ReaderGate;
 };
 
+/*
+** Non-shareable admission for an owning point result. Database::Get keeps this
+** object at one stable stack address until the copied value is complete,
+** avoiding a shared-lease allocation when no cursor can escape.
+*/
+class ScopedSnapshotToken final {
+ public:
+  ScopedSnapshotToken() = default;
+  ScopedSnapshotToken(const ScopedSnapshotToken &) = delete;
+  auto operator=(const ScopedSnapshotToken &) -> ScopedSnapshotToken & = delete;
+  ScopedSnapshotToken(ScopedSnapshotToken &&) = delete;
+  auto operator=(ScopedSnapshotToken &&) -> ScopedSnapshotToken & = delete;
+  ~ScopedSnapshotToken() = default;
+
+  auto State() const -> const DatabaseState &;
+
+ private:
+  ReaderGateAdmission admission_;
+
+  friend class ReaderGate;
+};
+
 struct ReaderGateStats {
   std::size_t active_readers{0};
   bool publication_pending{false};
@@ -64,6 +110,7 @@ class ReaderGate final {
   auto operator=(const ReaderGate &) -> ReaderGate & = delete;
 
   auto BeginRead() -> SnapshotToken;
+  void BeginRead(ScopedSnapshotToken &snapshot);
   auto BeginPublication() noexcept -> PublicationGuard;
   auto CurrentState() const -> std::shared_ptr<const DatabaseState>;
   void AdvanceCheckpoint(std::uint64_t checkpoint_lsn);

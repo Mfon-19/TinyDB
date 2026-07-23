@@ -182,6 +182,7 @@ auto DecodeRecord(std::span<const std::byte> bytes) -> Result<Record>;
 ** transaction's visible LSN to its commit record. Decode rejects any missing,
 ** duplicated, reordered, corrupt, or trailing record.
 */
+// Page images must be in strictly increasing page-ID order.
 auto EncodeTransaction(std::uint64_t transaction_id, std::uint64_t first_lsn, std::span<const PageImageView> pages,
                        txn::DatabaseState state) -> Result<EncodedTransaction>;
 auto DecodeTransaction(std::span<const std::byte> bytes,

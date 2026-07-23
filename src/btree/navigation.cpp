@@ -32,7 +32,7 @@ auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child
     if (!page) {
       return std::unexpected(std::move(page).error());
     }
-    const auto type = RawNodeType(page->Data());
+    const auto type = RawNodeType(*page);
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
       // The consumer opens and validates this leaf while retaining the same
       // lease. Returning it avoids a second cache lookup and pin cycle.

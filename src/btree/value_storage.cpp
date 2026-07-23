@@ -161,15 +161,11 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
   });
 }
 
-/* Copy and authenticate one logical value. No borrowed page bytes escape. */
-auto CopyValue(PageReader *pages, LeafValueView value) -> Result<std::string> {
-  if (!value.IsOverflow()) {
-    return std::string(value.InlineBytes());
-  }
-
+/* Copy and authenticate one overflow value. No borrowed page bytes escape. */
+auto CopyOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor) -> Result<std::string> {
   auto output = std::string{};
-  output.reserve(static_cast<std::size_t>(value.Size()));
-  const auto status = WalkOverflowValue(pages, value.OverflowDescriptor(), ChainConstraints{},
+  output.reserve(static_cast<std::size_t>(descriptor.total_value_bytes));
+  const auto status = WalkOverflowValue(pages, descriptor, ChainConstraints{},
                                         [&output](page_id_t, std::span<const std::byte> payload) {
                                           output.append(reinterpret_cast<const char *>(payload.data()), payload.size());
                                           return Status{};

@@ -28,12 +28,19 @@ class PageSource;
 ** every physical overflow page belongs to exactly one leaf value.
 */
 auto PrepareValue(PageSource *pages, std::string_view key, std::string_view value) -> Result<LeafValue>;
-auto CopyValue(PageReader *pages, LeafValueView value) -> Result<std::string>;
+auto CopyOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor) -> Result<std::string>;
+
+inline auto CopyValue(PageReader *pages, LeafValueView value) -> Result<std::string> {
+  if (!value.IsOverflow()) {
+    return std::string(value.InlineBytes());
+  }
+  return CopyOverflowValue(pages, value.OverflowDescriptor());
+}
+
 auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descriptor) -> Status;
 
 auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, page_id_t high_water_page_id,
-                           std::uint64_t maximum_page_lsn,
-                           const std::unordered_set<page_id_t> &free_pages,
+                           std::uint64_t maximum_page_lsn, const std::unordered_set<page_id_t> &free_pages,
                            const std::unordered_set<page_id_t> &allocator_pages,
                            std::unordered_set<page_id_t> *claimed_pages) -> Status;
 

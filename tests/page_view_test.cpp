@@ -31,20 +31,29 @@ TEST(Page, LeafSearch) {
   builder.Upsert("alpha", tinydb::LeafValue::Inline("one"));
   builder.Upsert("middle", tinydb::LeafValue::Inline("two"));
   builder.Upsert("omega", tinydb::LeafValue::Inline("three"));
+  const auto overflow = tinydb::OverflowValueDescriptor{
+      .total_value_bytes = 8U << 10U,
+      .first_page_id = 9,
+      .value_checksum = 0x12345678U,
+  };
+  builder.Upsert("overflow", tinydb::LeafValue::Overflow(overflow));
   builder.Store(page.data(), 2);
 
   const auto view = tinydb::LeafPageView::Open(page.data(), 2);
   ASSERT_TRUE(view.has_value()) << view.error().ToString();
-  EXPECT_EQ(view->Count(), 3U);
+  EXPECT_EQ(view->Count(), 4U);
   EXPECT_EQ(view->NextLeaf(), tinydb::HEADER_PAGE_ID);
   EXPECT_EQ(view->KeyAt(0), "alpha");
   EXPECT_EQ(view->ValueAt(1).InlineBytes(), "two");
   EXPECT_EQ(view->LowerBound(""), 0U);
   EXPECT_EQ(view->LowerBound("middle"), 1U);
   EXPECT_EQ(view->LowerBound("middle!"), 2U);
-  EXPECT_EQ(view->LowerBound("zulu"), 3U);
+  EXPECT_EQ(view->LowerBound("zulu"), 4U);
   ASSERT_TRUE(view->Get("omega").has_value());
   EXPECT_EQ(view->Get("omega")->InlineBytes(), "three");
+  ASSERT_TRUE(view->Get("overflow").has_value());
+  EXPECT_TRUE(view->Get("overflow")->IsOverflow());
+  EXPECT_EQ(view->Get("overflow")->OverflowDescriptor(), overflow);
   EXPECT_EQ(view->Get("missing"), std::nullopt);
 
   const auto value = view->ValueAt(0);

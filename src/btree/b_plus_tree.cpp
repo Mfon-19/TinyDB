@@ -1,6 +1,7 @@
 #include "btree/b_plus_tree.h"
 #include "util/check.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -8,7 +9,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 #include "internal_page_builder.h"
 #include "leaf_page_builder.h"
@@ -46,33 +46,47 @@
 namespace tinydb {
 namespace {
 
-auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key) -> Result<std::vector<page_id_t>> {
+struct DescentPath final {
+  static constexpr auto MAX_DEPTH = std::size_t{64};
+
+  auto Back() const -> page_id_t {
+    TINYDB_CHECK(size != 0, "reading an empty tree descent path");
+    return pages[size - 1];
+  }
+
+  std::array<page_id_t, MAX_DEPTH> pages;
+  std::size_t size{0};
+};
+
+auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key, DescentPath *path) -> Status {
   // Retain page ids, not page handles: each level is released before the next
   // read. Sixty-four levels exceed the representable page population at
-  // minimum fanout, so the bound also turns a corrupt child cycle into a
-  // finite error without a second allocation-bearing visited set.
-  auto path = std::vector<page_id_t>{root_page_id};
+  // minimum fanout, so the fixed path also turns a corrupt child cycle into a
+  // finite error without allocating on every Put.
+  TINYDB_CHECK(path != nullptr, "tree descent requires a result path");
+  path->pages[0] = root_page_id;
+  path->size = 1;
   for (;;) {
-    if (path.size() > 64U) {
-      return std::unexpected(Status::Corruption("tree descent is too deep or cyclic"));
-    }
-    auto page = pages->Read(path.back());
+    auto page = pages->Read(path->Back());
     if (!page) {
-      return std::unexpected(std::move(page).error());
+      return std::move(page).error();
     }
-    const auto type = RawNodeType(page->Data());
+    const auto type = RawNodeType(*page);
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
-      return path;
+      return {};
     }
     if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
-      return std::unexpected(Status::Corruption("tree descent reached a non-tree page"));
+      return Status::Corruption("tree descent reached a non-tree page");
     }
     const auto node = InternalPageView::Open(*page);
     if (!node) {
-      return std::unexpected(node.error());
+      return node.error();
+    }
+    if (path->size == path->pages.size()) {
+      return Status::Corruption("tree descent is too deep or cyclic");
     }
     const auto child = node->ChildAt(node->FindChildIndex(key));
-    path.push_back(child);
+    path->pages[path->size++] = child;
   }
 }
 
@@ -142,15 +156,24 @@ auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusT
   TINYDB_CHECK(pages != nullptr, "page source is null");
   TINYDB_CHECK(root_page_id != HEADER_PAGE_ID, "root page id is the reserved header page");
 
-  // Zero cannot be a NodeType, so it unambiguously identifies a fresh page.
-  auto root_page = pages->Edit(root_page_id);
+  // Existing roots are normally read-only for the whole transaction. Do not
+  // copy one into the private write overlay merely to validate it.
+  auto root_page = pages->Read(root_page_id);
   if (!root_page) {
     return std::unexpected(std::move(root_page).error());
   }
-  const auto raw_type = RawNodeType(root_page->Data());
+  const auto raw_type = RawNodeType(*root_page);
   if (raw_type == 0) {
-    LeafPageBuilder{}.Store(root_page->MutableData(), root_page->Id());
-    root_page->MarkDirty();
+    // Zero cannot be a NodeType, so it unambiguously identifies the fresh page
+    // allocated during bootstrap. Release the read lease before editing it.
+    root_page = PageHandle{};
+    auto editable_root = pages->Edit(root_page_id);
+    if (!editable_root) {
+      return std::unexpected(std::move(editable_root).error());
+    }
+    TINYDB_CHECK(RawNodeType(*editable_root) == 0, "fresh tree root changed before initialization");
+    LeafPageBuilder{}.Store(editable_root->MutableData(), editable_root->Id());
+    editable_root->MarkDirty();
     return BPlusTree(pages, root_page_id);
   }
   const bool is_node = raw_type == static_cast<std::uint16_t>(NodeType::Leaf) ||
@@ -170,15 +193,15 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   // ancestor either absorbs that edge or splits and replaces it with another.
   TINYDB_CHECK(txn::ValidateKeySize(key.size()) == StatusCode::Ok && value.size() <= MAX_VALUE_BYTES,
                "Put sizes must be validated at the public boundary");
-  const auto path = DescendToLeaf(pages_, root_page_id_, key);
-  if (!path) {
-    return path.error();
+  DescentPath path;
+  if (auto status = DescendToLeaf(pages_, root_page_id_, key, &path); !status.Ok()) {
+    return status;
   }
 
   std::optional<PendingSeparator> pending;
   std::optional<OverflowValueDescriptor> retired_value;
   {
-    auto leaf_page = pages_->Edit(path->back());
+    auto leaf_page = pages_->Edit(path.Back());
     if (!leaf_page) {
       return std::move(leaf_page).error();
     }
@@ -187,18 +210,18 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
       return node_result.error();
     }
     auto node = std::move(*node_result);
-    retired_value = node.OverflowFor(key);
     auto prepared_value = PrepareValue(pages_, key, value);
     if (!prepared_value) {
       return prepared_value.error();
     }
-    const bool at_tail = node.Upsert(key, std::move(*prepared_value));
+    const auto upsert = node.Upsert(key, std::move(*prepared_value));
+    retired_value = upsert.replaced_overflow;
 
     if (node.Fits()) {
       node.Store(leaf_page->MutableData(), leaf_page->Id());
       leaf_page->MarkDirty();
     } else {
-      const bool tail_heavy = at_tail && node.NextLeaf() == HEADER_PAGE_ID;
+      const bool tail_heavy = upsert.at_tail && node.NextLeaf() == HEADER_PAGE_ID;
       auto split = SplitAndWrite(pages_, *leaf_page, node, tail_heavy);
       if (!split) {
         return std::move(split).error();
@@ -219,10 +242,10 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   }
 
   // level names the child that just split; decrementing selects its parent.
-  std::size_t level = path->size() - 1;
+  std::size_t level = path.size - 1;
   while (pending.has_value() && level > 0) {
     --level;
-    auto page = pages_->Edit((*path)[level]);
+    auto page = pages_->Edit(path.pages[level]);
     if (!page) {
       return std::move(page).error();
     }
@@ -261,8 +284,10 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
 
 // Point lookup retains no ancestor path and allocates only when copying a
 // present value into the API result.
-auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> {
-  auto leaf_page = FindLeaf(pages_, root_page_id_, key);
+auto BPlusTree::Read(PageReader *pages, page_id_t root_page_id,
+                     std::string_view key) -> Result<std::optional<std::string>> {
+  TINYDB_CHECK(pages != nullptr, "point lookup requires a page reader");
+  auto leaf_page = FindLeaf(pages, root_page_id, key);
   if (!leaf_page) {
     return std::unexpected(std::move(leaf_page).error());
   }
@@ -274,11 +299,15 @@ auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> 
   if (!value) {
     return std::nullopt;
   }
-  auto copied = CopyValue(pages_, *value);
+  auto copied = CopyValue(pages, *value);
   if (!copied) {
     return std::unexpected(copied.error());
   }
   return std::optional<std::string>{std::move(*copied)};
+}
+
+auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> {
+  return Read(pages_, root_page_id_, key);
 }
 
 auto BPlusTree::Remove(std::string_view key) -> Status {
@@ -298,10 +327,11 @@ auto BPlusTree::Remove(std::string_view key) -> Status {
     if (!builder) {
       return builder.error();
     }
-    retired_value = builder->OverflowFor(key);
-    if (!builder->Erase(key)) {
+    const auto erased = builder->Erase(key);
+    if (!erased.erased) {
       return {};
     }
+    retired_value = erased.removed_overflow;
     builder->Store(page->MutableData(), page->Id());
     page->MarkDirty();
   }

@@ -1,12 +1,14 @@
 #pragma once
 
-#include "util/check.h"
 #include "storage/page.h"
+#include "util/check.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 
 namespace tinydb {
 
@@ -42,55 +44,64 @@ class LeafValueView final {
   auto Kind() const -> LeafValueKind { return kind_; }
   auto IsOverflow() const -> bool { return kind_ == LeafValueKind::Overflow; }
   auto Size() const -> std::uint64_t {
-    return IsOverflow() ? overflow_.total_value_bytes : static_cast<std::uint64_t>(inline_bytes_.size());
+    return IsOverflow() ? payload_.overflow.total_value_bytes
+                        : static_cast<std::uint64_t>(payload_.inline_bytes.size());
   }
 
   auto InlineBytes() const -> std::string_view {
     TINYDB_CHECK(!IsOverflow(), "reading inline bytes from an overflow descriptor");
-    return inline_bytes_;
+    return payload_.inline_bytes;
   }
   auto OverflowDescriptor() const -> const OverflowValueDescriptor & {
     TINYDB_CHECK(IsOverflow(), "reading an overflow descriptor from an inline value");
-    return overflow_;
+    return payload_.overflow;
   }
 
  private:
-  explicit LeafValueView(std::string_view bytes) : inline_bytes_(bytes) {}
-  explicit LeafValueView(OverflowValueDescriptor descriptor)
-      : kind_(LeafValueKind::Overflow), overflow_(descriptor) {}
+  union Payload {
+    explicit Payload(std::string_view bytes) : inline_bytes(bytes) {}
+    explicit Payload(OverflowValueDescriptor descriptor) : overflow(descriptor) {}
+
+    std::string_view inline_bytes;
+    OverflowValueDescriptor overflow;
+  };
+
+  explicit LeafValueView(std::string_view bytes) : payload_(bytes) {}
+  explicit LeafValueView(OverflowValueDescriptor descriptor) : kind_(LeafValueKind::Overflow), payload_(descriptor) {}
 
   LeafValueKind kind_{LeafValueKind::Inline};
-  std::string_view inline_bytes_;
-  OverflowValueDescriptor overflow_;
+  Payload payload_;
 };
 
 /* Owning form used only while a private leaf is being rebuilt. */
-struct LeafValue {
-  static auto Inline(std::string_view bytes) -> LeafValue {
-    return LeafValue{
-        .kind = LeafValueKind::Inline,
-        .inline_bytes = std::string(bytes),
-        .overflow = {},
-    };
-  }
-  static auto Overflow(OverflowValueDescriptor descriptor) -> LeafValue {
-    return LeafValue{
-        .kind = LeafValueKind::Overflow,
-        .inline_bytes = {},
-        .overflow = descriptor,
-    };
-  }
+class LeafValue final {
+ public:
+  static auto Inline(std::string_view bytes) -> LeafValue { return LeafValue(std::string(bytes)); }
+  static auto Overflow(OverflowValueDescriptor descriptor) -> LeafValue { return LeafValue(descriptor); }
   static auto Copy(LeafValueView value) -> LeafValue {
     return value.IsOverflow() ? Overflow(value.OverflowDescriptor()) : Inline(value.InlineBytes());
   }
 
-  auto IsOverflow() const -> bool { return kind == LeafValueKind::Overflow; }
+  auto IsOverflow() const -> bool { return std::holds_alternative<OverflowValueDescriptor>(payload_); }
   auto EncodedBytes() const -> std::size_t {
-    return IsOverflow() ? OVERFLOW_VALUE_DESCRIPTOR_BYTES : inline_bytes.size();
+    return IsOverflow() ? OVERFLOW_VALUE_DESCRIPTOR_BYTES : std::get<std::string>(payload_).size();
   }
-  LeafValueKind kind{LeafValueKind::Inline};
-  std::string inline_bytes;
-  OverflowValueDescriptor overflow;
+
+  auto InlineBytes() const -> std::string_view {
+    TINYDB_CHECK(!IsOverflow(), "reading inline bytes from an owning overflow value");
+    return std::get<std::string>(payload_);
+  }
+
+  auto OverflowDescriptor() const -> const OverflowValueDescriptor & {
+    TINYDB_CHECK(IsOverflow(), "reading an overflow descriptor from an owning inline value");
+    return std::get<OverflowValueDescriptor>(payload_);
+  }
+
+ private:
+  explicit LeafValue(std::string bytes) : payload_(std::move(bytes)) {}
+  explicit LeafValue(OverflowValueDescriptor descriptor) : payload_(descriptor) {}
+
+  std::variant<std::string, OverflowValueDescriptor> payload_;
 };
 
 }  // namespace tinydb

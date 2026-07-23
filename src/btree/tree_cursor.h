@@ -2,6 +2,7 @@
 
 #include "btree/page_source.h"
 #include "btree/page_view.h"
+#include "util/check.h"
 
 #include <tinydb/status.h>
 
@@ -37,9 +38,25 @@ class BTreeCursor {
   auto operator=(BTreeCursor &&) noexcept -> BTreeCursor & = default;
 
   auto Valid() const -> bool { return leaf_.has_value() && index_ < leaf_->Count(); }
-  auto Key() const -> std::string_view;
-  auto Value() const -> LeafValueView;
-  auto Next() -> Status;
+
+  auto Key() const -> std::string_view {
+    TINYDB_CHECK(Valid(), "reading key from an invalid tree cursor");
+    return leaf_->KeyAt(index_);
+  }
+
+  auto Value() const -> LeafValueView {
+    TINYDB_CHECK(Valid(), "reading value from an invalid tree cursor");
+    return leaf_->ValueAt(index_);
+  }
+
+  auto Next() -> Status {
+    TINYDB_CHECK(Valid(), "advancing an invalid tree cursor");
+    ++index_;
+    if (index_ < leaf_->Count()) {
+      return {};
+    }
+    return AdvanceToNonEmptyLeaf(leaf_->NextLeaf());
+  }
 
  private:
   BTreeCursor(PageReader *pages, page_id_t high_water_page_id)
