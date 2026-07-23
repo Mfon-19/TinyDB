@@ -47,9 +47,12 @@ auto Image(tinydb::page_id_t page_id, std::uint64_t page_lsn) -> tinydb::cache::
   if (!encoded) {
     throw std::runtime_error(encoded.error().ToString());
   }
+  const auto header = tinydb::storage::DecodeDataPageHeader(std::as_bytes(std::span{*encoded}), page_id);
+  if (!header) {
+    throw std::runtime_error(header.error().ToString());
+  }
   return tinydb::cache::CommittedPageImage{
-      .page_id = page_id,
-      .page_lsn = page_lsn,
+      .header = *header,
       .bytes = std::make_unique<tinydb::cache::PageBytes>(*encoded),
   };
 }

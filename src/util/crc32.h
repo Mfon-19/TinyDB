@@ -1,6 +1,9 @@
 #pragma once
 
+#include "util/check.h"
+
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -38,6 +41,62 @@ constexpr auto MakeCrc32SlicingTable() -> std::array<std::array<std::uint32_t, 2
 }
 
 inline constexpr auto CRC32_SLICING_TABLE = MakeCrc32SlicingTable();
+
+namespace crc32_detail {
+
+using Matrix = std::array<std::uint32_t, 32>;
+
+constexpr auto MatrixTimes(const Matrix &matrix, std::uint32_t vector) noexcept -> std::uint32_t {
+  auto result = std::uint32_t{0};
+  while (vector != 0) {
+    result ^= matrix[static_cast<std::size_t>(std::countr_zero(vector))];
+    vector &= vector - 1U;
+  }
+  return result;
+}
+
+constexpr auto MatrixSquare(const Matrix &matrix) noexcept -> Matrix {
+  auto square = Matrix{};
+  for (auto index = std::size_t{0}; index < square.size(); ++index) {
+    square[index] = MatrixTimes(matrix, matrix[index]);
+  }
+  return square;
+}
+
+constexpr auto MakeByteShiftMatrices() noexcept -> std::array<Matrix, 64> {
+  auto one_bit = Matrix{};
+  one_bit[0] = 0xEDB88320U;
+  auto row = std::uint32_t{1};
+  for (auto index = std::size_t{1}; index < one_bit.size(); ++index) {
+    one_bit[index] = row;
+    row <<= 1U;
+  }
+
+  const auto two_bits = MatrixSquare(one_bit);
+  const auto four_bits = MatrixSquare(two_bits);
+  auto matrices = std::array<Matrix, 64>{};
+  matrices[0] = MatrixSquare(four_bits);
+  for (auto index = std::size_t{1}; index < matrices.size(); ++index) {
+    matrices[index] = MatrixSquare(matrices[index - 1]);
+  }
+  return matrices;
+}
+
+inline constexpr auto BYTE_SHIFT_MATRICES = MakeByteShiftMatrices();
+
+inline auto Shift(std::uint32_t crc, std::size_t zero_bytes) noexcept -> std::uint32_t {
+  auto power = std::size_t{0};
+  while (zero_bytes != 0) {
+    if ((zero_bytes & 1U) != 0) {
+      crc = MatrixTimes(BYTE_SHIFT_MATRICES[power], crc);
+    }
+    zero_bytes >>= 1U;
+    ++power;
+  }
+  return crc;
+}
+
+}  // namespace crc32_detail
 
 class Crc32Accumulator final {
  public:
@@ -86,6 +145,22 @@ inline auto Crc32(std::span<const std::byte> data) noexcept -> std::uint32_t {
 
 inline auto Crc32(const char *data, std::size_t size) noexcept -> std::uint32_t {
   return Crc32(std::as_bytes(std::span{data, size}));
+}
+
+// Combine already-computed checksums without rereading either byte range.
+inline auto Crc32Combine(std::uint32_t prefix_crc, std::uint32_t suffix_crc,
+                         std::size_t suffix_bytes) noexcept -> std::uint32_t {
+  return crc32_detail::Shift(prefix_crc, suffix_bytes) ^ suffix_crc;
+}
+
+// Update a complete checksum after replacing one equal-length byte range. The
+// caller supplies the number of bytes following the replaced range.
+inline auto Crc32Replace(std::uint32_t original_crc, std::span<const std::byte> original,
+                         std::span<const std::byte> replacement, std::size_t trailing_bytes) noexcept
+    -> std::uint32_t {
+  TINYDB_CHECK(original.size() == replacement.size(), "CRC replacement changed byte length");
+  const auto difference = Crc32(original) ^ Crc32(replacement);
+  return original_crc ^ crc32_detail::Shift(difference, trailing_bytes);
 }
 
 }  // namespace tinydb

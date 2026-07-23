@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <utility>
 
@@ -95,13 +96,37 @@ auto DecodeDatabaseState(std::span<const std::byte> payload) -> Result<txn::Data
   return state;
 }
 
+struct AppendedRecord final {
+  std::uint32_t encoded_crc;
+  std::size_t encoded_bytes;
+};
+
+struct KnownSuffixCrc final {
+  std::size_t offset;
+  std::uint32_t crc;
+};
+
+auto SealedPageCrc(const PageImageView &page) -> std::optional<std::uint32_t> {
+  if (page.validated_header == nullptr) {
+    return std::nullopt;
+  }
+  const auto bytes = std::as_bytes(page.bytes);
+  const auto checksum = storage::GetLittleEndian<std::uint32_t>(bytes, storage::data_page_offset::CHECKSUM);
+  TINYDB_CHECK(checksum.has_value(), "sealed page checksum field exceeds one page");
+  constexpr auto zero_checksum = std::array<std::byte, sizeof(std::uint32_t)>{};
+  return Crc32Replace(*checksum, zero_checksum,
+                      bytes.subspan(storage::data_page_offset::CHECKSUM, sizeof(std::uint32_t)),
+                      PAGE_SIZE - storage::data_page_offset::CHECKSUM - sizeof(std::uint32_t));
+}
+
 template <typename EncodePayload>
 auto AppendEncodedRecord(std::vector<char> &destination, RecordType type, std::uint64_t transaction_id,
                          std::uint64_t lsn, std::uint32_t record_sequence, std::size_t payload_bytes,
-                         EncodePayload encode_payload) -> Status {
+                         std::optional<KnownSuffixCrc> known_suffix, EncodePayload encode_payload)
+    -> Result<AppendedRecord> {
   if (!KnownRecordType(type) || transaction_id == 0 || lsn == 0 ||
       payload_bytes > std::numeric_limits<std::uint32_t>::max() - RECORD_HEADER_BYTES) {
-    return Status::InvalidArgument("invalid WAL record metadata");
+    return std::unexpected(Status::InvalidArgument("invalid WAL record metadata"));
   }
   const auto total_bytes = RECORD_HEADER_BYTES + payload_bytes;
   const auto offset = destination.size();
@@ -117,17 +142,35 @@ auto AppendEncodedRecord(std::vector<char> &destination, RecordType type, std::u
       storage::PutLittleEndian(bytes, record_offset::CHECKSUM, std::uint32_t{0}) &&
       storage::PutLittleEndian(bytes, record_offset::RESERVED, std::uint64_t{0}) &&
       encode_payload(bytes.subspan(record_offset::PAYLOAD, payload_bytes));
-  if (!encoded || !storage::PutLittleEndian(bytes, record_offset::CHECKSUM,
-                                            ChecksumWithZeroedField(bytes, record_offset::CHECKSUM))) {
+  if (!encoded) {
     destination.resize(offset);
-    return Status::Corruption("internal WAL record layout exceeds its buffer");
+    return std::unexpected(Status::Corruption("internal WAL record layout exceeds its buffer"));
   }
-  return {};
+  auto checksum = std::uint32_t{0};
+  if (known_suffix) {
+    TINYDB_CHECK(known_suffix->offset <= bytes.size(), "known WAL suffix starts beyond its record");
+    checksum = Crc32Combine(Crc32(bytes.first(known_suffix->offset)), known_suffix->crc,
+                            bytes.size() - known_suffix->offset);
+  } else {
+    checksum = ChecksumWithZeroedField(bytes, record_offset::CHECKSUM);
+  }
+  constexpr auto zero_checksum = std::array<std::byte, sizeof(std::uint32_t)>{};
+  if (!storage::PutLittleEndian(bytes, record_offset::CHECKSUM, checksum)) {
+    destination.resize(offset);
+    return std::unexpected(Status::Corruption("internal WAL record layout exceeds its buffer"));
+  }
+  const auto checksum_bytes = bytes.subspan(record_offset::CHECKSUM, sizeof(checksum));
+  return AppendedRecord{
+      .encoded_crc =
+          Crc32Replace(checksum, zero_checksum, checksum_bytes,
+                       total_bytes - record_offset::CHECKSUM - sizeof(checksum)),
+      .encoded_bytes = total_bytes,
+  };
 }
 
 auto AppendRecord(std::vector<char> &destination, RecordType type, std::uint64_t transaction_id, std::uint64_t lsn,
-                  std::uint32_t record_sequence, std::span<const std::byte> payload) -> Status {
-  return AppendEncodedRecord(destination, type, transaction_id, lsn, record_sequence, payload.size(),
+                  std::uint32_t record_sequence, std::span<const std::byte> payload) -> Result<AppendedRecord> {
+  return AppendEncodedRecord(destination, type, transaction_id, lsn, record_sequence, payload.size(), std::nullopt,
                              [payload](std::span<std::byte> destination_payload) {
                                return storage::PutBytes(destination_payload, 0, payload);
                              });
@@ -215,8 +258,9 @@ auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header> {
 auto EncodeRecord(RecordType type, std::uint64_t transaction_id, std::uint64_t lsn, std::uint32_t record_sequence,
                   std::span<const std::byte> payload) -> Result<std::vector<char>> {
   auto output = std::vector<char>{};
-  if (auto status = AppendRecord(output, type, transaction_id, lsn, record_sequence, payload); !status.Ok()) {
-    return std::unexpected(std::move(status));
+  auto appended = AppendRecord(output, type, transaction_id, lsn, record_sequence, payload);
+  if (!appended) {
+    return std::unexpected(std::move(appended).error());
   }
   return output;
 }
@@ -284,6 +328,7 @@ auto EncodeTransaction(std::uint64_t transaction_id, std::uint64_t first_lsn, st
                  DATABASE_STATE_PAYLOAD_BYTES + RECORD_HEADER_BYTES + COMMIT_PAYLOAD_BYTES);
   auto sequence = std::uint32_t{0};
   auto previous_page_id = HEADER_PAGE_ID;
+  auto transaction_digest = std::uint32_t{0};
 
   for (const auto &page : pages) {
     // Commit preparation supplies the transaction overlay's canonical page-ID
@@ -294,27 +339,44 @@ auto EncodeTransaction(std::uint64_t transaction_id, std::uint64_t first_lsn, st
           Status::InvalidArgument("WAL transaction contains unordered, invalid, or duplicate page IDs"));
     }
     previous_page_id = page.page_id;
-    const auto decoded = storage::DecodeDataPageHeader(std::as_bytes(page.bytes), page.page_id);
-    if (!decoded) {
-      return std::unexpected(decoded.error());
+    if (page.validated_header != nullptr) {
+      if (page.validated_header->page_id != page.page_id || page.validated_header->page_lsn != commit_lsn) {
+        return std::unexpected(Status::InvalidArgument("WAL page image disagrees with its seal proof"));
+      }
+    } else {
+      const auto decoded = storage::DecodeDataPageHeader(std::as_bytes(page.bytes), page.page_id);
+      if (!decoded) {
+        return std::unexpected(decoded.error());
+      }
     }
-    if (auto status = AppendEncodedRecord(
-            output, RecordType::PageImage, transaction_id, first_lsn + sequence, sequence, PAGE_IMAGE_PAYLOAD_BYTES,
-            [&page](std::span<std::byte> payload) {
-              return storage::PutLittleEndian(payload, PAGE_IMAGE_PAGE_ID_OFFSET, page.page_id) &&
-                     storage::PutBytes(payload, PAGE_IMAGE_DATA_OFFSET, std::as_bytes(page.bytes));
-            });
-        !status.Ok()) {
-      return std::unexpected(std::move(status));
+    const auto page_crc = SealedPageCrc(page);
+    const auto known_suffix =
+        page_crc ? std::optional<KnownSuffixCrc>{KnownSuffixCrc{
+                       .offset = record_offset::PAYLOAD + PAGE_IMAGE_DATA_OFFSET,
+                       .crc = *page_crc,
+                   }}
+                 : std::nullopt;
+    auto appended = AppendEncodedRecord(
+        output, RecordType::PageImage, transaction_id, first_lsn + sequence, sequence, PAGE_IMAGE_PAYLOAD_BYTES,
+        known_suffix, [&page](std::span<std::byte> payload) {
+          return storage::PutLittleEndian(payload, PAGE_IMAGE_PAGE_ID_OFFSET, page.page_id) &&
+                 storage::PutBytes(payload, PAGE_IMAGE_DATA_OFFSET, std::as_bytes(page.bytes));
+        });
+    if (!appended) {
+      return std::unexpected(std::move(appended).error());
     }
+    transaction_digest =
+        Crc32Combine(transaction_digest, appended->encoded_crc, appended->encoded_bytes);
     ++sequence;
   }
 
-  if (auto status = AppendRecord(output, RecordType::DatabaseState, transaction_id, first_lsn + sequence, sequence,
-                                 *state_payload);
-      !status.Ok()) {
-    return std::unexpected(std::move(status));
+  auto appended_state =
+      AppendRecord(output, RecordType::DatabaseState, transaction_id, first_lsn + sequence, sequence, *state_payload);
+  if (!appended_state) {
+    return std::unexpected(std::move(appended_state).error());
   }
+  transaction_digest =
+      Crc32Combine(transaction_digest, appended_state->encoded_crc, appended_state->encoded_bytes);
   ++sequence;
 
   auto commit_payload = std::array<std::byte, COMMIT_PAYLOAD_BYTES>{};
@@ -323,15 +385,14 @@ auto EncodeTransaction(std::uint64_t transaction_id, std::uint64_t first_lsn, st
       storage::PutLittleEndian(commit_payload, COMMIT_FINAL_LSN_OFFSET, commit_lsn) &&
       storage::PutLittleEndian(commit_payload, COMMIT_PAGE_COUNT_OFFSET, static_cast<std::uint32_t>(pages.size())) &&
       storage::PutLittleEndian(commit_payload, COMMIT_RECORD_COUNT_OFFSET, sequence) &&
-      storage::PutLittleEndian(commit_payload, COMMIT_TRANSACTION_DIGEST_OFFSET,
-                               Crc32(std::as_bytes(std::span{output}))) &&
+      storage::PutLittleEndian(commit_payload, COMMIT_TRANSACTION_DIGEST_OFFSET, transaction_digest) &&
       storage::PutLittleEndian(commit_payload, COMMIT_STATE_DIGEST_OFFSET, Crc32(*state_payload));
   if (!encoded_commit) {
     return std::unexpected(Status::Corruption("internal WAL commit layout exceeds its buffer"));
   }
-  if (auto status = AppendRecord(output, RecordType::Commit, transaction_id, commit_lsn, sequence, commit_payload);
-      !status.Ok()) {
-    return std::unexpected(std::move(status));
+  auto appended_commit = AppendRecord(output, RecordType::Commit, transaction_id, commit_lsn, sequence, commit_payload);
+  if (!appended_commit) {
+    return std::unexpected(std::move(appended_commit).error());
   }
 
   return EncodedTransaction{

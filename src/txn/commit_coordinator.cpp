@@ -69,8 +69,9 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
   wal_pages.reserve(committed_pages.size());
   for (const auto &image : committed_pages) {
     wal_pages.push_back(wal_format::PageImageView{
-        .page_id = image.page_id,
+        .page_id = image.header.page_id,
         .bytes = std::span<const char, PAGE_SIZE>{image.bytes->data(), PAGE_SIZE},
+        .validated_header = &image.header,
     });
   }
   auto prepared_wal = wal.Prepare(wal_pages, state);

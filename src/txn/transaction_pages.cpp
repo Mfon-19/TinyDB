@@ -99,6 +99,9 @@ auto TransactionPages::ChargePage() -> Status {
   return {};
 }
 
+// The analyzer does not model unique_ptr ownership after it moves into the
+// unordered map; ASan and the map's RAII ownership cover this path.
+// NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
 auto TransactionPages::CreatePrivatePage(page_id_t page_id, bool dirty) -> Result<PrivateFrame *> {
   if (auto existing = pages_.find(page_id); existing != pages_.end()) {
     return existing->second.get();
@@ -113,12 +116,11 @@ auto TransactionPages::CreatePrivatePage(page_id_t page_id, bool dirty) -> Resul
       .editing = false,
       .dirty = dirty,
       .tree_payload_validated = false,
+      .sealed_header = {},
   });
-  auto *const result = frame.get();
   const auto [position, inserted] = pages_.emplace(page_id, std::move(frame));
   TINYDB_CHECK(inserted, "transaction inserted one page twice");
-  (void)position;
-  return result;
+  return position->second.get();
 }
 
 auto TransactionPages::Read(page_id_t page_id) -> Result<PageHandle> {
@@ -440,11 +442,12 @@ auto TransactionPages::Seal(std::uint64_t commit_lsn) -> Status {
     if (!page->dirty || retired_page_ids_.contains(page_id)) {
       continue;
     }
-    if (auto status = storage::RewriteDataPageLsn(std::as_writable_bytes(std::span<char, PAGE_SIZE>(*page->bytes)),
-                                                  page_id, commit_lsn);
-        !status.Ok()) {
-      return status;
+    auto header = storage::RewriteDataPageLsn(std::as_writable_bytes(std::span<char, PAGE_SIZE>(*page->bytes)),
+                                              page_id, commit_lsn);
+    if (!header) {
+      return std::move(header).error();
     }
+    page->sealed_header = *header;
   }
   resulting_state_.visible_lsn = commit_lsn;
   RequireUnpinned();
@@ -490,16 +493,17 @@ auto TransactionPages::TakePages() -> std::vector<cache::CommittedPageImage> {
     if (!page->dirty || retired_page_ids_.contains(page_id)) {
       continue;
     }
+    TINYDB_CHECK(page->sealed_header.page_id == page_id, "taking a page without its seal proof");
     result.push_back(cache::CommittedPageImage{
-        .page_id = page_id,
-        .page_lsn = resulting_state_.visible_lsn,
+        .header = page->sealed_header,
         .bytes = std::move(page->bytes),
+        .tree_payload_validated = page->tree_payload_validated,
     });
   }
   // One order serves the WAL digest, adjacent duplicate validation, and cache
   // publication. The unordered private map no longer needs a second borrowed
   // page list solely to impose determinism.
-  std::ranges::sort(result, {}, &cache::CommittedPageImage::page_id);
+  std::ranges::sort(result, {}, [](const cache::CommittedPageImage &image) { return image.header.page_id; });
   // Any clean private copy served read-your-writes but has no committed image
   // to transfer. Clearing the map releases those copies with the dirty ones.
   pages_.clear();

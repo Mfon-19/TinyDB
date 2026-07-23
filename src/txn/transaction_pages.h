@@ -80,6 +80,7 @@ class TransactionPages final : public PageSource {
     bool editing{false};                      // mutable leases are exclusive
     bool dirty{false};                        // needs WAL/publication image
     bool tree_payload_validated{false};       // trusted private tree bytes
+    storage::DataPageHeader sealed_header{};  // page_id zero means not sealed
   };
 
   TransactionPages(PageReader *committed, DatabaseState base_state, std::size_t memory_limit_bytes)

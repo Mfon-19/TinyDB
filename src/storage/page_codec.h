@@ -108,7 +108,10 @@ auto FinalizeDataPage(std::span<std::byte> page) -> Status;
 
 // Assigns the durable LSN and seals trusted transaction-private bytes. Common
 // fields are checked, but the provisional checksum is deliberately not read.
-auto RewriteDataPageLsn(std::span<std::byte> page, page_id_t expected_page_id, std::uint64_t page_lsn) -> Status;
+// The returned header is the proof attached to the now-immutable page image,
+// so WAL and cache preparation do not need to checksum the same bytes again.
+auto RewriteDataPageLsn(std::span<std::byte> page, page_id_t expected_page_id,
+                        std::uint64_t page_lsn) -> Result<DataPageHeader>;
 
 /*
 ** expected_page_id is the physical file position. Comparing it with the

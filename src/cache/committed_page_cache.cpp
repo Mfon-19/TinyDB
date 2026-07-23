@@ -310,41 +310,42 @@ auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> imag
   }
   auto previous_page_id = HEADER_PAGE_ID;
   for (auto &image : images) {
-    if (image.bytes == nullptr || image.page_id < FIRST_DATA_PAGE_ID || image.page_id >= high_water_page_id ||
-        image.page_id <= previous_page_id) {
+    const auto &header = image.header;
+    if (image.bytes == nullptr || header.page_id < FIRST_DATA_PAGE_ID || header.page_id >= high_water_page_id ||
+        header.page_id <= previous_page_id || header.page_lsn == 0 || header.flags != 0 ||
+        header.payload_bytes > PAGE_SIZE - storage::data_page_offset::HEADER_BYTES) {
       return std::unexpected(Status::InvalidArgument("publication contains an invalid or duplicate page image"));
     }
-    previous_page_id = image.page_id;
-    const auto header =
-        storage::DecodeDataPageHeader(std::as_bytes(std::span<const char, PAGE_SIZE>(*image.bytes)), image.page_id);
-    if (!header) {
-      return std::unexpected(header.error());
+    previous_page_id = header.page_id;
+    const auto tree_page = header.type == storage::DataPageType::Leaf || header.type == storage::DataPageType::Internal;
+    const auto non_tree_page =
+        header.type == storage::DataPageType::Allocator || header.type == storage::DataPageType::Overflow;
+    if (!tree_page && !non_tree_page) {
+      return std::unexpected(Status::InvalidArgument("publication contains an unknown page type"));
     }
-    if (header->page_lsn != image.page_lsn) {
-      return std::unexpected(Status::InvalidArgument("committed page metadata disagrees with encoded LSN"));
-    }
-    const auto tree_page =
-        header->type == storage::DataPageType::Leaf || header->type == storage::DataPageType::Internal;
-    if (tree_page) {
-      if (auto status = ValidateTreePagePayload(image.bytes->data(), *header); !status.Ok()) {
+    if (tree_page && !image.tree_payload_validated) {
+      if (auto status = ValidateTreePagePayload(image.bytes->data(), header); !status.Ok()) {
         return std::unexpected(std::move(status));
       }
     }
-    const auto &existing = impl_->pages[image.page_id];
-    if (existing != nullptr && existing->header.page_lsn > image.page_lsn) {
+    if (!tree_page && image.tree_payload_validated) {
+      return std::unexpected(Status::InvalidArgument("non-tree publication carries a tree validation proof"));
+    }
+    const auto &existing = impl_->pages[header.page_id];
+    if (existing != nullptr && existing->header.page_lsn > header.page_lsn) {
       return std::unexpected(Status::InvalidArgument("committed page version moves backward"));
     }
-    frames.push_back(std::make_shared<CommittedFrame>(*header, std::move(image.bytes), tree_page,
-                                                      image.page_lsn <= impl_->checkpoint_lsn));
+    frames.push_back(std::make_shared<CommittedFrame>(header, std::move(image.bytes), tree_page,
+                                                      header.page_lsn <= impl_->checkpoint_lsn));
   }
   previous_page_id = HEADER_PAGE_ID;
   auto image_index = std::size_t{0};
   for (const auto page_id : retired) {
-    while (image_index < images.size() && images[image_index].page_id < page_id) {
+    while (image_index < images.size() && images[image_index].header.page_id < page_id) {
       ++image_index;
     }
     if (page_id < FIRST_DATA_PAGE_ID || page_id >= high_water_page_id || page_id <= previous_page_id ||
-        (image_index < images.size() && images[image_index].page_id == page_id)) {
+        (image_index < images.size() && images[image_index].header.page_id == page_id)) {
       return std::unexpected(Status::InvalidArgument("publication contains an invalid retired page"));
     }
     previous_page_id = page_id;

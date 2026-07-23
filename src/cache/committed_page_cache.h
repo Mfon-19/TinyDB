@@ -3,6 +3,7 @@
 #include <tinydb/status.h>
 #include "btree/page_source.h"
 #include "storage/page.h"
+#include "storage/page_codec.h"
 
 #include <array>
 #include <cstddef>
@@ -37,11 +38,15 @@ struct CommittedFrame;
 ** PageHandle is the sole byte lease for reads and checkpoints. Its shared
 ** keepalive both retains the immutable frame and supplies the exact cache pin.
 */
-/* A frozen transaction transfers this allocation directly into a frame. */
+/*
+** Seal has authenticated the final bytes and attaches their decoded common
+** header plus the builder's tree-payload proof. Publication consumes those
+** proofs while transferring the same allocation directly into a frame.
+*/
 struct CommittedPageImage {
-  page_id_t page_id{HEADER_PAGE_ID};
-  std::uint64_t page_lsn{0};
+  storage::DataPageHeader header;
   std::unique_ptr<PageBytes> bytes;
+  bool tree_payload_validated{false};
 };
 
 /*

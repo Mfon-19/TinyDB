@@ -168,20 +168,25 @@ auto FinalizeDataPage(std::span<std::byte> page) -> Status {
   return {};
 }
 
-auto RewriteDataPageLsn(std::span<std::byte> page, page_id_t expected_page_id, std::uint64_t page_lsn) -> Status {
+auto RewriteDataPageLsn(std::span<std::byte> page, page_id_t expected_page_id,
+                        std::uint64_t page_lsn) -> Result<DataPageHeader> {
   // This is the transaction-to-durability boundary. Private pages were either
   // copied from an authenticated frame or produced by an internal codec, so
   // verifying the provisional checksum immediately before replacing it would
-  // only hash the same bytes twice. Semantic fields are still checked here;
-  // the final CRC is validated again by WAL/cache preparation before append.
-  const auto header = DecodeDataPageHeaderFields(page, expected_page_id, false);
+  // only hash the same bytes twice. Semantic fields are still checked here,
+  // and the returned proof stays attached to these immutable final bytes.
+  auto header = DecodeDataPageHeaderFields(page, expected_page_id, false);
   if (!header) {
-    return header.error();
+    return std::unexpected(header.error());
   }
   if (!PutLittleEndian(page, data_page_offset::PAGE_LSN, page_lsn)) {
-    return Status::Corruption("data-page LSN field exceeds one page");
+    return std::unexpected(Status::Corruption("data-page LSN field exceeds one page"));
   }
-  return FinalizeDataPage(page);
+  if (auto status = FinalizeDataPage(page); !status.Ok()) {
+    return std::unexpected(std::move(status));
+  }
+  header->page_lsn = page_lsn;
+  return *header;
 }
 
 auto DecodeDataPageHeader(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<DataPageHeader> {

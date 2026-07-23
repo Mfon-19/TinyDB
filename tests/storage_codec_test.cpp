@@ -121,6 +121,31 @@ TEST(Format, Crc32RemainsIEEECompatibleAcrossChunkBoundaries) {
   EXPECT_EQ(fragmented.Finish(), expected);
 }
 
+TEST(Format, Crc32CombinesAndPatchesWithoutRereading) {
+  const auto bytes = std::array{
+      std::byte{0x00}, std::byte{0x10}, std::byte{0x20}, std::byte{0x30}, std::byte{0x40},
+      std::byte{0x50}, std::byte{0x60}, std::byte{0x70}, std::byte{0x80}, std::byte{0x90},
+  };
+  for (auto split = std::size_t{0}; split <= bytes.size(); ++split) {
+    const auto prefix = std::span{bytes}.first(split);
+    const auto suffix = std::span{bytes}.subspan(split);
+    EXPECT_EQ(tinydb::Crc32Combine(tinydb::Crc32(prefix), tinydb::Crc32(suffix), suffix.size()),
+              tinydb::Crc32(std::span{bytes}));
+  }
+
+  auto zeroed = bytes;
+  zeroed[3] = std::byte{0};
+  zeroed[4] = std::byte{0};
+  zeroed[5] = std::byte{0};
+  auto patched = zeroed;
+  patched[3] = std::byte{0xA1};
+  patched[4] = std::byte{0xB2};
+  patched[5] = std::byte{0xC3};
+  EXPECT_EQ(tinydb::Crc32Replace(tinydb::Crc32(std::span{zeroed}), std::span{zeroed}.subspan(3, 3),
+                                 std::span{patched}.subspan(3, 3), patched.size() - 6),
+            tinydb::Crc32(std::span{patched}));
+}
+
 TEST(Format, Superblock) {
   auto wanted = Fixture();
   wanted.optional_features = 1ULL << 47U;
@@ -285,9 +310,9 @@ TEST(Format, Allocator) {
   EXPECT_EQ(tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
                                                             tinydb::storage::data_page_offset::CHECKSUM),
             std::optional<std::uint32_t>{0U});
-  ASSERT_TRUE(
-      tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 2, 0x0102030405060708ULL)
-          .Ok());
+  ASSERT_TRUE(tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 2,
+                                                  0x0102030405060708ULL)
+                  .has_value());
   EXPECT_EQ(provisional, *encoded);
 
   auto adjacent = extents;
@@ -317,7 +342,8 @@ TEST(Format, Overflow) {
   EXPECT_EQ(tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
                                                             tinydb::storage::data_page_offset::CHECKSUM),
             std::optional<std::uint32_t>{0U});
-  ASSERT_TRUE(tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 7, 99).Ok());
+  ASSERT_TRUE(
+      tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 7, 99).has_value());
   EXPECT_EQ(provisional, *encoded);
 
   EXPECT_EQ(tinydb::storage::DecodeOverflowPage(bytes, 6).error().Code(), StatusCode::Corruption);
@@ -457,6 +483,27 @@ TEST(Format, Transaction) {
   EXPECT_EQ(decoded->pages[0].bytes, first);
   EXPECT_EQ(decoded->pages[1].page_id, 3U);
   EXPECT_EQ(decoded->pages[1].bytes, second);
+
+  const auto sealed_first =
+      tinydb::storage::EncodeOverflowPage(2, 103, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
+  const auto sealed_second =
+      tinydb::storage::EncodeOverflowPage(3, 103, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
+  const auto first_header = tinydb::storage::DecodeDataPageHeader(std::as_bytes(std::span{sealed_first}), 2).value();
+  const auto second_header = tinydb::storage::DecodeDataPageHeader(std::as_bytes(std::span{sealed_second}), 3).value();
+  const auto fallback_sealed_pages = std::array{
+      tinydb::wal_format::PageImageView{.page_id = 2, .bytes = sealed_first},
+      tinydb::wal_format::PageImageView{.page_id = 3, .bytes = sealed_second},
+  };
+  const auto sealed_pages = std::array{
+      tinydb::wal_format::PageImageView{.page_id = 2, .bytes = sealed_first, .validated_header = &first_header},
+      tinydb::wal_format::PageImageView{.page_id = 3, .bytes = sealed_second, .validated_header = &second_header},
+  };
+  const auto fallback_sealed_encoded =
+      tinydb::wal_format::EncodeTransaction(9, 100, fallback_sealed_pages, encoded->state);
+  const auto sealed_encoded = tinydb::wal_format::EncodeTransaction(9, 100, sealed_pages, encoded->state);
+  ASSERT_TRUE(fallback_sealed_encoded.has_value());
+  ASSERT_TRUE(sealed_encoded.has_value());
+  EXPECT_EQ(sealed_encoded->bytes, fallback_sealed_encoded->bytes);
 
   const auto unordered_pages = std::array{pages[1], pages[0]};
   const auto unordered = tinydb::wal_format::EncodeTransaction(10, 100, unordered_pages, encoded->state);

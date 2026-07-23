@@ -3,6 +3,7 @@
 #include <tinydb/status.h>
 #include "storage/database_uuid.h"
 #include "storage/page.h"
+#include "storage/page_codec.h"
 
 #include "txn/database_state.h"
 
@@ -143,6 +144,7 @@ struct Record {
 struct PageImageView {
   page_id_t page_id;
   std::span<const char, PAGE_SIZE> bytes;
+  const storage::DataPageHeader *validated_header{nullptr};
 };
 
 struct DecodedPageImage {
