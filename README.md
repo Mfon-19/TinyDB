@@ -229,25 +229,64 @@ and native YCSB A-F mixes; backend adapters let the same code measure TinyDB,
 SQLite, LevelDB, and RocksDB. TinyDB builds additionally expose cold-I/O,
 checkpoint, recovery, churn, and concurrent-reader qualification workloads.
 
-Measure the current checkout or compare buffered and direct I/O:
+Measure the current checkout:
 
 ```sh
 make bench
-make bench-compare
 ```
 
-Both commands build Release workers and replace
+The command builds a Release worker and replaces
 `/tmp/tinydb-benchmark-latest` only after a complete successful run. Fixture
-construction is outside timed regions. Every trial receives a private verified
-copy, and compatible buffered/direct workers consume identical persistent
-bytes. Reports include paired confidence intervals, call latency, CPU, PSS,
-database-file residency, physical I/O, persistent size, and TinyDB prefetch
-diagnostics. Each result is just `report.md`, raw `results.csv`, and
-`metadata.json`; fixture and trial files are deleted when the run completes.
+construction is outside timed regions, and every trial receives a private
+verified copy. Reports include call latency, CPU, PSS, database-file residency,
+physical I/O, persistent size, and TinyDB prefetch diagnostics. Each result is
+just `report.md`, raw `results.csv`, and `metadata.json`; fixture and trial
+files are deleted when the run completes.
+
+### Buffered-I/O baseline
+
+The following results came from `make bench` at `adcd08b` using a Release
+build, the standard profile, durable commits, and a 16 MiB TinyDB page cache.
+They are medians from three trials, except the concurrent-reader workload,
+which uses five. The complete run took 10.2 minutes.
+
+| Area | Workload | Median |
+|---|---|---:|
+| Writes | Sequential durable insert | 651 records/s |
+| Writes | Random durable insert | 618 records/s |
+| Writes | Batch-16 durable insert | 10,119 records/s |
+| Writes | Overwrite | 621 records/s |
+| Writes | Delete | 625 records/s |
+| Writes | 64 KiB values, batch four | 508 records/s |
+| Reads | Random point read | 574,858 reads/s |
+| Reads | Sequential scan | 5,460,605 rows/s |
+| Reads | Random seek | 497,197 seeks/s |
+| Cache | Fully engine-hot random read | 2,184,097 reads/s |
+| Cache | Eviction-heavy random read | 376,657 reads/s |
+| Cache | 256-row ranges | 613,529 rows/s |
+| Concurrency | Four readers with one writer | 397,021 reads/s |
+| Lifecycle | 64 MiB checkpoint | 90.98 ms |
+| Lifecycle | OS-cache-warm recovery | 1.085 s |
+| Lifecycle | Delete/checkpoint/reinsert churn | 102,159 operations/s |
+| Cold I/O | Sequential scan | 981,121 rows/s |
+| Cold I/O | Random point read | 11,506 reads/s |
+| Cold I/O | 64 KiB values, compatible layout | 15,873 values/s |
+| Cold I/O | 64 KiB values, native layout | 15,981 values/s |
+
+Batching sixteen small writes improved record throughput by 15.5×. Buffered
+I/O also makes the double-cache cost visible: the eviction workload occupied
+19.88 MiB of engine PSS plus 116.18 MiB of Linux file cache, while the range
+workload reached 183.45 MiB combined. Median physical writes were 17.86 MiB for
+the batch-16 insert, 169.34 MiB for sequential single inserts, 249.15 MiB for
+random single inserts, 2.17 GiB for overwrite, and 2.18 GiB for delete.
+
+These are host-specific results from an Intel Core i5-1135G7, Linux 6.17, and
+the `powersave` CPU governor. Recovery was noisy across its three trials
+(365 ms to 1.769 s), so small recovery changes require additional trials
+rather than relying on this median alone.
 
 See [the benchmark guide](bench/README.md) for profiles, focused commands,
-workload semantics, cache control, and artifacts. Published reference numbers
-should be regenerated with this unified matrix; results from the retired
+workload semantics, cache control, and artifacts. Results from the retired
 TinyDB-only CRUD matrix are not directly comparable.
 
 ## Repository
