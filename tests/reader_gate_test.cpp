@@ -23,14 +23,13 @@ using namespace std::chrono_literals;
 using tinydb::txn::DatabaseState;
 using tinydb::txn::ReaderGate;
 
-auto State(std::uint64_t transaction_id, tinydb::page_id_t root_page_id) -> std::shared_ptr<const DatabaseState> {
+auto State(std::uint64_t version, tinydb::page_id_t root_page_id) -> std::shared_ptr<const DatabaseState> {
   return std::make_shared<const DatabaseState>(DatabaseState{
       .root_page_id = root_page_id,
       .allocator_root_page_id = 11,
       .high_water_page_id = 20,
-      .transaction_id = transaction_id,
-      .visible_lsn = transaction_id * 10,
-      .checkpoint_lsn = (transaction_id - 1) * 10,
+      .visible_lsn = version * 10,
+      .checkpoint_lsn = (version - 1) * 10,
   });
 }
 
@@ -60,7 +59,7 @@ TEST(Readers, Snapshot) {
         std::this_thread::yield();
       }
       auto snapshot = gate.BeginRead();
-      if (snapshot.State().transaction_id != 7 || snapshot.State().root_page_id != 3) {
+      if (snapshot.State().visible_lsn != 70 || snapshot.State().root_page_id != 3) {
         failures.fetch_add(1, std::memory_order_relaxed);
       }
       admitted.fetch_add(1, std::memory_order_release);
@@ -96,7 +95,7 @@ TEST(Readers, Lifetime) {
   // Copies of one token share a single admission rather than inflating the
   // reader count for each cursor derived from a transaction.
   EXPECT_EQ(gate.Stats().active_readers, 1U);
-  EXPECT_EQ(cursor_token.State().transaction_id, 1U);
+  EXPECT_EQ(cursor_token.State().visible_lsn, 10U);
   cursor_token = {};
   EXPECT_EQ(gate.Stats().active_readers, 0U);
 }
@@ -106,7 +105,7 @@ TEST(Readers, ScopedLifetime) {
   {
     auto snapshot = tinydb::txn::ScopedSnapshotToken{};
     gate.BeginRead(snapshot);
-    EXPECT_EQ(snapshot.State().transaction_id, 3U);
+    EXPECT_EQ(snapshot.State().visible_lsn, 30U);
     EXPECT_EQ(snapshot.State().root_page_id, 7U);
     EXPECT_EQ(gate.Stats().active_readers, 1U);
     EXPECT_TRUE(gate.Stats().oldest_reader_age.has_value());
@@ -128,7 +127,7 @@ TEST(Readers, ScopedAdmissionRetainsGateState) {
     auto gate = ReaderGate(State(5, 9));
     gate.BeginRead(snapshot);
   }
-  EXPECT_EQ(snapshot.State().transaction_id, 5U);
+  EXPECT_EQ(snapshot.State().visible_lsn, 50U);
   EXPECT_EQ(snapshot.State().root_page_id, 9U);
 }
 
@@ -138,7 +137,7 @@ TEST(Readers, Fairness) {
   auto publisher_has_gate = std::atomic<bool>{false};
   auto release_publisher = std::atomic<bool>{false};
   auto late_reader_entered = std::atomic<bool>{false};
-  auto late_reader_transaction = std::atomic<std::uint64_t>{0};
+  auto late_reader_lsn = std::atomic<std::uint64_t>{0};
 
   auto publisher = std::thread([&] {
     auto publication = gate.BeginPublication();
@@ -152,7 +151,7 @@ TEST(Readers, Fairness) {
 
   auto late_reader = std::thread([&] {
     auto snapshot = gate.BeginRead();
-    late_reader_transaction.store(snapshot.State().transaction_id, std::memory_order_release);
+    late_reader_lsn.store(snapshot.State().visible_lsn, std::memory_order_release);
     late_reader_entered.store(true, std::memory_order_release);
   });
 
@@ -168,7 +167,7 @@ TEST(Readers, Fairness) {
   publisher.join();
   late_reader.join();
   EXPECT_TRUE(late_reader_entered.load(std::memory_order_acquire));
-  EXPECT_EQ(late_reader_transaction.load(std::memory_order_acquire), 2U);
+  EXPECT_EQ(late_reader_lsn.load(std::memory_order_acquire), 20U);
 }
 
 TEST(Readers, Abandon) {
@@ -176,7 +175,7 @@ TEST(Readers, Abandon) {
   { const auto publication = gate.BeginPublication(); }
 
   auto reader = gate.BeginRead();
-  EXPECT_EQ(reader.State().transaction_id, 4U);
+  EXPECT_EQ(reader.State().visible_lsn, 40U);
   EXPECT_FALSE(gate.Stats().publication_pending);
 }
 

@@ -59,7 +59,8 @@ measure:
 
 - hot-cache, eviction-heavy, range, and large-value cases;
 - concurrent readers with a writer;
-- checkpoint, WAL recovery, and delete/reinsert churn;
+- checkpoint, WAL recovery, and overflow-value delete/reinsert churn that
+  exercises retirement, checkpoint quarantine, and page reuse;
 - verified-cold sequential, random, and overflow-value reads; and
 - direct-I/O prefetch activity, usefulness, drops, failures, and memory.
 

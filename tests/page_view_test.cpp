@@ -38,7 +38,6 @@ TEST(Page, LeafSearch) {
   const auto overflow = tinydb::OverflowValueDescriptor{
       .total_value_bytes = 8U << 10U,
       .first_page_id = 9,
-      .value_checksum = 0x12345678U,
   };
   builder.Upsert("overflow", tinydb::LeafValueView::Overflow(overflow));
   builder.Store(page.data(), 2);

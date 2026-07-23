@@ -110,13 +110,23 @@ TEST(Durability, CheckpointOrder) {
   const auto data_sync = Find(calls, tinydb::io::Syscall::Fsync, path, data + 1U);
   const auto superblock = Find(calls, tinydb::io::Syscall::Pwrite, path, data_sync + 1U);
   const auto metadata_sync = Find(calls, tinydb::io::Syscall::Fsync, path, superblock + 1U);
+  const auto wal_path = tinydb::Wal::PathFor(path);
+  const auto wal_reset = Find(calls, tinydb::io::Syscall::Ftruncate, wal_path, metadata_sync + 1U);
+  const auto wal_header = Find(calls, tinydb::io::Syscall::Pwrite, wal_path, wal_reset + 1U);
+  const auto wal_sync = Find(calls, tinydb::io::Syscall::Fsync, wal_path, wal_header + 1U);
   ASSERT_NE(data, std::numeric_limits<std::size_t>::max());
   ASSERT_NE(data_sync, std::numeric_limits<std::size_t>::max());
   ASSERT_NE(superblock, std::numeric_limits<std::size_t>::max());
   ASSERT_NE(metadata_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_reset, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_header, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_sync, std::numeric_limits<std::size_t>::max());
   EXPECT_LT(data, data_sync);
   EXPECT_LT(data_sync, superblock);
   EXPECT_LT(superblock, metadata_sync);
+  EXPECT_LT(metadata_sync, wal_reset);
+  EXPECT_LT(wal_reset, wal_header);
+  EXPECT_LT(wal_header, wal_sync);
   tinydb::test::Remove(path);
 }
 
@@ -134,6 +144,31 @@ TEST(Durability, CheckpointFailure) {
         return std::nullopt;
       },
       [&] { EXPECT_EQ(database.Checkpoint().Code(), tinydb::StatusCode::IoError); });
+  tinydb::test::Copy(path, copy);
+  auto recovered = tinydb::Database::Open(copy).value();
+  EXPECT_EQ(recovered.Get("key").value(), "value");
+  tinydb::test::Remove(path);
+  tinydb::test::Remove(copy);
+}
+
+TEST(Durability, WalResetFailure) {
+  const auto path = tinydb::test::Path("wal_reset_failure");
+  const auto copy = tinydb::test::Path("wal_reset_failure_copy");
+  tinydb::test::Remove(path);
+  auto database = tinydb::Database::Open(path).value();
+  ASSERT_TRUE(database.Put("key", "value").Ok());
+  tinydb::test::WithHook(
+      [&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+        if (call.syscall == tinydb::io::Syscall::Pwrite && call.path == tinydb::Wal::PathFor(path) &&
+            call.offset == 0) {
+          return tinydb::io::Fault{.error = EIO};
+        }
+        return std::nullopt;
+      },
+      [&] { EXPECT_EQ(database.Checkpoint().Code(), tinydb::StatusCode::NeedsRecovery); });
+
+  // The database superblock was durable before reset began, so even an empty
+  // replacement WAL is a complete base, not data loss.
   tinydb::test::Copy(path, copy);
   auto recovered = tinydb::Database::Open(copy).value();
   EXPECT_EQ(recovered.Get("key").value(), "value");
@@ -161,10 +196,12 @@ TEST(Durability, TornTail) {
 TEST(Durability, MiddleCorruption) {
   const auto path = tinydb::test::Path("middle_corruption");
   const auto copy = tinydb::test::Path("middle_corruption_copy");
+  const auto framing_copy = tinydb::test::Path("middle_framing_corruption_copy");
   tinydb::test::Remove(path);
   auto database = tinydb::Database::Open(path).value();
   ASSERT_TRUE(database.Put("key", "value").Ok());
   tinydb::test::Copy(path, copy);
+  tinydb::test::Copy(path, framing_copy);
   const auto before = tinydb::test::ReadFile(copy);
   {
     auto wal = std::fstream(tinydb::Wal::PathFor(copy), std::ios::binary | std::ios::in | std::ios::out);
@@ -179,23 +216,41 @@ TEST(Durability, MiddleCorruption) {
   ASSERT_FALSE(opened.has_value());
   EXPECT_EQ(opened.error().Code(), tinydb::StatusCode::Corruption);
   EXPECT_EQ(tinydb::test::ReadFile(copy), before);
+
+  // Damage to the first record's framing must not disguise the complete state
+  // record after it as an ignorable torn tail.
+  {
+    auto wal = std::fstream(tinydb::Wal::PathFor(framing_copy), std::ios::binary | std::ios::in | std::ios::out);
+    wal.seekg(static_cast<std::streamoff>(tinydb::wal_format::HEADER_BYTES));
+    char byte = 0;
+    wal.get(byte);
+    wal.seekp(static_cast<std::streamoff>(tinydb::wal_format::HEADER_BYTES));
+    wal.put(static_cast<char>(byte ^ 1));
+  }
+  const auto framing_opened = tinydb::Database::Open(framing_copy);
+  ASSERT_FALSE(framing_opened.has_value());
+  EXPECT_EQ(framing_opened.error().Code(), tinydb::StatusCode::Corruption);
+  EXPECT_EQ(tinydb::test::ReadFile(framing_copy), before);
+
   tinydb::test::Remove(path);
   tinydb::test::Remove(copy);
+  tinydb::test::Remove(framing_copy);
 }
 
-TEST(Durability, Rotation) {
-  const auto path = tinydb::test::Path("rotation");
-  const auto copy = tinydb::test::Path("rotation_copy");
+TEST(Durability, CheckpointResetsWal) {
+  const auto path = tinydb::test::Path("wal_reset");
+  const auto copy = tinydb::test::Path("wal_reset_copy");
   tinydb::test::Remove(path);
   auto options = tinydb::Options{};
-  options.wal_segment_bytes = tinydb::wal_format::HEADER_BYTES + tinydb::PAGE_SIZE;
   options.checkpoint.wal_trigger_bytes = 64U << 20U;
   options.checkpoint.hard_wal_bytes = 128U << 20U;
   auto database = tinydb::Database::Open(path, options).value();
   for (std::size_t index = 0; index < 8; ++index) {
     ASSERT_TRUE(database.Put(tinydb::test::Key(index), tinydb::test::Value(index, 600)).Ok());
   }
-  EXPECT_GT(database.Stats()->wal_segments, 1U);
+  EXPECT_GT(database.Stats()->wal_bytes, tinydb::wal_format::HEADER_BYTES);
+  ASSERT_TRUE(database.Checkpoint().Ok());
+  EXPECT_EQ(database.Stats()->wal_bytes, tinydb::wal_format::HEADER_BYTES);
   tinydb::test::Copy(path, copy);
   auto recovered = tinydb::Database::Open(copy, options).value();
   EXPECT_EQ(tinydb::test::Rows(recovered).value().size(), 8U);

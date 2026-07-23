@@ -33,8 +33,8 @@ using SuperblockPage = std::array<std::byte, PAGE_SIZE>;
 
 inline constexpr auto SUPERBLOCK_MAGIC = std::array{
     std::byte{0x54}, std::byte{0x49}, std::byte{0x4E}, std::byte{0x59},
-    std::byte{0x44}, std::byte{0x42}, std::byte{0x30}, std::byte{0x34},
-};  // "TINYDB04"
+    std::byte{0x44}, std::byte{0x42}, std::byte{0x30}, std::byte{0x35},
+};  // "TINYDB05"
 inline constexpr std::uint16_t FORMAT_MAJOR = 1;
 inline constexpr std::uint16_t FORMAT_MINOR = 0;
 inline constexpr std::uint64_t SUPPORTED_REQUIRED_FEATURES = 0;
@@ -45,7 +45,7 @@ inline constexpr page_id_t FIRST_FORMAT_DATA_PAGE_ID = FIRST_DATA_PAGE_ID;
 **
 **   0   magic[8]                 48  generation u64
 **   8   format major/minor       56  checkpoint LSN u64
-**   12  page size u32            64  transaction ID u64
+**   12  page size u32            64  reserved u64
 **   16  required features u64    72  B+ tree root page ID u64
 **   24  optional features u64    80  allocator root page ID u64
 **   32  database UUID[16]        88  high-water page ID u64
@@ -61,7 +61,7 @@ inline constexpr std::size_t OPTIONAL_FEATURES = 24;
 inline constexpr std::size_t DATABASE_UUID = 32;
 inline constexpr std::size_t GENERATION = 48;
 inline constexpr std::size_t CHECKPOINT_LSN = 56;
-inline constexpr std::size_t TRANSACTION_ID = 64;
+inline constexpr std::size_t RESERVED = 64;
 inline constexpr std::size_t ROOT_PAGE_ID = 72;
 inline constexpr std::size_t ALLOCATOR_ROOT_PAGE_ID = 80;
 inline constexpr std::size_t HIGH_WATER_PAGE_ID = 88;
@@ -78,9 +78,6 @@ struct Superblock {
 
   // Recovery can ignore WAL history at or before this durable frontier.
   std::uint64_t checkpoint_lsn{0};
-
-  // Identity of the last transaction represented by this state.
-  std::uint64_t transaction_id{0};
 
   // Zero means the corresponding persistent tree/index is currently absent.
   page_id_t root_page_id{0};

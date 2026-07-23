@@ -91,7 +91,6 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
     return std::unexpected(Status::InvalidArgument("verification requires a page reader and positive issue limit"));
   }
   auto report = VerifyReport{};
-  report.transaction_id = state.transaction_id;
   report.visible_lsn = state.visible_lsn;
 
   auto transaction = txn::TransactionPages::Begin(pages, state, memory_budget);

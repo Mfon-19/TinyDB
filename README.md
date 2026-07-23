@@ -123,19 +123,20 @@ private overlay; reads consult private versions first and fall through to the
 committed cache for unchanged pages. The resulting root and allocator state
 are private as well, so aborting only discards the overlay.
 
-Commit freezes and validates the finished overlay, appends its final page
-images and database state to the WAL, writes a record binding them into one
-transaction, and synchronizes the WAL. Only after that durability point does
-the writer wait for older readers and publish the prepared pages into the
-committed cache. Publication performs no file I/O or allocation, so a durable
-transaction cannot fail halfway through becoming visible.
+Commit finishes and validates the overlay, assigns one commit LSN to every
+final page image, appends those images plus one terminal state record, and
+synchronizes the WAL. Only after that durability point does the writer wait
+for older readers and publish the prepared pages into the committed cache.
+Publication performs no file I/O or allocation, so a durable transaction
+cannot fail halfway through becoming visible.
 
-The database file contains state through the latest checkpoint. WAL segments
-contain committed transactions after it. A checkpoint writes exact committed
-page versions, synchronizes the database file, advances its checksummed
-superblock, and only then removes covered WAL segments. `Open()` selects the
-newest valid superblock and physically replays complete WAL transactions;
-recovery never reruns `Put`, `Delete`, splitting, or allocation logic.
+The database file contains state through the latest checkpoint. One append-only
+WAL file contains committed transactions after it. A checkpoint writes exact
+committed page versions, synchronizes the database file, advances its
+checksummed superblock, and only then resets the covered WAL to a clean header.
+`Open()` selects the newest valid superblock and physically replays complete
+WAL transactions; recovery never reruns `Put`, `Delete`, splitting, or
+allocation logic.
 
 ## Public API
 
@@ -300,7 +301,7 @@ TinyDB-only CRUD matrix are not directly comparable.
 | `src/cache` | Immutable committed-page cache |
 | `src/storage` | Database file, superblocks, and persistent page codecs |
 | `src/io` | POSIX I/O, locking, and injectable syscall boundary |
-| `src/wal` | Segmented write-ahead log |
+| `src/wal` | Single-file write-ahead log |
 | `src/recovery` | WAL validation and physical redo |
 | `src/checkpoint` | Durable database-file advancement |
 | `src/verify` | Read-only structural integrity verification |

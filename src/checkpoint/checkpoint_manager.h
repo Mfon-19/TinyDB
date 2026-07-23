@@ -52,11 +52,11 @@ struct Stats {
 **   extend file -> write captured pages -> fsync data
 **   -> write inactive superblock -> fsync superblock
 **   -> advance in-memory frontier -> mark cache versions checkpointed
-**   -> remove covered immutable WAL segments -> fsync WAL directory
+**   -> reset covered WAL -> fsync clean WAL header
 **
 ** Failure before the superblock fsync leaves the old superblock and WAL
-** authoritative. Failure afterward may leave redundant WAL history, but the
-** new checkpoint is already a complete recovery basis.
+** authoritative. Failure afterward requires reopen, but the new checkpoint is
+** already a complete recovery basis.
 */
 class Manager final {
  public:

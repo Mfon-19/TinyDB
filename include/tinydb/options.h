@@ -41,7 +41,6 @@ struct VerifyOptions final {
 struct Options final {
   std::size_t page_cache_bytes{16U << 20U};
   std::size_t max_write_transaction_bytes{16U << 20U};
-  std::uint64_t wal_segment_bytes{768U << 10U};
   CheckpointOptions checkpoint{};
 };
 

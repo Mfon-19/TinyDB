@@ -28,7 +28,7 @@ struct CommitTiming final {
 /*
 ** DURABLE COMMIT
 **
-** Join one frozen logical transaction to WAL durability, committed-cache
+** Join one prepared logical transaction to WAL durability, committed-cache
 ** ownership, and visible DatabaseState. The operation owns none of those
 ** layers and performs no tree mutation itself.
 **

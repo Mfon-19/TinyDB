@@ -71,12 +71,7 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
             page, descriptor_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES);
         const auto first_page =
             storage::GetLittleEndian<page_id_t>(page, descriptor_offset + overflow_descriptor_offset::FIRST_PAGE_ID);
-        const auto checksum = storage::GetLittleEndian<std::uint32_t>(
-            page, descriptor_offset + overflow_descriptor_offset::VALUE_CHECKSUM);
-        const auto reserved =
-            storage::GetLittleEndian<std::uint32_t>(page, descriptor_offset + overflow_descriptor_offset::RESERVED);
-        if (!total || !first_page || !checksum || !reserved || *total == 0 || *total > MAX_VALUE_BYTES ||
-            *first_page < FIRST_DATA_PAGE_ID || *reserved != 0) {
+        if (!total || !first_page || *total == 0 || *total > MAX_VALUE_BYTES || *first_page < FIRST_DATA_PAGE_ID) {
           return Status::Corruption("leaf cell contains an invalid overflow descriptor");
         }
       }

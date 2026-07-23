@@ -65,7 +65,15 @@ if(KVBENCH_BACKEND STREQUAL "tinydb")
   target_sources(
     TinyDB_bench
     PRIVATE tinydb.cpp)
-  target_compile_definitions(TinyDB_bench PRIVATE KVBENCH_TINYDB=1)
+  get_target_property(TINYDB_FORMAT_FAMILY TinyDB TINYDB_FORMAT_FAMILY)
+  if(NOT TINYDB_FORMAT_FAMILY)
+    # Revisions before the v2 format property all use the original family.
+    set(TINYDB_FORMAT_FAMILY "tinydb-v1")
+  endif()
+  target_compile_definitions(
+    TinyDB_bench
+    PRIVATE KVBENCH_TINYDB=1
+            KVBENCH_TINYDB_FORMAT_FAMILY="${TINYDB_FORMAT_FAMILY}")
   target_include_directories(TinyDB_bench PRIVATE "${TINYDB_ENGINE_SOURCE_DIR}/src")
   target_link_libraries(TinyDB_bench PRIVATE TinyDB::TinyDB)
 elseif(KVBENCH_BACKEND STREQUAL "sqlite")

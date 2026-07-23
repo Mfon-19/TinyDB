@@ -129,15 +129,11 @@ void LeafPageBuilder::Store(char *page, page_id_t page_id) const {
     const auto value_offset = offset + LEAF_CELL_HEADER_SIZE + key.size();
     if (value.IsOverflow()) {
       const auto &descriptor = value.OverflowDescriptor();
-      TINYDB_CHECK(
-          storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES,
-                                   descriptor.total_value_bytes) &&
-              storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID,
-                                       descriptor.first_page_id) &&
-              storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM,
-                                       descriptor.value_checksum) &&
-              storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::RESERVED, std::uint32_t{0}),
-          "overflow descriptor exceeds leaf cell");
+      TINYDB_CHECK(storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES,
+                                            descriptor.total_value_bytes) &&
+                       storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID,
+                                                descriptor.first_page_id),
+                   "overflow descriptor exceeds leaf cell");
     } else {
       const auto inline_bytes = value.InlineBytes();
       std::copy_n(inline_bytes.data(), inline_bytes.size(), page + value_offset);

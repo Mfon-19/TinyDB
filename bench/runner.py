@@ -870,6 +870,8 @@ def write_report(
         "combined_observed_memory",
         "database_file_resident_bytes",
         "database_size",
+        "file_amplification",
+        "growth",
         "storage_read_bytes",
         "storage_write_bytes",
         "workload_storage_read_amplification",

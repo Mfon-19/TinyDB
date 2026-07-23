@@ -76,11 +76,9 @@ TEST(Database, IdenticalPutDoesNotAdvanceDurabilityState) {
   ASSERT_TRUE(write.Put("key", "value").Ok());
   const auto committed = std::move(write).Commit();
   ASSERT_TRUE(committed.has_value());
-  EXPECT_EQ(committed->transaction_id, before.transaction_id);
   EXPECT_EQ(committed->commit_lsn, before.visible_lsn);
 
   const auto after = database.Stats().value();
-  EXPECT_EQ(after.transaction_id, before.transaction_id);
   EXPECT_EQ(after.visible_lsn, before.visible_lsn);
   EXPECT_EQ(after.wal_bytes, before.wal_bytes);
   EXPECT_EQ(after.dirty_pages, before.dirty_pages);

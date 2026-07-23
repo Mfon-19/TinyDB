@@ -27,7 +27,6 @@ struct DatabaseState final {
   page_id_t root_page_id{HEADER_PAGE_ID};            // visible B+ tree root
   page_id_t allocator_root_page_id{HEADER_PAGE_ID};  // free-extent chain root
   page_id_t high_water_page_id{FIRST_DATA_PAGE_ID};  // first never-allocated ID
-  std::uint64_t transaction_id{0};                   // logical commit identity
   std::uint64_t visible_lsn{0};                      // newest published WAL LSN
   std::uint64_t checkpoint_lsn{0};                   // newest DB-file-resident LSN
 

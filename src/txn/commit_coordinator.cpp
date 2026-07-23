@@ -29,24 +29,19 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
     }
   };
   transaction.SetRootPageId(tree.RootPageId());
-  if (auto status = transaction.Freeze(); !status.Ok()) {
-    record_prepare();
-    transaction.Abort();
-    return std::unexpected(std::move(status));
-  }
   if (!transaction.HasChanges()) {
     record_prepare();
     const auto &state = transaction.ResultingState();
-    return CommitInfo{.transaction_id = state.transaction_id, .commit_lsn = state.visible_lsn};
+    return CommitInfo{.commit_lsn = state.visible_lsn};
   }
 
-  const auto commit_lsn = wal.NextCommitLsn(transaction.FinalPageCount());
+  const auto commit_lsn = wal.NextCommitLsn();
   if (!commit_lsn) {
     record_prepare();
     transaction.Abort();
     return std::unexpected(commit_lsn.error());
   }
-  if (auto status = transaction.Seal(*commit_lsn); !status.Ok()) {
+  if (auto status = transaction.PrepareCommit(*commit_lsn); !status.Ok()) {
     record_prepare();
     transaction.Abort();
     return std::unexpected(std::move(status));
@@ -100,8 +95,7 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
     transaction.Abort();
     return std::unexpected(durable.error());
   }
-  TINYDB_CHECK(durable->transaction_id == state.transaction_id, "WAL committed a different transaction identity");
-  TINYDB_CHECK(durable->commit_lsn == state.visible_lsn, "WAL committed a different transaction frontier");
+  TINYDB_CHECK(*durable == state.visible_lsn, "WAL committed a different transaction frontier");
 
   /*
   ** INFALLIBLE PUBLICATION
@@ -119,7 +113,7 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
     cache.Publish(std::move(*publication_plan));
     publication.Publish(std::move(published_state));
   }
-  return CommitInfo{.transaction_id = durable->transaction_id, .commit_lsn = durable->commit_lsn};
+  return CommitInfo{.commit_lsn = *durable};
 }
 
 }  // namespace tinydb::txn

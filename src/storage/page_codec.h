@@ -30,8 +30,8 @@ inline constexpr auto DATA_PAGE_MAGIC = std::array{
     std::byte{0x54},
     std::byte{0x44},
     std::byte{0x50},
-    std::byte{0x34},
-};  // "TDP4"
+    std::byte{0x35},
+};  // "TDP5"
 inline constexpr std::uint16_t DATA_PAGE_FORMAT_VERSION = 1;
 
 enum class DataPageType : std::uint16_t {

@@ -33,7 +33,6 @@ struct VerifyIssue final {
 ** bytes made further traversal unsafe.
 */
 struct VerifyReport final {
-  std::uint64_t transaction_id{0};
   std::uint64_t visible_lsn{0};
   bool complete{true};
 
@@ -56,11 +55,9 @@ struct VerifyReport final {
 ** checkpointed database file.
 */
 struct DatabaseStats final {
-  std::uint64_t transaction_id{0};
   std::uint64_t visible_lsn{0};
   std::uint64_t checkpoint_lsn{0};
   std::uint64_t wal_bytes{0};
-  std::size_t wal_segments{0};
 
   std::size_t active_readers{0};
   bool publication_pending{false};

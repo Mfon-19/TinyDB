@@ -155,6 +155,7 @@ void AddLifecycleScenarios(std::vector<Scenario> &scenarios) {
 void AddChurnScenario(std::vector<Scenario> &scenarios) {
   auto scenario =
       BaseScenario("churn.steady_state", "churn", Workload::Churn, "throughput", MetricDirection::Higher, 0.10);
+  scenario.value_bytes = 8U << 10U;
   scenario.rows = RowsForRatio(scenario.page_cache_bytes, 2, 1, scenario.key_bytes, scenario.value_bytes);
   scenario.trials = kIoTrials;
   scenario.churn_warmup_rounds = 2;

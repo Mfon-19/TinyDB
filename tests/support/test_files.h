@@ -29,9 +29,6 @@ inline void Remove(const std::filesystem::path &path) {
   std::error_code ignored;
   std::filesystem::remove(path, ignored);
   std::filesystem::remove(Wal::PathFor(path), ignored);
-  for (std::uint64_t segment = 1; segment < 32; ++segment) {
-    std::filesystem::remove(Wal::SegmentPathFor(Wal::PathFor(path), segment), ignored);
-  }
 }
 
 inline void Copy(const std::filesystem::path &from, const std::filesystem::path &to) {
@@ -40,12 +37,6 @@ inline void Copy(const std::filesystem::path &from, const std::filesystem::path 
   const auto source_wal = Wal::PathFor(from);
   if (std::filesystem::exists(source_wal)) {
     std::filesystem::copy_file(source_wal, Wal::PathFor(to));
-  }
-  for (std::uint64_t segment = 1; segment < 32; ++segment) {
-    const auto source = Wal::SegmentPathFor(source_wal, segment);
-    if (std::filesystem::exists(source)) {
-      std::filesystem::copy_file(source, Wal::SegmentPathFor(Wal::PathFor(to), segment));
-    }
   }
 }
 

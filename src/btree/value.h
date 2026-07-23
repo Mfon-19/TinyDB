@@ -15,8 +15,9 @@ namespace tinydb {
 ** Inline values borrow bytes from their leaf. Overflow values store one fixed
 ** descriptor in the leaf and place the logical bytes in separately checksummed
 ** pages. The first page ID is also the value identifier recorded by every page
-** in the chain; it prevents one valid page from being spliced into another
-** value. value_checksum binds ordering and content across the complete chain.
+** in the chain. The owner and chunk index reject cross-value or cross-position
+** links; canonical payload lengths and each page's checksum protect the chain
+** geometry and physical bytes.
 */
 enum class LeafValueKind : std::uint8_t {
   Inline = 0,
@@ -26,12 +27,11 @@ enum class LeafValueKind : std::uint8_t {
 struct OverflowValueDescriptor {
   std::uint64_t total_value_bytes{0};
   page_id_t first_page_id{HEADER_PAGE_ID};
-  std::uint32_t value_checksum{0};
 
   auto operator==(const OverflowValueDescriptor &) const -> bool = default;
 };
 
-inline constexpr std::size_t OVERFLOW_VALUE_DESCRIPTOR_BYTES = 24;
+inline constexpr std::size_t OVERFLOW_VALUE_DESCRIPTOR_BYTES = 16;
 
 class LeafValueView final {
  public:

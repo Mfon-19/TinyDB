@@ -7,6 +7,7 @@
 #include "storage/encoding.h"
 #include "storage/page_codec.h"
 #include "storage/superblock.h"
+#include "txn/transaction_pages.h"
 #include "util/crc32.h"
 #include "wal/wal_codec.h"
 
@@ -17,10 +18,13 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 /*
@@ -37,6 +41,25 @@ using tinydb::storage::SelectedSuperblock;
 using tinydb::storage::Superblock;
 using tinydb::storage::SuperblockPage;
 using tinydb::storage::SuperblockSlot;
+
+class FixedPageReader final : public tinydb::PageReader {
+ public:
+  void Add(tinydb::page_id_t page_id, const std::array<char, tinydb::PAGE_SIZE> &bytes) {
+    pages_.emplace(page_id, std::make_shared<const std::array<char, tinydb::PAGE_SIZE>>(bytes));
+  }
+
+  auto Read(tinydb::page_id_t page_id) -> tinydb::Result<tinydb::PageHandle> override {
+    const auto page = pages_.find(page_id);
+    if (page == pages_.end()) {
+      return std::unexpected(tinydb::Status::Corruption("test reader has no such page"));
+    }
+    std::shared_ptr<const void> keepalive = page->second;
+    return tinydb::PageHandle(page_id, page->second->data(), std::move(keepalive));
+  }
+
+ private:
+  std::map<tinydb::page_id_t, std::shared_ptr<const std::array<char, tinydb::PAGE_SIZE>>> pages_;
+};
 
 auto Golden(std::string_view name) -> std::vector<std::byte> {
   const auto path = std::filesystem::path{TINYDB_TEST_SOURCE_DIR} / "tests" / "fixtures" / name;
@@ -61,7 +84,6 @@ auto Fixture(std::uint64_t generation = 0x0102030405060708ULL) -> Superblock {
       .database_uuid = uuid,
       .generation = generation,
       .checkpoint_lsn = 0x1112131415161718ULL,
-      .transaction_id = 0x2122232425262728ULL,
       .root_page_id = 2,
       .allocator_root_page_id = 3,
       .high_water_page_id = 4,
@@ -163,7 +185,7 @@ TEST(Format, SuperblockGolden) {
   // The checked-in bytes are a compatibility contract independent of this
   // translation unit. CI therefore catches a codec and fixture disagreement
   // even when encoder and decoder are changed together.
-  const auto golden_prefix = Golden("superblock_v4.hex");
+  const auto golden_prefix = Golden("superblock_v5.hex");
   ASSERT_EQ(golden_prefix.size(), tinydb::storage::superblock_offset::ENCODED_BYTES);
 
   EXPECT_TRUE(std::ranges::equal(golden_prefix, std::span{*encoded}.first(golden_prefix.size())));
@@ -181,7 +203,7 @@ TEST(Format, Checksums) {
         tinydb::storage::superblock_offset::PAGE_SIZE, tinydb::storage::superblock_offset::REQUIRED_FEATURES,
         tinydb::storage::superblock_offset::OPTIONAL_FEATURES, tinydb::storage::superblock_offset::DATABASE_UUID,
         tinydb::storage::superblock_offset::GENERATION, tinydb::storage::superblock_offset::CHECKPOINT_LSN,
-        tinydb::storage::superblock_offset::TRANSACTION_ID, tinydb::storage::superblock_offset::ROOT_PAGE_ID,
+        tinydb::storage::superblock_offset::RESERVED, tinydb::storage::superblock_offset::ROOT_PAGE_ID,
         tinydb::storage::superblock_offset::ALLOCATOR_ROOT_PAGE_ID,
         tinydb::storage::superblock_offset::HIGH_WATER_PAGE_ID, tinydb::storage::superblock_offset::CHECKSUM,
         tinydb::storage::superblock_offset::ENCODED_BYTES}) {
@@ -279,7 +301,7 @@ TEST(Format, Tears) {
 TEST(Format, Conflict) {
   auto first = Fixture(5);
   auto second = first;
-  ++second.transaction_id;
+  ++second.root_page_id;
   const auto page_a = tinydb::storage::EncodeSuperblock(first);
   const auto page_b = tinydb::storage::EncodeSuperblock(second);
   ASSERT_TRUE(page_a.has_value());
@@ -310,14 +332,58 @@ TEST(Format, Allocator) {
   EXPECT_EQ(tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
                                                             tinydb::storage::data_page_offset::CHECKSUM),
             std::optional<std::uint32_t>{0U});
-  ASSERT_TRUE(tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 2,
-                                                  0x0102030405060708ULL)
-                  .has_value());
+  ASSERT_TRUE(
+      tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 2, 0x0102030405060708ULL)
+          .has_value());
   EXPECT_EQ(provisional, *encoded);
 
   auto adjacent = extents;
   adjacent[1].first_page_id = 7;
   EXPECT_EQ(tinydb::storage::EncodeFreeExtentPage(2, 0, 0, adjacent).error().Code(), StatusCode::InvalidArgument);
+}
+
+TEST(Format, AllocatorPersistsMultipleRetirementsAcrossPages) {
+  auto extents = std::vector<tinydb::storage::FreeExtent>{};
+  extents.reserve(200);
+  for (std::uint64_t index = 0; index < 200; ++index) {
+    extents.push_back(tinydb::storage::FreeExtent{.first_page_id = 10 + 4 * index, .page_count = 1, .retire_lsn = 7});
+  }
+
+  auto pages = FixedPageReader{};
+  const auto first = tinydb::storage::EncodeFreeExtentPage(
+      2, 7, 3, std::span<const tinydb::storage::FreeExtent>{extents}.first(tinydb::storage::FREE_EXTENTS_PER_PAGE));
+  const auto second = tinydb::storage::EncodeFreeExtentPage(
+      3, 7, tinydb::HEADER_PAGE_ID,
+      std::span<const tinydb::storage::FreeExtent>{extents}.subspan(tinydb::storage::FREE_EXTENTS_PER_PAGE));
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  pages.Add(2, *first);
+  pages.Add(3, *second);
+
+  auto transaction = tinydb::txn::TransactionPages::Begin(&pages,
+                                                          tinydb::txn::DatabaseState{
+                                                              .root_page_id = 4,
+                                                              .allocator_root_page_id = 2,
+                                                              .high_water_page_id = 1'000,
+                                                              .visible_lsn = 7,
+                                                              .checkpoint_lsn = 7,
+                                                          },
+                                                          4 * tinydb::PAGE_SIZE)
+                         .value();
+  ASSERT_TRUE(transaction.Free(811).Ok());
+  ASSERT_TRUE(transaction.Free(815).Ok());
+  ASSERT_TRUE(transaction.Free(819).Ok());
+  ASSERT_TRUE(transaction.PrepareCommit(8).Ok());
+
+  auto changed = transaction.TakePages();
+  ASSERT_EQ(changed.size(), 2U);
+  EXPECT_EQ(changed[0].header.page_id, 2U);
+  EXPECT_EQ(changed[1].header.page_id, 3U);
+  const auto decoded =
+      tinydb::storage::DecodeFreeExtentPage(std::as_bytes(std::span{*changed[1].bytes}), 3, changed[1].header);
+  ASSERT_TRUE(decoded.has_value());
+  ASSERT_EQ(decoded->extents.size(), 35U);
+  EXPECT_EQ(decoded->extents.back().first_page_id, 819U);
 }
 
 TEST(Format, Overflow) {
@@ -342,8 +408,7 @@ TEST(Format, Overflow) {
   EXPECT_EQ(tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
                                                             tinydb::storage::data_page_offset::CHECKSUM),
             std::optional<std::uint32_t>{0U});
-  ASSERT_TRUE(
-      tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 7, 99).has_value());
+  ASSERT_TRUE(tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 7, 99).has_value());
   EXPECT_EQ(provisional, *encoded);
 
   EXPECT_EQ(tinydb::storage::DecodeOverflowPage(bytes, 6).error().Code(), StatusCode::Corruption);
@@ -410,11 +475,10 @@ TEST(Format, WalHeader) {
   }
   const auto wanted = tinydb::wal_format::Header{
       .database_uuid = uuid,
-      .segment_id = 0x0102030405060708ULL,
   };
   const auto encoded = tinydb::wal_format::EncodeHeader(wanted);
   ASSERT_TRUE(encoded.has_value());
-  const auto golden = Golden("wal_header_v5.hex");
+  const auto golden = Golden("wal_header_v6.hex");
   ASSERT_EQ(golden.size(), tinydb::wal_format::HEADER_BYTES);
   const auto bytes = std::as_bytes(std::span{*encoded});
   EXPECT_TRUE(std::ranges::equal(golden, bytes));
@@ -423,23 +487,20 @@ TEST(Format, WalHeader) {
 
 TEST(Format, WalRecord) {
   constexpr auto payload = std::array{std::byte{0xAA}, std::byte{0xBB}, std::byte{0xCC}};
-  const auto encoded = tinydb::wal_format::EncodeRecord(tinydb::wal_format::RecordType::PageImage,
-                                                        0x0102030405060708ULL, 80, 0x0A0B0C0DU, payload);
+  const auto encoded = tinydb::wal_format::EncodeRecord(tinydb::wal_format::RecordType::PageImage, 80, payload);
   ASSERT_TRUE(encoded.has_value());
-  const auto golden = Golden("wal_record_v5.hex");
-  ASSERT_EQ(golden.size(), 43U);
+  const auto golden = Golden("wal_record_v6.hex");
+  ASSERT_EQ(golden.size(), 27U);
   const auto bytes = std::as_bytes(std::span{*encoded});
   EXPECT_TRUE(std::ranges::equal(golden, bytes));
   const auto decoded = tinydb::wal_format::DecodeRecord(bytes);
   ASSERT_TRUE(decoded.has_value());
   EXPECT_EQ(decoded->type, tinydb::wal_format::RecordType::PageImage);
-  EXPECT_EQ(decoded->transaction_id, 0x0102030405060708ULL);
   EXPECT_EQ(decoded->lsn, 80U);
-  EXPECT_EQ(decoded->record_sequence, 0x0A0B0C0DU);
   EXPECT_TRUE(std::ranges::equal(decoded->payload, payload));
 
-  for (const auto offset : {std::size_t{0}, std::size_t{4}, std::size_t{8}, std::size_t{16}, std::size_t{24},
-                            std::size_t{28}, std::size_t{32}, std::size_t{42}}) {
+  for (const auto offset :
+       {std::size_t{0}, std::size_t{4}, std::size_t{8}, std::size_t{16}, std::size_t{20}, std::size_t{26}}) {
     auto corrupted = *encoded;
     corrupted[offset] ^= 0x01;
     EXPECT_EQ(tinydb::wal_format::DecodeRecord(std::as_bytes(std::span{corrupted})).error().Code(),
@@ -457,27 +518,24 @@ TEST(Format, Transaction) {
       tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
       tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},
   };
-  const auto encoded = tinydb::wal_format::EncodeTransaction(9, 100, pages,
+  const auto encoded = tinydb::wal_format::EncodeTransaction(100, pages,
                                                              tinydb::txn::DatabaseState{
                                                                  .root_page_id = 2,
                                                                  .allocator_root_page_id = tinydb::HEADER_PAGE_ID,
                                                                  .high_water_page_id = 4,
-                                                                 .transaction_id = 8,
                                                                  .visible_lsn = 99,
                                                                  .checkpoint_lsn = 90,
                                                              });
   ASSERT_TRUE(encoded.has_value()) << encoded.error().ToString();
-  EXPECT_EQ(encoded->commit_lsn, 103U);
-  EXPECT_EQ(encoded->next_lsn, 104U);
-  EXPECT_EQ(encoded->state.transaction_id, 9U);
-  EXPECT_EQ(encoded->state.visible_lsn, 103U);
+  EXPECT_EQ(encoded->commit_lsn, 100U);
 
   const auto decoded = tinydb::wal_format::DecodeTransaction(std::as_bytes(std::span{encoded->bytes}), 100);
   ASSERT_TRUE(decoded.has_value()) << decoded.error().ToString();
-  EXPECT_EQ(decoded->transaction_id, 9U);
-  EXPECT_EQ(decoded->commit_lsn, 103U);
-  EXPECT_EQ(decoded->next_lsn, 104U);
-  EXPECT_EQ(decoded->state, encoded->state);
+  EXPECT_EQ(decoded->commit_lsn, 100U);
+  EXPECT_EQ(decoded->state.root_page_id, 2U);
+  EXPECT_EQ(decoded->state.allocator_root_page_id, tinydb::HEADER_PAGE_ID);
+  EXPECT_EQ(decoded->state.high_water_page_id, 4U);
+  EXPECT_EQ(decoded->state.visible_lsn, 100U);
   ASSERT_EQ(decoded->pages.size(), 2U);
   EXPECT_EQ(decoded->pages[0].page_id, 2U);
   EXPECT_EQ(decoded->pages[0].bytes, first);
@@ -485,9 +543,9 @@ TEST(Format, Transaction) {
   EXPECT_EQ(decoded->pages[1].bytes, second);
 
   const auto sealed_first =
-      tinydb::storage::EncodeOverflowPage(2, 103, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
+      tinydb::storage::EncodeOverflowPage(2, 100, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
   const auto sealed_second =
-      tinydb::storage::EncodeOverflowPage(3, 103, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
+      tinydb::storage::EncodeOverflowPage(3, 100, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
   const auto first_header = tinydb::storage::DecodeDataPageHeader(std::as_bytes(std::span{sealed_first}), 2).value();
   const auto second_header = tinydb::storage::DecodeDataPageHeader(std::as_bytes(std::span{sealed_second}), 3).value();
   const auto fallback_sealed_pages = std::array{
@@ -499,19 +557,19 @@ TEST(Format, Transaction) {
       tinydb::wal_format::PageImageView{.page_id = 3, .bytes = sealed_second, .validated_header = &second_header},
   };
   const auto fallback_sealed_encoded =
-      tinydb::wal_format::EncodeTransaction(9, 100, fallback_sealed_pages, encoded->state);
-  const auto sealed_encoded = tinydb::wal_format::EncodeTransaction(9, 100, sealed_pages, encoded->state);
+      tinydb::wal_format::EncodeTransaction(100, fallback_sealed_pages, decoded->state);
+  const auto sealed_encoded = tinydb::wal_format::EncodeTransaction(100, sealed_pages, decoded->state);
   ASSERT_TRUE(fallback_sealed_encoded.has_value());
   ASSERT_TRUE(sealed_encoded.has_value());
   EXPECT_EQ(sealed_encoded->bytes, fallback_sealed_encoded->bytes);
 
   const auto unordered_pages = std::array{pages[1], pages[0]};
-  const auto unordered = tinydb::wal_format::EncodeTransaction(10, 100, unordered_pages, encoded->state);
+  const auto unordered = tinydb::wal_format::EncodeTransaction(100, unordered_pages, decoded->state);
   ASSERT_FALSE(unordered.has_value());
   EXPECT_EQ(unordered.error().Code(), StatusCode::InvalidArgument);
 
   const auto exhausted = tinydb::wal_format::EncodeTransaction(
-      10, std::numeric_limits<std::uint64_t>::max() - 2, std::span{pages}.first<1>(), tinydb::txn::DatabaseState{});
+      std::numeric_limits<std::uint64_t>::max(), std::span{pages}.first<1>(), tinydb::txn::DatabaseState{});
   ASSERT_FALSE(exhausted.has_value());
   EXPECT_EQ(exhausted.error().Code(), StatusCode::ResourceExhausted);
 }
@@ -525,7 +583,7 @@ TEST(Format, TransactionDamage) {
       tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
       tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},
   };
-  const auto encoded = tinydb::wal_format::EncodeTransaction(4, 50, pages,
+  const auto encoded = tinydb::wal_format::EncodeTransaction(50, pages,
                                                              tinydb::txn::DatabaseState{
                                                                  .root_page_id = 2,
                                                                  .high_water_page_id = 4,
@@ -534,7 +592,7 @@ TEST(Format, TransactionDamage) {
   constexpr auto page_record_bytes =
       tinydb::wal_format::RECORD_HEADER_BYTES + tinydb::wal_format::PAGE_IMAGE_PAYLOAD_BYTES;
   constexpr auto state_record_bytes =
-      tinydb::wal_format::RECORD_HEADER_BYTES + tinydb::wal_format::DATABASE_STATE_PAYLOAD_BYTES;
+      tinydb::wal_format::RECORD_HEADER_BYTES + tinydb::wal_format::COMMIT_STATE_PAYLOAD_BYTES;
 
   auto missing = encoded.bytes;
   missing.erase(missing.begin() + static_cast<std::ptrdiff_t>(page_record_bytes),
@@ -556,7 +614,7 @@ TEST(Format, TransactionDamage) {
 
   auto corrupt_state = encoded.bytes;
   const auto state_payload = 2 * page_record_bytes + tinydb::wal_format::RECORD_HEADER_BYTES;
-  corrupt_state[state_payload + tinydb::wal_format::DATABASE_STATE_ROOT_OFFSET] ^= 0x01;
+  corrupt_state[state_payload + tinydb::wal_format::COMMIT_STATE_ROOT_OFFSET] ^= 0x01;
   EXPECT_EQ(tinydb::wal_format::DecodeTransaction(std::as_bytes(std::span{corrupt_state}), 50).error().Code(),
             StatusCode::Corruption);
 

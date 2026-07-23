@@ -192,7 +192,6 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
 auto DiskManager::GetRootPageId() const -> page_id_t { return selected_.value.root_page_id; }
 auto DiskManager::GetAllocatorRootPageId() const -> page_id_t { return selected_.value.allocator_root_page_id; }
 auto DiskManager::HighWaterPageId() const -> page_id_t { return selected_.value.high_water_page_id; }
-auto DiskManager::TransactionId() const -> std::uint64_t { return selected_.value.transaction_id; }
 auto DiskManager::CheckpointLsn() const -> std::uint64_t { return selected_.value.checkpoint_lsn; }
 auto DiskManager::Uuid() const -> const DatabaseUuid & { return selected_.value.database_uuid; }
 
@@ -226,8 +225,7 @@ auto DiskManager::WriteCheckpointPage(page_id_t page_id, const char *data,
 }
 
 auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id,
-                                   page_id_t high_water_page_id, std::uint64_t transaction_id,
-                                   std::uint64_t checkpoint_lsn) -> Status {
+                                   page_id_t high_water_page_id, std::uint64_t checkpoint_lsn) -> Status {
   TINYDB_CHECK(fd_.Valid(), "checkpointing a closed disk manager");
   if (checkpoint_lsn < CheckpointLsn()) {
     return Status::InvalidArgument("checkpoint frontier moved backward");
@@ -247,7 +245,6 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
   auto next = selected_.value;
   ++next.generation;
   next.checkpoint_lsn = checkpoint_lsn;
-  next.transaction_id = transaction_id;
   next.root_page_id = root_page_id;
   next.allocator_root_page_id = allocator_root_page_id;
   next.high_water_page_id = high_water_page_id;

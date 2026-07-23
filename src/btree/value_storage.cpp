@@ -3,7 +3,6 @@
 #include "btree/page_format.h"
 #include "btree/page_source.h"
 #include "storage/page_codec.h"
-#include "util/crc32.h"
 
 #include <tinydb/bytes.h>
 
@@ -31,9 +30,8 @@ struct ChainConstraints {
 
 /*
 ** Walk one descriptor without trusting any link or redundant field. The
-** visitor runs only after the current page's identity, owner, chunk index, and
-** canonical payload length have been checked. The final logical checksum is
-** compared only after the terminator proves the exact advertised length.
+** visitor runs only after the current page's checksum, identity, owner, chunk
+** index, and canonical payload length have been checked.
 */
 template <typename Visitor>
 auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor,
@@ -44,7 +42,6 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
     return Status::Corruption("invalid overflow value descriptor");
   }
 
-  auto checksum = Crc32Accumulator{};
   auto page_id = descriptor.first_page_id;
   auto remaining = descriptor.total_value_bytes;
   auto expected_chunk = std::uint32_t{0};
@@ -88,7 +85,6 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
       return Status::Corruption("overflow chain is truncated or non-canonical");
     }
 
-    checksum.Update(decoded->payload);
     if (auto status = visit(page_id, decoded->payload); !status.Ok()) {
       return status;
     }
@@ -103,9 +99,7 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
     page_id = decoded->next_page_id;
   }
 
-  return checksum.Finish() == descriptor.value_checksum
-             ? Status{}
-             : Status::Corruption("overflow value checksum does not match its descriptor");
+  return {};
 }
 
 }  // namespace
@@ -157,7 +151,6 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
   return LeafValueView::Overflow(OverflowValueDescriptor{
       .total_value_bytes = value.size(),
       .first_page_id = owner_value_id,
-      .value_checksum = Crc32(value_bytes),
   });
 }
 

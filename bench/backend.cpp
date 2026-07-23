@@ -392,7 +392,7 @@ class SelectedBackend final : public Backend {
 
 auto Identity() -> BackendIdentity {
 #if defined(KVBENCH_TINYDB)
-  return {"tinydb", "tinydb-v1", true, true};
+  return {"tinydb", KVBENCH_TINYDB_FORMAT_FAMILY, true, true};
 #elif defined(KVBENCH_SQLITE)
   return {"sqlite", "sqlite", false, false};
 #elif defined(KVBENCH_LEVELDB)

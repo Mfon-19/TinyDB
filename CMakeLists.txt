@@ -145,6 +145,7 @@ add_library(
   src/wal/wal_codec.cpp
   src/wal/wal_codec.h)
 add_library(TinyDB::TinyDB ALIAS TinyDB)
+set_property(TARGET TinyDB PROPERTY TINYDB_FORMAT_FAMILY tinydb-v2)
 target_sources(
   TinyDB
   PUBLIC FILE_SET

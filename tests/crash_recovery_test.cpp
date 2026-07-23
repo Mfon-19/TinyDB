@@ -69,7 +69,6 @@ auto ReadAll(int fd, void *data, std::size_t size) -> bool {
 
 auto Options() -> tinydb::Options {
   auto options = tinydb::Options{};
-  options.wal_segment_bytes = tinydb::wal_format::HEADER_BYTES + tinydb::PAGE_SIZE;
   options.checkpoint.wal_trigger_bytes = 64U << 20U;
   options.checkpoint.hard_wal_bytes = 128U << 20U;
   return options;

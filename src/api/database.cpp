@@ -58,12 +58,12 @@ namespace {
 **
 ** Commit order is fixed:
 **
-**   freeze structure -> assign exact commit LSN -> seal page bytes
+**   assign commit LSN -> finish allocator state and seal page bytes
 **   -> encode WAL transaction -> prepare cache/state ownership
 **   -> append and fsync WAL -> drain old readers -> publish noexcept
 **
 ** Every validation and allocation happens before WAL append. Once fsync proves
-** the COMMIT record durable, publication only transfers existing ownership and
+** the COMMIT_STATE record durable, publication only transfers existing ownership and
 ** replaces the one visible DatabaseState pointer.
 */
 using io::ErrnoStatus;
@@ -76,9 +76,6 @@ auto ValidateOptions(const Options &options) -> Status {
   if (options.max_write_transaction_bytes < PAGE_SIZE) {
     return Status::InvalidArgument("write transaction budget must hold at least one database page");
   }
-  if (options.wal_segment_bytes <= wal_format::HEADER_BYTES) {
-    return Status::InvalidArgument("WAL segment size must exceed the encoded segment header");
-  }
   const auto &checkpoint = options.checkpoint;
   if (checkpoint.wal_trigger_bytes == 0 || checkpoint.dirty_trigger_bytes == 0 ||
       checkpoint.hard_wal_bytes < checkpoint.wal_trigger_bytes ||
@@ -90,7 +87,7 @@ auto ValidateOptions(const Options &options) -> Status {
 }
 
 auto AcquireDatabaseLock(const std::filesystem::path &path) -> Result<UniqueFd> {
-  // Ownership precedes recovery because replay and segment cleanup are writes.
+  // Ownership precedes recovery because replay and WAL reset are writes.
   auto fd = UniqueFd(io::Open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
   if (!fd.Valid()) {
     return std::unexpected(ErrnoStatus("open"));
@@ -119,7 +116,6 @@ auto InitialState(const DiskManager &disk) -> std::shared_ptr<const txn::Databas
       .root_page_id = disk.GetRootPageId(),
       .allocator_root_page_id = disk.GetAllocatorRootPageId(),
       .high_water_page_id = disk.HighWaterPageId(),
-      .transaction_id = disk.TransactionId(),
       .visible_lsn = disk.CheckpointLsn(),
       .checkpoint_lsn = disk.CheckpointLsn(),
   });
@@ -290,11 +286,9 @@ class DatabaseCore final {
       operation_stats = operational_stats;
     }
     auto result = DatabaseStats{
-        .transaction_id = state->transaction_id,
         .visible_lsn = state->visible_lsn,
         .checkpoint_lsn = state->checkpoint_lsn,
         .wal_bytes = wal->SizeBytes(),
-        .wal_segments = wal->SegmentCount(),
         .active_readers = reader_stats.active_readers,
         .publication_pending = reader_stats.publication_pending,
         .oldest_reader_age = std::nullopt,
@@ -615,7 +609,7 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
   ** OPEN ORDER
   **
   ** Options are rejected without touching the filesystem. Process ownership
-  ** then precedes recovery because replay and segment cleanup mutate durable
+  ** then precedes recovery because replay and WAL reset mutate durable
   ** files. Recovery completes before DiskManager selects superblocks and
   ** before any cache can retain page bytes.
   */
@@ -637,8 +631,7 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
   auto disk = std::make_unique<DiskManager>(*std::move(disk_result));
   auto cache = std::make_unique<cache::CommittedPageCache>(disk.get(), options.page_cache_bytes, disk->CheckpointLsn());
   auto readers = std::make_unique<txn::ReaderGate>(InitialState(*disk));
-  auto wal_result = Wal::Open(wal_path, disk->Uuid(), disk->TransactionId() + 1, disk->CheckpointLsn() + 1,
-                              options.wal_segment_bytes);
+  auto wal_result = Wal::Open(wal_path, disk->Uuid(), disk->CheckpointLsn() + 1);
   if (!wal_result) {
     return std::unexpected(wal_result.error());
   }

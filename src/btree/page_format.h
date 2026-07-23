@@ -55,7 +55,7 @@ namespace leaf_cell_offset {
 **   4 value kind u8
 **
 ** Inline stored bytes are the value itself. Overflow stored bytes are the
-** fixed 24-byte descriptor below. The logical value length is then the
+** fixed 16-byte descriptor below. The logical value length is then the
 ** descriptor's u64, not the cell's u16 stored length.
 */
 inline constexpr std::size_t KEY_BYTES = 0;
@@ -65,11 +65,9 @@ inline constexpr std::size_t HEADER_BYTES = 5;
 }  // namespace leaf_cell_offset
 
 namespace overflow_descriptor_offset {
-// 0 total u64 | 8 first/owner page u64 | 16 value CRC-32 | 20 reserved u32
+// 0 total u64 | 8 first/owner page u64
 inline constexpr std::size_t TOTAL_VALUE_BYTES = 0;
 inline constexpr std::size_t FIRST_PAGE_ID = 8;
-inline constexpr std::size_t VALUE_CHECKSUM = 16;
-inline constexpr std::size_t RESERVED = 20;
 }  // namespace overflow_descriptor_offset
 
 namespace internal_cell_offset {

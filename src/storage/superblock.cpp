@@ -96,7 +96,6 @@ auto EncodeSuperblock(const Superblock &superblock) -> Result<SuperblockPage> {
       PutBytes(bytes, superblock_offset::DATABASE_UUID, superblock.database_uuid) &&
       PutLittleEndian(bytes, superblock_offset::GENERATION, superblock.generation) &&
       PutLittleEndian(bytes, superblock_offset::CHECKPOINT_LSN, superblock.checkpoint_lsn) &&
-      PutLittleEndian(bytes, superblock_offset::TRANSACTION_ID, superblock.transaction_id) &&
       PutLittleEndian(bytes, superblock_offset::ROOT_PAGE_ID, superblock.root_page_id) &&
       PutLittleEndian(bytes, superblock_offset::ALLOCATOR_ROOT_PAGE_ID, superblock.allocator_root_page_id) &&
       PutLittleEndian(bytes, superblock_offset::HIGH_WATER_PAGE_ID, superblock.high_water_page_id);
@@ -147,17 +146,16 @@ auto DecodeSuperblock(std::span<const std::byte> page) -> Result<Superblock> {
   }
   const auto generation = GetLittleEndian<std::uint64_t>(page, superblock_offset::GENERATION);
   const auto checkpoint_lsn = GetLittleEndian<std::uint64_t>(page, superblock_offset::CHECKPOINT_LSN);
-  const auto transaction_id = GetLittleEndian<std::uint64_t>(page, superblock_offset::TRANSACTION_ID);
+  const auto reserved = GetLittleEndian<std::uint64_t>(page, superblock_offset::RESERVED);
   const auto root_page_id = GetLittleEndian<page_id_t>(page, superblock_offset::ROOT_PAGE_ID);
   const auto allocator_root_page_id = GetLittleEndian<page_id_t>(page, superblock_offset::ALLOCATOR_ROOT_PAGE_ID);
   const auto high_water_page_id = GetLittleEndian<page_id_t>(page, superblock_offset::HIGH_WATER_PAGE_ID);
-  if (!generation || !checkpoint_lsn || !transaction_id || !root_page_id || !allocator_root_page_id ||
-      !high_water_page_id) {
+  if (!generation || !checkpoint_lsn || !reserved || !root_page_id || !allocator_root_page_id || !high_water_page_id ||
+      *reserved != 0) {
     return std::unexpected(Status::Corruption("truncated superblock state fields"));
   }
   superblock.generation = *generation;
   superblock.checkpoint_lsn = *checkpoint_lsn;
-  superblock.transaction_id = *transaction_id;
   superblock.root_page_id = *root_page_id;
   superblock.allocator_root_page_id = *allocator_root_page_id;
   superblock.high_water_page_id = *high_water_page_id;

@@ -79,7 +79,6 @@ auto BenchmarkOptions(const Scenario &scenario, std::optional<std::size_t> page_
   const auto transaction_payload =
       CheckedMultiply(scenario.batch, scenario.key_bytes + scenario.value_bytes, "transaction payload");
   options.max_write_transaction_bytes = std::max<std::size_t>(32U << 20U, transaction_payload * 3U);
-  options.wal_segment_bytes = 64U << 20U;
   options.checkpoint.wal_trigger_bytes = std::numeric_limits<std::uint64_t>::max();
   options.checkpoint.dirty_trigger_bytes = std::numeric_limits<std::size_t>::max();
   options.checkpoint.hard_wal_bytes = std::numeric_limits<std::uint64_t>::max();

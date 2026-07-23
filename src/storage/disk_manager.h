@@ -41,7 +41,6 @@ class DiskManager {
   auto GetRootPageId() const -> page_id_t;
   auto GetAllocatorRootPageId() const -> page_id_t;
   auto HighWaterPageId() const -> page_id_t;
-  auto TransactionId() const -> std::uint64_t;
   auto CheckpointLsn() const -> std::uint64_t;
   auto Uuid() const -> const DatabaseUuid &;
 
@@ -51,7 +50,7 @@ class DiskManager {
 
   auto WriteCheckpointPage(page_id_t page_id, const char *data, page_id_t captured_high_water_page_id) const -> Status;
   auto CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
-                        std::uint64_t transaction_id, std::uint64_t checkpoint_lsn) -> Status;
+                        std::uint64_t checkpoint_lsn) -> Status;
   auto Sync() const -> Status;
 
   auto ReadPage(page_id_t page_id, char *data) const -> Status;

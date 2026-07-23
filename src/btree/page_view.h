@@ -83,8 +83,6 @@ class LeafPageView {
             page_, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES),
         .first_page_id = page_view_detail::LoadLittleEndian<page_id_t>(
             page_, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID),
-        .value_checksum = page_view_detail::LoadLittleEndian<std::uint32_t>(
-            page_, value_offset + overflow_descriptor_offset::VALUE_CHECKSUM),
     });
   }
 

@@ -82,7 +82,7 @@ auto Manager::Checkpoint() -> Status {
       return Record(std::move(status));
     }
     if (auto status = disk_->CommitCheckpoint(state->root_page_id, state->allocator_root_page_id,
-                                              state->high_water_page_id, state->transaction_id, target_lsn);
+                                              state->high_water_page_id, target_lsn);
         !status.Ok()) {
       return Record(std::move(status));
     }
@@ -97,7 +97,7 @@ auto Manager::Checkpoint() -> Status {
   */
   readers_->AdvanceCheckpoint(target_lsn);
   cache_->MarkCheckpointed(target_lsn);
-  if (auto status = wal_->CleanupCheckpointed(target_lsn); !status.Ok()) {
+  if (auto status = wal_->Reset(target_lsn); !status.Ok()) {
     return Record(std::move(status));
   }
   return Record({});

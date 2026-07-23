@@ -13,7 +13,6 @@ namespace tinydb {
 class Database;
 
 struct CommitInfo final {
-  std::uint64_t transaction_id{0};
   std::uint64_t commit_lsn{0};
 };
 

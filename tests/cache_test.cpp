@@ -39,7 +39,7 @@ void WritePages(tinydb::DiskManager &disk, std::size_t count) {
     ASSERT_TRUE(disk.WriteCheckpointPage(page_id, encoded->data(), high_water).Ok());
   }
   ASSERT_TRUE(disk.Sync().Ok());
-  ASSERT_TRUE(disk.CommitCheckpoint(tinydb::FIRST_DATA_PAGE_ID, tinydb::HEADER_PAGE_ID, high_water, 1, 1).Ok());
+  ASSERT_TRUE(disk.CommitCheckpoint(tinydb::FIRST_DATA_PAGE_ID, tinydb::HEADER_PAGE_ID, high_water, 1).Ok());
 }
 
 auto Image(tinydb::page_id_t page_id, std::uint64_t page_lsn) -> tinydb::cache::CommittedPageImage {
