@@ -43,12 +43,18 @@ class SnapshotCursor final {
   auto Next() -> Status { return cursor_.Next(); }
 
  private:
-  SnapshotCursor(SnapshotToken snapshot, PageReader *pages, page_id_t root_page_id, BTreeCursor cursor)
-      : snapshot_(std::move(snapshot)), pages_(pages), root_page_id_(root_page_id), cursor_(std::move(cursor)) {}
+  SnapshotCursor(SnapshotToken snapshot, PageReader *pages, page_id_t root_page_id, page_id_t high_water_page_id,
+                 BTreeCursor cursor)
+      : snapshot_(std::move(snapshot)),
+        pages_(pages),
+        root_page_id_(root_page_id),
+        high_water_page_id_(high_water_page_id),
+        cursor_(std::move(cursor)) {}
 
   SnapshotToken snapshot_;
   PageReader *pages_;
   page_id_t root_page_id_;
+  page_id_t high_water_page_id_;
   BTreeCursor cursor_;
 
   friend class ReadSnapshot;

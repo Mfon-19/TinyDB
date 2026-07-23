@@ -19,7 +19,7 @@ namespace {
 ** an allocation-sized visited set.
 */
 template <typename ChooseChild>
-auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child) -> Result<page_id_t> {
+auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child) -> Result<PageHandle> {
   auto page_id = root_page_id;
   auto depth = std::size_t{0};
   for (;;) {
@@ -34,11 +34,9 @@ auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child
     }
     const auto type = RawNodeType(page->Data());
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
-      const auto leaf = LeafPageView::Open(*page);
-      if (!leaf) {
-        return std::unexpected(leaf.error());
-      }
-      return page_id;
+      // The consumer opens and validates this leaf while retaining the same
+      // lease. Returning it avoids a second cache lookup and pin cycle.
+      return std::move(*page);
     }
     if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
       return std::unexpected(Status::Corruption("tree descent reached a non-tree page"));
@@ -53,14 +51,14 @@ auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child
 
 }  // namespace
 
-auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<page_id_t> {
+auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<PageHandle> {
   // Separator equality routes right, matching the inclusive-lower-bound
   // invariant used by page builders and verification.
   return Descend(pages, root_page_id,
                  [key](const InternalPageView &page) { return page.ChildAt(page.FindChildIndex(key)); });
 }
 
-auto FindFirstLeaf(PageReader *pages, page_id_t root_page_id) -> Result<page_id_t> {
+auto FindFirstLeaf(PageReader *pages, page_id_t root_page_id) -> Result<PageHandle> {
   return Descend(pages, root_page_id, [](const InternalPageView &page) { return page.ChildAt(0); });
 }
 

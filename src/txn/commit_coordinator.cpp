@@ -9,6 +9,7 @@
 #include "txn/reader_gate.h"
 #include "txn/transaction_pages.h"
 
+#include <algorithm>
 #include <chrono>
 #include <expected>
 #include <memory>
@@ -54,19 +55,22 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
   /*
   ** PREPARE DURABLE AND VISIBLE OWNERSHIP
   **
-  ** WAL copies final bytes before TransactionPages transfers them into
-  ** committed frames. The shared DatabaseState, dense page-table capacity,
-  ** frame control blocks, retirement list, and encoded WAL transaction are all
-  ** created while failure is still a definite abort.
+  ** TransactionPages transfers one ordered image vector. WAL borrows and
+  ** copies those bytes before the same allocations move into committed frames.
+  ** The shared DatabaseState, dense page-table capacity, frame control blocks,
+  ** retirement list, and encoded WAL transaction are all created while failure
+  ** is still a definite abort.
   */
   const auto state = transaction.ResultingState();
-  const auto borrowed_images = transaction.PageImages();
+  auto retired = std::vector<page_id_t>(transaction.RetiredPageIds().begin(), transaction.RetiredPageIds().end());
+  std::ranges::sort(retired);
+  auto committed_pages = transaction.TakePages();
   auto wal_pages = std::vector<wal_format::PageImageView>{};
-  wal_pages.reserve(borrowed_images.size());
-  for (const auto &[page_id, bytes] : borrowed_images) {
+  wal_pages.reserve(committed_pages.size());
+  for (const auto &image : committed_pages) {
     wal_pages.push_back(wal_format::PageImageView{
-        .page_id = page_id,
-        .bytes = std::span<const char, PAGE_SIZE>{bytes, PAGE_SIZE},
+        .page_id = image.page_id,
+        .bytes = std::span<const char, PAGE_SIZE>{image.bytes->data(), PAGE_SIZE},
     });
   }
   auto prepared_wal = wal.Prepare(wal_pages, state);
@@ -75,15 +79,8 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
     transaction.Abort();
     return std::unexpected(prepared_wal.error());
   }
-  auto retired = std::vector<page_id_t>(transaction.RetiredPageIds().begin(), transaction.RetiredPageIds().end());
-  auto committed_pages = transaction.TakePages();
-  if (!committed_pages) {
-    record_prepare();
-    transaction.Abort();
-    return std::unexpected(committed_pages.error());
-  }
   auto publication_plan =
-      cache.PreparePublication(std::move(*committed_pages), std::move(retired), state.high_water_page_id);
+      cache.PreparePublication(std::move(committed_pages), std::move(retired), state.high_water_page_id);
   if (!publication_plan) {
     record_prepare();
     transaction.Abort();

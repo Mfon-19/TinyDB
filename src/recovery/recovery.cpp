@@ -73,7 +73,7 @@ struct LoadedSegment {
 struct LoadedLog {
   DatabaseUuid database_uuid{};
   std::vector<LoadedSegment> segments;
-  std::vector<char> encoded_records;
+  std::vector<wal_format::DecodedTransaction> transactions;
   bool active_present{false};
   bool active_partial{false};
   bool cleanup_needed{false};
@@ -90,8 +90,6 @@ struct RecoveryPlan {
   bool active_present{false};
   bool cleanup_needed{false};
 };
-
-auto Bytes(const std::vector<char> &value) -> std::span<const std::byte> { return std::as_bytes(std::span{value}); }
 
 /*
 ** Return every syntactically named archive and the active WAL.  Filenames are
@@ -232,6 +230,8 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
     auto expected_sequence = std::uint32_t{0};
     auto offset = std::size_t{wal_format::HEADER_BYTES};
     auto last_type = std::optional<wal_format::RecordType>{};
+    auto run_offset = offset;
+    auto run_first_lsn = expected_lsn;
     while (offset < segment.bytes.size()) {
       const auto remaining = std::as_bytes(std::span{segment.bytes}).subspan(offset);
       const auto total = storage::GetLittleEndian<std::uint32_t>(remaining, 0);
@@ -262,11 +262,19 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
         return std::unexpected(Status::Corruption("WAL record sequence overflows the LSN space"));
       }
 
-      log.encoded_records.insert(log.encoded_records.end(), segment.bytes.begin() + static_cast<std::ptrdiff_t>(offset),
-                                 segment.bytes.begin() + static_cast<std::ptrdiff_t>(offset + *total));
+      if (expected_sequence == 0) {
+        run_offset = offset;
+        run_first_lsn = record->lsn;
+      }
       ++expected_lsn;
       last_type = record->type;
       if (record->type == wal_format::RecordType::Commit) {
+        const auto run = std::as_bytes(std::span{segment.bytes}).subspan(run_offset, offset + *total - run_offset);
+        auto transaction = wal_format::DecodeTransaction(run, run_first_lsn);
+        if (!transaction) {
+          return std::unexpected(transaction.error());
+        }
+        log.transactions.push_back(std::move(*transaction));
         expected_sequence = 0;
       } else {
         if (expected_sequence == std::numeric_limits<std::uint32_t>::max()) {
@@ -283,6 +291,13 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
     if (has_following_segment && last_type != wal_format::RecordType::Commit) {
       return std::unexpected(Status::Corruption("a WAL transaction crosses a segment boundary"));
     }
+    if (last_type.has_value() && last_type != wal_format::RecordType::Commit && !segment.file.active) {
+      return std::unexpected(Status::Corruption("archived WAL ends with an incomplete transaction"));
+    }
+    // Decoded page images now own every complete transaction. Release the
+    // segment buffer immediately instead of retaining a second full WAL copy
+    // through semantic planning and redo.
+    segment.bytes = std::vector<char>{};
   }
   log.cleanup_needed = log.cleanup_needed || !log.active_present;
   return std::optional{std::move(log)};
@@ -362,10 +377,9 @@ auto EncodeRecoveredSuperblock(const wal_format::DecodedTransaction &transaction
 }
 
 /*
-** Authenticate every complete transaction and derive all redo metadata.  This
-** is the semantic half of Pass 1: it must finish successfully before Recover
-** opens the database read/write.  A final run without COMMIT is ignored only
-** when an active (possibly partial) tail exists.
+** Derive redo metadata from the complete transactions authenticated while
+** loading the segments. This semantic half of Pass 1 must finish successfully
+** before Recover opens the database read/write.
 */
 auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result<RecoveryPlan> {
   if (base.value.database_uuid != log.database_uuid) {
@@ -399,8 +413,6 @@ auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result
   }
 
   const auto checkpoint_lsn = base.value.checkpoint_lsn;
-  auto run = std::vector<char>{};
-  auto run_first_lsn = log.segments.front().header.starting_lsn;
   auto previous_transaction_id = std::optional<std::uint64_t>{};
   auto previous_next_lsn = std::optional<std::uint64_t>{};
   auto saw_uncheckpointed_transaction = false;
@@ -408,58 +420,34 @@ auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result
   auto expected_live_transaction_id =
       base.value.transaction_id == std::numeric_limits<std::uint64_t>::max() ? 0 : base.value.transaction_id + 1U;
   auto previous_high_water = base.value.high_water_page_id;
-  auto offset = std::size_t{0};
-  while (offset < log.encoded_records.size()) {
-    const auto remaining = std::as_bytes(std::span{log.encoded_records}).subspan(offset);
-    const auto total = storage::GetLittleEndian<std::uint32_t>(remaining, 0);
-    if (!total || *total > remaining.size()) {
-      return std::unexpected(Status::Corruption("validated WAL record geometry is inconsistent"));
-    }
-    const auto record = wal_format::DecodeRecord(remaining.first(*total));
-    if (!record) {
-      return std::unexpected(record.error());
-    }
-    if (run.empty()) {
-      run_first_lsn = record->lsn;
-    }
-    run.insert(run.end(), log.encoded_records.begin() + static_cast<std::ptrdiff_t>(offset),
-               log.encoded_records.begin() + static_cast<std::ptrdiff_t>(offset + *total));
-    offset += *total;
-    if (record->type != wal_format::RecordType::Commit) {
-      continue;
-    }
-
-    auto transaction = wal_format::DecodeTransaction(Bytes(run), run_first_lsn);
-    if (!transaction) {
-      return std::unexpected(transaction.error());
-    }
-    if (previous_next_lsn && transaction->first_lsn != *previous_next_lsn) {
+  for (auto &transaction : log.transactions) {
+    if (previous_next_lsn && transaction.first_lsn != *previous_next_lsn) {
       // Cleanup may have removed any subset of segments whose records are
       // already represented by the selected superblock.  Such a gap is safe
       // only while both sides remain at or behind checkpoint_lsn.  The first
       // live record and everything after it must be exactly contiguous.
-      if (transaction->first_lsn < *previous_next_lsn || *previous_next_lsn > checkpoint_lsn + 1U ||
-          transaction->first_lsn > checkpoint_lsn + 1U) {
+      if (transaction.first_lsn < *previous_next_lsn || *previous_next_lsn > checkpoint_lsn + 1U ||
+          transaction.first_lsn > checkpoint_lsn + 1U) {
         return std::unexpected(Status::Corruption("WAL transaction LSN sequence is missing or reordered"));
       }
     }
-    if (previous_transaction_id && transaction->transaction_id <= *previous_transaction_id) {
+    if (previous_transaction_id && transaction.transaction_id <= *previous_transaction_id) {
       return std::unexpected(Status::Corruption("WAL transaction ID sequence is duplicated or reordered"));
     }
-    previous_transaction_id = transaction->transaction_id;
-    previous_next_lsn = transaction->next_lsn;
-    plan.durable_next_lsn = std::max(plan.durable_next_lsn, transaction->next_lsn);
+    previous_transaction_id = transaction.transaction_id;
+    previous_next_lsn = transaction.next_lsn;
+    plan.durable_next_lsn = std::max(plan.durable_next_lsn, transaction.next_lsn);
 
-    if (transaction->commit_lsn > checkpoint_lsn) {
-      if (transaction->first_lsn <= checkpoint_lsn) {
+    if (transaction.commit_lsn > checkpoint_lsn) {
+      if (transaction.first_lsn <= checkpoint_lsn) {
         return std::unexpected(Status::Corruption("database checkpoint cuts through a WAL transaction"));
       }
-      if (expected_live_transaction_id == 0 || transaction->first_lsn != expected_live_lsn ||
-          transaction->transaction_id != expected_live_transaction_id) {
+      if (expected_live_transaction_id == 0 || transaction.first_lsn != expected_live_lsn ||
+          transaction.transaction_id != expected_live_transaction_id) {
         return std::unexpected(Status::Corruption("WAL live transaction suffix is missing or reordered"));
       }
       saw_uncheckpointed_transaction = true;
-      expected_live_lsn = transaction->next_lsn;
+      expected_live_lsn = transaction.next_lsn;
       if (expected_live_transaction_id == std::numeric_limits<std::uint64_t>::max()) {
         expected_live_transaction_id = 0;
       } else {
@@ -468,26 +456,21 @@ auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result
       // A transaction may have begun while this checkpoint was writing and
       // therefore record an older allocator-reuse frontier. It may never claim
       // a checkpoint newer than the selected durable base.
-      if (transaction->state.checkpoint_lsn > checkpoint_lsn ||
-          transaction->state.high_water_page_id < previous_high_water ||
-          transaction->state.high_water_page_id > MAX_FILE_PAGES) {
+      if (transaction.state.checkpoint_lsn > checkpoint_lsn ||
+          transaction.state.high_water_page_id < previous_high_water ||
+          transaction.state.high_water_page_id > MAX_FILE_PAGES) {
         return std::unexpected(Status::Corruption("WAL database-state frontier is inconsistent with its base"));
       }
-      for (const auto &page : transaction->pages) {
-        if (page.page_id >= transaction->state.high_water_page_id) {
+      for (const auto &page : transaction.pages) {
+        if (page.page_id >= transaction.state.high_water_page_id) {
           return std::unexpected(Status::Corruption("WAL page image lies beyond its allocation frontier"));
         }
       }
-      previous_high_water = transaction->state.high_water_page_id;
-      plan.transactions.push_back(std::move(*transaction));
-    } else if (transaction->transaction_id > base.value.transaction_id) {
+      previous_high_water = transaction.state.high_water_page_id;
+      plan.transactions.push_back(std::move(transaction));
+    } else if (transaction.transaction_id > base.value.transaction_id) {
       return std::unexpected(Status::Corruption("covered WAL transaction is newer than the selected superblock"));
     }
-    run.clear();
-  }
-
-  if (!run.empty() && !log.active_present && !log.active_partial) {
-    return std::unexpected(Status::Corruption("archived WAL ends with an incomplete transaction"));
   }
   if (!saw_uncheckpointed_transaction && log.segments.front().header.starting_lsn > checkpoint_lsn + 1U) {
     return std::unexpected(Status::Corruption("WAL segment sequence begins after the checkpoint frontier"));

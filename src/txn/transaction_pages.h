@@ -68,9 +68,9 @@ class TransactionPages final : public PageSource {
   auto FreeExtents() const -> const std::vector<storage::FreeExtent> & { return free_extents_; }
   auto AllocatorPageIds() const -> const std::vector<page_id_t> & { return allocator_page_ids_; }
 
-  // Borrowed images remain stable until Abort, destruction, or TakePages.
-  auto PageImages() const -> std::vector<std::pair<page_id_t, const char *>>;
-  auto TakePages() -> Result<std::vector<cache::CommittedPageImage>>;
+  // Transfer final images in page-ID order so WAL encoding and publication
+  // share one deterministic representation without copying page bytes.
+  auto TakePages() -> std::vector<cache::CommittedPageImage>;
 
  private:
   struct PrivateFrame {

@@ -2,6 +2,7 @@
 
 #include "storage/disk_manager.h"
 #include "storage/page.h"
+#include "storage/page_codec.h"
 #include "util/check.h"
 #include "wal/wal.h"
 
@@ -15,11 +16,11 @@
 namespace tinydb::checkpoint {
 namespace {
 
-auto DirtyBytes(const cache::CommittedCacheStats &stats) -> std::size_t {
-  if (stats.dirty_pages > std::numeric_limits<std::size_t>::max() / PAGE_SIZE) {
+auto DirtyBytes(std::size_t dirty_pages) -> std::size_t {
+  if (dirty_pages > std::numeric_limits<std::size_t>::max() / PAGE_SIZE) {
     return std::numeric_limits<std::size_t>::max();
   }
-  return stats.dirty_pages * PAGE_SIZE;
+  return dirty_pages * PAGE_SIZE;
 }
 
 }  // namespace
@@ -67,9 +68,10 @@ auto Manager::Checkpoint() -> Status {
       return Record(std::move(status));
     }
     for (const auto &page : pages) {
-      TINYDB_CHECK(page.PageLsn() <= target_lsn, "checkpoint captured a future page version");
-      if (auto status = disk_->WriteCheckpointPage(page.Id(), page.Data().data(), state->high_water_page_id);
-          !status.Ok()) {
+      const auto *const header = page.ValidatedHeader();
+      TINYDB_CHECK(header != nullptr && header->page_lsn <= target_lsn,
+                   "checkpoint captured an unvalidated or future page version");
+      if (auto status = disk_->WriteCheckpointPage(page.Id(), page.Data(), state->high_water_page_id); !status.Ok()) {
         return Record(std::move(status));
       }
     }
@@ -99,12 +101,11 @@ auto Manager::Checkpoint() -> Status {
 }
 
 auto Manager::ShouldCheckpoint() const -> bool {
-  const auto cache = cache_->Stats();
+  const auto dirty_pages = cache_->DirtyPages();
   const auto wal_bytes = wal_->SizeBytes();
   auto lock = std::lock_guard(state_mutex_);
-  const auto dirty_bytes = DirtyBytes(cache);
-  const auto age_expired =
-      cache.dirty_pages != 0 && std::chrono::steady_clock::now() - last_success_ >= options_.maximum_age;
+  const auto dirty_bytes = DirtyBytes(dirty_pages);
+  const auto age_expired = dirty_pages != 0 && std::chrono::steady_clock::now() - last_success_ >= options_.maximum_age;
   return consecutive_failures_ != 0 || wal_bytes >= options_.wal_trigger_bytes ||
          dirty_bytes >= options_.dirty_trigger_bytes || age_expired;
 }
@@ -114,9 +115,9 @@ auto Manager::WriteAdmissionStatus() const -> Status {
   if (consecutive_failures_ < options_.failures_before_backpressure) {
     return {};
   }
-  const auto cache = cache_->Stats();
+  const auto dirty_pages = cache_->DirtyPages();
   const auto wal_bytes = wal_->SizeBytes();
-  const auto dirty_bytes = DirtyBytes(cache);
+  const auto dirty_bytes = DirtyBytes(dirty_pages);
   if (wal_bytes < options_.hard_wal_bytes && dirty_bytes < options_.hard_dirty_bytes) {
     return {};
   }
@@ -125,15 +126,14 @@ auto Manager::WriteAdmissionStatus() const -> Status {
 }
 
 auto Manager::GetStats() const -> Stats {
-  const auto cache = cache_->Stats();
+  const auto dirty_pages = cache_->DirtyPages();
   const auto wal_bytes = wal_->SizeBytes();
   auto lock = std::lock_guard(state_mutex_);
-  const auto age_expired =
-      cache.dirty_pages != 0 && std::chrono::steady_clock::now() - last_success_ >= options_.maximum_age;
+  const auto age_expired = dirty_pages != 0 && std::chrono::steady_clock::now() - last_success_ >= options_.maximum_age;
   return Stats{
       .consecutive_failures = consecutive_failures_,
       .checkpoint_requested = consecutive_failures_ != 0 || wal_bytes >= options_.wal_trigger_bytes ||
-                              DirtyBytes(cache) >= options_.dirty_trigger_bytes || age_expired,
+                              DirtyBytes(dirty_pages) >= options_.dirty_trigger_bytes || age_expired,
       .age_since_success = std::chrono::steady_clock::now() - last_success_,
       .last_error = last_failure_ ? std::optional<std::string>{last_failure_->ToString()} : std::nullopt,
   };

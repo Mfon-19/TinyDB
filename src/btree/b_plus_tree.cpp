@@ -262,11 +262,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
 // Point lookup retains no ancestor path and allocates only when copying a
 // present value into the API result.
 auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> {
-  const auto leaf_id = FindLeaf(pages_, root_page_id_, key);
-  if (!leaf_id) {
-    return std::unexpected(leaf_id.error());
-  }
-  auto leaf_page = pages_->Read(*leaf_id);
+  auto leaf_page = FindLeaf(pages_, root_page_id_, key);
   if (!leaf_page) {
     return std::unexpected(std::move(leaf_page).error());
   }
@@ -286,13 +282,15 @@ auto BPlusTree::Get(std::string_view key) -> Result<std::optional<std::string>> 
 }
 
 auto BPlusTree::Remove(std::string_view key) -> Status {
-  const auto leaf_id = FindLeaf(pages_, root_page_id_, key);
-  if (!leaf_id) {
-    return leaf_id.error();
+  auto leaf = FindLeaf(pages_, root_page_id_, key);
+  if (!leaf) {
+    return leaf.error();
   }
+  const auto leaf_id = leaf->Id();
+  leaf = PageHandle{};
   std::optional<OverflowValueDescriptor> retired_value;
   {
-    auto page = pages_->Edit(*leaf_id);
+    auto page = pages_->Edit(leaf_id);
     if (!page) {
       return std::move(page).error();
     }

@@ -74,32 +74,6 @@ struct DatabaseStats final {
   std::size_t dirty_bytes{0};
   std::uint64_t cache_hits{0};
   std::uint64_t cache_misses{0};
-
-  /*
-  ** Read-stream counters describe speculative reads performed on behalf of
-  ** ordered traversals. Engines without a read-ahead backend expose the same
-  ** diagnostic schema with zero activity.
-  */
-  std::uint64_t read_streams_started{0};
-  std::uint64_t read_streams_activated{0};
-  std::uint64_t readahead_runs_queued{0};
-  std::uint64_t readahead_runs_submitted{0};
-  std::uint64_t readahead_pages_queued{0};
-  std::uint64_t readahead_pages_submitted{0};
-  std::uint64_t readahead_read_bytes{0};
-  std::uint64_t readahead_pages_ready{0};
-  std::uint64_t readahead_pages_waited{0};
-  std::uint64_t readahead_pages_bypassed{0};
-  std::uint64_t readahead_pages_unused{0};
-  std::uint64_t readahead_queue_drops{0};
-  std::uint64_t readahead_budget_drops{0};
-  std::uint64_t readahead_io_failures{0};
-  std::size_t readahead_staging_bytes{0};
-  std::size_t readahead_maximum_staging_bytes{0};
-  std::size_t readahead_in_flight_operations{0};
-  std::size_t readahead_maximum_in_flight_operations{0};
-  std::size_t readahead_in_flight_bytes{0};
-  std::size_t readahead_maximum_in_flight_bytes{0};
   std::uint64_t cache_evictions{0};
 
   std::uint64_t write_attempts{0};

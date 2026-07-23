@@ -385,7 +385,7 @@ TEST(Format, WalRecord) {
   EXPECT_EQ(decoded->transaction_id, 0x0102030405060708ULL);
   EXPECT_EQ(decoded->lsn, 80U);
   EXPECT_EQ(decoded->record_sequence, 0x0A0B0C0DU);
-  EXPECT_EQ(decoded->payload, std::vector<std::byte>(payload.begin(), payload.end()));
+  EXPECT_TRUE(std::ranges::equal(decoded->payload, payload));
 
   for (const auto offset : {std::size_t{0}, std::size_t{4}, std::size_t{8}, std::size_t{16}, std::size_t{24},
                             std::size_t{28}, std::size_t{32}, std::size_t{42}}) {

@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
-#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -52,7 +51,7 @@ class Wal {
   Wal(const Wal &) = delete;
   auto operator=(const Wal &) -> Wal & = delete;
 
-  Wal(Wal &&) noexcept = default;
+  Wal(Wal &&other) noexcept;
   auto operator=(Wal &&) -> Wal & = delete;
   ~Wal() = default;
 
@@ -91,8 +90,7 @@ class Wal {
         next_transaction_id_(next_transaction_id),
         next_lsn_(next_lsn),
         max_segment_bytes_(max_segment_bytes),
-        checkpoint_lsn_(next_lsn - 1U),
-        mutex_(std::make_unique<std::mutex>()) {}
+        checkpoint_lsn_(next_lsn - 1U) {}
 
   auto RotateSegment() -> Status;
 
@@ -114,6 +112,6 @@ class Wal {
   bool needs_recovery_{false};
   bool cleanup_directory_dirty_{false};
   std::deque<ArchivedSegment> archived_segments_;
-  std::unique_ptr<std::mutex> mutex_;
+  mutable std::mutex mutex_;
 };
 }  // namespace tinydb

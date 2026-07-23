@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <span>
 #include <utility>
 #include <vector>
 
@@ -27,7 +26,7 @@ struct CommittedFrame;
 **
 ** The page table contains only the newest visible committed version of each
 ** page. Installed frame bytes never change. Replacing a page swaps the table's
-** shared frame pointer, while an older PageGuard can continue reading the old
+** shared frame pointer, while an older PageHandle can continue reading the old
 ** immutable frame until its snapshot drains.
 **
 ** Frames newer than checkpoint_lsn are dirty in the cache sense: WAL contains
@@ -35,36 +34,10 @@ struct CommittedFrame;
 ** be evicted. The byte target is consequently soft; publication may exceed it
 ** until checkpointing advances the frontier.
 **
-** PageGuard is the only cache-facing byte lease. It is move-only so one cache
-** pin has one owner and one release point.
+** PageHandle is the sole byte lease for reads and checkpoints. Its shared
+** keepalive retains an immutable frame while its release callback owns one
+** exact cache pin.
 */
-class PageGuard final {
- public:
-  PageGuard() = default;
-  PageGuard(const PageGuard &) = delete;
-  auto operator=(const PageGuard &) -> PageGuard & = delete;
-  PageGuard(PageGuard &&other) noexcept;
-  auto operator=(PageGuard &&other) noexcept -> PageGuard &;
-  ~PageGuard();
-
-  auto Id() const -> page_id_t;
-  auto Data() const -> std::span<const char, PAGE_SIZE>;
-  auto PageLsn() const -> std::uint64_t;
-
-  // Transfers this exact pin into the tree's generic page lease. The frame's
-  // shared owner keeps old immutable bytes alive after cache replacement.
-  auto IntoPageHandle() && -> PageHandle;
-  explicit operator bool() const noexcept { return frame_ != nullptr; }
-
- private:
-  explicit PageGuard(std::shared_ptr<const CommittedFrame> frame);
-  void Reset() noexcept;
-
-  std::shared_ptr<const CommittedFrame> frame_;
-
-  friend class CommittedPageCache;
-};
-
 /* A frozen transaction transfers this allocation directly into a frame. */
 struct CommittedPageImage {
   page_id_t page_id{HEADER_PAGE_ID};
@@ -110,7 +83,7 @@ struct CommittedCacheStats {
 /*
 ** Thread-safe cache for latest committed versions. Its mutex protects the
 ** dense page table and the intrusive evictable LRU queue. Pin and checkpoint
-** flags are atomic because guards release outside that mutex; a final release
+** flags are atomic because handles release outside that mutex; a final release
 ** briefly reacquires it to return an eligible frame to the queue.
 */
 class CommittedPageCache final : public PageReader {
@@ -130,16 +103,16 @@ class CommittedPageCache final : public PageReader {
   // Capture strong references to exact current versions in (checkpoint_lsn,
   // target_lsn]. The caller must serialize this call with publication so the
   // returned versions and captured DatabaseState describe one visibility point.
-  auto CaptureCheckpointPages(std::uint64_t checkpoint_lsn, std::uint64_t target_lsn) -> std::vector<PageGuard>;
+  auto CaptureCheckpointPages(std::uint64_t checkpoint_lsn, std::uint64_t target_lsn) -> std::vector<PageHandle>;
 
   // The caller invokes this only after the database file and superblock make
   // every page through checkpoint_lsn durable.
   void MarkCheckpointed(std::uint64_t checkpoint_lsn);
+  auto DirtyPages() const -> std::size_t;
   auto Stats() const -> CommittedCacheStats;
 
  private:
   struct Impl;
-  auto ReadGuard(page_id_t page_id) -> Result<PageGuard>;
   std::unique_ptr<Impl> impl_;
 };
 

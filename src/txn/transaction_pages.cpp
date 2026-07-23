@@ -446,22 +446,7 @@ auto TransactionPages::ResultingState() const -> const DatabaseState & {
   return resulting_state_;
 }
 
-auto TransactionPages::PageImages() const -> std::vector<std::pair<page_id_t, const char *>> {
-  TINYDB_CHECK(sealed_, "reading transaction pages before seal");
-  // Stable ordering makes WAL construction deterministic and lets a commit
-  // digest bind one unambiguous physical transaction representation.
-  auto result = std::vector<std::pair<page_id_t, const char *>>{};
-  result.reserve(pages_.size());
-  for (const auto &[page_id, page] : pages_) {
-    if (page->dirty && !retired_page_ids_.contains(page_id)) {
-      result.emplace_back(page_id, page->bytes->data());
-    }
-  }
-  std::ranges::sort(result, {}, &std::pair<page_id_t, const char *>::first);
-  return result;
-}
-
-auto TransactionPages::TakePages() -> Result<std::vector<cache::CommittedPageImage>> {
+auto TransactionPages::TakePages() -> std::vector<cache::CommittedPageImage> {
   TINYDB_CHECK(sealed_, "taking transaction pages before seal");
   RequireUnpinned();
   auto result = std::vector<cache::CommittedPageImage>{};
@@ -471,17 +456,16 @@ auto TransactionPages::TakePages() -> Result<std::vector<cache::CommittedPageIma
     if (!page->dirty || retired_page_ids_.contains(page_id)) {
       continue;
     }
-    const auto header =
-        storage::DecodeDataPageHeader(std::as_bytes(std::span<const char, PAGE_SIZE>(*page->bytes)), page_id);
-    if (!header) {
-      return std::unexpected(header.error());
-    }
     result.push_back(cache::CommittedPageImage{
         .page_id = page_id,
-        .page_lsn = header->page_lsn,
+        .page_lsn = resulting_state_.visible_lsn,
         .bytes = std::move(page->bytes),
     });
   }
+  // One order serves the WAL digest, adjacent duplicate validation, and cache
+  // publication. The unordered private map no longer needs a second borrowed
+  // page list solely to impose determinism.
+  std::ranges::sort(result, {}, &cache::CommittedPageImage::page_id);
   // Any clean private copy served read-your-writes but has no committed image
   // to transfer. Clearing the map releases those copies with the dirty ones.
   pages_.clear();

@@ -1,8 +1,8 @@
 #pragma once
 
+#include <tinydb/status.h>
 #include "storage/database_uuid.h"
 #include "storage/page.h"
-#include <tinydb/status.h>
 
 #include "txn/database_state.h"
 
@@ -130,14 +130,14 @@ struct Header {
   auto operator==(const Header &) const -> bool = default;
 };
 
-// Decoded records own their payload so recovery can validate and retain a
-// complete transaction without borrowing from a reusable I/O buffer.
+// A decoded record is a validated view. Its payload borrows the exact encoded
+// record supplied to DecodeRecord and cannot outlive those bytes.
 struct Record {
   RecordType type;
   std::uint64_t transaction_id;
   std::uint64_t lsn;
   std::uint32_t record_sequence;
-  std::vector<std::byte> payload;
+  std::span<const std::byte> payload;
 };
 
 struct PageImageView {

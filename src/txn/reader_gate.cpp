@@ -4,7 +4,6 @@
 
 #include <condition_variable>
 #include <mutex>
-#include <set>
 #include <utility>
 
 namespace tinydb::txn {
@@ -23,15 +22,20 @@ struct ReaderGateControl final {
   std::shared_ptr<const DatabaseState> state;
   bool publication_pending{false};  // admission is closed when true
 
-  // The multiset is both the active lease set and the source of exact
-  // oldest-reader diagnostics when several readers begin in one clock tick.
-  std::multiset<Clock::time_point> reader_starts;
+  // Admissions append in clock order. Intrusive links live in the lease's
+  // existing shared allocation, avoiding a second allocation per reader just
+  // to report the oldest-reader diagnostic.
+  SnapshotLease *oldest_reader{nullptr};
+  SnapshotLease *newest_reader{nullptr};
+  std::size_t active_readers{0};
 };
 
 struct SnapshotLease final {
   std::shared_ptr<ReaderGateControl> control;
   std::shared_ptr<const DatabaseState> state;
   Clock::time_point started_at{};
+  SnapshotLease *previous{nullptr};
+  SnapshotLease *next{nullptr};
   bool admitted{false};
 
   ~SnapshotLease() {
@@ -40,18 +44,27 @@ struct SnapshotLease final {
     }
 
     /*
-    ** The final shared token owns the one count decrement. The timestamp is
-    ** removed under the same mutex so Stats can never observe a count and age
-    ** derived from different reader populations.
+    ** The final shared token owns the one unlink. Count and oldest age change
+    ** under the same mutex, so diagnostics always describe one population.
     */
     auto lock = std::lock_guard(control->mutex);
-    const auto start = control->reader_starts.find(started_at);
-    TINYDB_CHECK(start != control->reader_starts.end(), "reader gate lost a reader timestamp");
-    control->reader_starts.erase(start);
-
-    // A publisher only needs the zero transition, but notifying on every
-    // release also keeps the condition independent of that optimization.
-    control->changed.notify_all();
+    TINYDB_CHECK(control->active_readers != 0, "reader gate active count underflow");
+    if (previous != nullptr) {
+      previous->next = next;
+    } else {
+      TINYDB_CHECK(control->oldest_reader == this, "reader gate lost its oldest reader");
+      control->oldest_reader = next;
+    }
+    if (next != nullptr) {
+      next->previous = previous;
+    } else {
+      TINYDB_CHECK(control->newest_reader == this, "reader gate lost its newest reader");
+      control->newest_reader = previous;
+    }
+    --control->active_readers;
+    if (control->active_readers == 0) {
+      control->changed.notify_all();
+    }
   }
 };
 
@@ -77,10 +90,16 @@ auto ReaderGate::BeginRead() -> SnapshotToken {
 
   // Capture the state and join the active set in one critical section. A
   // publisher can therefore order this reader wholly before or after itself.
-  const auto started_at = Clock::now();
-  control_->reader_starts.insert(started_at);
   lease->state = control_->state;
-  lease->started_at = started_at;
+  lease->started_at = Clock::now();
+  lease->previous = control_->newest_reader;
+  if (control_->newest_reader != nullptr) {
+    control_->newest_reader->next = lease.get();
+  } else {
+    control_->oldest_reader = lease.get();
+  }
+  control_->newest_reader = lease.get();
+  ++control_->active_readers;
   lease->admitted = true;
   return SnapshotToken(std::move(lease));
 }
@@ -114,12 +133,12 @@ void ReaderGate::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
 auto ReaderGate::Stats() const -> ReaderGateStats {
   auto lock = std::lock_guard(control_->mutex);
   auto result = ReaderGateStats{
-      .active_readers = control_->reader_starts.size(),
+      .active_readers = control_->active_readers,
       .publication_pending = control_->publication_pending,
       .oldest_reader_age = std::nullopt,
   };
-  if (!control_->reader_starts.empty()) {
-    result.oldest_reader_age = Clock::now() - *control_->reader_starts.begin();
+  if (control_->oldest_reader != nullptr) {
+    result.oldest_reader_age = Clock::now() - control_->oldest_reader->started_at;
   }
   return result;
 }
@@ -132,7 +151,7 @@ PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) n
   // the fairness boundary: subsequent BeginRead calls cannot prolong the wait.
   control_->changed.wait(lock, [this] { return !control_->publication_pending; });
   control_->publication_pending = true;
-  control_->changed.wait(lock, [this] { return control_->reader_starts.empty(); });
+  control_->changed.wait(lock, [this] { return control_->active_readers == 0; });
 }
 
 PublicationGuard::PublicationGuard(PublicationGuard &&other) noexcept : control_(std::move(other.control_)) {}
@@ -151,7 +170,7 @@ void PublicationGuard::Publish(std::shared_ptr<const DatabaseState> state) noexc
   TINYDB_CHECK(control_ != nullptr, "publishing through an empty publication guard");
   TINYDB_CHECK(state != nullptr, "publishing a null database state");
   auto lock = std::lock_guard(control_->mutex);
-  TINYDB_CHECK(control_->publication_pending && control_->reader_starts.empty(),
+  TINYDB_CHECK(control_->publication_pending && control_->active_readers == 0,
                "publishing outside an exclusive visibility phase");
   // This pointer replacement is the visibility event. No admitted reader can
   // observe it halfway through because the active reader population is empty.

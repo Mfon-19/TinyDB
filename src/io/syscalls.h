@@ -81,7 +81,7 @@ inline auto MaybeFault(const Call &call) -> bool {
 }
 
 inline auto Open(const std::filesystem::path &path, int flags, mode_t mode = 0) -> int {
-  if (MaybeFault(Call{.syscall = Syscall::Open, .path = path, .flags = flags, .mode = mode})) {
+  if (TestHookRef() && MaybeFault(Call{.syscall = Syscall::Open, .path = path, .flags = flags, .mode = mode})) {
     return -1;
   }
   const int fd = (flags & O_CREAT) != 0 ? ::open(path.c_str(), flags, mode) : ::open(path.c_str(), flags);
@@ -92,56 +92,59 @@ inline auto Open(const std::filesystem::path &path, int flags, mode_t mode = 0) 
 }
 
 inline auto Rename(const std::filesystem::path &from, const std::filesystem::path &to) -> int {
-  if (MaybeFault(Call{.syscall = Syscall::Rename, .path = from})) {
+  if (TestHookRef() && MaybeFault(Call{.syscall = Syscall::Rename, .path = from})) {
     return -1;
   }
   return ::rename(from.c_str(), to.c_str());
 }
 
 inline auto Unlink(const std::filesystem::path &path) -> int {
-  if (MaybeFault(Call{.syscall = Syscall::Unlink, .path = path})) {
+  if (TestHookRef() && MaybeFault(Call{.syscall = Syscall::Unlink, .path = path})) {
     return -1;
   }
   return ::unlink(path.c_str());
 }
 
 inline auto Fstat(int fd, struct stat *stat_buffer) -> int {
-  if (MaybeFault(Call{.syscall = Syscall::Fstat, .path = PathForFd(fd), .fd = fd})) {
+  if (TestHookRef() && MaybeFault(Call{.syscall = Syscall::Fstat, .path = PathForFd(fd), .fd = fd})) {
     return -1;
   }
   return ::fstat(fd, stat_buffer);
 }
 
 inline auto Pread(int fd, void *data, std::size_t size, std::uint64_t offset) -> ssize_t {
-  if (MaybeFault(Call{.syscall = Syscall::Pread, .path = PathForFd(fd), .fd = fd, .size = size, .offset = offset})) {
+  if (TestHookRef() &&
+      MaybeFault(Call{.syscall = Syscall::Pread, .path = PathForFd(fd), .fd = fd, .size = size, .offset = offset})) {
     return -1;
   }
   return ::pread(fd, data, size, static_cast<off_t>(offset));
 }
 
 inline auto Pwrite(int fd, const void *data, std::size_t size, std::uint64_t offset) -> ssize_t {
-  if (MaybeFault(Call{.syscall = Syscall::Pwrite, .path = PathForFd(fd), .fd = fd, .size = size, .offset = offset})) {
+  if (TestHookRef() &&
+      MaybeFault(Call{.syscall = Syscall::Pwrite, .path = PathForFd(fd), .fd = fd, .size = size, .offset = offset})) {
     return -1;
   }
   return ::pwrite(fd, data, size, static_cast<off_t>(offset));
 }
 
 inline auto Fsync(int fd) -> int {
-  if (MaybeFault(Call{.syscall = Syscall::Fsync, .path = PathForFd(fd), .fd = fd})) {
+  if (TestHookRef() && MaybeFault(Call{.syscall = Syscall::Fsync, .path = PathForFd(fd), .fd = fd})) {
     return -1;
   }
   return ::fsync(fd);
 }
 
 inline auto Ftruncate(int fd, std::uint64_t size) -> int {
-  if (MaybeFault(Call{.syscall = Syscall::Ftruncate, .path = PathForFd(fd), .fd = fd, .size = size})) {
+  if (TestHookRef() && MaybeFault(Call{.syscall = Syscall::Ftruncate, .path = PathForFd(fd), .fd = fd, .size = size})) {
     return -1;
   }
   return ::ftruncate(fd, static_cast<off_t>(size));
 }
 
 inline auto Flock(int fd, int operation) -> int {
-  if (MaybeFault(Call{.syscall = Syscall::Flock, .path = PathForFd(fd), .fd = fd, .flags = operation})) {
+  if (TestHookRef() &&
+      MaybeFault(Call{.syscall = Syscall::Flock, .path = PathForFd(fd), .fd = fd, .flags = operation})) {
     return -1;
   }
   return ::flock(fd, operation);

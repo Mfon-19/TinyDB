@@ -155,7 +155,14 @@ auto ValidateTreePage(const PageHandle &page) -> Status {
   if (common->page_id != page.Id()) {
     return Status::Corruption("validated page header changed identity");
   }
+  if (page.TreePayloadValidated()) {
+    return {};
+  }
   return ValidateTreePayload(page.Data(), *common);
+}
+
+auto ValidateTreePagePayload(const char *page, const storage::DataPageHeader &validated_header) -> Status {
+  return ValidateTreePayload(page, validated_header);
 }
 
 }  // namespace tinydb

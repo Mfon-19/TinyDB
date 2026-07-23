@@ -61,6 +61,20 @@ auto Wal::SegmentPathFor(const std::filesystem::path &wal_path, std::uint64_t se
   return path;
 }
 
+Wal::Wal(Wal &&other) noexcept
+    : fd_(std::move(other.fd_)),
+      wal_path_(std::move(other.wal_path_)),
+      database_uuid_(other.database_uuid_),
+      segment_id_(other.segment_id_),
+      size_bytes_(other.size_bytes_),
+      next_transaction_id_(other.next_transaction_id_),
+      next_lsn_(other.next_lsn_),
+      max_segment_bytes_(other.max_segment_bytes_),
+      checkpoint_lsn_(other.checkpoint_lsn_),
+      needs_recovery_(other.needs_recovery_),
+      cleanup_directory_dirty_(other.cleanup_directory_dirty_),
+      archived_segments_(std::move(other.archived_segments_)) {}
+
 auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &database_uuid,
                std::uint64_t next_transaction_id, std::uint64_t starting_lsn,
                std::uint64_t max_segment_bytes) -> Result<Wal> {
@@ -202,7 +216,7 @@ auto Wal::RotateSegment() -> Status {
 }
 
 auto Wal::NextCommitLsn(std::size_t page_count) const -> Result<std::uint64_t> {
-  auto lock = std::lock_guard(*mutex_);
+  auto lock = std::lock_guard(mutex_);
   if (page_count == 0 || page_count > std::numeric_limits<std::uint32_t>::max() - 2U ||
       next_lsn_ >= std::numeric_limits<std::uint64_t>::max() ||
       page_count > std::numeric_limits<std::uint64_t>::max() - next_lsn_ - 1U) {
@@ -213,7 +227,7 @@ auto Wal::NextCommitLsn(std::size_t page_count) const -> Result<std::uint64_t> {
 
 auto Wal::Prepare(std::span<const wal_format::PageImageView> pages,
                   txn::DatabaseState state) const -> Result<wal_format::EncodedTransaction> {
-  auto lock = std::lock_guard(*mutex_);
+  auto lock = std::lock_guard(mutex_);
   TINYDB_CHECK(fd_.Valid(), "preparing through a moved-from log");
   if (needs_recovery_) {
     return std::unexpected(Status::NeedsRecovery("WAL tail is not trustworthy; reopen the database"));
@@ -225,7 +239,7 @@ auto Wal::Prepare(std::span<const wal_format::PageImageView> pages,
 }
 
 auto Wal::Commit(wal_format::EncodedTransaction transaction) -> Result<CommitInfo> {
-  auto lock = std::lock_guard(*mutex_);
+  auto lock = std::lock_guard(mutex_);
   TINYDB_CHECK(fd_.Valid(), "committing on a moved-from log");
   if (needs_recovery_) {
     return std::unexpected(Status::NeedsRecovery("WAL tail is not trustworthy; reopen the database"));
@@ -282,7 +296,7 @@ auto Wal::Commit(wal_format::EncodedTransaction transaction) -> Result<CommitInf
 }
 
 auto Wal::SizeBytes() const -> std::uint64_t {
-  auto lock = std::lock_guard(*mutex_);
+  auto lock = std::lock_guard(mutex_);
   auto live_bytes = std::uint64_t{0};
   for (const auto &segment : archived_segments_) {
     if (segment.final_lsn > checkpoint_lsn_) {
@@ -297,14 +311,14 @@ auto Wal::SizeBytes() const -> std::uint64_t {
 }
 
 auto Wal::SegmentCount() const -> std::size_t {
-  auto lock = std::lock_guard(*mutex_);
+  auto lock = std::lock_guard(mutex_);
   // The active append target exists for the lifetime of Wal. Archives remain
   // observable until a checkpoint has durably covered and removed them.
   return archived_segments_.size() + 1U;
 }
 
 auto Wal::CleanupCheckpointed(std::uint64_t checkpoint_lsn) -> Status {
-  auto lock = std::lock_guard(*mutex_);
+  auto lock = std::lock_guard(mutex_);
   TINYDB_CHECK(fd_.Valid(), "cleaning a moved-from log");
   TINYDB_CHECK(checkpoint_lsn >= checkpoint_lsn_, "WAL checkpoint frontier moved backward");
   checkpoint_lsn_ = checkpoint_lsn;

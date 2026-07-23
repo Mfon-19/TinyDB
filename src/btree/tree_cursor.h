@@ -7,9 +7,7 @@
 
 #include <cstddef>
 #include <optional>
-#include <string>
 #include <string_view>
-#include <unordered_set>
 
 namespace tinydb {
 
@@ -22,13 +20,16 @@ namespace tinydb {
 ** pages are read by the snapshot wrapper only when a value copy is requested.
 **
 ** Opening each successor validates both page-local structure and global chain
-** order. visited_ detects cycles even through empty leaves, for which no key
-** boundary exists. Empty underfull leaves are legal and are skipped.
+** order. Strict key boundaries detect every cycle containing a non-empty
+** leaf; a temporary set is needed only while skipping empty leaves. Normal
+** scans therefore carry no cycle-tracking allocation. Empty underfull leaves
+** are legal and are skipped.
 */
 class BTreeCursor {
  public:
-  static auto First(PageReader *pages, page_id_t root_page_id) -> Result<BTreeCursor>;
-  static auto Seek(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<BTreeCursor>;
+  static auto First(PageReader *pages, page_id_t root_page_id, page_id_t high_water_page_id) -> Result<BTreeCursor>;
+  static auto Seek(PageReader *pages, page_id_t root_page_id, page_id_t high_water_page_id,
+                   std::string_view key) -> Result<BTreeCursor>;
 
   BTreeCursor(const BTreeCursor &) = delete;
   auto operator=(const BTreeCursor &) -> BTreeCursor & = delete;
@@ -41,18 +42,19 @@ class BTreeCursor {
   auto Next() -> Status;
 
  private:
-  explicit BTreeCursor(PageReader *pages) : pages_(pages) {}
+  BTreeCursor(PageReader *pages, page_id_t high_water_page_id)
+      : pages_(pages), high_water_page_id_(high_water_page_id) {}
 
-  auto OpenLeaf(page_id_t page_id, std::size_t index) -> Status;
+  auto OpenInitialLeaf(PageHandle page, std::size_t index) -> Status;
   auto AdvanceToNonEmptyLeaf(page_id_t page_id) -> Status;
-  void RememberLastKey();
+  auto ValidateLeafId(page_id_t page_id) const -> Status;
+  auto ValidateBoundary(const LeafPageView &next) const -> Status;
 
   PageReader *pages_;
+  page_id_t high_water_page_id_;
   PageHandle page_;
   std::optional<LeafPageView> leaf_;
   std::size_t index_{0};
-  std::optional<std::string> previous_last_key_;
-  std::unordered_set<page_id_t> visited_;
 };
 
 }  // namespace tinydb

@@ -130,42 +130,48 @@ auto FinishResources(const ResourceStart &start, ProcessMemory before_open) -> R
   };
 }
 
-auto CounterDelta(std::uint64_t after, std::uint64_t before, std::string_view name) -> std::uint64_t {
+[[maybe_unused]] auto CounterDelta(std::uint64_t after, std::uint64_t before, std::string_view name) -> std::uint64_t {
   if (after < before) {
     Fail(std::string(name) + " counter moved backward");
   }
   return after - before;
 }
 
-auto CaptureReadDiagnostics(const DatabaseStats &before, const DatabaseStats &after) -> ReadDiagnostics {
-  return ReadDiagnostics{
-      .streams_started = CounterDelta(after.read_streams_started, before.read_streams_started, "read streams"),
-      .streams_activated =
-          CounterDelta(after.read_streams_activated, before.read_streams_activated, "activated read streams"),
-      .runs_queued = CounterDelta(after.readahead_runs_queued, before.readahead_runs_queued, "queued readahead runs"),
-      .runs_submitted =
-          CounterDelta(after.readahead_runs_submitted, before.readahead_runs_submitted, "submitted readahead runs"),
-      .pages_queued =
-          CounterDelta(after.readahead_pages_queued, before.readahead_pages_queued, "queued readahead pages"),
-      .pages_submitted =
-          CounterDelta(after.readahead_pages_submitted, before.readahead_pages_submitted, "submitted readahead pages"),
-      .read_bytes = CounterDelta(after.readahead_read_bytes, before.readahead_read_bytes, "readahead bytes"),
-      .pages_ready = CounterDelta(after.readahead_pages_ready, before.readahead_pages_ready, "ready readahead pages"),
-      .pages_waited =
-          CounterDelta(after.readahead_pages_waited, before.readahead_pages_waited, "waited readahead pages"),
-      .pages_bypassed =
-          CounterDelta(after.readahead_pages_bypassed, before.readahead_pages_bypassed, "bypassed readahead pages"),
-      .pages_unused =
-          CounterDelta(after.readahead_pages_unused, before.readahead_pages_unused, "unused readahead pages"),
-      .queue_drops = CounterDelta(after.readahead_queue_drops, before.readahead_queue_drops, "readahead queue drops"),
-      .budget_drops =
-          CounterDelta(after.readahead_budget_drops, before.readahead_budget_drops, "readahead budget drops"),
-      .io_failures = CounterDelta(after.readahead_io_failures, before.readahead_io_failures, "readahead I/O failures"),
-      .staging_bytes = after.readahead_staging_bytes,
-      .maximum_staging_bytes = after.readahead_maximum_staging_bytes,
-      .maximum_in_flight_operations = after.readahead_maximum_in_flight_operations,
-      .maximum_in_flight_bytes = after.readahead_maximum_in_flight_bytes,
-  };
+template <typename Stats>
+auto CaptureReadDiagnostics(const Stats &before, const Stats &after) -> ReadDiagnostics {
+  if constexpr (requires { before.read_streams_started; }) {
+    return ReadDiagnostics{
+        .streams_started = CounterDelta(after.read_streams_started, before.read_streams_started, "read streams"),
+        .streams_activated =
+            CounterDelta(after.read_streams_activated, before.read_streams_activated, "activated read streams"),
+        .runs_queued = CounterDelta(after.readahead_runs_queued, before.readahead_runs_queued, "queued readahead runs"),
+        .runs_submitted =
+            CounterDelta(after.readahead_runs_submitted, before.readahead_runs_submitted, "submitted readahead runs"),
+        .pages_queued =
+            CounterDelta(after.readahead_pages_queued, before.readahead_pages_queued, "queued readahead pages"),
+        .pages_submitted = CounterDelta(after.readahead_pages_submitted, before.readahead_pages_submitted,
+                                        "submitted readahead pages"),
+        .read_bytes = CounterDelta(after.readahead_read_bytes, before.readahead_read_bytes, "readahead bytes"),
+        .pages_ready = CounterDelta(after.readahead_pages_ready, before.readahead_pages_ready, "ready readahead pages"),
+        .pages_waited =
+            CounterDelta(after.readahead_pages_waited, before.readahead_pages_waited, "waited readahead pages"),
+        .pages_bypassed =
+            CounterDelta(after.readahead_pages_bypassed, before.readahead_pages_bypassed, "bypassed readahead pages"),
+        .pages_unused =
+            CounterDelta(after.readahead_pages_unused, before.readahead_pages_unused, "unused readahead pages"),
+        .queue_drops = CounterDelta(after.readahead_queue_drops, before.readahead_queue_drops, "readahead queue drops"),
+        .budget_drops =
+            CounterDelta(after.readahead_budget_drops, before.readahead_budget_drops, "readahead budget drops"),
+        .io_failures =
+            CounterDelta(after.readahead_io_failures, before.readahead_io_failures, "readahead I/O failures"),
+        .staging_bytes = after.readahead_staging_bytes,
+        .maximum_staging_bytes = after.readahead_maximum_staging_bytes,
+        .maximum_in_flight_operations = after.readahead_maximum_in_flight_operations,
+        .maximum_in_flight_bytes = after.readahead_maximum_in_flight_bytes,
+    };
+  } else {
+    return {};
+  }
 }
 
 auto NearestRank(std::vector<double> values, double percentile) -> double {

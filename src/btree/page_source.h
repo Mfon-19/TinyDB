@@ -39,13 +39,14 @@ class PageHandle {
   // Immutable caches retain a frame through keepalive while release updates
   // frame-local pin accounting. No per-read wrapper allocation is required.
   PageHandle(void *owner, page_id_t page_id, const char *data, Release release, std::shared_ptr<const void> keepalive,
-             const storage::DataPageHeader *validated_header = nullptr)
+             const storage::DataPageHeader *validated_header = nullptr, bool tree_payload_validated = false)
       : owner_(owner),
         page_id_(page_id),
         data_(data),
         release_(release),
         keepalive_(std::move(keepalive)),
-        validated_header_(validated_header) {}
+        validated_header_(validated_header),
+        tree_payload_validated_(tree_payload_validated) {}
 
   PageHandle(const PageHandle &) = delete;
   auto operator=(const PageHandle &) -> PageHandle & = delete;
@@ -69,6 +70,7 @@ class PageHandle {
   // bytes first crossed the persistent validation boundary. The header and
   // bytes share a lifetime. Mutable handles deliberately carry no proof.
   auto ValidatedHeader() const noexcept -> const storage::DataPageHeader * { return validated_header_; }
+  auto TreePayloadValidated() const noexcept -> bool { return tree_payload_validated_; }
 
   // Only Edit and Allocate may produce an editable handle.
   auto MutableData() -> char *;
@@ -86,6 +88,7 @@ class PageHandle {
   Release release_{nullptr};
   std::shared_ptr<const void> keepalive_;
   const storage::DataPageHeader *validated_header_{nullptr};
+  bool tree_payload_validated_{false};
 };
 
 /* Read algorithms depend only on stable immutable leases. */

@@ -45,7 +45,6 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
     return Status::Corruption("invalid overflow value descriptor");
   }
 
-  auto local_pages = std::unordered_set<page_id_t>{};
   auto checksum = Crc32Accumulator{};
   auto page_id = descriptor.first_page_id;
   auto remaining = descriptor.total_value_bytes;
@@ -54,9 +53,6 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
   for (;;) {
     if (page_id < FIRST_DATA_PAGE_ID || page_id >= constraints.high_water_page_id) {
       return Status::Corruption("overflow page lies outside the allocation frontier");
-    }
-    if (!local_pages.insert(page_id).second) {
-      return Status::Corruption("overflow chain contains a duplicate page or cycle");
     }
     if ((constraints.free_pages != nullptr && constraints.free_pages->contains(page_id)) ||
         (constraints.allocator_pages != nullptr && constraints.allocator_pages->contains(page_id))) {
@@ -132,34 +128,30 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
 
   const auto chunks = (value.size() + storage::OVERFLOW_PAGE_PAYLOAD_BYTES - 1) / storage::OVERFLOW_PAGE_PAYLOAD_BYTES;
   static_assert(MAX_VALUE_BYTES / storage::OVERFLOW_PAGE_PAYLOAD_BYTES < std::numeric_limits<std::uint32_t>::max());
-  auto page_ids = std::vector<page_id_t>{};
-  page_ids.reserve(chunks);
+  auto allocated = std::vector<PageHandle>{};
+  allocated.reserve(chunks);
   for (std::size_t index = 0; index < chunks; ++index) {
     auto page = pages->Allocate();
     if (!page) {
       return std::unexpected(std::move(page).error());
     }
-    page_ids.push_back(page->Id());
+    allocated.push_back(std::move(*page));
   }
 
   const auto value_bytes = std::as_bytes(std::span{value.data(), value.size()});
-  const auto owner_value_id = page_ids.front();
-  for (std::size_t index = 0; index < page_ids.size(); ++index) {
+  const auto owner_value_id = allocated.front().Id();
+  for (std::size_t index = 0; index < allocated.size(); ++index) {
     const auto offset = index * storage::OVERFLOW_PAGE_PAYLOAD_BYTES;
     const auto count = std::min(storage::OVERFLOW_PAGE_PAYLOAD_BYTES, value.size() - offset);
-    const auto next = index + 1 < page_ids.size() ? page_ids[index + 1] : HEADER_PAGE_ID;
+    const auto next = index + 1 < allocated.size() ? allocated[index + 1].Id() : HEADER_PAGE_ID;
     const auto encoded =
-        storage::EncodeOverflowPage(page_ids[index], 0, owner_value_id, static_cast<std::uint32_t>(index), next,
+        storage::EncodeOverflowPage(allocated[index].Id(), 0, owner_value_id, static_cast<std::uint32_t>(index), next,
                                     value_bytes.subspan(offset, count));
     if (!encoded) {
       return std::unexpected(encoded.error());
     }
-    auto page = pages->Edit(page_ids[index]);
-    if (!page) {
-      return std::unexpected(std::move(page).error());
-    }
-    std::memcpy(page->MutableData(), encoded->data(), PAGE_SIZE);
-    page->MarkDirty();
+    std::memcpy(allocated[index].MutableData(), encoded->data(), PAGE_SIZE);
+    allocated[index].MarkDirty();
   }
 
   return LeafValue::Overflow(OverflowValueDescriptor{
