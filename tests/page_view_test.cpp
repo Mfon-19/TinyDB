@@ -25,19 +25,24 @@
 */
 namespace {
 
+void Seal(std::array<char, tinydb::PAGE_SIZE> &page) {
+  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{page})).Ok());
+}
+
 TEST(Page, LeafSearch) {
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};
-  builder.Upsert("alpha", tinydb::LeafValue::Inline("one"));
-  builder.Upsert("middle", tinydb::LeafValue::Inline("two"));
-  builder.Upsert("omega", tinydb::LeafValue::Inline("three"));
+  builder.Upsert("alpha", tinydb::LeafValueView::Inline("one"));
+  builder.Upsert("middle", tinydb::LeafValueView::Inline("two"));
+  builder.Upsert("omega", tinydb::LeafValueView::Inline("three"));
   const auto overflow = tinydb::OverflowValueDescriptor{
       .total_value_bytes = 8U << 10U,
       .first_page_id = 9,
       .value_checksum = 0x12345678U,
   };
-  builder.Upsert("overflow", tinydb::LeafValue::Overflow(overflow));
+  builder.Upsert("overflow", tinydb::LeafValueView::Overflow(overflow));
   builder.Store(page.data(), 2);
+  Seal(page);
 
   const auto view = tinydb::LeafPageView::Open(page.data(), 2);
   ASSERT_TRUE(view.has_value()) << view.error().ToString();
@@ -66,9 +71,10 @@ TEST(Page, ByteOrder) {
   auto builder = tinydb::LeafPageBuilder{};
   const auto low = std::string(1, static_cast<char>(0x7F));
   const auto high = std::string(1, static_cast<char>(0x80));
-  builder.Upsert(low, tinydb::LeafValue::Inline("low"));
-  builder.Upsert(high, tinydb::LeafValue::Inline("high"));
+  builder.Upsert(low, tinydb::LeafValueView::Inline("low"));
+  builder.Upsert(high, tinydb::LeafValueView::Inline("high"));
   builder.Store(page.data(), 2);
+  Seal(page);
 
   const auto view = tinydb::LeafPageView::Open(page.data(), 2).value();
   EXPECT_EQ(view.LowerBound(low), 0U);
@@ -83,6 +89,7 @@ TEST(Page, InternalRouting) {
   builder.InsertSeparator("delta", 4);
   builder.InsertSeparator("hotel", 5);
   builder.Store(page.data(), 6);
+  Seal(page);
 
   const auto view = tinydb::InternalPageView::Open(page.data(), 6);
   ASSERT_TRUE(view.has_value()) << view.error().ToString();
@@ -99,8 +106,9 @@ TEST(Page, InternalRouting) {
 TEST(Page, Identity) {
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto leaf = tinydb::LeafPageBuilder{};
-  leaf.Upsert("key", tinydb::LeafValue::Inline("value"));
+  leaf.Upsert("key", tinydb::LeafValueView::Inline("value"));
   leaf.Store(leaf_page.data(), 2);
+  Seal(leaf_page);
 
   EXPECT_EQ(tinydb::InternalPageView::Open(leaf_page.data(), 2).error().Code(), tinydb::StatusCode::Corruption);
   EXPECT_EQ(tinydb::LeafPageView::Open(leaf_page.data(), 3).error().Code(), tinydb::StatusCode::Corruption);
@@ -116,8 +124,9 @@ TEST(Page, Identity) {
 TEST(Page, Slots) {
   auto page = std::array<char, tinydb::PAGE_SIZE>{};
   auto builder = tinydb::LeafPageBuilder{};
-  builder.Upsert("key", tinydb::LeafValue::Inline("value"));
+  builder.Upsert("key", tinydb::LeafValueView::Inline("value"));
   builder.Store(page.data(), 2);
+  Seal(page);
 
   auto bytes = std::as_writable_bytes(std::span{page});
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::LEAF_HEADER_SIZE, tinydb::slot_t{1}));
@@ -132,6 +141,7 @@ TEST(Page, Links) {
   auto internal = tinydb::InternalPageBuilder{2, "bravo", 3};
   internal.InsertSeparator("delta", 4);
   internal.Store(internal_page.data(), 5);
+  Seal(internal_page);
 
   // The header link is the mandatory leftmost child of an internal page.
   auto bytes = std::as_writable_bytes(std::span{internal_page});
@@ -140,6 +150,7 @@ TEST(Page, Links) {
   EXPECT_EQ(tinydb::InternalPageView::Open(internal_page.data(), 5).error().Code(), tinydb::StatusCode::Corruption);
 
   internal.Store(internal_page.data(), 5);
+  Seal(internal_page);
   bytes = std::as_writable_bytes(std::span{internal_page});
   const auto first_slot = tinydb::storage::GetLittleEndian<tinydb::slot_t>(bytes, tinydb::INTERNAL_HEADER_SIZE);
   const auto second_slot =
@@ -152,6 +163,7 @@ TEST(Page, Links) {
 
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
   tinydb::LeafPageBuilder{}.Store(leaf_page.data(), 6);
+  Seal(leaf_page);
   bytes = std::as_writable_bytes(std::span{leaf_page});
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::node_page_offset::LINK, tinydb::SUPERBLOCK_B_PAGE_ID));
   ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
@@ -163,9 +175,10 @@ TEST(Page, Mutations) {
   auto builder = tinydb::LeafPageBuilder{};
   for (int index = 0; index < 24; ++index) {
     builder.Upsert("key-" + std::to_string(index + 100),
-                   tinydb::LeafValue::Inline(std::string(static_cast<std::size_t>(index), 'v')));
+                   tinydb::LeafValueView::Inline(std::string(static_cast<std::size_t>(index), 'v')));
   }
   builder.Store(seed_page.data(), 2);
+  Seal(seed_page);
 
   // Recompute the checksum after each mutation so the test reaches the
   // structural decoder instead of being rejected at the outer checksum on

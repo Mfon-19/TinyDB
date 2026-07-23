@@ -114,6 +114,7 @@ TEST(Database, Snapshots) {
 
 TEST(Database, Limits) {
   const auto path = tinydb::test::Path("limits");
+  Cleanup(path);
   auto invalid = tinydb::Options{};
   invalid.page_cache_bytes = tinydb::PAGE_SIZE - 1U;
   const auto rejected = tinydb::Database::Open(path, invalid);

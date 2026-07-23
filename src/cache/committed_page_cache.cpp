@@ -127,7 +127,7 @@ struct CommittedPageCache::Impl final {
     }
   }
 
-  auto TryEvictOne() -> bool {
+  auto TakeEvictionCandidate() -> std::shared_ptr<CommittedFrame> {
     // Pinned frames remain linked so their final release needs no mutex. In
     // ordinary use they are near the MRU end, leaving victim selection O(1);
     // a long-lived reader may require a short walk past its pinned frames.
@@ -141,24 +141,36 @@ struct CommittedPageCache::Impl final {
       victim = victim->newer;
     }
     if (victim == nullptr) {
-      return false;
+      return {};
     }
     const auto victim_page_id = victim->header.page_id;
     Unlink(victim);
-    pages[victim_page_id].reset();
+    auto frame = std::move(pages[victim_page_id]);
     --resident_pages;
     ++evictions;
-    return true;
+    return frame;
   }
 
   void TrimToTarget() {
-    while (resident_pages * PAGE_SIZE > target_bytes && TryEvictOne()) {
+    while (resident_pages * PAGE_SIZE > target_bytes) {
+      if (TakeEvictionCandidate() == nullptr) {
+        break;
+      }
     }
   }
 
-  void MakeRoomForRead() {
-    while ((resident_pages + 1) * PAGE_SIZE > target_bytes && TryEvictOne()) {
+  auto MakeRoomForRead() -> std::shared_ptr<CommittedFrame> {
+    auto reusable = std::shared_ptr<CommittedFrame>{};
+    while ((resident_pages + 1) * PAGE_SIZE > target_bytes) {
+      auto frame = TakeEvictionCandidate();
+      if (frame == nullptr) {
+        break;
+      }
+      if (reusable == nullptr) {
+        reusable = std::move(frame);
+      }
     }
+    return reusable;
   }
 };
 
@@ -182,14 +194,21 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageHandle> {
   // Disk reads obey the hard target. Unlike publication, a cache miss has no
   // already-approved transaction overage and may fail if every frame is pinned
   // or waiting for checkpoint.
-  impl_->MakeRoomForRead();
+  auto frame = impl_->MakeRoomForRead();
   if ((impl_->resident_pages + 1) * PAGE_SIZE > impl_->target_bytes) {
     return std::unexpected(Status::ResourceExhausted("committed cache is full of pinned or uncheckpointed pages"));
   }
 
   // The cache mutex remains held across I/O. This deliberately serializes a
   // miss so a second reader cannot load and install a duplicate frame.
-  auto bytes = std::make_unique<PageBytes>();
+  // An unpinned victim has no observer, so its frame and aligned page buffer
+  // can become the miss destination. This removes allocator/control-block
+  // churn from steady-state scans and random reads without weakening leases.
+  auto new_bytes = std::unique_ptr<PageBytes>{};
+  if (frame == nullptr) {
+    new_bytes = std::make_unique<PageBytes>();
+  }
+  auto *const bytes = frame != nullptr ? frame->bytes.get() : new_bytes.get();
   if (auto status = impl_->disk->ReadPage(page_id, bytes->data()); !status.Ok()) {
     if (status.Code() == StatusCode::InvalidArgument) {
       return std::unexpected(Status::Corruption("tree references a page outside the allocated database"));
@@ -207,7 +226,13 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageHandle> {
     }
   }
 
-  auto frame = std::make_shared<CommittedFrame>(*header, std::move(bytes), tree_page, true);
+  if (frame != nullptr) {
+    frame->header = *header;
+    frame->tree_payload_validated = tree_page;
+    frame->checkpointed = true;
+  } else {
+    frame = std::make_shared<CommittedFrame>(*header, std::move(new_bytes), tree_page, true);
+  }
   if (page_id >= impl_->pages.size()) {
     impl_->pages.resize(page_id + 1);
   }

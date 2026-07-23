@@ -25,8 +25,8 @@ constexpr auto MakeCrc32Table() -> std::array<std::uint32_t, 256> {
 
 inline constexpr auto CRC32_TABLE = MakeCrc32Table();
 
-constexpr auto MakeCrc32SlicingTable() -> std::array<std::array<std::uint32_t, 256>, 8> {
-  auto tables = std::array<std::array<std::uint32_t, 256>, 8>{};
+constexpr auto MakeCrc32SlicingTable() -> std::array<std::array<std::uint32_t, 256>, 16> {
+  auto tables = std::array<std::array<std::uint32_t, 256>, 16>{};
   tables[0] = CRC32_TABLE;
   for (std::size_t slice = 1; slice < tables.size(); ++slice) {
     for (std::size_t byte = 0; byte < tables[slice].size(); ++byte) {
@@ -42,14 +42,22 @@ inline constexpr auto CRC32_SLICING_TABLE = MakeCrc32SlicingTable();
 class Crc32Accumulator final {
  public:
   void Update(std::span<const std::byte> data) noexcept {
-    while (data.size() >= 8) {
+    // Slicing by 16 keeps every lookup independent and halves loop/control
+    // overhead while retaining a portable IEEE CRC-32 implementation.
+    while (data.size() >= 16) {
       const auto first = LoadLittleEndian(data) ^ remainder_;
       const auto second = LoadLittleEndian(data.subspan(4));
-      remainder_ = CRC32_SLICING_TABLE[7][first & 0xFFU] ^ CRC32_SLICING_TABLE[6][(first >> 8U) & 0xFFU] ^
-                   CRC32_SLICING_TABLE[5][(first >> 16U) & 0xFFU] ^ CRC32_SLICING_TABLE[4][first >> 24U] ^
-                   CRC32_SLICING_TABLE[3][second & 0xFFU] ^ CRC32_SLICING_TABLE[2][(second >> 8U) & 0xFFU] ^
-                   CRC32_SLICING_TABLE[1][(second >> 16U) & 0xFFU] ^ CRC32_SLICING_TABLE[0][second >> 24U];
-      data = data.subspan(8);
+      const auto third = LoadLittleEndian(data.subspan(8));
+      const auto fourth = LoadLittleEndian(data.subspan(12));
+      remainder_ = CRC32_SLICING_TABLE[15][first & 0xFFU] ^ CRC32_SLICING_TABLE[14][(first >> 8U) & 0xFFU] ^
+                   CRC32_SLICING_TABLE[13][(first >> 16U) & 0xFFU] ^ CRC32_SLICING_TABLE[12][first >> 24U] ^
+                   CRC32_SLICING_TABLE[11][second & 0xFFU] ^ CRC32_SLICING_TABLE[10][(second >> 8U) & 0xFFU] ^
+                   CRC32_SLICING_TABLE[9][(second >> 16U) & 0xFFU] ^ CRC32_SLICING_TABLE[8][second >> 24U] ^
+                   CRC32_SLICING_TABLE[7][third & 0xFFU] ^ CRC32_SLICING_TABLE[6][(third >> 8U) & 0xFFU] ^
+                   CRC32_SLICING_TABLE[5][(third >> 16U) & 0xFFU] ^ CRC32_SLICING_TABLE[4][third >> 24U] ^
+                   CRC32_SLICING_TABLE[3][fourth & 0xFFU] ^ CRC32_SLICING_TABLE[2][(fourth >> 8U) & 0xFFU] ^
+                   CRC32_SLICING_TABLE[1][(fourth >> 16U) & 0xFFU] ^ CRC32_SLICING_TABLE[0][fourth >> 24U];
+      data = data.subspan(16);
     }
     for (const auto value : data) {
       const auto byte = std::to_integer<unsigned int>(value);

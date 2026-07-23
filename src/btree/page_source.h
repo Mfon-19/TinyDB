@@ -31,11 +31,17 @@ struct DataPageHeader;
 */
 class PageHandle {
  public:
-  using Release = void (*)(void *owner, page_id_t page_id, bool dirty);
+  using Release = void (*)(void *owner, page_id_t page_id, bool dirty, bool tree_payload_validated);
 
   PageHandle() = default;
-  PageHandle(void *owner, page_id_t page_id, char *data, bool editable, Release release)
-      : owner_(owner), page_id_(page_id), data_(data), release_(release), editable_(editable) {}
+  PageHandle(void *owner, page_id_t page_id, char *data, bool editable, Release release,
+             bool tree_payload_validated = false)
+      : owner_(owner),
+        page_id_(page_id),
+        data_(data),
+        release_(release),
+        editable_(editable),
+        tree_payload_validated_(tree_payload_validated) {}
 
   // Immutable caches retain a frame through keepalive. Its shared ownership is
   // also the exact eviction pin, so release needs no owner callback.
@@ -66,15 +72,23 @@ class PageHandle {
   auto Data() const -> const char * { return data_; }
 
   // Immutable cache owners may retain the common-header proof produced when
-  // bytes first crossed the persistent validation boundary. The header and
-  // bytes share a lifetime. Mutable handles deliberately carry no proof.
+  // bytes first crossed the persistent validation boundary. Transaction
+  // handles may instead carry a structural proof for their private bytes.
   auto ValidatedHeader() const noexcept -> const storage::DataPageHeader * { return validated_header_; }
   auto TreePayloadValidated() const noexcept -> bool { return tree_payload_validated_; }
 
   // Only Edit and Allocate may produce an editable handle.
   auto MutableData() -> char * {
     TINYDB_CHECK(editable_, "mutable access through a read-only page handle");
+    // Any write invalidates the source's previous structural proof. A tree
+    // builder restores it after emitting one complete canonical node.
+    tree_payload_validated_ = false;
     return const_cast<char *>(data_);
+  }
+
+  void MarkTreePayloadValidated() {
+    TINYDB_CHECK(editable_, "marking a read-only page as structurally validated");
+    tree_payload_validated_ = true;
   }
 
   void MarkDirty() {
@@ -84,13 +98,14 @@ class PageHandle {
 
  private:
   void Reset() noexcept {
-    // The source receives the accumulated dirty bit exactly once.
+    // The source receives accumulated mutation state exactly once.
     if (release_ != nullptr) {
-      release_(owner_, page_id_, dirty_);
+      release_(owner_, page_id_, dirty_, tree_payload_validated_);
     }
     owner_ = nullptr;
     data_ = nullptr;
     editable_ = false;
+    dirty_ = false;
     release_ = nullptr;
     keepalive_.reset();
     validated_header_ = nullptr;

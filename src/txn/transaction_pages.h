@@ -77,7 +77,9 @@ class TransactionPages final : public PageSource {
     page_id_t page_id{HEADER_PAGE_ID};        // immutable identity of this frame
     std::unique_ptr<cache::PageBytes> bytes;  // stable address until transfer
     std::size_t pin_count{0};                 // outstanding PageHandles
+    bool editing{false};                      // mutable leases are exclusive
     bool dirty{false};                        // needs WAL/publication image
+    bool tree_payload_validated{false};       // trusted private tree bytes
   };
 
   TransactionPages(PageReader *committed, DatabaseState base_state, std::size_t memory_limit_bytes)
@@ -86,14 +88,15 @@ class TransactionPages final : public PageSource {
         resulting_state_(base_state),
         memory_limit_bytes_(memory_limit_bytes) {}
 
-  static void ReleasePrivate(void *owner, page_id_t page_id, bool dirty);
+  static void ReleasePrivate(void *owner, page_id_t page_id, bool dirty, bool tree_payload_validated);
   auto PrivateHandle(PrivateFrame *frame, bool editable) -> PageHandle;
   auto CreatePrivatePage(page_id_t page_id, bool dirty) -> Result<PrivateFrame *>;
   auto AllocateHighWaterPage() -> Result<PrivateFrame *>;
   auto LoadFreeExtents() -> Status;
   auto AllocateReusablePage() -> std::optional<page_id_t>;
   void AddRetiredExtents(std::uint64_t retire_lsn);
-  auto StoreFreeExtentIndex(std::uint64_t page_lsn) -> Status;
+  auto EnsureFreeExtentIndexFrames() -> Status;
+  auto StoreFreeExtentIndex() -> Status;
   auto ChargePage() -> Status;
   void RequireActive() const;
   void RequireUnpinned() const;

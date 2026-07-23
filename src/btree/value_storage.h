@@ -27,7 +27,7 @@ class PageSource;
 ** supplies the allocation frontier and a global ownership set, proving that
 ** every physical overflow page belongs to exactly one leaf value.
 */
-auto PrepareValue(PageSource *pages, std::string_view key, std::string_view value) -> Result<LeafValue>;
+auto PrepareValue(PageSource *pages, std::string_view key, std::string_view value) -> Result<LeafValueView>;
 auto CopyOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor) -> Result<std::string>;
 
 inline auto CopyValue(PageReader *pages, LeafValueView value) -> Result<std::string> {

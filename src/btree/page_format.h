@@ -103,15 +103,17 @@ auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status;
 auto ValidateTreePagePayload(const char *page, const storage::DataPageHeader &validated_header) -> Status;
 
 inline auto ValidateTreePage(const PageHandle &page) -> Status {
+  // Transaction-owned nodes carry the same structural proof as committed
+  // frames even while their checksum is deferred until commit.
+  if (page.TreePayloadValidated()) {
+    return {};
+  }
   const auto *const common = page.ValidatedHeader();
   if (common == nullptr) {
     return ValidateTreePage(page.Data(), page.Id());
   }
   if (common->page_id != page.Id()) {
     return Status::Corruption("validated page header changed identity");
-  }
-  if (page.TreePayloadValidated()) {
-    return {};
   }
   return ValidateTreePagePayload(page.Data(), *common);
 }

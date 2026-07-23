@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <expected>
 #include <limits>
 #include <span>
@@ -116,14 +115,15 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
 ** allocated, encoded, and marked dirty before success. Any error means the
 ** caller must abort its private page transaction; no committed state changed.
 */
-auto PrepareValue(PageSource *pages, std::string_view key, std::string_view value) -> Result<LeafValue> {
+auto PrepareValue(PageSource *pages, std::string_view key, std::string_view value) -> Result<LeafValueView> {
   TINYDB_CHECK(pages != nullptr, "overflow preparation requires a page source");
   if (value.size() > MAX_VALUE_BYTES) {
     return std::unexpected(Status::InvalidArgument("value exceeds the maximum value size"));
   }
   const auto inline_footprint = SLOT_SIZE + LEAF_CELL_HEADER_SIZE + key.size() + value.size();
   if (inline_footprint <= MAX_LEAF_RECORD_BYTES) {
-    return LeafValue::Inline(value);
+    // The builder copies this borrowed value before Put returns.
+    return LeafValueView::Inline(value);
   }
 
   const auto chunks = (value.size() + storage::OVERFLOW_PAGE_PAYLOAD_BYTES - 1) / storage::OVERFLOW_PAGE_PAYLOAD_BYTES;
@@ -144,17 +144,17 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
     const auto offset = index * storage::OVERFLOW_PAGE_PAYLOAD_BYTES;
     const auto count = std::min(storage::OVERFLOW_PAGE_PAYLOAD_BYTES, value.size() - offset);
     const auto next = index + 1 < allocated.size() ? allocated[index + 1].Id() : HEADER_PAGE_ID;
-    const auto encoded =
-        storage::EncodeOverflowPage(allocated[index].Id(), 0, owner_value_id, static_cast<std::uint32_t>(index), next,
-                                    value_bytes.subspan(offset, count));
-    if (!encoded) {
-      return std::unexpected(encoded.error());
+    auto page = std::as_writable_bytes(std::span<char, PAGE_SIZE>{allocated[index].MutableData(), PAGE_SIZE});
+    if (auto status = storage::InitializeOverflowPage(page, allocated[index].Id(), 0, owner_value_id,
+                                                      static_cast<std::uint32_t>(index), next,
+                                                      value_bytes.subspan(offset, count));
+        !status.Ok()) {
+      return std::unexpected(std::move(status));
     }
-    std::memcpy(allocated[index].MutableData(), encoded->data(), PAGE_SIZE);
     allocated[index].MarkDirty();
   }
 
-  return LeafValue::Overflow(OverflowValueDescriptor{
+  return LeafValueView::Overflow(OverflowValueDescriptor{
       .total_value_bytes = value.size(),
       .first_page_id = owner_value_id,
       .value_checksum = Crc32(value_bytes),

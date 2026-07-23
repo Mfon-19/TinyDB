@@ -62,19 +62,31 @@ void TransactionPages::RequireUnpinned() const {
   }
 }
 
-void TransactionPages::ReleasePrivate(void *owner, page_id_t page_id, bool dirty) {
+void TransactionPages::ReleasePrivate(void *owner, page_id_t page_id, bool dirty, bool tree_payload_validated) {
   auto *const frame = static_cast<PrivateFrame *>(owner);
   TINYDB_CHECK(frame->page_id == page_id, "transaction page lease changed identity");
   TINYDB_CHECK(frame->pin_count != 0, "transaction page pin count underflow");
-  // Dirty is sticky across leases to this private frame; releasing it never
-  // updates shared cache metadata.
+  if (frame->editing) {
+    TINYDB_CHECK(frame->pin_count == 1, "mutable transaction page lease overlapped another lease");
+    frame->editing = false;
+  }
+  // Dirty is sticky. The structural proof describes the current private bytes
+  // and is replaced only by the sole mutable lease.
   --frame->pin_count;
   frame->dirty = frame->dirty || dirty;
+  frame->tree_payload_validated = tree_payload_validated;
 }
 
 auto TransactionPages::PrivateHandle(PrivateFrame *frame, bool editable) -> PageHandle {
+  if (editable) {
+    TINYDB_CHECK(frame->pin_count == 0 && !frame->editing, "editing a transaction page with an outstanding lease");
+    frame->editing = true;
+  } else {
+    TINYDB_CHECK(!frame->editing, "reading a transaction page through an active mutable lease");
+  }
   ++frame->pin_count;
-  return PageHandle(frame, frame->page_id, frame->bytes->data(), editable, ReleasePrivate);
+  return PageHandle(frame, frame->page_id, frame->bytes->data(), editable, ReleasePrivate,
+                    frame->tree_payload_validated);
 }
 
 auto TransactionPages::ChargePage() -> Status {
@@ -97,7 +109,9 @@ auto TransactionPages::CreatePrivatePage(page_id_t page_id, bool dirty) -> Resul
       .page_id = page_id,
       .bytes = std::make_unique<cache::PageBytes>(),
       .pin_count = 0,
+      .editing = false,
       .dirty = dirty,
+      .tree_payload_validated = false,
   });
   auto *const result = frame.get();
   const auto [position, inserted] = pages_.emplace(page_id, std::move(frame));
@@ -141,6 +155,7 @@ auto TransactionPages::Edit(page_id_t page_id) -> Result<PageHandle> {
     return std::unexpected(std::move(private_page).error());
   }
   std::memcpy((*private_page)->bytes->data(), committed->Data(), PAGE_SIZE);
+  (*private_page)->tree_payload_validated = committed->TreePayloadValidated();
   return PrivateHandle(*private_page, true);
 }
 
@@ -314,7 +329,7 @@ void TransactionPages::AddRetiredExtents(std::uint64_t retire_lsn) {
   free_extents_.resize(output);
 }
 
-auto TransactionPages::StoreFreeExtentIndex(std::uint64_t page_lsn) -> Status {
+auto TransactionPages::EnsureFreeExtentIndexFrames() -> Status {
   if (free_extents_.empty() && allocator_page_ids_.empty()) {
     resulting_state_.allocator_root_page_id = HEADER_PAGE_ID;
     return {};
@@ -331,27 +346,39 @@ auto TransactionPages::StoreFreeExtentIndex(std::uint64_t page_lsn) -> Status {
     allocator_page_ids_.push_back((*page)->page_id);
   }
 
-  // Rewrite the whole metadata chain. Unused retained pages encode empty
-  // ranges rather than being retired recursively while the index is changing.
-  for (std::size_t index = 0; index < allocator_page_ids_.size(); ++index) {
-    auto page = CreatePrivatePage(allocator_page_ids_[index], true);
+  // Freeze must include every final allocator image in its page count, but the
+  // exact retirement LSN is not known yet. Reserve the frames now and encode
+  // them once during Seal.
+  for (const auto page_id : allocator_page_ids_) {
+    auto page = CreatePrivatePage(page_id, true);
     if (!page) {
       return std::move(page).error();
     }
+    (*page)->dirty = true;
+  }
+  resulting_state_.allocator_root_page_id = allocator_page_ids_.front();
+  return {};
+}
+
+auto TransactionPages::StoreFreeExtentIndex() -> Status {
+  // Rewrite the whole metadata chain. Unused retained pages encode empty
+  // ranges rather than being retired recursively while the index is changing.
+  for (std::size_t index = 0; index < allocator_page_ids_.size(); ++index) {
+    const auto page_id = allocator_page_ids_[index];
+    const auto page = pages_.find(page_id);
+    TINYDB_CHECK(page != pages_.end(), "allocator frame was not reserved before sealing");
     const auto first = index * storage::FREE_EXTENTS_PER_PAGE;
     const auto count =
         first < free_extents_.size() ? std::min(storage::FREE_EXTENTS_PER_PAGE, free_extents_.size() - first) : 0;
     const auto next = index + 1 < allocator_page_ids_.size() ? allocator_page_ids_[index + 1] : HEADER_PAGE_ID;
-    const auto encoded =
-        storage::EncodeFreeExtentPage(allocator_page_ids_[index], page_lsn, next,
-                                      std::span<const storage::FreeExtent>{free_extents_}.subspan(first, count));
-    if (!encoded) {
-      return encoded.error();
+    auto bytes = std::as_writable_bytes(std::span<char, PAGE_SIZE>{page->second->bytes->data(), PAGE_SIZE});
+    if (auto status = storage::InitializeFreeExtentPage(
+            bytes, page_id, 0, next, std::span<const storage::FreeExtent>{free_extents_}.subspan(first, count));
+        !status.Ok()) {
+      return status;
     }
-    std::memcpy((*page)->bytes->data(), encoded->data(), PAGE_SIZE);
-    (*page)->dirty = true;
+    page->second->dirty = true;
   }
-  resulting_state_.allocator_root_page_id = allocator_page_ids_.front();
   return {};
 }
 
@@ -362,7 +389,7 @@ auto TransactionPages::Freeze() -> Status {
   // advance the resulting high-water frontier.
   if (allocator_dirty_) {
     AddRetiredExtents(PENDING_COMMIT_LSN);
-    if (auto status = StoreFreeExtentIndex(PENDING_COMMIT_LSN); !status.Ok()) {
+    if (auto status = EnsureFreeExtentIndexFrames(); !status.Ok()) {
       return status;
     }
   }
@@ -393,7 +420,7 @@ auto TransactionPages::Seal(std::uint64_t commit_lsn) -> Status {
         extent.retire_lsn = commit_lsn;
       }
     }
-    if (auto status = StoreFreeExtentIndex(commit_lsn); !status.Ok()) {
+    if (auto status = StoreFreeExtentIndex(); !status.Ok()) {
       return status;
     }
     // Freeze already allocated every allocator frame. A change here would make

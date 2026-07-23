@@ -24,9 +24,10 @@
 ** each record owns the child on its right. Persistent bytes enter only through
 ** InternalPageView.
 **
-** Store emits one complete canonical page. A split promotes one separator to
-** the parent; the promoted key belongs to neither resulting child and its old
-** right child becomes the new right page's first child.
+** Store emits one complete canonical private page and leaves checksum sealing
+** to commit. A split promotes one separator to the parent; the promoted key
+** belongs to neither resulting child and its old right child becomes the new
+** right page's first child.
 */
 
 namespace tinydb {
@@ -34,21 +35,33 @@ namespace {
 
 constexpr std::size_t USABLE_BYTES = PAGE_SIZE - INTERNAL_HEADER_SIZE;
 
-auto KeyIsBefore(const InternalPageBuilder::Record &record, std::string_view target) -> bool {
-  return txn::BytewiseLess{}(record.key, target);
-}
-
-// Store adds exactly one slot and one unpadded cell per separator.
-auto RecordFootprint(const InternalPageBuilder::Record &record) -> std::size_t {
-  return SLOT_SIZE + INTERNAL_CELL_HEADER_SIZE + record.key.size();
-}
-
 }  // namespace
+
+auto InternalPageBuilder::Append(std::string_view bytes) -> Slice {
+  if (bytes_.capacity() == 0) {
+    bytes_.reserve(PAGE_SIZE + MAX_KEY_BYTES);
+  }
+  const auto result = Slice{.offset = bytes_.size(), .size = bytes.size()};
+  bytes_.insert(bytes_.end(), bytes.begin(), bytes.end());
+  return result;
+}
+
+auto InternalPageBuilder::MakeRecord(std::string_view key, page_id_t right_child) -> Record {
+  return Record{.key = Append(key), .right_child = right_child};
+}
+
+auto InternalPageBuilder::Key(const Record &record) const -> std::string_view {
+  return {bytes_.data() + record.key.offset, record.key.size};
+}
+
+auto InternalPageBuilder::RecordFootprint(const Record &record) -> std::size_t {
+  return SLOT_SIZE + INTERNAL_CELL_HEADER_SIZE + record.key.size;
+}
 
 // Construct the minimal internal page used when a split creates a new root.
 InternalPageBuilder::InternalPageBuilder(page_id_t first_child, std::string separator, page_id_t right_child)
     : first_child_(first_child) {
-  auto record = Record{std::move(separator), right_child};
+  auto record = MakeRecord(separator, right_child);
   encoded_bytes_ = RecordFootprint(record);
   records_.push_back(std::move(record));
 }
@@ -57,9 +70,10 @@ InternalPageBuilder::InternalPageBuilder(page_id_t first_child, std::string sepa
 auto InternalPageBuilder::From(const InternalPageView &page) -> InternalPageBuilder {
   InternalPageBuilder builder;
   builder.first_child_ = page.ChildAt(0);
-  builder.records_.reserve(page.SeparatorCount());
+  // Put adds at most one separator before this builder is stored or split.
+  builder.records_.reserve(page.SeparatorCount() + 1);
   for (std::size_t index = 0; index < page.SeparatorCount(); ++index) {
-    auto record = Record{std::string(page.KeyAt(index)), page.ChildAt(index + 1)};
+    auto record = builder.MakeRecord(page.KeyAt(index), page.ChildAt(index + 1));
     builder.encoded_bytes_ += RecordFootprint(record);
     builder.records_.push_back(std::move(record));
   }
@@ -80,13 +94,14 @@ void InternalPageBuilder::Store(char *page, page_id_t page_id) const {
   std::size_t free_end = PAGE_SIZE;
   for (std::size_t i = 0; i < records_.size(); ++i) {
     const auto &record = records_[i];
-    const std::size_t cell_size = INTERNAL_CELL_HEADER_SIZE + record.key.size();
+    const auto key = Key(record);
+    const std::size_t cell_size = INTERNAL_CELL_HEADER_SIZE + key.size();
     const std::size_t offset = free_end - cell_size;
     TINYDB_CHECK(storage::PutLittleEndian(bytes, offset + internal_cell_offset::RIGHT_CHILD, record.right_child) &&
                      storage::PutLittleEndian(bytes, offset + internal_cell_offset::KEY_BYTES,
-                                              static_cast<std::uint16_t>(record.key.size())),
+                                              static_cast<std::uint16_t>(key.size())),
                  "internal cell header exceeds page");
-    std::copy_n(record.key.data(), record.key.size(), page + offset + INTERNAL_CELL_HEADER_SIZE);
+    std::copy_n(key.data(), key.size(), page + offset + INTERNAL_CELL_HEADER_SIZE);
     TINYDB_CHECK(storage::PutLittleEndian(bytes, INTERNAL_HEADER_SIZE + i * SLOT_SIZE, static_cast<slot_t>(offset)),
                  "internal slot exceeds page");
     free_end = offset;
@@ -98,14 +113,15 @@ void InternalPageBuilder::Store(char *page, page_id_t page_id) const {
                                    static_cast<std::uint16_t>(INTERNAL_HEADER_SIZE + records_.size() * SLOT_SIZE)) &&
           storage::PutLittleEndian(bytes, node_page_offset::FREE_END, static_cast<std::uint16_t>(free_end)) &&
           storage::PutLittleEndian(bytes, node_page_offset::RESERVED, std::uint16_t{0}) &&
-          storage::PutLittleEndian(bytes, node_page_offset::LINK, first_child_) &&
-          storage::FinalizeDataPage(bytes).Ok(),
+          storage::PutLittleEndian(bytes, node_page_offset::LINK, first_child_),
       "failed to encode internal page");
 }
 
 void InternalPageBuilder::InsertSeparator(std::string key, page_id_t right_child) {
-  const auto it = std::lower_bound(records_.begin(), records_.end(), key, KeyIsBefore);
-  auto record = Record{std::move(key), right_child};
+  const auto it = std::lower_bound(
+      records_.begin(), records_.end(), key,
+      [this](const Record &record, std::string_view target) { return txn::BytewiseLess{}(Key(record), target); });
+  auto record = MakeRecord(key, right_child);
   encoded_bytes_ += RecordFootprint(record);
   records_.insert(it, std::move(record));
 }
@@ -151,11 +167,13 @@ auto InternalPageBuilder::Split() -> SplitResult {
   const auto promoted_bytes = RecordFootprint(records_[split]);
 
   SplitResult result;
-  result.separator = std::move(records_[split].key);
+  result.separator = std::string(Key(records_[split]));
   result.right.first_child_ = records_[split].right_child;
-  result.right.records_.assign(std::make_move_iterator(split_it + 1), std::make_move_iterator(records_.end()));
-  for (const auto &record : result.right.records_) {
-    result.right.encoded_bytes_ += RecordFootprint(record);
+  result.right.records_.reserve(records_.size() - split - 1);
+  for (auto record = split_it + 1; record != records_.end(); ++record) {
+    auto copied = result.right.MakeRecord(Key(*record), record->right_child);
+    result.right.encoded_bytes_ += RecordFootprint(copied);
+    result.right.records_.push_back(std::move(copied));
   }
   TINYDB_CHECK(encoded_bytes_ >= promoted_bytes + result.right.encoded_bytes_,
                "internal split byte accounting underflow");

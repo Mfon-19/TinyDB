@@ -15,11 +15,6 @@ namespace tinydb {
 // through InternalPageView.
 class InternalPageBuilder {
  public:
-  struct Record {
-    std::string key;
-    page_id_t right_child;
-  };
-
   struct SplitResult;
 
   InternalPageBuilder() = default;
@@ -27,7 +22,7 @@ class InternalPageBuilder {
 
   static auto From(const InternalPageView &page) -> InternalPageBuilder;
 
-  // Emits a complete canonical page whose encoded identity is page_id.
+  // Emits canonical transaction bytes. Commit assigns the final LSN and CRC.
   void Store(char *page, page_id_t page_id) const;
 
   void InsertSeparator(std::string key, page_id_t right_child);
@@ -37,9 +32,24 @@ class InternalPageBuilder {
   auto Split() -> SplitResult;
 
  private:
+  struct Slice {
+    std::size_t offset;
+    std::size_t size;
+  };
+
+  struct Record {
+    Slice key;
+    page_id_t right_child;
+  };
+
+  auto Append(std::string_view bytes) -> Slice;
+  auto MakeRecord(std::string_view key, page_id_t right_child) -> Record;
+  auto Key(const Record &record) const -> std::string_view;
+  static auto RecordFootprint(const Record &record) -> std::size_t;
   auto ChooseSplitIndex() const -> std::size_t;
 
   page_id_t first_child_{HEADER_PAGE_ID};
+  std::vector<char> bytes_;
   std::vector<Record> records_;
   std::size_t encoded_bytes_{0};
 };

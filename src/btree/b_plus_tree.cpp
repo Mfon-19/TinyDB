@@ -108,6 +108,13 @@ auto InternalBuilder(PageHandle &page) -> Result<InternalPageBuilder> {
   return InternalPageBuilder::From(*view);
 }
 
+template <typename Builder>
+void StoreTreePage(const Builder &builder, PageHandle &page) {
+  builder.Store(page.MutableData(), page.Id());
+  page.MarkTreePayloadValidated();
+  page.MarkDirty();
+}
+
 // A split leaves its left half at the original page and carries this edge to
 // the parent. Parent overflow replaces it with another pending edge.
 struct PendingSeparator {
@@ -124,11 +131,9 @@ auto SplitAndWrite(PageSource *pages, PageHandle &page, LeafPageBuilder &node,
     return std::unexpected(std::move(right_page).error());
   }
   auto split = node.Split(right_page->Id(), tail_heavy);
-  split.right.Store(right_page->MutableData(), right_page->Id());
-  right_page->MarkDirty();
+  StoreTreePage(split.right, *right_page);
 
-  node.Store(page.MutableData(), page.Id());
-  page.MarkDirty();
+  StoreTreePage(node, page);
   return PendingSeparator{std::move(split.separator), right_page->Id()};
 }
 
@@ -140,11 +145,9 @@ auto SplitAndWrite(PageSource *pages, PageHandle &page, InternalPageBuilder &nod
     return std::unexpected(std::move(right_page).error());
   }
   auto split = node.Split();
-  split.right.Store(right_page->MutableData(), right_page->Id());
-  right_page->MarkDirty();
+  StoreTreePage(split.right, *right_page);
 
-  node.Store(page.MutableData(), page.Id());
-  page.MarkDirty();
+  StoreTreePage(node, page);
   return PendingSeparator{std::move(split.separator), right_page->Id()};
 }
 
@@ -172,8 +175,7 @@ auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusT
       return std::unexpected(std::move(editable_root).error());
     }
     TINYDB_CHECK(RawNodeType(*editable_root) == 0, "fresh tree root changed before initialization");
-    LeafPageBuilder{}.Store(editable_root->MutableData(), editable_root->Id());
-    editable_root->MarkDirty();
+    StoreTreePage(LeafPageBuilder{}, *editable_root);
     return BPlusTree(pages, root_page_id);
   }
   const bool is_node = raw_type == static_cast<std::uint16_t>(NodeType::Leaf) ||
@@ -218,8 +220,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     retired_value = upsert.replaced_overflow;
 
     if (node.Fits()) {
-      node.Store(leaf_page->MutableData(), leaf_page->Id());
-      leaf_page->MarkDirty();
+      StoreTreePage(node, *leaf_page);
     } else {
       const bool tail_heavy = upsert.at_tail && node.NextLeaf() == HEADER_PAGE_ID;
       auto split = SplitAndWrite(pages_, *leaf_page, node, tail_heavy);
@@ -257,8 +258,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     node.InsertSeparator(std::move(pending->key), pending->right_child);
 
     if (node.Fits()) {
-      node.Store(page->MutableData(), page->Id());
-      page->MarkDirty();
+      StoreTreePage(node, *page);
       return {};
     }
     auto split = SplitAndWrite(pages_, *page, node);
@@ -274,9 +274,8 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     if (!new_root) {
       return std::move(new_root).error();
     }
-    InternalPageBuilder(root_page_id_, std::move(pending->key), pending->right_child)
-        .Store(new_root->MutableData(), new_root->Id());
-    new_root->MarkDirty();
+    const auto root = InternalPageBuilder(root_page_id_, std::move(pending->key), pending->right_child);
+    StoreTreePage(root, *new_root);
     root_page_id_ = new_root->Id();
   }
   return {};
@@ -332,8 +331,7 @@ auto BPlusTree::Remove(std::string_view key) -> Status {
       return {};
     }
     retired_value = erased.removed_overflow;
-    builder->Store(page->MutableData(), page->Id());
-    page->MarkDirty();
+    StoreTreePage(*builder, *page);
   }
   if (retired_value.has_value()) {
     if (auto status = RetireOverflowValue(pages_, *retired_value); !status.Ok()) {

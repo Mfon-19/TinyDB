@@ -5,9 +5,12 @@
 
 #include "txn/contract.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <string>
+#include <string_view>
 
 /*
 ** CONTRACT TESTS
@@ -46,4 +49,30 @@ TEST(Contract, ByteOrder) {
   EXPECT_LT(tinydb::txn::BytewiseCompare(low, high), 0);
   EXPECT_EQ(tinydb::txn::BytewiseCompare(std::string{"a\0b", 3}, std::string{"a\0b", 3}), 0);
   EXPECT_GT(tinydb::txn::BytewiseCompare("prefix-longer", "prefix"), 0);
+
+  const auto reference = [](std::string_view left, std::string_view right) {
+    const auto common = std::min(left.size(), right.size());
+    const auto order = common == 0 ? 0 : std::memcmp(left.data(), right.data(), common);
+    return order != 0 ? order
+                      : static_cast<int>(left.size() > right.size()) - static_cast<int>(left.size() < right.size());
+  };
+  for (auto size = std::size_t{0}; size <= 65; ++size) {
+    auto left = std::string(size, '\0');
+    for (auto index = std::size_t{0}; index < size; ++index) {
+      left[index] = static_cast<char>((index * 37U + size) & 0xffU);
+    }
+    auto right = left;
+    EXPECT_EQ(tinydb::txn::BytewiseCompare(left, right), 0);
+    for (auto mismatch = std::size_t{0}; mismatch < size; ++mismatch) {
+      right = left;
+      right[mismatch] = static_cast<char>(static_cast<unsigned char>(right[mismatch]) ^ 0x80U);
+      const auto expected = reference(left, right);
+      const auto actual = tinydb::txn::BytewiseCompare(left, right);
+      EXPECT_EQ((actual > 0) - (actual < 0), (expected > 0) - (expected < 0))
+          << "size=" << size << " mismatch=" << mismatch;
+    }
+    right = left;
+    right.push_back('\0');
+    EXPECT_LT(tinydb::txn::BytewiseCompare(left, right), 0);
+  }
 }

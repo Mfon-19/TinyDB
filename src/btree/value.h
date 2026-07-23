@@ -5,10 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <string>
 #include <string_view>
-#include <utility>
-#include <variant>
 
 namespace tinydb {
 
@@ -71,37 +68,6 @@ class LeafValueView final {
 
   LeafValueKind kind_{LeafValueKind::Inline};
   Payload payload_;
-};
-
-/* Owning form used only while a private leaf is being rebuilt. */
-class LeafValue final {
- public:
-  static auto Inline(std::string_view bytes) -> LeafValue { return LeafValue(std::string(bytes)); }
-  static auto Overflow(OverflowValueDescriptor descriptor) -> LeafValue { return LeafValue(descriptor); }
-  static auto Copy(LeafValueView value) -> LeafValue {
-    return value.IsOverflow() ? Overflow(value.OverflowDescriptor()) : Inline(value.InlineBytes());
-  }
-
-  auto IsOverflow() const -> bool { return std::holds_alternative<OverflowValueDescriptor>(payload_); }
-  auto EncodedBytes() const -> std::size_t {
-    return IsOverflow() ? OVERFLOW_VALUE_DESCRIPTOR_BYTES : std::get<std::string>(payload_).size();
-  }
-
-  auto InlineBytes() const -> std::string_view {
-    TINYDB_CHECK(!IsOverflow(), "reading inline bytes from an owning overflow value");
-    return std::get<std::string>(payload_);
-  }
-
-  auto OverflowDescriptor() const -> const OverflowValueDescriptor & {
-    TINYDB_CHECK(IsOverflow(), "reading an overflow descriptor from an owning inline value");
-    return std::get<OverflowValueDescriptor>(payload_);
-  }
-
- private:
-  explicit LeafValue(std::string bytes) : payload_(std::move(bytes)) {}
-  explicit LeafValue(OverflowValueDescriptor descriptor) : payload_(descriptor) {}
-
-  std::variant<std::string, OverflowValueDescriptor> payload_;
 };
 
 }  // namespace tinydb

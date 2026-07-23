@@ -279,6 +279,17 @@ TEST(Format, Allocator) {
   EXPECT_EQ(decoded->extents, std::vector(extents.begin(), extents.end()));
   EXPECT_EQ(tinydb::storage::DecodeDataPageHeader(bytes, 2)->page_lsn, 0x0102030405060708ULL);
 
+  auto provisional = std::array<char, tinydb::PAGE_SIZE>{};
+  ASSERT_TRUE(
+      tinydb::storage::InitializeFreeExtentPage(std::as_writable_bytes(std::span{provisional}), 2, 0, 3, extents).Ok());
+  EXPECT_EQ(*tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
+                                                             tinydb::storage::data_page_offset::CHECKSUM),
+            0U);
+  ASSERT_TRUE(
+      tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 2, 0x0102030405060708ULL)
+          .Ok());
+  EXPECT_EQ(provisional, *encoded);
+
   auto adjacent = extents;
   adjacent[1].first_page_id = 7;
   EXPECT_EQ(tinydb::storage::EncodeFreeExtentPage(2, 0, 0, adjacent).error().Code(), StatusCode::InvalidArgument);
@@ -298,6 +309,16 @@ TEST(Format, Overflow) {
   EXPECT_EQ(decoded->chunk_index, 3U);
   EXPECT_EQ(decoded->next_page_id, 8U);
   EXPECT_TRUE(std::ranges::equal(decoded->payload, payload));
+
+  auto provisional = std::array<char, tinydb::PAGE_SIZE>{};
+  ASSERT_TRUE(
+      tinydb::storage::InitializeOverflowPage(std::as_writable_bytes(std::span{provisional}), 7, 0, 7, 3, 8, payload)
+          .Ok());
+  EXPECT_EQ(*tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
+                                                             tinydb::storage::data_page_offset::CHECKSUM),
+            0U);
+  ASSERT_TRUE(tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 7, 99).Ok());
+  EXPECT_EQ(provisional, *encoded);
 
   EXPECT_EQ(tinydb::storage::DecodeOverflowPage(bytes, 6).error().Code(), StatusCode::Corruption);
   auto corrupted = *encoded;
@@ -333,9 +354,10 @@ TEST(Format, Tree) {
   // retain a parallel legacy decoder beside the common page codec.
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto leaf = tinydb::LeafPageBuilder{};
-  leaf.Upsert("alpha", tinydb::LeafValue::Inline("one"));
-  leaf.Upsert("omega", tinydb::LeafValue::Inline("two"));
+  leaf.Upsert("alpha", tinydb::LeafValueView::Inline("one"));
+  leaf.Upsert("omega", tinydb::LeafValueView::Inline("two"));
   leaf.Store(leaf_page.data(), 2);
+  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{leaf_page})).Ok());
   EXPECT_TRUE(tinydb::ValidateTreePage(leaf_page.data(), 2).Ok());
   const auto loaded_leaf = tinydb::LeafPageView::Open(leaf_page.data(), 2).value();
   ASSERT_TRUE(loaded_leaf.Get("alpha").has_value());
@@ -346,6 +368,7 @@ TEST(Format, Tree) {
   auto internal_page = std::array<char, tinydb::PAGE_SIZE>{};
   const auto internal = tinydb::InternalPageBuilder{2, "middle", 3};
   internal.Store(internal_page.data(), 4);
+  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{internal_page})).Ok());
   EXPECT_TRUE(tinydb::ValidateTreePage(internal_page.data(), 4).Ok());
   const auto loaded_internal = tinydb::InternalPageView::Open(internal_page.data(), 4).value();
   EXPECT_EQ(loaded_internal.ChildAt(0), 2U);
