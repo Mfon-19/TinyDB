@@ -97,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     compare = subparsers.add_parser("compare", help="run a paired A/B comparison")
     compare.add_argument("baseline", type=pathlib.Path)
     compare.add_argument("candidate", type=pathlib.Path)
+    compare.add_argument("--baseline-cache-mib", type=positive_integer)
     compare.add_argument("--candidate-cache-mib", type=positive_integer)
 
     for subparser in (run, compare):
@@ -685,16 +686,26 @@ def write_report(
     comparisons: list[dict[str, object]],
     scenario_timings: list[dict[str, object]],
     elapsed: float,
+    baseline_cache_bytes: int | None,
     candidate_cache_bytes: int | None,
 ) -> None:
     lines = ["# TinyDB benchmark report", "", f"Mode: `{mode}`  ", f"Wall time: {elapsed / 60.0:.1f} minutes", ""]
     specs = {row["scenario"]: row for row in matrix}
     declared_cache_bytes = sorted({int(row["cache_bytes"]) for row in matrix})
     declared_cache = ", ".join(format_value(value, "bytes") for value in declared_cache_bytes)
-    if mode == "compare" and candidate_cache_bytes is not None:
+    if mode == "compare" and (baseline_cache_bytes is not None or candidate_cache_bytes is not None):
+        baseline_cache = (
+            f"{format_value(baseline_cache_bytes, 'bytes')} (override)"
+            if baseline_cache_bytes is not None
+            else f"{declared_cache} (scenario setting)"
+        )
+        candidate_cache = (
+            f"{format_value(candidate_cache_bytes, 'bytes')} (override)"
+            if candidate_cache_bytes is not None
+            else f"{declared_cache} (scenario setting)"
+        )
         lines += [
-            f"Page cache: baseline {declared_cache} (scenario setting); "
-            f"candidate {format_value(candidate_cache_bytes, 'bytes')} (override)",
+            f"Page cache: baseline {baseline_cache}; candidate {candidate_cache}",
             "",
         ]
     else:
@@ -893,6 +904,11 @@ def main() -> None:
     started = time.monotonic()
     managed_output = ManagedOutput(default_output()) if args.output is None else None
     root = managed_output.path if managed_output is not None else args.output
+    baseline_cache_bytes = (
+        args.baseline_cache_mib << 20
+        if args.mode == "compare" and args.baseline_cache_mib is not None
+        else None
+    )
     candidate_cache_bytes = (
         args.candidate_cache_mib << 20
         if args.mode == "compare" and args.candidate_cache_mib is not None
@@ -998,7 +1014,7 @@ def main() -> None:
                     manifest,
                     logical_dataset_id,
                     root,
-                    candidate_cache_bytes if variant == "candidate" else None,
+                    baseline_cache_bytes if variant == "baseline" else candidate_cache_bytes,
                 )
                 trial_record["runs"].append(
                     {
@@ -1039,6 +1055,7 @@ def main() -> None:
         comparisons,
         scenario_timings,
         elapsed,
+        baseline_cache_bytes,
         candidate_cache_bytes,
     )
     for variant, metadata in child_metadata.items():
@@ -1054,9 +1071,10 @@ def main() -> None:
             )
         }
     metadata = {
-        "suite_version": 8,
+        "suite_version": 9,
         "mode": args.mode,
         "seed": args.seed,
+        "baseline_page_cache_override_bytes": baseline_cache_bytes,
         "candidate_page_cache_override_bytes": candidate_cache_bytes,
         "elapsed_seconds": elapsed,
         "binaries": artifacts,

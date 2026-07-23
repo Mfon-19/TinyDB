@@ -5,8 +5,10 @@
 import math
 import pathlib
 import random
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import runner as target
 
@@ -34,6 +36,25 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(target.positive_integer("16"), 16)
         with self.assertRaises(target.argparse.ArgumentTypeError):
             target.positive_integer("0")
+
+    def test_compare_accepts_independent_cache_overrides(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "runner.py",
+                "compare",
+                "buffered",
+                "direct",
+                "--baseline-cache-mib",
+                "16",
+                "--candidate-cache-mib",
+                "32",
+            ],
+        ):
+            args = target.parse_args()
+        self.assertEqual(args.baseline_cache_mib, 16)
+        self.assertEqual(args.candidate_cache_mib, 32)
 
     def test_managed_output_replaces_only_a_completed_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
