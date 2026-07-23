@@ -17,7 +17,7 @@ def sample(variant: str, value: float = 1.0, **changes: str) -> dict[str, str]:
         "scenario": "read.engine_hot",
         "family": "reads",
         "trial_seed": "42",
-        "fixture_id": "fixture-a",
+        "dataset_id": "dataset-a",
         "metric": "throughput",
         "unit": "reads/second",
         "scope": "trial",
@@ -90,6 +90,24 @@ class RunnerTest(unittest.TestCase):
         self.assertNotEqual(first, target.derive_trial_seed(7, "read.engine_hot", 1))
         self.assertNotEqual(first, target.derive_trial_seed(7, "read.eviction.uniform", 0))
 
+    def test_dataset_identity_is_logical_and_stable(self) -> None:
+        scenario = {"scenario": "read.cold.large-values.native.64MiB", "rows": "1023"}
+        self.assertEqual(target.dataset_id(scenario, 7), target.dataset_id(scenario, 7))
+        self.assertNotEqual(target.dataset_id(scenario, 7), target.dataset_id(scenario, 8))
+
+    def test_native_comparison_accounts_for_both_canonical_fixtures(self) -> None:
+        shared = {
+            "rows": "1",
+            "key_bytes": "16",
+            "value_bytes": "16",
+            "target_bytes": "0",
+            "fixture_policy": "shared",
+        }
+        native = {**shared, "fixture_policy": "native"}
+        overhead = 2 * 64 + (512 << 20)
+        self.assertEqual(target.estimate_fixture_bytes([shared], "compare"), 64 + overhead)
+        self.assertEqual(target.estimate_fixture_bytes([native], "compare"), 128 + overhead)
+
     def test_exact_pairing(self) -> None:
         pairs = target.pair_trial_samples([sample("candidate", 2.0), sample("baseline", 1.0)])
         self.assertEqual(len(pairs), 1)
@@ -103,10 +121,10 @@ class RunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate baseline"):
             target.pair_trial_samples([sample("baseline"), sample("baseline")])
 
-    def test_pair_identity_includes_fixture(self) -> None:
+    def test_pair_identity_includes_dataset(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing"):
             target.pair_trial_samples(
-                [sample("baseline"), sample("candidate", fixture_id="fixture-b")]
+                [sample("baseline"), sample("candidate", dataset_id="dataset-b")]
             )
 
     def test_primary_sample_count_is_enforced(self) -> None:

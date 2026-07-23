@@ -29,7 +29,7 @@ CHILD_FIELDS = (
     "scenario",
     "family",
     "trial_seed",
-    "fixture_id",
+    "dataset_id",
     "metric",
     "unit",
     "scope",
@@ -272,7 +272,7 @@ def family_manifest(database: pathlib.Path) -> dict[str, object]:
         identity.update(b"\0")
         identity.update(content_hash.encode())
         identity.update(b"\n")
-    return {"fixture_id": identity.hexdigest(), "database": database.name, "files": files}
+    return {"family_id": identity.hexdigest(), "database": database.name, "files": files}
 
 
 def freeze_fixture(database: pathlib.Path, manifest: dict[str, object]) -> None:
@@ -307,7 +307,7 @@ def copy_fixture(source: pathlib.Path, destination: pathlib.Path, manifest: dict
             }
         )
     fsync_directory(destination.parent)
-    return {"fixture_id": manifest["fixture_id"], "files": copied_files}
+    return {"family_id": manifest["family_id"], "files": copied_files}
 
 
 def remove_working_directory(directory: pathlib.Path) -> None:
@@ -338,6 +338,15 @@ def derive_trial_seed(base_seed: int, scenario: str, trial: int) -> int:
     return (base_seed ^ int.from_bytes(identity[:8], "little")) & ((1 << 64) - 1)
 
 
+def dataset_id(scenario: dict[str, str], seed: int) -> str:
+    identity = hashlib.sha256()
+    identity.update(b"tinydb-benchmark-dataset-v1\0")
+    identity.update(json.dumps(scenario, sort_keys=True, separators=(",", ":")).encode())
+    identity.update(b"\0")
+    identity.update(str(seed).encode())
+    return identity.hexdigest()
+
+
 def balanced_orders(trials: int, scenario_index: int, generator: random.Random) -> list[list[str]]:
     baseline_first = (trials + (1 if scenario_index % 2 == 0 else 0)) // 2
     orders = [["baseline", "candidate"]] * baseline_first
@@ -362,6 +371,7 @@ def run_trial(
     trial_seed: int,
     fixture: pathlib.Path,
     manifest: dict[str, object],
+    logical_dataset_id: str,
     root: pathlib.Path,
     page_cache_bytes: int | None,
 ) -> tuple[list[dict[str, str]], dict[str, object], dict[str, object]]:
@@ -376,8 +386,8 @@ def run_trial(
         scenario,
         "--run-trial",
         str(working_database),
-        "--fixture-id",
-        str(manifest["fixture_id"]),
+        "--dataset-id",
+        logical_dataset_id,
         "--seed",
         str(trial_seed),
         "--trial-index",
@@ -395,7 +405,7 @@ def run_trial(
         expected = {
             "scenario": scenario,
             "trial_seed": str(trial_seed),
-            "fixture_id": str(manifest["fixture_id"]),
+            "dataset_id": logical_dataset_id,
             "trial": str(trial),
         }
         for field, value in expected.items():
@@ -508,7 +518,7 @@ def write_standalone_summary(root: pathlib.Path, rows: list[dict[str, str]]) -> 
 
 
 def pair_trial_samples(rows: list[dict[str, str]]) -> list[tuple[tuple[str, ...], float, float]]:
-    fields = ("scenario", "trial_seed", "fixture_id", "metric", "unit", "trial")
+    fields = ("scenario", "trial_seed", "dataset_id", "metric", "unit", "trial")
     pending: dict[tuple[str, ...], dict[str, float]] = defaultdict(dict)
     for row in rows:
         key = tuple(row[field] for field in fields)
@@ -689,6 +699,12 @@ def write_report(
         ]
     else:
         lines += [f"Page cache: {declared_cache} (scenario setting)", ""]
+    if mode == "compare" and any(row["fixture_policy"] == "native" for row in matrix):
+        lines += [
+            "Fixture layouts: `shared` uses one baseline-built database family; "
+            "`native` uses a logically identical family built by each variant.",
+            "",
+        ]
     if mode == "run":
         lookup = {(str(row["scenario"]), str(row["metric"])): row for row in standalone}
         lines += ["## Primary results", "", "| Scenario | Median | p95 | Trials |", "|---|---:|---:|---:|"]
@@ -804,13 +820,14 @@ def write_report(
     (root / "report.md").write_text("\n".join(lines))
 
 
-def estimate_fixture_bytes(matrix: list[dict[str, str]]) -> int:
+def estimate_fixture_bytes(matrix: list[dict[str, str]], mode: str) -> int:
     total = 0
     maximum = 0
     for row in matrix:
         logical = int(row["rows"]) * (int(row["key_bytes"]) + int(row["value_bytes"]) + 32)
         size = max(logical, int(row["target_bytes"]))
-        total += size
+        copies = 2 if mode == "compare" and row["fixture_policy"] == "native" else 1
+        total += copies * size
         maximum = max(maximum, size)
     return total + 2 * maximum + (512 << 20)
 
@@ -896,7 +913,7 @@ def main() -> None:
     matrix = next(iter(matrices.values()))
     if any(candidate != matrix for candidate in matrices.values()):
         raise SystemExit("engine revisions expose different benchmark matrices")
-    required_free = estimate_fixture_bytes(matrix)
+    required_free = estimate_fixture_bytes(matrix, args.mode)
     available_free = shutil.disk_usage(root).free
     if available_free < required_free:
         raise SystemExit(
@@ -907,7 +924,6 @@ def main() -> None:
     generator = random.Random(args.seed)
     scenarios = matrix.copy()
     generator.shuffle(scenarios)
-    builder_variant = "current" if args.mode == "run" else "baseline"
     rows: list[dict[str, str]] = []
     fixtures: list[dict[str, object]] = []
     execution: list[dict[str, object]] = []
@@ -917,11 +933,41 @@ def main() -> None:
     for scenario_index, scenario_row in enumerate(scenarios):
         scenario_started = time.monotonic()
         scenario = scenario_row["scenario"]
-        fixture = root / "fixtures" / scenario / "database.db"
+        fixture_policy = scenario_row["fixture_policy"]
+        if fixture_policy not in ("shared", "native"):
+            raise ValueError(f"unknown fixture policy {fixture_policy!r} for {scenario}")
+        logical_dataset_id = dataset_id(scenario_row, args.seed)
         fixture_started = time.monotonic()
-        manifest = build_fixture(binaries[builder_variant], fixture, scenario, args.seed)
+        if args.mode == "run":
+            fixture_builders = {"current": "current"}
+        elif fixture_policy == "native":
+            fixture_builders = {variant: variant for variant in binaries}
+        else:
+            fixture_builders = {"shared": "baseline"}
+
+        physical_fixtures: dict[str, tuple[pathlib.Path, dict[str, object]]] = {}
+        for layout, builder_variant in fixture_builders.items():
+            fixture = root / "fixtures" / scenario / layout / "database.db"
+            manifest = build_fixture(binaries[builder_variant], fixture, scenario, args.seed)
+            physical_fixtures[layout] = (fixture, manifest)
+            fixtures.append(
+                {
+                    "scenario": scenario,
+                    "fixture_policy": fixture_policy,
+                    "dataset_id": logical_dataset_id,
+                    "layout": layout,
+                    "builder_variant": builder_variant,
+                    "path": str(fixture),
+                    "manifest": manifest,
+                }
+            )
+        if args.mode == "run":
+            fixtures_by_variant = {"current": physical_fixtures["current"]}
+        elif fixture_policy == "native":
+            fixtures_by_variant = {variant: physical_fixtures[variant] for variant in binaries}
+        else:
+            fixtures_by_variant = {variant: physical_fixtures["shared"] for variant in binaries}
         fixture_seconds = time.monotonic() - fixture_started
-        fixtures.append({"scenario": scenario, "path": str(fixture), "manifest": manifest})
         trials = int(scenario_row["trials"])
         if args.mode == "run":
             orders = [["current"] for _ in range(trials)]
@@ -931,6 +977,8 @@ def main() -> None:
             seed = derive_trial_seed(args.seed, scenario, trial)
             trial_record: dict[str, object] = {
                 "scenario": scenario,
+                "fixture_policy": fixture_policy,
+                "dataset_id": logical_dataset_id,
                 "trial": trial,
                 "trial_seed": seed,
                 "order": order,
@@ -938,8 +986,9 @@ def main() -> None:
             }
             execution.append(trial_record)
             for variant in order:
+                fixture, manifest = fixtures_by_variant[variant]
                 run_started = time.monotonic()
-                emitted, _, metadata = run_trial(
+                emitted, audit, metadata = run_trial(
                     binaries[variant],
                     variant,
                     scenario,
@@ -947,12 +996,14 @@ def main() -> None:
                     seed,
                     fixture,
                     manifest,
+                    logical_dataset_id,
                     root,
                     candidate_cache_bytes if variant == "candidate" else None,
                 )
                 trial_record["runs"].append(
                     {
                         "variant": variant,
+                        "family_id": audit["family_id"],
                         "runner_seconds": time.monotonic() - run_started,
                         "benchmark_seconds": metadata.get("elapsed_seconds"),
                     }
@@ -1003,7 +1054,7 @@ def main() -> None:
             )
         }
     metadata = {
-        "suite_version": 7,
+        "suite_version": 8,
         "mode": args.mode,
         "seed": args.seed,
         "candidate_page_cache_override_bytes": candidate_cache_bytes,
@@ -1018,7 +1069,9 @@ def main() -> None:
         "trial_samples": len(trial_rows),
         "nested_observations": len(observation_rows),
         "note": (
-            "Every trial used a private userspace copy of one immutable canonical fixture. "
+            "Every trial used a private userspace copy of an immutable canonical fixture. Shared-layout "
+            "scenarios use one baseline-built family for both variants; native-layout scenarios use each "
+            "variant's own physical family under one validated logical dataset identity. "
             "A/B confidence intervals use paired trial log-ratios; nested commit and churn observations "
             "are descriptive only."
         ),

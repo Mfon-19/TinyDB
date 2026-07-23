@@ -45,7 +45,7 @@ device, especially for synchronous commits and cache-dropped random reads.
 
 ## Matrix
 
-The fixed representative matrix contains fifteen scenarios:
+The fixed representative matrix contains sixteen scenarios:
 
 - sequential single-row inserts, random batched inserts, random overwrites,
   and 64 KiB values;
@@ -55,15 +55,17 @@ The fixed representative matrix contains fifteen scenarios:
 - one writer with four readers;
 - 64 MiB checkpoint and OS-warm recovery;
 - bounded delete/reinsert churn; and
-- cache-dropped full scans, random reads, and large-value scans.
+- cache-dropped full scans, random reads, and both shared-layout compatibility
+  and native-layout large-value scans.
 
 This is intentionally not a Cartesian product. Variants that previously
 repeated the same conclusion were removed. Long endurance questions are
 targeted experiments, not a larger version of the whole suite.
 
-Each scenario declares its own trial count, cache condition, primary metric,
-preferred direction, and meaningful-effect threshold. Stable workloads use
-five trials. Cold I/O, lifecycle, and churn use three more expensive trials.
+Each scenario declares its fixture policy, trial count, cache condition,
+primary metric, preferred direction, and meaningful-effect threshold. Stable
+workloads use five trials. Cold I/O, lifecycle, and churn use three more
+expensive trials.
 
 ## One trial contract
 
@@ -99,14 +101,18 @@ when the engine revisions live on different branches.
 
 ## Paired comparison
 
-Baseline and candidate never run concurrently. For each scenario and trial,
-they receive the same persistent bytes and trial seed, then run consecutively.
-First position is randomized in balanced `AB`/`BA` blocks, and scenario order
-is randomized once per run.
+Baseline and candidate never run concurrently. Shared-layout scenarios give
+both variants the same baseline-built persistent bytes. Native-layout scenarios
+let each variant build the same deterministic logical dataset using its own
+allocator and format. Every trial pair shares one logical dataset ID and trial
+seed, then runs consecutively. First position is randomized in balanced
+`AB`/`BA` blocks, and scenario order is randomized once per run.
 
-The canonical fixture and every working copy are regular, single-link files.
-Copies use an explicit read/write loop, are hashed while copied, are synced,
-and are rejected if FIEMAP reports shared extents. The exact executables are
+Every canonical physical family and working copy consists of regular,
+single-link files. Each family has its own content-derived ID. Copies use an
+explicit read/write loop, are hashed while copied, are synced, and are rejected
+if FIEMAP reports shared extents. Trials validate the declared logical dataset
+through TinyDB reads before emitting paired results. The exact executables are
 also copied and hashed into the result directory before use.
 
 Do not compare two independent `make bench` directories to infer a small

@@ -32,7 +32,7 @@ auto main(int argc, char **argv) -> int {
 
   const auto wall_started = std::chrono::system_clock::now();
   const auto steady_started = std::chrono::steady_clock::now();
-  auto results = Results{config.seed, config.fixture_id};
+  auto results = Results{config.seed, config.dataset_id};
   RunTrial(config.fixture, scenarios.front(), config, results);
   results.Write(config.output);
   WriteMetadata(config, scenarios.front(), config.output, wall_started,

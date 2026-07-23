@@ -108,6 +108,10 @@ auto CacheConditionName(CacheCondition condition) -> std::string_view {
   Fail("unknown cache condition");
 }
 
+auto FixturePolicyName(FixturePolicy policy) -> std::string_view {
+  return policy == FixturePolicy::Shared ? "shared" : "native";
+}
+
 auto DirectionName(MetricDirection direction) -> std::string_view {
   return direction == MetricDirection::Higher ? "higher" : "lower";
 }
@@ -253,7 +257,8 @@ void AddChurnScenario(std::vector<Scenario> &scenarios) {
 }
 
 void AddColdIoScenarios(std::vector<Scenario> &scenarios) {
-  const auto add = [&](std::string name, AccessPattern access, std::size_t value_bytes, std::size_t operations) {
+  const auto add = [&](std::string name, AccessPattern access, std::size_t value_bytes, std::size_t operations,
+                       FixturePolicy fixture_policy = FixturePolicy::Shared) {
     auto scenario = BaseScenario(std::move(name), "cold_io", Workload::IoRead, "throughput",
                                  MetricDirection::Higher, 0.05);
     scenario.access = access;
@@ -263,13 +268,16 @@ void AddColdIoScenarios(std::vector<Scenario> &scenarios) {
     scenario.operations = operations;
     scenario.trials = kIoTrials;
     scenario.cache_condition = CacheCondition::FileCold;
+    scenario.fixture_policy = fixture_policy;
     scenario.drop_file_cache = true;
     scenarios.push_back(std::move(scenario));
   };
 
   add("read.cold.scan.64MiB", AccessPattern::Sequential, 1U << 10U, 0);
   add("read.cold.random.64MiB", AccessPattern::Uniform, 1U << 10U, 2'048);
-  add("read.cold.large-values.64MiB", AccessPattern::Sequential, 64U << 10U, 0);
+  add("read.cold.large-values.compat.64MiB", AccessPattern::Sequential, 64U << 10U, 0);
+  add("read.cold.large-values.native.64MiB", AccessPattern::Sequential, 64U << 10U, 0,
+      FixturePolicy::Native);
 }
 
 auto ParseUnsigned(std::string_view text, std::string_view flag) -> std::uint64_t {
@@ -301,7 +309,7 @@ void Usage() {
   std::puts(
       "usage: TinyDB_bench --list [--family NAME] [--filter TEXT]\n"
       "       TinyDB_bench --scenario NAME --build-fixture DATABASE\n"
-      "       TinyDB_bench --scenario NAME --run-trial DATABASE --fixture-id SHA256\n"
+      "       TinyDB_bench --scenario NAME --run-trial DATABASE --dataset-id SHA256\n"
       "                    --trial-index N --seed N --output PATH\n"
       "                    [--page-cache-bytes BYTES]\n");
 }
@@ -432,8 +440,8 @@ auto ParseConfig(int argc, char **argv) -> Config {
       config.mode = flag == "--build-fixture" ? BenchmarkMode::BuildFixture : BenchmarkMode::RunTrial;
       config.fixture = value;
       selected_mode = true;
-    } else if (flag == "--fixture-id") {
-      config.fixture_id = value;
+    } else if (flag == "--dataset-id") {
+      config.dataset_id = value;
     } else if (flag == "--trial-index") {
       config.trial_index = AsSize(ParseUnsigned(value, flag), flag);
     } else if (flag == "--page-cache-bytes") {
@@ -451,8 +459,8 @@ auto ParseConfig(int argc, char **argv) -> Config {
   if (config.mode != BenchmarkMode::List && (!config.scenario || config.fixture.empty())) {
     Fail("fixture modes require --scenario and a database path");
   }
-  if (config.mode == BenchmarkMode::RunTrial && (config.fixture_id.empty() || config.output.empty())) {
-    Fail("--run-trial requires --fixture-id and --output");
+  if (config.mode == BenchmarkMode::RunTrial && (config.dataset_id.empty() || config.output.empty())) {
+    Fail("--run-trial requires --dataset-id and --output");
   }
   if (config.page_cache_bytes && config.mode != BenchmarkMode::RunTrial) {
     Fail("--page-cache-bytes requires --run-trial");
@@ -484,18 +492,22 @@ auto BuildScenarios(const Config &config) -> std::vector<Scenario> {
 
 void PrintScenarios(const std::vector<Scenario> &scenarios) {
   std::puts(
-      "scenario,family,workload,access,cache_condition,primary_metric,primary_direction,meaningful_difference,"
+      "scenario,family,workload,access,cache_condition,fixture_policy,primary_metric,primary_direction,"
+      "meaningful_difference,"
       "rows,key_bytes,value_bytes,cache_bytes,trials,warmup_ms,measurement_ms,preparation_rounds,commits,batch,"
       "scan_rows,operations,reader_threads,churn_warmup_rounds,churn_measured_rounds,target_bytes,overwrite,"
       "random_write_order,transaction_scoped_reads,copy_values,drop_file_cache");
   for (const auto &scenario : scenarios) {
     std::printf(
-        "%s,%s,%.*s,%.*s,%.*s,%s,%.*s,%.6f,%zu,%zu,%zu,%zu,%zu,%lld,%lld,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,"
+        "%s,%s,%.*s,%.*s,%.*s,%.*s,%s,%.*s,%.6f,%zu,%zu,%zu,%zu,%zu,%lld,%lld,%zu,%zu,%zu,%zu,%zu,%zu,%zu,"
+        "%zu,"
         "%llu,%s,%s,%s,%s,%s\n",
         scenario.name.c_str(), scenario.family.c_str(), static_cast<int>(WorkloadName(scenario.workload).size()),
         WorkloadName(scenario.workload).data(), static_cast<int>(AccessName(scenario.access).size()),
         AccessName(scenario.access).data(), static_cast<int>(CacheConditionName(scenario.cache_condition).size()),
-        CacheConditionName(scenario.cache_condition).data(), scenario.primary_metric.c_str(),
+        CacheConditionName(scenario.cache_condition).data(),
+        static_cast<int>(FixturePolicyName(scenario.fixture_policy).size()),
+        FixturePolicyName(scenario.fixture_policy).data(), scenario.primary_metric.c_str(),
         static_cast<int>(DirectionName(scenario.primary_direction).size()),
         DirectionName(scenario.primary_direction).data(), scenario.meaningful_difference, scenario.rows,
         scenario.key_bytes, scenario.value_bytes, scenario.cache_bytes, scenario.trials,
@@ -508,12 +520,12 @@ void PrintScenarios(const std::vector<Scenario> &scenarios) {
   }
 }
 
-Results::Results(std::uint64_t trial_seed, std::string fixture_id)
-    : trial_seed_(trial_seed), fixture_id_(std::move(fixture_id)) {}
+Results::Results(std::uint64_t trial_seed, std::string dataset_id)
+    : trial_seed_(trial_seed), dataset_id_(std::move(dataset_id)) {}
 
 void Results::Add(const Scenario &scenario, std::string_view metric, std::string_view unit, SampleScope scope,
                   std::size_t trial, std::size_t observation, double value) {
-  samples_.push_back(Sample{scenario.name, scenario.family, trial_seed_, fixture_id_, std::string(metric),
+  samples_.push_back(Sample{scenario.name, scenario.family, trial_seed_, dataset_id_, std::string(metric),
                             std::string(unit), scope, trial, observation, value});
 }
 
@@ -532,10 +544,10 @@ void Results::Write(const std::filesystem::path &directory) const {
   if (!samples) {
     Fail("cannot open samples.csv");
   }
-  samples << "scenario,family,trial_seed,fixture_id,metric,unit,scope,trial,observation,value\n";
+  samples << "scenario,family,trial_seed,dataset_id,metric,unit,scope,trial,observation,value\n";
   samples << std::setprecision(17);
   for (const auto &sample : samples_) {
-    samples << sample.scenario << ',' << sample.family << ',' << sample.trial_seed << ',' << sample.fixture_id << ','
+    samples << sample.scenario << ',' << sample.family << ',' << sample.trial_seed << ',' << sample.dataset_id << ','
             << sample.metric << ',' << sample.unit << ',' << ScopeName(sample.scope) << ',' << sample.trial << ','
             << sample.observation << ',' << sample.value << '\n';
   }
@@ -560,10 +572,10 @@ void WriteMetadata(const Config &config, const Scenario &scenario, const std::fi
     Fail("cannot open metadata.json");
   }
   output << "{\n"
-         << "  \"suite_version\": 7,\n"
+         << "  \"suite_version\": 8,\n"
          << "  \"trial_seed\": " << config.seed << ",\n"
          << "  \"trial\": " << config.trial_index << ",\n"
-         << "  \"fixture_id\": \"" << JsonEscape(config.fixture_id) << "\",\n"
+         << "  \"dataset_id\": \"" << JsonEscape(config.dataset_id) << "\",\n"
          << "  \"started_utc\": \"" << Timestamp(started) << "\",\n"
          << "  \"elapsed_seconds\": " << std::chrono::duration<double>(elapsed).count() << ",\n"
          << "  \"engine_git_commit\": \"" << TINYDB_BENCH_ENGINE_GIT_COMMIT << "\",\n"
@@ -591,7 +603,8 @@ void WriteMetadata(const Config &config, const Scenario &scenario, const std::fi
          << "  },\n"
          << "  \"scenario\": {\"name\": \"" << JsonEscape(scenario.name) << "\", \"family\": \""
          << JsonEscape(scenario.family) << "\", \"cache_condition\": \"" << CacheConditionName(scenario.cache_condition)
-         << "\", \"rows\": " << scenario.rows << ", \"cache_bytes\": " << scenario.cache_bytes
+         << "\", \"fixture_policy\": \"" << FixturePolicyName(scenario.fixture_policy) << "\", \"rows\": "
+         << scenario.rows << ", \"cache_bytes\": " << scenario.cache_bytes
          << ", \"effective_cache_bytes\": " << config.page_cache_bytes.value_or(scenario.cache_bytes) << "},\n"
          << "  \"arguments\": [";
   for (std::size_t index = 0; index < config.arguments.size(); ++index) {

@@ -39,6 +39,11 @@ enum class CacheCondition {
   OsWarm,
 };
 
+enum class FixturePolicy {
+  Shared,
+  Native,
+};
+
 enum class MetricDirection {
   Higher,
   Lower,
@@ -61,6 +66,7 @@ struct Scenario final {
   Workload workload{Workload::PointRead};
   AccessPattern access{AccessPattern::Uniform};
   CacheCondition cache_condition{CacheCondition::Fresh};
+  FixturePolicy fixture_policy{FixturePolicy::Shared};
 
   std::string primary_metric{"throughput"};
   MetricDirection primary_direction{MetricDirection::Higher};
@@ -101,7 +107,7 @@ struct Config final {
   std::optional<std::string> filter;
   std::optional<std::string> scenario;
   std::optional<std::size_t> page_cache_bytes;
-  std::string fixture_id;
+  std::string dataset_id;
   std::uint64_t seed{0x54494E594442ULL};
   std::size_t trial_index{0};
   std::vector<std::string> arguments;
@@ -118,7 +124,7 @@ struct Sample final {
   std::string scenario;
   std::string family;
   std::uint64_t trial_seed{0};
-  std::string fixture_id;
+  std::string dataset_id;
   std::string metric;
   std::string unit;
   SampleScope scope{SampleScope::Trial};
@@ -129,7 +135,7 @@ struct Sample final {
 
 class Results final {
  public:
-  Results(std::uint64_t trial_seed, std::string fixture_id);
+  Results(std::uint64_t trial_seed, std::string dataset_id);
 
   void AddTrial(const Scenario &scenario, std::string_view metric, std::string_view unit, std::size_t trial,
                 double value);
@@ -142,7 +148,7 @@ class Results final {
            std::size_t trial, std::size_t observation, double value);
 
   std::uint64_t trial_seed_{0};
-  std::string fixture_id_;
+  std::string dataset_id_;
   std::vector<Sample> samples_;
 };
 
