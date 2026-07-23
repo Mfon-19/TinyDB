@@ -66,8 +66,9 @@ ReaderGateAdmission::~ReaderGateAdmission() {
 namespace {
 
 void Admit(std::shared_ptr<ReaderGateControl> control, ReaderGateAdmission *admission) {
-  TINYDB_CHECK(control != nullptr && admission != nullptr && !admission->admitted,
-               "reader gate received an invalid admission");
+  TINYDB_CHECK(control != nullptr, "reader gate received a null control");
+  TINYDB_CHECK(admission != nullptr, "reader gate received a null admission");
+  TINYDB_CHECK(!admission->admitted, "reader gate received an active admission");
   admission->control = std::move(control);
   auto *const gate = admission->control.get();
 
@@ -183,8 +184,8 @@ void PublicationGuard::Publish(std::shared_ptr<const DatabaseState> state) noexc
   TINYDB_CHECK(control_ != nullptr, "publishing through an empty publication guard");
   TINYDB_CHECK(state != nullptr, "publishing a null database state");
   auto lock = std::lock_guard(control_->mutex);
-  TINYDB_CHECK(control_->publication_pending && control_->active_readers == 0,
-               "publishing outside an exclusive visibility phase");
+  TINYDB_CHECK(control_->publication_pending, "publishing while reader admission is open");
+  TINYDB_CHECK(control_->active_readers == 0, "publishing while readers remain active");
   // This pointer replacement is the visibility event. No admitted reader can
   // observe it halfway through because the active reader population is empty.
   control_->state = std::move(state);

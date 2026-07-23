@@ -54,11 +54,13 @@ TEST(Page, LeafSearch) {
   EXPECT_EQ(view->LowerBound("middle"), 1U);
   EXPECT_EQ(view->LowerBound("middle!"), 2U);
   EXPECT_EQ(view->LowerBound("zulu"), 4U);
-  ASSERT_TRUE(view->Get("omega").has_value());
-  EXPECT_EQ(view->Get("omega")->InlineBytes(), "three");
-  ASSERT_TRUE(view->Get("overflow").has_value());
-  EXPECT_TRUE(view->Get("overflow")->IsOverflow());
-  EXPECT_EQ(view->Get("overflow")->OverflowDescriptor(), overflow);
+  const auto omega = view->Get("omega");
+  ASSERT_TRUE(omega.has_value());
+  EXPECT_EQ(omega.value_or(tinydb::LeafValueView::Inline({})).InlineBytes(), "three");
+  const auto overflow_value = view->Get("overflow");
+  ASSERT_TRUE(overflow_value.has_value());
+  EXPECT_TRUE(overflow_value.value_or(tinydb::LeafValueView::Inline({})).IsOverflow());
+  EXPECT_EQ(overflow_value.value_or(tinydb::LeafValueView::Overflow({})).OverflowDescriptor(), overflow);
   EXPECT_EQ(view->Get("missing"), std::nullopt);
 
   const auto value = view->ValueAt(0);
@@ -79,8 +81,9 @@ TEST(Page, ByteOrder) {
   const auto view = tinydb::LeafPageView::Open(page.data(), 2).value();
   EXPECT_EQ(view.LowerBound(low), 0U);
   EXPECT_EQ(view.LowerBound(high), 1U);
-  ASSERT_TRUE(view.Get(high).has_value());
-  EXPECT_EQ(view.Get(high)->InlineBytes(), "high");
+  const auto value = view.Get(high);
+  ASSERT_TRUE(value.has_value());
+  EXPECT_EQ(value.value_or(tinydb::LeafValueView::Inline({})).InlineBytes(), "high");
 }
 
 TEST(Page, InternalRouting) {
@@ -116,7 +119,7 @@ TEST(Page, Identity) {
   auto bytes = std::as_writable_bytes(std::span{leaf_page});
   const auto slot = tinydb::storage::GetLittleEndian<tinydb::slot_t>(bytes, tinydb::LEAF_HEADER_SIZE);
   ASSERT_TRUE(slot.has_value());
-  bytes[*slot + tinydb::leaf_cell_offset::VALUE_KIND] = std::byte{0x7f};
+  bytes[slot.value_or(0) + tinydb::leaf_cell_offset::VALUE_KIND] = std::byte{0x7f};
   ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
   EXPECT_EQ(tinydb::LeafPageView::Open(leaf_page.data(), 2).error().Code(), tinydb::StatusCode::Corruption);
 }
@@ -156,8 +159,9 @@ TEST(Page, Links) {
   const auto second_slot =
       tinydb::storage::GetLittleEndian<tinydb::slot_t>(bytes, tinydb::INTERNAL_HEADER_SIZE + tinydb::SLOT_SIZE);
   ASSERT_TRUE(first_slot.has_value() && second_slot.has_value());
-  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::INTERNAL_HEADER_SIZE, *second_slot));
-  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::INTERNAL_HEADER_SIZE + tinydb::SLOT_SIZE, *first_slot));
+  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::INTERNAL_HEADER_SIZE, second_slot.value_or(0)));
+  ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::INTERNAL_HEADER_SIZE + tinydb::SLOT_SIZE,
+                                               first_slot.value_or(0)));
   ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
   EXPECT_EQ(tinydb::InternalPageView::Open(internal_page.data(), 5).error().Code(), tinydb::StatusCode::Corruption);
 

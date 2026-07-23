@@ -18,14 +18,14 @@ class InternalPageBuilder {
   struct SplitResult;
 
   InternalPageBuilder() = default;
-  InternalPageBuilder(page_id_t first_child, std::string separator, page_id_t right_child);
+  InternalPageBuilder(page_id_t first_child, std::string_view separator, page_id_t right_child);
 
   static auto From(const InternalPageView &page) -> InternalPageBuilder;
 
   // Emits canonical transaction bytes. Commit assigns the final LSN and CRC.
   void Store(char *page, page_id_t page_id) const;
 
-  void InsertSeparator(std::string key, page_id_t right_child);
+  void InsertSeparator(std::string_view key, page_id_t right_child);
 
   auto Fits() const -> bool;
 

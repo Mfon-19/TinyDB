@@ -91,7 +91,7 @@ class CommittedPageCache final : public PageReader {
   CommittedPageCache(DiskManager *disk, std::size_t target_bytes, std::uint64_t checkpoint_lsn);
   CommittedPageCache(const CommittedPageCache &) = delete;
   auto operator=(const CommittedPageCache &) -> CommittedPageCache & = delete;
-  ~CommittedPageCache();
+  ~CommittedPageCache() override;
 
   // A miss validates the complete common page header before caching bytes.
   auto Read(page_id_t page_id) -> Result<PageHandle> override;

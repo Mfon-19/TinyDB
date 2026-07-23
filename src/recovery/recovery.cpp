@@ -413,29 +413,35 @@ auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result
   }
 
   const auto checkpoint_lsn = base.value.checkpoint_lsn;
-  auto previous_transaction_id = std::optional<std::uint64_t>{};
-  auto previous_next_lsn = std::optional<std::uint64_t>{};
+  auto previous_transaction_id = std::uint64_t{0};
+  auto previous_next_lsn = std::uint64_t{0};
+  auto has_previous_transaction = false;
   auto saw_uncheckpointed_transaction = false;
   auto expected_live_lsn = checkpoint_lsn + 1U;
   auto expected_live_transaction_id =
       base.value.transaction_id == std::numeric_limits<std::uint64_t>::max() ? 0 : base.value.transaction_id + 1U;
   auto previous_high_water = base.value.high_water_page_id;
   for (auto &transaction : log.transactions) {
-    if (previous_next_lsn && transaction.first_lsn != *previous_next_lsn) {
-      // Cleanup may have removed any subset of segments whose records are
-      // already represented by the selected superblock.  Such a gap is safe
-      // only while both sides remain at or behind checkpoint_lsn.  The first
-      // live record and everything after it must be exactly contiguous.
-      if (transaction.first_lsn < *previous_next_lsn || *previous_next_lsn > checkpoint_lsn + 1U ||
-          transaction.first_lsn > checkpoint_lsn + 1U) {
-        return std::unexpected(Status::Corruption("WAL transaction LSN sequence is missing or reordered"));
+    if (has_previous_transaction) {
+      if (transaction.first_lsn != previous_next_lsn) {
+        // Cleanup may have removed any subset of segments whose records are
+        // already represented by the selected superblock. Such a gap is safe
+        // only while both sides remain at or behind checkpoint_lsn. The first
+        // live record and everything after it must be exactly contiguous.
+        if (transaction.first_lsn < previous_next_lsn || previous_next_lsn > checkpoint_lsn + 1U ||
+            transaction.first_lsn > checkpoint_lsn + 1U) {
+          return std::unexpected(Status::Corruption("WAL transaction LSN sequence is missing or reordered"));
+        }
       }
     }
-    if (previous_transaction_id && transaction.transaction_id <= *previous_transaction_id) {
-      return std::unexpected(Status::Corruption("WAL transaction ID sequence is duplicated or reordered"));
+    if (has_previous_transaction) {
+      if (transaction.transaction_id <= previous_transaction_id) {
+        return std::unexpected(Status::Corruption("WAL transaction ID sequence is duplicated or reordered"));
+      }
     }
     previous_transaction_id = transaction.transaction_id;
     previous_next_lsn = transaction.next_lsn;
+    has_previous_transaction = true;
     plan.durable_next_lsn = std::max(plan.durable_next_lsn, transaction.next_lsn);
 
     if (transaction.commit_lsn > checkpoint_lsn) {
@@ -485,7 +491,7 @@ auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result
     if (!encoded) {
       return std::unexpected(encoded.error());
     }
-    plan.recovered_superblock = std::move(*encoded);
+    plan.recovered_superblock = *encoded;
     plan.superblock_page_id = base.slot == storage::SuperblockSlot::A ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
   }
   return plan;
@@ -577,14 +583,16 @@ auto CleanupWal(const std::filesystem::path &wal_path, const RecoveryPlan &plan)
 }  // namespace
 
 auto Recover(const std::filesystem::path &db_path, const std::filesystem::path &wal_path) -> Status {
-  auto loaded = LoadLog(wal_path);
-  if (!loaded) {
-    return loaded.error();
+  auto loaded_result = LoadLog(wal_path);
+  if (!loaded_result) {
+    return loaded_result.error();
   }
-  if (!loaded->has_value()) {
+  auto loaded = std::move(*loaded_result);
+  if (!loaded.has_value()) {
     return {};
   }
-  if (loaded->value().segments.empty()) {
+  auto log = std::move(loaded.value());
+  if (log.segments.empty()) {
     // A partial active header contains no authenticated database identity or
     // commit.  Clearing it cannot discard acknowledged state; Wal::Open will
     // create and synchronize a complete header after the database is opened.
@@ -595,17 +603,18 @@ auto Recover(const std::filesystem::path &db_path, const std::filesystem::path &
     return {};
   }
 
-  auto base = ReadDatabaseBase(db_path);
-  if (!base) {
-    return base.error();
+  auto base_result = ReadDatabaseBase(db_path);
+  if (!base_result) {
+    return base_result.error();
   }
-  if (!base->has_value()) {
+  auto base = *base_result;
+  if (!base.has_value()) {
     return Status::Corruption("database base is missing; WAL is not a complete backup");
   }
 
   // BuildPlan is the write-free boundary.  Once it returns, all segment,
   // transaction, page, state, and superblock bytes needed by redo are valid.
-  auto plan = BuildPlan(std::move(loaded->value()), base->value());
+  auto plan = BuildPlan(std::move(log), base.value());
   if (!plan) {
     return plan.error();
   }

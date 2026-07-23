@@ -34,6 +34,10 @@ class PageHandle {
   using Release = void (*)(void *owner, page_id_t page_id, bool dirty, bool tree_payload_validated);
 
   PageHandle() = default;
+  // Mutable typing is the construction-time proof that an editable handle
+  // cannot be created over truly const storage. The member becomes const-only
+  // so all later writes still pass through MutableData().
+  // NOLINTNEXTLINE(readability-non-const-parameter)
   PageHandle(void *owner, page_id_t page_id, char *data, bool editable, Release release,
              bool tree_payload_validated = false)
       : owner_(owner),

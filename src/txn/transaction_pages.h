@@ -44,7 +44,7 @@ class TransactionPages final : public PageSource {
   auto operator=(const TransactionPages &) -> TransactionPages & = delete;
   TransactionPages(TransactionPages &&) noexcept = default;
   auto operator=(TransactionPages &&) -> TransactionPages & = delete;
-  ~TransactionPages();
+  ~TransactionPages() override;
 
   auto Read(page_id_t page_id) -> Result<PageHandle> override;
   auto Edit(page_id_t page_id) -> Result<PageHandle> override;
@@ -89,7 +89,7 @@ class TransactionPages final : public PageSource {
         memory_limit_bytes_(memory_limit_bytes) {}
 
   static void ReleasePrivate(void *owner, page_id_t page_id, bool dirty, bool tree_payload_validated);
-  auto PrivateHandle(PrivateFrame *frame, bool editable) -> PageHandle;
+  static auto PrivateHandle(PrivateFrame *frame, bool editable) -> PageHandle;
   auto CreatePrivatePage(page_id_t page_id, bool dirty) -> Result<PrivateFrame *>;
   auto AllocateHighWaterPage() -> Result<PrivateFrame *>;
   auto LoadFreeExtents() -> Status;

@@ -193,8 +193,9 @@ auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusT
 auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   // Upsert the destination leaf, then carry at most one separator upward. Each
   // ancestor either absorbs that edge or splits and replaces it with another.
-  TINYDB_CHECK(txn::ValidateKeySize(key.size()) == StatusCode::Ok && value.size() <= MAX_VALUE_BYTES,
-               "Put sizes must be validated at the public boundary");
+  TINYDB_CHECK(txn::ValidateKeySize(key.size()) == StatusCode::Ok,
+               "Put key size must be validated at the public boundary");
+  TINYDB_CHECK(value.size() <= MAX_VALUE_BYTES, "Put value size must be validated at the public boundary");
   DescentPath path;
   if (auto status = DescendToLeaf(pages_, root_page_id_, key, &path); !status.Ok()) {
     return status;
@@ -216,7 +217,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     if (!prepared_value) {
       return prepared_value.error();
     }
-    const auto upsert = node.Upsert(key, std::move(*prepared_value));
+    const auto upsert = node.Upsert(key, *prepared_value);
     retired_value = upsert.replaced_overflow;
 
     if (node.Fits()) {
@@ -255,7 +256,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
       return node_result.error();
     }
     auto node = std::move(*node_result);
-    node.InsertSeparator(std::move(pending->key), pending->right_child);
+    node.InsertSeparator(pending->key, pending->right_child);
 
     if (node.Fits()) {
       StoreTreePage(node, *page);
@@ -274,7 +275,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     if (!new_root) {
       return std::move(new_root).error();
     }
-    const auto root = InternalPageBuilder(root_page_id_, std::move(pending->key), pending->right_child);
+    const auto root = InternalPageBuilder(root_page_id_, pending->key, pending->right_child);
     StoreTreePage(root, *new_root);
     root_page_id_ = new_root->Id();
   }

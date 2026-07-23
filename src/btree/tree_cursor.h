@@ -41,21 +41,21 @@ class BTreeCursor {
 
   auto Key() const -> std::string_view {
     TINYDB_CHECK(Valid(), "reading key from an invalid tree cursor");
-    return leaf_->KeyAt(index_);
+    return CurrentLeaf().KeyAt(index_);
   }
 
   auto Value() const -> LeafValueView {
     TINYDB_CHECK(Valid(), "reading value from an invalid tree cursor");
-    return leaf_->ValueAt(index_);
+    return CurrentLeaf().ValueAt(index_);
   }
 
   auto Next() -> Status {
     TINYDB_CHECK(Valid(), "advancing an invalid tree cursor");
     ++index_;
-    if (index_ < leaf_->Count()) {
+    if (index_ < CurrentLeaf().Count()) {
       return {};
     }
-    return AdvanceToNonEmptyLeaf(leaf_->NextLeaf());
+    return AdvanceToNonEmptyLeaf(CurrentLeaf().NextLeaf());
   }
 
  private:
@@ -66,6 +66,12 @@ class BTreeCursor {
   auto AdvanceToNonEmptyLeaf(page_id_t page_id) -> Status;
   auto ValidateLeafId(page_id_t page_id) const -> Status;
   auto ValidateBoundary(const LeafPageView &next) const -> Status;
+  auto CurrentLeaf() const -> const LeafPageView & {
+    if (!leaf_.has_value()) {
+      PanicAt(__FILE__, __LINE__, "tree cursor has no current leaf");
+    }
+    return *leaf_;
+  }
 
   PageReader *pages_;
   page_id_t high_water_page_id_;

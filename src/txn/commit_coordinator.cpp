@@ -99,8 +99,8 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
     transaction.Abort();
     return std::unexpected(durable.error());
   }
-  TINYDB_CHECK(durable->transaction_id == state.transaction_id && durable->commit_lsn == state.visible_lsn,
-               "WAL committed a different frozen transaction");
+  TINYDB_CHECK(durable->transaction_id == state.transaction_id, "WAL committed a different transaction identity");
+  TINYDB_CHECK(durable->commit_lsn == state.visible_lsn, "WAL committed a different transaction frontier");
 
   /*
   ** INFALLIBLE PUBLICATION

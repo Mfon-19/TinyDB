@@ -32,7 +32,7 @@ struct ReaderGateAdmission final {
   // existing control block.
   std::shared_ptr<ReaderGateControl> control;
   std::shared_ptr<const DatabaseState> state;
-  std::chrono::steady_clock::time_point started_at{};
+  std::chrono::steady_clock::time_point started_at;
   ReaderGateAdmission *previous{nullptr};
   ReaderGateAdmission *next{nullptr};
   bool admitted{false};

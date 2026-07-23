@@ -95,7 +95,7 @@ auto LeafPageBuilder::From(const LeafPageView &page) -> LeafPageBuilder {
   for (std::size_t index = 0; index < page.Count(); ++index) {
     auto record = builder.MakeRecord(page.KeyAt(index), page.ValueAt(index));
     builder.encoded_bytes_ += RecordFootprint(record);
-    builder.records_.push_back(std::move(record));
+    builder.records_.push_back(record);
   }
   return builder;
 }
@@ -175,7 +175,7 @@ auto LeafPageBuilder::Upsert(std::string_view key, LeafValueView value) -> Upser
   } else {
     auto record = MakeRecord(key, value);
     encoded_bytes_ += RecordFootprint(record);
-    records_.insert(it, std::move(record));
+    records_.insert(it, record);
   }
   return UpsertResult{
       .at_tail = at_tail,
@@ -247,7 +247,7 @@ auto LeafPageBuilder::Split(page_id_t right_page_id, bool tail_heavy) -> SplitRe
   for (auto record = split_it; record != records_.end(); ++record) {
     auto copied = result.right.MakeRecord(Key(*record), Value(*record));
     result.right.encoded_bytes_ += RecordFootprint(copied);
-    result.right.records_.push_back(std::move(copied));
+    result.right.records_.push_back(copied);
   }
   TINYDB_CHECK(encoded_bytes_ >= result.right.encoded_bytes_, "leaf split byte accounting underflow");
   encoded_bytes_ -= result.right.encoded_bytes_;

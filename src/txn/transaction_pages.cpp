@@ -52,7 +52,8 @@ auto TransactionPages::Begin(PageReader *committed, DatabaseState base_state,
 TransactionPages::~TransactionPages() { RequireUnpinned(); }
 
 void TransactionPages::RequireActive() const {
-  TINYDB_CHECK(!frozen_ && !aborted_, "mutating an inactive page transaction");
+  TINYDB_CHECK(!frozen_, "mutating a frozen page transaction");
+  TINYDB_CHECK(!aborted_, "mutating an aborted page transaction");
 }
 
 void TransactionPages::RequireUnpinned() const {
@@ -79,14 +80,14 @@ void TransactionPages::ReleasePrivate(void *owner, page_id_t page_id, bool dirty
 
 auto TransactionPages::PrivateHandle(PrivateFrame *frame, bool editable) -> PageHandle {
   if (editable) {
-    TINYDB_CHECK(frame->pin_count == 0 && !frame->editing, "editing a transaction page with an outstanding lease");
+    TINYDB_CHECK(frame->pin_count == 0, "editing a transaction page with an outstanding lease");
+    TINYDB_CHECK(!frame->editing, "editing a transaction page through an existing mutable lease");
     frame->editing = true;
   } else {
     TINYDB_CHECK(!frame->editing, "reading a transaction page through an active mutable lease");
   }
   ++frame->pin_count;
-  return PageHandle(frame, frame->page_id, frame->bytes->data(), editable, ReleasePrivate,
-                    frame->tree_payload_validated);
+  return {frame, frame->page_id, frame->bytes->data(), editable, ReleasePrivate, frame->tree_payload_validated};
 }
 
 auto TransactionPages::ChargePage() -> Status {
@@ -245,9 +246,10 @@ auto TransactionPages::Free(page_id_t page_id) -> Status {
 
 void TransactionPages::SetRootPageId(page_id_t root_page_id) {
   RequireActive();
-  TINYDB_CHECK(root_page_id >= FIRST_DATA_PAGE_ID && root_page_id < resulting_state_.high_water_page_id &&
-                   !retired_page_ids_.contains(root_page_id),
-               "transaction root is outside its allocation state");
+  TINYDB_CHECK(root_page_id >= FIRST_DATA_PAGE_ID, "transaction root is a reserved page");
+  TINYDB_CHECK(root_page_id < resulting_state_.high_water_page_id,
+               "transaction root lies beyond the allocation frontier");
+  TINYDB_CHECK(!retired_page_ids_.contains(root_page_id), "transaction root has been retired");
   resulting_state_.root_page_id = root_page_id;
 }
 
@@ -408,8 +410,11 @@ auto TransactionPages::Freeze() -> Status {
 }
 
 auto TransactionPages::Seal(std::uint64_t commit_lsn) -> Status {
-  TINYDB_CHECK(frozen_ && !sealed_ && !aborted_, "sealing a transaction outside its frozen state");
-  TINYDB_CHECK(commit_lsn != 0 && commit_lsn != PENDING_COMMIT_LSN, "sealing an invalid commit LSN");
+  TINYDB_CHECK(frozen_, "sealing a transaction before freeze");
+  TINYDB_CHECK(!sealed_, "sealing a transaction twice");
+  TINYDB_CHECK(!aborted_, "sealing an aborted transaction");
+  TINYDB_CHECK(commit_lsn != 0, "sealing a zero commit LSN");
+  TINYDB_CHECK(commit_lsn != PENDING_COMMIT_LSN, "sealing the provisional commit LSN");
   RequireUnpinned();
 
   const auto page_count = pages_.size();
@@ -425,8 +430,8 @@ auto TransactionPages::Seal(std::uint64_t commit_lsn) -> Status {
     }
     // Freeze already allocated every allocator frame. A change here would make
     // the previously computed commit LSN circular and is an internal bug.
-    TINYDB_CHECK(pages_.size() == page_count && resulting_state_.high_water_page_id == high_water,
-                 "sealing changed the frozen transaction page set");
+    TINYDB_CHECK(pages_.size() == page_count, "sealing changed the frozen transaction page count");
+    TINYDB_CHECK(resulting_state_.high_water_page_id == high_water, "sealing changed the frozen allocation frontier");
   }
 
   // Page LSNs and their checksums are the final bytes consumed by both WAL and

@@ -264,7 +264,7 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
   }
 
   selected_ = storage::SelectedSuperblock{
-      .value = std::move(next),
+      .value = next,
       .slot = selected_.slot == storage::SuperblockSlot::A ? storage::SuperblockSlot::B : storage::SuperblockSlot::A,
   };
   return {};

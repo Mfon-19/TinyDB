@@ -28,13 +28,16 @@ auto DirtyBytes(std::size_t dirty_pages) -> std::size_t {
 Manager::Manager(DiskManager *disk, cache::CommittedPageCache *cache, txn::ReaderGate *readers, Wal *wal,
                  CheckpointOptions options)
     : disk_(disk), cache_(cache), readers_(readers), wal_(wal), options_(options) {
-  TINYDB_CHECK(disk_ != nullptr && cache_ != nullptr && readers_ != nullptr && wal_ != nullptr,
-               "checkpoint manager requires every storage domain");
-  TINYDB_CHECK(options_.wal_trigger_bytes != 0 && options_.dirty_trigger_bytes != 0 &&
-                   options_.hard_wal_bytes >= options_.wal_trigger_bytes &&
-                   options_.hard_dirty_bytes >= options_.dirty_trigger_bytes &&
-                   options_.failures_before_backpressure != 0,
-               "checkpoint policy has invalid pressure thresholds");
+  TINYDB_CHECK(disk_ != nullptr, "checkpoint manager requires a database file");
+  TINYDB_CHECK(cache_ != nullptr, "checkpoint manager requires a committed cache");
+  TINYDB_CHECK(readers_ != nullptr, "checkpoint manager requires a reader gate");
+  TINYDB_CHECK(wal_ != nullptr, "checkpoint manager requires a WAL");
+  TINYDB_CHECK(options_.wal_trigger_bytes != 0, "checkpoint WAL trigger must be nonzero");
+  TINYDB_CHECK(options_.dirty_trigger_bytes != 0, "checkpoint dirty trigger must be nonzero");
+  TINYDB_CHECK(options_.hard_wal_bytes >= options_.wal_trigger_bytes, "checkpoint hard WAL limit precedes its trigger");
+  TINYDB_CHECK(options_.hard_dirty_bytes >= options_.dirty_trigger_bytes,
+               "checkpoint hard dirty limit precedes its trigger");
+  TINYDB_CHECK(options_.failures_before_backpressure != 0, "checkpoint failure threshold must be nonzero");
 }
 
 auto Manager::Record(Status status) -> Status {
@@ -69,8 +72,8 @@ auto Manager::Checkpoint() -> Status {
     }
     for (const auto &page : pages) {
       const auto *const header = page.ValidatedHeader();
-      TINYDB_CHECK(header != nullptr && header->page_lsn <= target_lsn,
-                   "checkpoint captured an unvalidated or future page version");
+      TINYDB_CHECK(header != nullptr, "checkpoint captured an unvalidated page version");
+      TINYDB_CHECK(header->page_lsn <= target_lsn, "checkpoint captured a future page version");
       if (auto status = disk_->WriteCheckpointPage(page.Id(), page.Data(), state->high_water_page_id); !status.Ok()) {
         return Record(std::move(status));
       }

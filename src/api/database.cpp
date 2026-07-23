@@ -147,11 +147,11 @@ auto LifecycleError(Lifecycle lifecycle, bool diagnostics = false) -> Status {
 
 auto KeyRange::All() -> KeyRange { return {}; }
 
-auto KeyRange::From(BytesView lower) -> KeyRange { return KeyRange(Bytes(lower), std::nullopt); }
+auto KeyRange::From(BytesView lower) -> KeyRange { return {Bytes(lower), std::nullopt}; }
 
-auto KeyRange::Until(BytesView upper) -> KeyRange { return KeyRange(std::nullopt, Bytes(upper)); }
+auto KeyRange::Until(BytesView upper) -> KeyRange { return {std::nullopt, Bytes(upper)}; }
 
-auto KeyRange::Between(BytesView lower, BytesView upper) -> KeyRange { return KeyRange(Bytes(lower), Bytes(upper)); }
+auto KeyRange::Between(BytesView lower, BytesView upper) -> KeyRange { return {Bytes(lower), Bytes(upper)}; }
 
 auto KeyRange::Prefix(BytesView prefix) -> KeyRange {
   auto lower = Bytes(prefix);
@@ -167,9 +167,9 @@ auto KeyRange::Prefix(BytesView prefix) -> KeyRange {
     }
     upper[index - 1] = static_cast<char>(byte + 1U);
     upper.resize(index);
-    return KeyRange(std::move(lower), std::move(upper));
+    return {std::move(lower), std::move(upper)};
   }
-  return KeyRange(std::move(lower), std::nullopt);
+  return {std::move(lower), std::nullopt};
 }
 
 auto KeyRange::Lower() const -> std::optional<BytesView> {
@@ -454,6 +454,20 @@ struct WriteTransaction::Impl final {
     Release();
   }
 
+  auto Transaction() -> txn::TransactionPages & {
+    if (!transaction.has_value()) {
+      PanicAt(__FILE__, __LINE__, "write transaction has no private page state");
+    }
+    return *transaction;
+  }
+
+  auto Tree() -> BPlusTree & {
+    if (!tree.has_value()) {
+      PanicAt(__FILE__, __LINE__, "write transaction has no B+ tree");
+    }
+    return *tree;
+  }
+
   std::shared_ptr<detail::DatabaseCore> core;
   std::unique_lock<std::mutex> writer;
   std::optional<txn::TransactionPages> transaction;
@@ -475,7 +489,8 @@ auto ReadTransaction::Scan(KeyRange range) -> Result<Cursor> {
   if (impl_ == nullptr) {
     return std::unexpected(Status::Closed("Scan on an inactive read transaction"));
   }
-  auto snapshot_cursor = range.Lower() ? impl_->snapshot.Seek(*range.Lower()) : impl_->snapshot.First();
+  const auto lower = range.Lower();
+  auto snapshot_cursor = lower.has_value() ? impl_->snapshot.Seek(lower.value()) : impl_->snapshot.First();
   if (!snapshot_cursor) {
     return std::unexpected(snapshot_cursor.error());
   }
@@ -538,7 +553,7 @@ auto WriteTransaction::Get(BytesView key) -> Result<std::optional<Bytes>> {
   if (impl_ == nullptr || !impl_->transaction.has_value()) {
     return std::unexpected(Status::Closed("Get on an inactive write transaction"));
   }
-  return impl_->tree->Get(key);
+  return impl_->Tree().Get(key);
 }
 
 auto WriteTransaction::Put(BytesView key, BytesView value) -> Status {
@@ -548,9 +563,9 @@ auto WriteTransaction::Put(BytesView key, BytesView value) -> Status {
   if (txn::ValidateKeySize(key.size()) != StatusCode::Ok || txn::ValidateValueSize(value.size()) != StatusCode::Ok) {
     return Status::InvalidArgument("key or value exceeds its configured size limit");
   }
-  auto status = impl_->transaction->ChargeValueBytes(value.size());
+  auto status = impl_->Transaction().ChargeValueBytes(value.size());
   if (status.Ok()) {
-    status = impl_->tree->Put(key, value);
+    status = impl_->Tree().Put(key, value);
   }
   if (!status.Ok() && status.Code() != StatusCode::InvalidArgument) {
     impl_->Abort();
@@ -565,7 +580,7 @@ auto WriteTransaction::Delete(BytesView key) -> Status {
   if (txn::ValidateKeySize(key.size()) != StatusCode::Ok) {
     return Status::InvalidArgument("key exceeds the maximum key size");
   }
-  auto status = impl_->tree->Remove(key);
+  auto status = impl_->Tree().Remove(key);
   if (!status.Ok() && status.Code() != StatusCode::InvalidArgument) {
     impl_->Abort();
   }
@@ -576,7 +591,7 @@ auto WriteTransaction::Commit() && -> Result<CommitInfo> {
   if (impl_ == nullptr || !impl_->transaction.has_value()) {
     return std::unexpected(Status::Closed("Commit on an inactive write transaction"));
   }
-  auto result = impl_->core->Commit(*impl_->transaction, *impl_->tree);
+  auto result = impl_->core->Commit(impl_->Transaction(), impl_->Tree());
   impl_->Release();
   return result;
 }
@@ -707,7 +722,7 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
   auto transaction_impl = std::make_unique<WriteTransaction::Impl>(core, std::move(writer), std::move(*transaction));
   auto root_page_id = base->root_page_id;
   if (root_page_id == HEADER_PAGE_ID) {
-    auto root = transaction_impl->transaction->Allocate();
+    auto root = transaction_impl->Transaction().Allocate();
     if (!root) {
       transaction_impl->Abort();
       return std::unexpected(root.error());
@@ -715,12 +730,12 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
     root_page_id = root->Id();
     root = PageHandle{};
   }
-  auto tree = BPlusTree::Open(&*transaction_impl->transaction, root_page_id);
+  auto tree = BPlusTree::Open(&transaction_impl->Transaction(), root_page_id);
   if (!tree) {
     transaction_impl->Abort();
     return std::unexpected(tree.error());
   }
-  transaction_impl->tree.emplace(std::move(*tree));
+  transaction_impl->tree.emplace(*tree);
   return WriteTransaction(std::move(transaction_impl));
 }
 

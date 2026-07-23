@@ -24,7 +24,7 @@ auto BTreeCursor::First(PageReader *pages, page_id_t root_page_id,
     return std::unexpected(std::move(status));
   }
   if (!cursor.Valid()) {
-    const auto next_leaf = cursor.leaf_->NextLeaf();
+    const auto next_leaf = cursor.CurrentLeaf().NextLeaf();
     if (auto status = cursor.AdvanceToNonEmptyLeaf(next_leaf); !status.Ok()) {
       return std::unexpected(std::move(status));
     }
@@ -45,13 +45,13 @@ auto BTreeCursor::Seek(PageReader *pages, page_id_t root_page_id, page_id_t high
   if (auto status = cursor.OpenInitialLeaf(std::move(*page), 0); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  cursor.index_ = cursor.leaf_->LowerBound(key);
+  cursor.index_ = cursor.CurrentLeaf().LowerBound(key);
   if (cursor.Valid()) {
     return cursor;
   }
   // Keep this lease alive while opening the successor so its last key remains
   // available for the global ordering check without an owning copy.
-  const auto next_leaf = cursor.leaf_->NextLeaf();
+  const auto next_leaf = cursor.CurrentLeaf().NextLeaf();
   if (auto status = cursor.AdvanceToNonEmptyLeaf(next_leaf); !status.Ok()) {
     return std::unexpected(std::move(status));
   }

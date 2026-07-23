@@ -23,7 +23,7 @@ namespace tinydb::cache {
 struct CommittedFrame final {
   CommittedFrame(storage::DataPageHeader initial_header, std::unique_ptr<PageBytes> initial_bytes,
                  bool initial_tree_payload_validated, bool initially_checkpointed)
-      : header(std::move(initial_header)),
+      : header(initial_header),
         bytes(std::move(initial_bytes)),
         tree_payload_validated(initial_tree_payload_validated),
         checkpointed(initially_checkpointed) {}
@@ -55,8 +55,8 @@ auto Lease(std::shared_ptr<CommittedFrame> frame) -> PageHandle {
   TINYDB_CHECK(frame != nullptr, "leasing a null committed frame");
   auto *const leased = frame.get();
   auto keeper = std::static_pointer_cast<const void>(std::move(frame));
-  return PageHandle(leased->header.page_id, leased->bytes->data(), std::move(keeper), &leased->header,
-                    leased->tree_payload_validated);
+  return {leased->header.page_id, leased->bytes->data(), std::move(keeper), &leased->header,
+          leased->tree_payload_validated};
 }
 
 }  // namespace
@@ -79,8 +79,10 @@ struct CommittedPageCache::Impl final {
       : disk(database_file), target_bytes(byte_target), checkpoint_lsn(initial_checkpoint_lsn) {}
 
   void LinkMostRecent(CommittedFrame *frame) {
-    TINYDB_CHECK(frame != nullptr && !frame->in_lru && frame->newer == nullptr && frame->older == nullptr,
-                 "linking a page already present in the LRU");
+    TINYDB_CHECK(frame != nullptr, "linking a null page into the LRU");
+    TINYDB_CHECK(!frame->in_lru, "linking a page already present in the LRU");
+    TINYDB_CHECK(frame->newer == nullptr, "linking a page with a stale newer LRU link");
+    TINYDB_CHECK(frame->older == nullptr, "linking a page with a stale older LRU link");
     TINYDB_CHECK(frame->checkpointed, "linking an uncheckpointed eviction candidate");
 
     frame->older = most_recent;
@@ -94,7 +96,8 @@ struct CommittedPageCache::Impl final {
   }
 
   void Unlink(CommittedFrame *frame) {
-    TINYDB_CHECK(frame != nullptr && frame->in_lru, "unlinking a page absent from the LRU");
+    TINYDB_CHECK(frame != nullptr, "unlinking a null page from the LRU");
+    TINYDB_CHECK(frame->in_lru, "unlinking a page absent from the LRU");
     if (frame->newer != nullptr) {
       frame->newer->older = frame->older;
     } else {
@@ -113,7 +116,8 @@ struct CommittedPageCache::Impl final {
   }
 
   void Touch(CommittedFrame *frame) {
-    TINYDB_CHECK(frame != nullptr && frame->in_lru, "touching a page absent from the LRU");
+    TINYDB_CHECK(frame != nullptr, "touching a null page in the LRU");
+    TINYDB_CHECK(frame->in_lru, "touching a page absent from the LRU");
     if (frame == most_recent) {
       return;
     }
@@ -134,7 +138,8 @@ struct CommittedPageCache::Impl final {
     auto *victim = least_recent;
     while (victim != nullptr) {
       const auto page_id = victim->header.page_id;
-      TINYDB_CHECK(page_id < pages.size() && pages[page_id].get() == victim, "LRU contains a stale frame");
+      TINYDB_CHECK(page_id < pages.size(), "LRU page lies outside the cache table");
+      TINYDB_CHECK(pages[page_id].get() == victim, "LRU contains a stale frame");
       if (pages[page_id].use_count() == 1) {
         break;
       }
@@ -325,8 +330,9 @@ void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
   }
   for (auto &frame : plan.frames_) {
     auto &current = impl_->pages[frame->header.page_id];
-    TINYDB_CHECK(current == nullptr || current->header.page_lsn <= frame->header.page_lsn,
-                 "prepared publication regressed a page version");
+    if (current != nullptr) {
+      TINYDB_CHECK(current->header.page_lsn <= frame->header.page_lsn, "prepared publication regressed a page version");
+    }
     if (current == nullptr) {
       ++impl_->resident_pages;
     } else {

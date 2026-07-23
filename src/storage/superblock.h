@@ -1,8 +1,8 @@
 #pragma once
 
+#include <tinydb/status.h>
 #include "storage/database_uuid.h"
 #include "storage/page.h"
-#include <tinydb/status.h>
 
 #include <array>
 #include <cstddef>

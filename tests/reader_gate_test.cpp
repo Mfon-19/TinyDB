@@ -47,14 +47,14 @@ auto WaitUntil(const auto &predicate) -> bool {
 
 TEST(Readers, Snapshot) {
   auto gate = ReaderGate(State(7, 3));
-  constexpr auto THREADS = std::size_t{12};
+  constexpr auto thread_count = std::size_t{12};
   auto start = std::atomic<bool>{false};
   auto admitted = std::atomic<std::size_t>{0};
   auto release = std::atomic<bool>{false};
   auto failures = std::atomic<std::size_t>{0};
   auto readers = std::vector<std::thread>{};
 
-  for (auto index = std::size_t{0}; index < THREADS; ++index) {
+  for (auto index = std::size_t{0}; index < thread_count; ++index) {
     readers.emplace_back([&] {
       while (!start.load(std::memory_order_acquire)) {
         std::this_thread::yield();
@@ -71,9 +71,9 @@ TEST(Readers, Snapshot) {
   }
 
   start.store(true, std::memory_order_release);
-  const auto all_admitted = WaitUntil([&] { return admitted.load(std::memory_order_acquire) == THREADS; });
+  const auto all_admitted = WaitUntil([&] { return admitted.load(std::memory_order_acquire) == thread_count; });
   EXPECT_TRUE(all_admitted);
-  EXPECT_EQ(gate.Stats().active_readers, THREADS);
+  EXPECT_EQ(gate.Stats().active_readers, thread_count);
   EXPECT_TRUE(gate.Stats().oldest_reader_age.has_value());
   release.store(true, std::memory_order_release);
   for (auto &reader : readers) {

@@ -59,11 +59,11 @@ auto InternalPageBuilder::RecordFootprint(const Record &record) -> std::size_t {
 }
 
 // Construct the minimal internal page used when a split creates a new root.
-InternalPageBuilder::InternalPageBuilder(page_id_t first_child, std::string separator, page_id_t right_child)
+InternalPageBuilder::InternalPageBuilder(page_id_t first_child, std::string_view separator, page_id_t right_child)
     : first_child_(first_child) {
   auto record = MakeRecord(separator, right_child);
   encoded_bytes_ = RecordFootprint(record);
-  records_.push_back(std::move(record));
+  records_.push_back(record);
 }
 
 // Copy only through view accessors so builders cannot become a second decoder.
@@ -75,7 +75,7 @@ auto InternalPageBuilder::From(const InternalPageView &page) -> InternalPageBuil
   for (std::size_t index = 0; index < page.SeparatorCount(); ++index) {
     auto record = builder.MakeRecord(page.KeyAt(index), page.ChildAt(index + 1));
     builder.encoded_bytes_ += RecordFootprint(record);
-    builder.records_.push_back(std::move(record));
+    builder.records_.push_back(record);
   }
   return builder;
 }
@@ -117,13 +117,13 @@ void InternalPageBuilder::Store(char *page, page_id_t page_id) const {
       "failed to encode internal page");
 }
 
-void InternalPageBuilder::InsertSeparator(std::string key, page_id_t right_child) {
+void InternalPageBuilder::InsertSeparator(std::string_view key, page_id_t right_child) {
   const auto it = std::lower_bound(
       records_.begin(), records_.end(), key,
       [this](const Record &record, std::string_view target) { return txn::BytewiseLess{}(Key(record), target); });
   auto record = MakeRecord(key, right_child);
   encoded_bytes_ += RecordFootprint(record);
-  records_.insert(it, std::move(record));
+  records_.insert(it, record);
 }
 
 auto InternalPageBuilder::Fits() const -> bool { return encoded_bytes_ <= USABLE_BYTES; }
@@ -173,7 +173,7 @@ auto InternalPageBuilder::Split() -> SplitResult {
   for (auto record = split_it + 1; record != records_.end(); ++record) {
     auto copied = result.right.MakeRecord(Key(*record), record->right_child);
     result.right.encoded_bytes_ += RecordFootprint(copied);
-    result.right.records_.push_back(std::move(copied));
+    result.right.records_.push_back(copied);
   }
   TINYDB_CHECK(encoded_bytes_ >= promoted_bytes + result.right.encoded_bytes_,
                "internal split byte accounting underflow");

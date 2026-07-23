@@ -165,11 +165,11 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
 auto CopyOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor) -> Result<std::string> {
   auto output = std::string{};
   output.reserve(static_cast<std::size_t>(descriptor.total_value_bytes));
-  const auto status = WalkOverflowValue(pages, descriptor, ChainConstraints{},
-                                        [&output](page_id_t, std::span<const std::byte> payload) {
-                                          output.append(reinterpret_cast<const char *>(payload.data()), payload.size());
-                                          return Status{};
-                                        });
+  auto status = WalkOverflowValue(pages, descriptor, ChainConstraints{},
+                                  [&output](page_id_t, std::span<const std::byte> payload) {
+                                    output.append(reinterpret_cast<const char *>(payload.data()), payload.size());
+                                    return Status{};
+                                  });
   if (!status.Ok()) {
     return std::unexpected(status);
   }
@@ -186,11 +186,11 @@ auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descr
   // partially retired transaction state. The caller still aborts on any later
   // allocator failure.
   auto page_ids = std::vector<page_id_t>{};
-  const auto status = WalkOverflowValue(pages, descriptor, ChainConstraints{},
-                                        [&page_ids](page_id_t page_id, std::span<const std::byte>) {
-                                          page_ids.push_back(page_id);
-                                          return Status{};
-                                        });
+  auto status = WalkOverflowValue(pages, descriptor, ChainConstraints{},
+                                  [&page_ids](page_id_t page_id, std::span<const std::byte>) {
+                                    page_ids.push_back(page_id);
+                                    return Status{};
+                                  });
   if (!status.Ok()) {
     return status;
   }

@@ -401,7 +401,7 @@ auto DecodeTransaction(std::span<const std::byte> bytes,
       if (!decoded) {
         return std::unexpected(decoded.error());
       }
-      result.pages.push_back(std::move(page));
+      result.pages.push_back(page);
       encoded_prefix_bytes += encoded_record.size();
     } else if (record->type == RecordType::DatabaseState) {
       if (!state_payload.empty()) {

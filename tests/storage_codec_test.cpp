@@ -282,9 +282,9 @@ TEST(Format, Allocator) {
   auto provisional = std::array<char, tinydb::PAGE_SIZE>{};
   ASSERT_TRUE(
       tinydb::storage::InitializeFreeExtentPage(std::as_writable_bytes(std::span{provisional}), 2, 0, 3, extents).Ok());
-  EXPECT_EQ(*tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
-                                                             tinydb::storage::data_page_offset::CHECKSUM),
-            0U);
+  EXPECT_EQ(tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
+                                                            tinydb::storage::data_page_offset::CHECKSUM),
+            std::optional<std::uint32_t>{0U});
   ASSERT_TRUE(
       tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 2, 0x0102030405060708ULL)
           .Ok());
@@ -314,9 +314,9 @@ TEST(Format, Overflow) {
   ASSERT_TRUE(
       tinydb::storage::InitializeOverflowPage(std::as_writable_bytes(std::span{provisional}), 7, 0, 7, 3, 8, payload)
           .Ok());
-  EXPECT_EQ(*tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
-                                                             tinydb::storage::data_page_offset::CHECKSUM),
-            0U);
+  EXPECT_EQ(tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
+                                                            tinydb::storage::data_page_offset::CHECKSUM),
+            std::optional<std::uint32_t>{0U});
   ASSERT_TRUE(tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 7, 99).Ok());
   EXPECT_EQ(provisional, *encoded);
 
@@ -360,10 +360,12 @@ TEST(Format, Tree) {
   ASSERT_TRUE(tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{leaf_page})).Ok());
   EXPECT_TRUE(tinydb::ValidateTreePage(leaf_page.data(), 2).Ok());
   const auto loaded_leaf = tinydb::LeafPageView::Open(leaf_page.data(), 2).value();
-  ASSERT_TRUE(loaded_leaf.Get("alpha").has_value());
-  ASSERT_TRUE(loaded_leaf.Get("omega").has_value());
-  EXPECT_EQ(loaded_leaf.Get("alpha")->InlineBytes(), "one");
-  EXPECT_EQ(loaded_leaf.Get("omega")->InlineBytes(), "two");
+  const auto alpha = loaded_leaf.Get("alpha");
+  const auto omega = loaded_leaf.Get("omega");
+  ASSERT_TRUE(alpha.has_value());
+  ASSERT_TRUE(omega.has_value());
+  EXPECT_EQ(alpha.value_or(tinydb::LeafValueView::Inline({})).InlineBytes(), "one");
+  EXPECT_EQ(omega.value_or(tinydb::LeafValueView::Inline({})).InlineBytes(), "two");
 
   auto internal_page = std::array<char, tinydb::PAGE_SIZE>{};
   const auto internal = tinydb::InternalPageBuilder{2, "middle", 3};
