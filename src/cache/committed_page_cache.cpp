@@ -7,7 +7,6 @@
 #include "btree/page_source.h"
 #include "storage/page_codec.h"
 
-#include <algorithm>
 #include <expected>
 #include <mutex>
 #include <utility>
