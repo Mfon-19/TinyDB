@@ -35,9 +35,6 @@ namespace tinydb {
 class Wal {
  public:
   static auto PathFor(const std::filesystem::path &db_path) -> std::filesystem::path;
-
-  // Recovery leaves a header-only WAL whose starting LSN is the checkpoint
-  // frontier plus one. Open creates that header for a new database.
   static auto Open(const std::filesystem::path &wal_path, const DatabaseUuid &database_uuid,
                    std::uint64_t starting_lsn) -> Result<Wal>;
 
@@ -54,9 +51,6 @@ class Wal {
 
   auto SizeBytes() const -> std::uint64_t;
 
-  // The caller has already made checkpoint_lsn durable in the database
-  // superblock and excludes writers. A failure forbids further appends until
-  // reopen, while the durable database remains a complete recovery base.
   auto Reset(std::uint64_t checkpoint_lsn) -> Status;
 
  private:
