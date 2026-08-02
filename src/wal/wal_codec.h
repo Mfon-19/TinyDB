@@ -18,19 +18,33 @@ namespace tinydb::wal_format {
 /*
 ** WAL RECORD FORMAT
 **
-** A WAL file begins with one checksummed identity header followed by
-** self-framing records. Every record in one transaction carries the same
-** commit LSN. PageImage records contain final physical pages; one terminal
-** CommitState record carries the resulting roots/frontier and exact page
-** count. Recovery accepts none of the page images until that terminal record
-** validates.
-** Required feature bits are a reader contract; flags and reserved bytes remain
-** zero until a newer format assigns semantics to them.
+** TinyDB WAL is a versioned, checksummed physical redo log. The file starts
+** with one identity header and continues with self-framing transaction records.
 **
-** This magic intentionally differs from all prior WAL formats. There is no
-** compatibility shim: interpreting old framing as current records could turn
-** arbitrary bytes into apparently committed page images.
+**   low file offset
+**          |
+**          v
+**   +--------------------------------------+
+**   | WAL header (64 bytes)                |
+**   +======================================+
+**   | PageImage       commit LSN N         | \
+**   +--------------------------------------+  |
+**   | ... more PageImage records ...       |  | transaction N
+**   +--------------------------------------+  |
+**   | CommitState     commit LSN N         | /  terminal record
+**   +======================================+
+**   | Next transaction ...                 |
+**   +--------------------------------------+
+**          |
+**          v
+**   high file offset
+**
+** All records in one transaction carry the same commit LSN. PageImage records
+** contain final physical pages. CommitState contains the resulting roots,
+** allocation frontier, and exact page count. Recovery accepts no page image
+** until it validates the terminal CommitState record.
 */
+
 inline constexpr auto MAGIC = std::array{
     std::byte{0x54}, std::byte{0x49}, std::byte{0x4E}, std::byte{0x59},
     std::byte{0x57}, std::byte{0x4C}, std::byte{0x30}, std::byte{0x36},
@@ -101,6 +115,8 @@ inline constexpr std::size_t COMMIT_STATE_PAGE_COUNT_OFFSET = 24;
 inline constexpr std::size_t COMMIT_STATE_RESERVED_OFFSET = 28;
 inline constexpr std::size_t COMMIT_STATE_PAYLOAD_BYTES = 32;
 
+// Header contains the variable identity and compatibility fields of the fixed
+// WAL file header. The codec supplies its magic, version, size, and checksum.
 struct Header {
   DatabaseUuid database_uuid{};
   std::uint64_t starting_lsn{1};
@@ -110,39 +126,43 @@ struct Header {
   auto operator==(const Header &) const -> bool = default;
 };
 
-// A decoded record is a validated view. Its payload borrows the exact encoded
-// record supplied to DecodeRecord and cannot outlive those bytes.
+// Record is a validated, non-owning view of one encoded WAL record. Its payload
+// refers to the input bytes and cannot outlive them.
 struct Record {
   RecordType type;
   std::uint64_t lsn;
   std::span<const std::byte> payload;
 };
 
+// PageImageView is a non-owning encoder input for one final data-page image.
+// validated_header can supply an existing validation result for the same bytes.
 struct PageImageView {
   page_id_t page_id;
   std::span<const char, PAGE_SIZE> bytes;
   const storage::DataPageHeader *validated_header{nullptr};
 };
 
+// DecodedPageImage owns one validated data-page image from a WAL transaction.
 struct DecodedPageImage {
   page_id_t page_id;
   std::array<char, PAGE_SIZE> bytes;
 };
 
+// EncodedTransaction owns the complete record sequence for one prepared WAL
+// commit. The byte sequence does not include the WAL file header.
 struct EncodedTransaction {
   std::uint64_t commit_lsn;
   std::vector<char> bytes;
 };
 
+// DecodedTransaction owns one complete and validated WAL transaction. It
+// contains the resulting database state and the final page images.
 struct DecodedTransaction {
   std::uint64_t commit_lsn;
   txn::DatabaseState state;
   std::vector<DecodedPageImage> pages;
 };
 
-// Required feature bits are a reader contract: any unknown bit rejects the
-// file. Optional bits can be ignored by an older reader. Reserved bytes and
-// flags must remain zero until a format version assigns them semantics.
 auto EncodeHeader(const Header &header) -> Result<std::vector<char>>;
 auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header>;
 auto EncodeRecord(RecordType type, std::uint64_t lsn, std::span<const std::byte> payload) -> Result<std::vector<char>>;

@@ -25,6 +25,7 @@ __pycache__/
 *.profraw
 *.profdata
 
-# Local bench artifacts
+# Local artifacts
 /benchmark-results/
 /rust-port/
+/.agents/
