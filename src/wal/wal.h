@@ -14,13 +14,23 @@
 namespace tinydb {
 
 /*
-** SINGLE-FILE REDO LOG
+** WAL FILE LIFECYCLE
 **
-** Prepare encodes final data-page images without touching the filesystem.
-** Commit appends that owned transaction and synchronizes once; the fsync is
-** the public durability point. After a checkpoint has synchronized the same
-** pages and its new superblock, Reset replaces the covered log with one clean
-** header. There are no archive files or segment lifecycle.
+** Wal manages one active redo-log file. TinyDB does not create WAL segments or
+** archive files.
+**
+** Prepare encodes one transaction in memory. It performs no file I/O.
+**
+** Commit appends the prepared transaction. It then calls fsync once. Commit
+** reports success only after this fsync succeeds. This fsync is the transaction
+** durability point.
+**
+** Reset runs only after a checkpoint writes all committed WAL changes to the
+** database file. The checkpoint records that state in a durable superblock.
+** Recovery no longer needs the WAL transactions from before that checkpoint.
+** Reset then truncates the WAL and writes a clean header. The new header starts
+** at the first LSN after the checkpoint. Reset synchronizes this header before
+** it reports success.
 */
 class Wal {
  public:
