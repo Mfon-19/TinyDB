@@ -14,17 +14,40 @@ namespace tinydb::storage {
 /*
 ** DATA PAGE FORMAT
 **
-** Every non-superblock page starts with one independently validated header.
-** A reader validates size, magic, checksum, format, type, physical page ID,
-** payload bounds, and flags before any type-specific decoder follows offsets
-** inside the payload. Persistent bytes are untrusted input; decode failures
-** return Corruption or UnsupportedFormat and never invoke TINYDB_CHECK.
+** Each encoded data page occupies exactly PAGE_SIZE bytes. Database pages 0
+** and 1 are superblocks and use a different format.
 **
-** Page construction has two phases. InitializeDataPage zeroes the complete
-** page and writes the common fields. A type-specific builder writes its
-** payload. FinalizeDataPage then seals all 4096 bytes with a checksum. This
-** ordering prevents deleted records, allocator fragments, or stale memory from
-** surviving in checksum-covered free space.
+**   low byte offset
+**          |
+**          v
+**   +--------------------------------------------------+ 0
+**   | Common data-page header (32 bytes)               |
+**   | magic, type, version, page ID, page LSN,         |
+**   | payload_bytes, flags, and CRC-32                 |
+**   +==================================================+ 32
+**   | Type-specific payload                            |
+**   | payload_bytes bytes                              |
+**   +--------------------------------------------------+ 32 + payload_bytes
+**   | Zero-filled unused tail (possibly empty)         |
+**   +--------------------------------------------------+ PAGE_SIZE (4096)
+**          |
+**          v
+**   high byte offset
+**
+** The type selects the payload decoder. Leaf and Internal payloads contain B+
+** tree nodes. Allocator payloads contain free extents. Overflow payloads
+** contain chunks of values stored across pages.
+**
+** A reader examines the size, magic, checksum, version, type, physical page
+** ID, payload bounds, and flags before it reads payload fields. Persistent
+** bytes are untrusted input. A decoder reports Corruption or UnsupportedFormat.
+** It does not call TINYDB_CHECK for invalid persistent bytes.
+**
+** Page construction has three steps. InitializeDataPage fills all 4096 bytes
+** with zero and writes the common header. A type-specific builder writes the
+** payload. FinalizeDataPage stores the CRC-32. The checksum covers all 4096
+** bytes and treats its field as zero. This order prevents stale data in unused
+** space.
 */
 inline constexpr auto DATA_PAGE_MAGIC = std::array{
     std::byte{0x54},
@@ -71,6 +94,11 @@ struct DataPageHeader {
   std::uint16_t flags;
 };
 
+// A FreeExtent describes one consecutive range of page IDs that the latest
+// committed state no longer uses. The range starts at first_page_id and
+// contains page_count pages. The allocator can reuse the range only after the
+// durable checkpoint LSN reaches retire_lsn. Before that point, the durable
+// checkpoint can still refer to the previous contents of these pages.
 struct FreeExtent {
   page_id_t first_page_id;
   std::uint64_t page_count;

@@ -14,16 +14,10 @@
 namespace tinydb::storage {
 namespace {
 
-/*
-** A superblock encoder and decoder share the same semantic rules but report
-** violations differently. Impossible state supplied by in-memory code is an
-** InvalidArgument. The same impossible state reconstructed from a validly
-** framed page is Corruption.
-*/
-// Semantic checks that cannot be expressed by field widths alone. Encoding
-// reports these as InvalidArgument because the caller supplied impossible
-// state; decoding reports the same findings as Corruption because the state
-// came from persistent bytes.
+// Finds the first invalid value or relationship in the superblock metadata.
+// It returns a description of the error, or no value when the metadata is
+// valid. The encoder reports this error as InvalidArgument. The decoder reports
+// it as Corruption.
 auto InvalidSuperblock(const Superblock &superblock) -> std::optional<std::string> {
   if (std::ranges::all_of(superblock.database_uuid, [](std::byte byte) { return byte == std::byte{0}; })) {
     return "database UUID is zero";
@@ -34,8 +28,7 @@ auto InvalidSuperblock(const Superblock &superblock) -> std::optional<std::strin
   if (superblock.high_water_page_id < FIRST_FORMAT_DATA_PAGE_ID) {
     return "high-water page ID overlaps the superblocks";
   }
-  // Zero is the null page reference. Every real metadata root must name a
-  // page that has already been allocated below the high-water frontier.
+
   const auto valid_reference = [&](page_id_t page_id) {
     return page_id == 0 || (page_id >= FIRST_FORMAT_DATA_PAGE_ID && page_id < superblock.high_water_page_id);
   };
@@ -48,21 +41,9 @@ auto InvalidSuperblock(const Superblock &superblock) -> std::optional<std::strin
   return std::nullopt;
 }
 
-// The checksum protects the complete 4 KiB page, including reserved zeros.
-// Treating the checksum field itself as zero makes encoding and verification
-// use one deterministic calculation without special CRC concatenation logic.
-auto ChecksumPage(std::span<const std::byte> input) -> std::uint32_t {
-  auto page = SuperblockPage{};
-  std::ranges::copy(input, page.begin());
-  std::ranges::fill(page.begin() + static_cast<std::ptrdiff_t>(superblock_offset::CHECKSUM),
-                    page.begin() + static_cast<std::ptrdiff_t>(superblock_offset::CHECKSUM + sizeof(std::uint32_t)),
-                    std::byte{0});
-  return Crc32(page);
-}
-
+// Creates the combined error used when neither superblock slot is usable. It
+// preserves UnsupportedFormat and maps every other status code to Corruption.
 auto DecodeError(StatusCode code, std::string message) -> Status {
-  // Selection collapses two detailed decode failures into one public result,
-  // while preserving the important "recognized but damaged" distinction.
   if (code == StatusCode::UnsupportedFormat) {
     return Status::UnsupportedFormat(std::move(message));
   }
@@ -71,10 +52,12 @@ auto DecodeError(StatusCode code, std::string message) -> Status {
 
 }  // namespace
 
+// Encodes logical Superblock metadata into one page after it applies the format
+// rules. It uses fixed little-endian offsets, preserves optional feature bits,
+// fills reserved bytes with zero, and adds a CRC-32 checksum. It reports unknown
+// required features as UnsupportedFormat. It reports other invalid metadata as
+// InvalidArgument.
 auto EncodeSuperblock(const Superblock &superblock) -> Result<SuperblockPage> {
-  // An encoder must never mint bytes that this binary has already declared it
-  // cannot interpret. Optional bits are different: preserving an unknown
-  // optional bit cannot change the meaning required for safe reading.
   if ((superblock.required_features & ~SUPPORTED_REQUIRED_FEATURES) != 0) {
     return std::unexpected(Status::UnsupportedFormat("cannot encode unsupported required superblock features"));
   }
@@ -82,8 +65,6 @@ auto EncodeSuperblock(const Superblock &superblock) -> Result<SuperblockPage> {
     return std::unexpected(Status::InvalidArgument(*invalid));
   }
 
-  // Value-initialization zeroes every reserved byte. Besides preventing stale
-  // memory disclosure, this gives future decoders a canonical extension area.
   auto page = SuperblockPage{};
   auto bytes = std::span<std::byte>{page};
   const auto encoded =
@@ -100,33 +81,31 @@ auto EncodeSuperblock(const Superblock &superblock) -> Result<SuperblockPage> {
       PutLittleEndian(bytes, superblock_offset::ALLOCATOR_ROOT_PAGE_ID, superblock.allocator_root_page_id) &&
       PutLittleEndian(bytes, superblock_offset::HIGH_WATER_PAGE_ID, superblock.high_water_page_id);
   if (!encoded) {
-    // Offsets are compile-time constants, so reaching this branch indicates a
-    // codec maintenance bug rather than malformed user input.
     return std::unexpected(Status::Corruption("internal superblock layout exceeds one page"));
   }
-  if (!PutLittleEndian(bytes, superblock_offset::CHECKSUM, ChecksumPage(page))) {
+  if (!PutLittleEndian(bytes, superblock_offset::CHECKSUM, Crc32WithZeroedU32(bytes, superblock_offset::CHECKSUM))) {
     return std::unexpected(Status::Corruption("superblock checksum field exceeds one page"));
   }
   return page;
 }
 
+// Decodes one complete on-disk page into logical Superblock metadata. It
+// examines the page length, magic, checksum, format fields, reserved bytes, and
+// relationships between values. It reports unknown or incompatible formats as
+// UnsupportedFormat. It reports malformed or inconsistent pages as Corruption.
 auto DecodeSuperblock(std::span<const std::byte> page) -> Result<Superblock> {
   if (page.size() != PAGE_SIZE) {
     return std::unexpected(Status::Corruption("superblock is not exactly one page"));
   }
   if (!std::ranges::equal(SUPERBLOCK_MAGIC, page.subspan(superblock_offset::MAGIC, SUPERBLOCK_MAGIC.size()))) {
-    // Check magic before CRC so an old or foreign file is reported as an
-    // unsupported format, not misleadingly as a damaged current superblock.
     return std::unexpected(Status::UnsupportedFormat("unrecognized TinyDB superblock magic"));
   }
 
   const auto stored_checksum = GetLittleEndian<std::uint32_t>(page, superblock_offset::CHECKSUM);
-  if (!stored_checksum || *stored_checksum != ChecksumPage(page)) {
+  if (!stored_checksum || *stored_checksum != Crc32WithZeroedU32(page, superblock_offset::CHECKSUM)) {
     return std::unexpected(Status::Corruption("superblock checksum mismatch"));
   }
 
-  // Do not interpret state-bearing page IDs until framing, checksum, version,
-  // page size, and required feature semantics have all been accepted.
   const auto major = GetLittleEndian<std::uint16_t>(page, superblock_offset::FORMAT_MAJOR);
   const auto minor = GetLittleEndian<std::uint16_t>(page, superblock_offset::FORMAT_MINOR);
   const auto page_size = GetLittleEndian<std::uint32_t>(page, superblock_offset::PAGE_SIZE);
@@ -162,9 +141,6 @@ auto DecodeSuperblock(std::span<const std::byte> page) -> Result<Superblock> {
   superblock.required_features = *required;
   superblock.optional_features = *optional;
 
-  // Current writers canonicalize unused bytes to zero. Rejecting nonzero
-  // reserved bytes prevents silent acceptance of a format extension whose
-  // semantics this reader does not understand.
   if (const auto nonzero = std::ranges::find_if(page.subspan(superblock_offset::ENCODED_BYTES),
                                                 [](std::byte byte) { return byte != std::byte{0}; });
       nonzero != page.end()) {
@@ -176,17 +152,19 @@ auto DecodeSuperblock(std::span<const std::byte> page) -> Result<Superblock> {
   return superblock;
 }
 
+// Decodes both slots independently and returns the selected metadata with its
+// slot. The selected slot tells the next checkpoint which page it must
+// preserve. If both slots are valid, the larger generation wins. One valid slot
+// is sufficient. Equal valid generations must contain identical metadata.
+// If neither slot is usable, Corruption takes priority over UnsupportedFormat.
 auto SelectSuperblock(std::span<const std::byte> page_a,
                       std::span<const std::byte> page_b) -> Result<SelectedSuperblock> {
-  // Decode independently: damage to one slot must not prevent the other slot
-  // from opening the database.
   auto first = DecodeSuperblock(page_a);
   auto second = DecodeSuperblock(page_b);
 
   if (first && second) {
-    // Equal generations are expected after creation and checkpoint mirroring.
-    // They must describe identical logical state; differing state would make
-    // the chosen root/free-list nondeterministic across readers.
+    // Equal generations provide no ordering information. Different metadata
+    // would make either choice unsafe.
     if (first->generation == second->generation && *first != *second) {
       return std::unexpected(Status::Corruption("superblocks have the same generation but different state"));
     }
@@ -196,8 +174,7 @@ auto SelectSuperblock(std::span<const std::byte> page_a,
     return SelectedSuperblock{.value = *first, .slot = SuperblockSlot::A};
   }
   if (first) {
-    // A single valid copy is sufficient. The next successful checkpoint will
-    // restore redundancy by writing the alternate slot.
+    // The next checkpoint restores the second copy in the other slot.
     return SelectedSuperblock{.value = *first, .slot = SuperblockSlot::A};
   }
   if (second) {
@@ -207,9 +184,6 @@ auto SelectSuperblock(std::span<const std::byte> page_a,
   const auto code = first.error().Code() == StatusCode::Corruption || second.error().Code() == StatusCode::Corruption
                         ? StatusCode::Corruption
                         : StatusCode::UnsupportedFormat;
-  // If either slot looked like this format but failed integrity validation,
-  // report corruption. UnsupportedFormat is reserved for the case where both
-  // slots are simply not a format this binary recognizes.
   return std::unexpected(DecodeError(code, "neither superblock is valid"));
 }
 

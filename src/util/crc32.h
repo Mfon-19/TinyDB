@@ -26,15 +26,13 @@ constexpr auto MakeCrc32Table() -> std::array<std::uint32_t, 256> {
   return table;
 }
 
-inline constexpr auto CRC32_TABLE = MakeCrc32Table();
-
 constexpr auto MakeCrc32SlicingTable() -> std::array<std::array<std::uint32_t, 256>, 16> {
   auto tables = std::array<std::array<std::uint32_t, 256>, 16>{};
-  tables[0] = CRC32_TABLE;
+  tables[0] = MakeCrc32Table();
   for (std::size_t slice = 1; slice < tables.size(); ++slice) {
     for (std::size_t byte = 0; byte < tables[slice].size(); ++byte) {
       const auto previous = tables[slice - 1][byte];
-      tables[slice][byte] = CRC32_TABLE[previous & 0xFFU] ^ (previous >> 8U);
+      tables[slice][byte] = tables[0][previous & 0xFFU] ^ (previous >> 8U);
     }
   }
   return tables;
@@ -120,7 +118,7 @@ class Crc32Accumulator final {
     }
     for (const auto value : data) {
       const auto byte = std::to_integer<unsigned int>(value);
-      remainder_ = CRC32_TABLE[(remainder_ ^ byte) & 0xFFU] ^ (remainder_ >> 8U);
+      remainder_ = CRC32_SLICING_TABLE[0][(remainder_ ^ byte) & 0xFFU] ^ (remainder_ >> 8U);
     }
   }
 
@@ -143,8 +141,17 @@ inline auto Crc32(std::span<const std::byte> data) noexcept -> std::uint32_t {
   return accumulator.Finish();
 }
 
-inline auto Crc32(const char *data, std::size_t size) noexcept -> std::uint32_t {
-  return Crc32(std::as_bytes(std::span{data, size}));
+// Calculate a CRC after treating one four-byte field as zero. The input bytes
+// remain unchanged.
+inline auto Crc32WithZeroedU32(std::span<const std::byte> data, std::size_t offset) noexcept -> std::uint32_t {
+  const auto field_fits = offset <= data.size() && data.size() - offset >= sizeof(std::uint32_t);
+  TINYDB_CHECK(field_fits, "CRC field exceeds input");
+  constexpr auto zero_field = std::array<std::byte, sizeof(std::uint32_t)>{};
+  auto accumulator = Crc32Accumulator{};
+  accumulator.Update(data.first(offset));
+  accumulator.Update(zero_field);
+  accumulator.Update(data.subspan(offset + zero_field.size()));
+  return accumulator.Finish();
 }
 
 // Combine already-computed checksums without rereading either byte range.
@@ -156,8 +163,7 @@ inline auto Crc32Combine(std::uint32_t prefix_crc, std::uint32_t suffix_crc,
 // Update a complete checksum after replacing one equal-length byte range. The
 // caller supplies the number of bytes following the replaced range.
 inline auto Crc32Replace(std::uint32_t original_crc, std::span<const std::byte> original,
-                         std::span<const std::byte> replacement, std::size_t trailing_bytes) noexcept
-    -> std::uint32_t {
+                         std::span<const std::byte> replacement, std::size_t trailing_bytes) noexcept -> std::uint32_t {
   TINYDB_CHECK(original.size() == replacement.size(), "CRC replacement changed byte length");
   const auto difference = Crc32(original) ^ Crc32(replacement);
   return original_crc ^ crc32_detail::Shift(difference, trailing_bytes);

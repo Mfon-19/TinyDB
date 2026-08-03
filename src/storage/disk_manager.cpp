@@ -3,7 +3,6 @@
 
 #include "io/file_io.h"
 #include "io/syscalls.h"
-#include "storage/page_codec.h"
 #include "storage/superblock.h"
 
 #include <fcntl.h>

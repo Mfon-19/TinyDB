@@ -52,20 +52,7 @@ constexpr std::size_t OVERFLOW_RESERVED16_OFFSET = OVERFLOW_DATA_BYTES_OFFSET + 
 constexpr std::size_t OVERFLOW_DATA_OFFSET = OVERFLOW_RESERVED16_OFFSET + sizeof(std::uint16_t);
 static_assert(PAGE_SIZE - OVERFLOW_DATA_OFFSET == OVERFLOW_PAGE_PAYLOAD_BYTES);
 
-auto ChecksumPage(std::span<const std::byte> input) -> std::uint32_t {
-  // Hash a logical zero checksum field without copying or mutating a pinned
-  // cache frame. Incremental CRC produces exactly the same persistent value.
-  constexpr auto zero_checksum = std::array<std::byte, sizeof(std::uint32_t)>{};
-  auto checksum = Crc32Accumulator{};
-  checksum.Update(input.first(data_page_offset::CHECKSUM));
-  checksum.Update(zero_checksum);
-  checksum.Update(input.subspan(data_page_offset::CHECKSUM + sizeof(std::uint32_t)));
-  return checksum.Finish();
-}
-
 auto IsKnownType(DataPageType type) -> bool {
-  // Do not use a numeric range check: future format versions may intentionally
-  // leave holes in the persisted type namespace.
   switch (type) {
     case DataPageType::Leaf:
     case DataPageType::Internal:
@@ -85,12 +72,9 @@ auto DecodeDataPageHeaderFields(std::span<const std::byte> page, page_id_t expec
     return std::unexpected(Status::Corruption("unrecognized data-page magic"));
   }
 
-  // Persistent bytes must be authenticated before any other field is trusted.
-  // Transaction-private bytes have already crossed that boundary and are
-  // decoded only so commit can assign their final LSN and checksum.
   if (verify_checksum) {
     const auto stored_checksum = GetLittleEndian<std::uint32_t>(page, data_page_offset::CHECKSUM);
-    if (!stored_checksum || *stored_checksum != ChecksumPage(page)) {
+    if (!stored_checksum || *stored_checksum != Crc32WithZeroedU32(page, data_page_offset::CHECKSUM)) {
       return std::unexpected(Status::Corruption("data-page checksum mismatch"));
     }
   }
@@ -159,10 +143,9 @@ auto FinalizeDataPage(std::span<std::byte> page) -> Status {
   if (page.size() != PAGE_SIZE) {
     return Status::InvalidArgument("data page is not exactly one page");
   }
-  // Always clear a previous checksum first. Builders may reuse a buffer that
-  // previously held a valid page, and that old value must not influence CRC.
-  if (!PutLittleEndian(page, data_page_offset::CHECKSUM, std::uint32_t{0}) ||
-      !PutLittleEndian(page, data_page_offset::CHECKSUM, ChecksumPage(page))) {
+  // The calculation treats an existing checksum as zero without changing the
+  // page before it stores the new value.
+  if (!PutLittleEndian(page, data_page_offset::CHECKSUM, Crc32WithZeroedU32(page, data_page_offset::CHECKSUM))) {
     return Status::Corruption("data-page checksum field exceeds one page");
   }
   return {};

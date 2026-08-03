@@ -21,16 +21,6 @@ auto NonzeroUuid(const DatabaseUuid &uuid) -> bool {
   return std::ranges::any_of(uuid, [](std::byte byte) { return byte != std::byte{0}; });
 }
 
-auto ChecksumWithZeroedField(std::span<const std::byte> input, std::size_t checksum_offset) -> std::uint32_t {
-  TINYDB_CHECK(checksum_offset + sizeof(std::uint32_t) <= input.size(), "checksum field exceeds encoded object");
-  constexpr auto zero_checksum = std::array<std::byte, sizeof(std::uint32_t)>{};
-  auto checksum = Crc32Accumulator{};
-  checksum.Update(input.first(checksum_offset));
-  checksum.Update(zero_checksum);
-  checksum.Update(input.subspan(checksum_offset + zero_checksum.size()));
-  return checksum.Finish();
-}
-
 auto KnownRecordType(RecordType type) -> bool {
   return type == RecordType::PageImage || type == RecordType::CommitState;
 }
@@ -133,7 +123,7 @@ auto AppendEncodedRecord(std::vector<char> &destination, RecordType type, std::u
   }
   const auto checksum = payload_crc
                             ? Crc32Combine(Crc32(bytes.first(record_offset::PAYLOAD)), *payload_crc, payload_bytes)
-                            : ChecksumWithZeroedField(bytes, record_offset::CHECKSUM);
+                            : Crc32WithZeroedU32(bytes, record_offset::CHECKSUM);
   if (!storage::PutLittleEndian(bytes, record_offset::CHECKSUM, checksum)) {
     destination.resize(offset);
     return Status::Corruption("internal WAL checksum field exceeds its buffer");
@@ -175,8 +165,8 @@ auto EncodeHeader(const Header &header) -> Result<std::vector<char>> {
       storage::PutBytes(bytes, header_offset::DATABASE_UUID, header.database_uuid) &&
       storage::PutLittleEndian(bytes, header_offset::STARTING_LSN, header.starting_lsn) &&
       storage::PutLittleEndian(bytes, header_offset::CHECKSUM, std::uint32_t{0});
-  if (!encoded || !storage::PutLittleEndian(bytes, header_offset::CHECKSUM,
-                                            ChecksumWithZeroedField(bytes, header_offset::CHECKSUM))) {
+  if (!encoded ||
+      !storage::PutLittleEndian(bytes, header_offset::CHECKSUM, Crc32WithZeroedU32(bytes, header_offset::CHECKSUM))) {
     return std::unexpected(Status::Corruption("internal WAL header layout exceeds its buffer"));
   }
   return output;
@@ -193,7 +183,7 @@ auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header> {
     return std::unexpected(Status::UnsupportedFormat("unrecognized TinyDB WAL magic"));
   }
   const auto checksum = storage::GetLittleEndian<std::uint32_t>(bytes, header_offset::CHECKSUM);
-  if (!checksum || *checksum != ChecksumWithZeroedField(bytes, header_offset::CHECKSUM)) {
+  if (!checksum || *checksum != Crc32WithZeroedU32(bytes, header_offset::CHECKSUM)) {
     return std::unexpected(Status::Corruption("WAL header checksum mismatch"));
   }
   const auto major = storage::GetLittleEndian<std::uint16_t>(bytes, header_offset::FORMAT_MAJOR);
@@ -251,7 +241,7 @@ auto DecodeRecord(std::span<const std::byte> bytes) -> Result<Record> {
       *total < RECORD_HEADER_BYTES) {
     return std::unexpected(Status::Corruption("invalid WAL record length"));
   }
-  if (*checksum != ChecksumWithZeroedField(bytes, record_offset::CHECKSUM)) {
+  if (*checksum != Crc32WithZeroedU32(bytes, record_offset::CHECKSUM)) {
     return std::unexpected(Status::Corruption("WAL record checksum mismatch"));
   }
   const auto type = static_cast<RecordType>(*raw_type);

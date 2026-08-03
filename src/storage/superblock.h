@@ -12,22 +12,40 @@
 namespace tinydb::storage {
 
 /*
-** SUPERBLOCK FORMAT AND SELECTION
+** SUPERBLOCK PAGE AND STORAGE PROTOCOL
 **
-** Pages 0 and 1 each hold one complete database-state root. Updates normally
-** target the inactive slot with a monotonically increasing generation. A torn
-** metadata write can therefore invalidate at most the copy being replaced.
-** Opening decodes the slots independently and chooses the valid copy with the
-** greatest generation.
+** SuperblockPage holds the exact PAGE_SIZE bytes stored in one superblock
+** slot. It separates the on-disk byte format from the decoded Superblock
+** values used by the program. Its fixed size makes each superblock read and
+** write cover exactly one database page.
 **
-** If both copies have the same generation they must describe identical state;
-** otherwise there is no principled winner and opening reports corruption. One
-** valid copy is sufficient. Unknown required features reject the format, while
-** optional feature bits may be retained and ignored.
+** Database pages 0 and 1 are slots A and B. Each slot contains a complete copy
+** of the metadata for one durable checkpoint. Two slots keep the previous copy
+** safe while TinyDB writes the next copy.
 **
-** All fields use explicit little-endian offsets. Reserved bytes are zero and
-** participate in the page checksum. No native C++ object representation is
-** ever copied into the database file.
+** The checkpoint protocol is:
+**
+**   1. The checkpoint manager synchronizes all changed data pages.
+**   2. TinyDB copies the current metadata, increases its generation, and
+**      records the new checkpoint state.
+**   3. TinyDB encodes the metadata in a SuperblockPage.
+**   4. TinyDB writes the page to the slot that is not currently selected.
+**   5. TinyDB synchronizes the database file.
+**   6. TinyDB selects the new slot in memory.
+**
+** A crash during the write can leave the new slot incomplete. The previous
+** slot remains valid because this protocol does not modify it.
+**
+** Opening decodes both slots independently. It selects the valid slot with the
+** larger generation. One valid slot is sufficient. If both valid slots have
+** the same generation, their decoded metadata must match. Otherwise, TinyDB
+** reports corruption because it cannot identify one state as newer.
+**
+** The encoder writes each field at an explicit little-endian offset. It fills
+** reserved bytes with zero and includes them in the checksum. It never copies
+** the compiler-dependent memory layout of Superblock into the database file.
+** TinyDB rejects unknown required features. It preserves and ignores unknown
+** optional features.
 */
 using SuperblockPage = std::array<std::byte, PAGE_SIZE>;
 

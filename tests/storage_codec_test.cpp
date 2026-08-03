@@ -129,7 +129,8 @@ TEST(Format, Encoding) {
 
 TEST(Format, Crc32RemainsIEEECompatibleAcrossChunkBoundaries) {
   constexpr auto check = std::string_view{"123456789"};
-  EXPECT_EQ(tinydb::Crc32(check.data(), check.size()), 0xCBF43926U);
+  const auto check_bytes = std::as_bytes(std::span{check.data(), check.size()});
+  EXPECT_EQ(tinydb::Crc32(check_bytes), 0xCBF43926U);
 
   auto bytes = std::array<std::byte, 257>{};
   for (std::size_t index = 0; index < bytes.size(); ++index) {
