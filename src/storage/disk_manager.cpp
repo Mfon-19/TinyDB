@@ -52,7 +52,7 @@ auto RandomUuid() -> DatabaseUuid {
       uuid[offset + byte] = static_cast<std::byte>((word >> (byte * 8U)) & 0xFFU);
     }
   }
-  if (std::ranges::all_of(uuid, [](std::byte value) { return value == std::byte{0}; })) {
+  if (uuid == DatabaseUuid{}) {
     uuid.back() = std::byte{1};
   }
   return uuid;
@@ -251,7 +251,9 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
   if (!encoded) {
     return encoded.error();
   }
-  const auto inactive = selected_.slot == storage::SuperblockSlot::A ? SUPERBLOCK_B_PAGE_ID : SUPERBLOCK_A_PAGE_ID;
+  const auto next_slot =
+      selected_.slot == storage::SuperblockSlot::A ? storage::SuperblockSlot::B : storage::SuperblockSlot::A;
+  const auto inactive = next_slot == storage::SuperblockSlot::A ? SUPERBLOCK_A_PAGE_ID : SUPERBLOCK_B_PAGE_ID;
   if (auto status = WriteWholePage(fd_.Get(), inactive, *encoded); !status.Ok()) {
     return status;
   }
@@ -261,7 +263,7 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
 
   selected_ = storage::SelectedSuperblock{
       .value = next,
-      .slot = selected_.slot == storage::SuperblockSlot::A ? storage::SuperblockSlot::B : storage::SuperblockSlot::A,
+      .slot = next_slot,
   };
   return {};
 }

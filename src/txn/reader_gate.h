@@ -12,12 +12,11 @@ namespace tinydb::txn {
 class ReaderGate;
 class PublicationGuard;
 struct ReaderGateControl;
-struct SnapshotLease;
 
 /*
-** One admitted reader node. Shared SnapshotTokens place it in SnapshotLease;
-** a convenience point read places it directly on its stack. Its address may
-** not change while admitted because the gate's diagnostic list is intrusive.
+** One admitted reader node. SnapshotToken owns it through shared ownership; a
+** convenience point read places it directly on its stack. Its address may not
+** change while admitted because the gate's diagnostic list is intrusive.
 */
 struct ReaderGateAdmission final {
   ReaderGateAdmission() = default;
@@ -35,7 +34,6 @@ struct ReaderGateAdmission final {
   std::chrono::steady_clock::time_point started_at;
   ReaderGateAdmission *previous{nullptr};
   ReaderGateAdmission *next{nullptr};
-  bool admitted{false};
 };
 
 /*
@@ -64,12 +62,12 @@ class SnapshotToken final {
   SnapshotToken() = default;
 
   auto State() const -> const DatabaseState &;
-  explicit operator bool() const noexcept { return lease_ != nullptr; }
+  explicit operator bool() const noexcept { return admission_ != nullptr; }
 
  private:
-  explicit SnapshotToken(std::shared_ptr<SnapshotLease> lease) : lease_(std::move(lease)) {}
+  explicit SnapshotToken(std::shared_ptr<ReaderGateAdmission> admission) : admission_(std::move(admission)) {}
 
-  std::shared_ptr<SnapshotLease> lease_;
+  std::shared_ptr<ReaderGateAdmission> admission_;
 
   friend class ReaderGate;
 };
@@ -128,18 +126,17 @@ class ReaderGate final {
 */
 class PublicationGuard final {
  public:
-  PublicationGuard() = default;
+  PublicationGuard() = delete;
   PublicationGuard(const PublicationGuard &) = delete;
   auto operator=(const PublicationGuard &) -> PublicationGuard & = delete;
-  PublicationGuard(PublicationGuard &&other) noexcept;
-  auto operator=(PublicationGuard &&other) noexcept -> PublicationGuard &;
+  PublicationGuard(PublicationGuard &&) = delete;
+  auto operator=(PublicationGuard &&) -> PublicationGuard & = delete;
   ~PublicationGuard();
 
   void Publish(std::shared_ptr<const DatabaseState> state) noexcept;
 
  private:
   explicit PublicationGuard(std::shared_ptr<ReaderGateControl> control) noexcept;
-  void Reopen() noexcept;
 
   std::shared_ptr<ReaderGateControl> control_;
 

@@ -91,7 +91,6 @@ struct DataPageHeader {
   page_id_t page_id;
   std::uint64_t page_lsn;
   std::uint16_t payload_bytes;
-  std::uint16_t flags;
 };
 
 // A FreeExtent describes one consecutive range of page IDs that the latest

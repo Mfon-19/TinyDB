@@ -21,7 +21,7 @@ static_assert(superblock_offset::ENCODED_BYTES <= PAGE_SIZE);
 // valid. The encoder reports this error as InvalidArgument. The decoder reports
 // it as Corruption.
 auto InvalidSuperblock(const Superblock &superblock) -> std::optional<std::string> {
-  if (std::ranges::all_of(superblock.database_uuid, [](std::byte byte) { return byte == std::byte{0}; })) {
+  if (superblock.database_uuid == DatabaseUuid{}) {
     return "database UUID is zero";
   }
   if (superblock.generation == 0) {
@@ -41,15 +41,6 @@ auto InvalidSuperblock(const Superblock &superblock) -> std::optional<std::strin
     return "allocator root page ID is outside the logical page range";
   }
   return std::nullopt;
-}
-
-// Creates the combined error used when neither superblock slot is usable. It
-// preserves UnsupportedFormat and maps every other status code to Corruption.
-auto DecodeError(StatusCode code, std::string message) -> Status {
-  if (code == StatusCode::UnsupportedFormat) {
-    return Status::UnsupportedFormat(std::move(message));
-  }
-  return Status::Corruption(std::move(message));
 }
 
 }  // namespace
@@ -172,10 +163,10 @@ auto SelectSuperblock(std::span<const std::byte> page_a,
     return SelectedSuperblock{.value = *second, .slot = SuperblockSlot::B};
   }
 
-  const auto code = first.error().Code() == StatusCode::Corruption || second.error().Code() == StatusCode::Corruption
-                        ? StatusCode::Corruption
-                        : StatusCode::UnsupportedFormat;
-  return std::unexpected(DecodeError(code, "neither superblock is valid"));
+  if (first.error().Code() == StatusCode::UnsupportedFormat && second.error().Code() == StatusCode::UnsupportedFormat) {
+    return std::unexpected(Status::UnsupportedFormat("neither superblock is valid"));
+  }
+  return std::unexpected(Status::Corruption("neither superblock is valid"));
 }
 
 }  // namespace tinydb::storage

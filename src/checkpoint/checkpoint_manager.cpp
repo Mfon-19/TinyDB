@@ -35,10 +35,10 @@ auto Manager::Checkpoint() -> Status {
   const auto state = readers_.CurrentState();
   const auto durable_lsn = disk_.CheckpointLsn();
   TINYDB_CHECK(durable_lsn <= state->visible_lsn, "database file is newer than visible state");
-  auto pages = cache_.CaptureCheckpointPages(durable_lsn, state->visible_lsn);
+  auto pages = cache_.CaptureDirtyPages();
 
   const auto target_lsn = state->visible_lsn;
-  if (target_lsn > disk_.CheckpointLsn()) {
+  if (target_lsn > durable_lsn) {
     // File growth is harmless before the recovery root advances. A failure can
     // leave trailing zero pages. The old logical page count excludes them.
     if (auto status = disk_.EnsurePageCount(state->logical_page_count); !status.Ok()) {

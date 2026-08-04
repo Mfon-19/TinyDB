@@ -58,7 +58,6 @@ class TransactionPages final : public PageSource {
   // private image. The WAL LSN no longer depends on page count, so structural
   // preparation and byte sealing are one operation.
   auto PrepareCommit(std::uint64_t commit_lsn) -> Status;
-  void Abort() noexcept;
 
   auto ResultingState() const -> const DatabaseState &;
   auto HasChanges() const -> bool;
@@ -96,7 +95,7 @@ class TransactionPages final : public PageSource {
   void AddRetiredExtents(std::uint64_t retire_lsn);
   auto EnsureFreeExtentIndexFrames() -> Status;
   auto StoreFreeExtentIndex() -> Status;
-  auto ChargePage() -> Status;
+  auto Charge(std::size_t bytes) -> Status;
   void RequireActive() const;
   void RequireUnpinned() const;
 
@@ -106,10 +105,11 @@ class TransactionPages final : public PageSource {
   std::size_t memory_limit_bytes_;  // pages plus retained values
   std::size_t memory_used_bytes_{0};
   bool prepared_{false};         // final page set carries the exact commit LSN
-  bool aborted_{false};          // private state was discarded
   bool allocator_dirty_{false};  // extent index needs rewriting
 
-  std::unordered_map<page_id_t, std::unique_ptr<PrivateFrame>> pages_;
+  // unordered_map preserves element addresses across rehash. Free removes a
+  // frame only after proving that no PageHandle still refers to it.
+  std::unordered_map<page_id_t, PrivateFrame> pages_;
   std::unordered_set<page_id_t> retired_page_ids_;
   std::vector<storage::FreeExtent> free_extents_;
   std::vector<page_id_t> allocator_page_ids_;

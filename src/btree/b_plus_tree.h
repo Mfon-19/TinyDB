@@ -23,7 +23,7 @@ class PageReader;
 */
 class BPlusTree {
  public:
-  // Existing roots are validated; a zero-filled allocated root becomes a leaf.
+  // Existing roots are validated; HEADER_PAGE_ID creates the first leaf.
   static auto Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusTree>;
   static auto Read(PageReader *pages, page_id_t root_page_id,
                    std::string_view key) -> Result<std::optional<std::string>>;

@@ -42,7 +42,7 @@ struct CommitTiming final {
 ** database lifecycle before admitting another operation.
 */
 auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &readers, TransactionPages &transaction,
-                       BPlusTree &tree, CommitTiming *timing = nullptr) -> Result<CommitInfo>;
+                       BPlusTree &tree, CommitTiming &timing) -> Result<CommitInfo>;
 
 }  // namespace txn
 }  // namespace tinydb

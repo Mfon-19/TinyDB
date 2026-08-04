@@ -29,11 +29,11 @@ TEST(Contract, StatusNames) {
 }
 
 TEST(Contract, Limits) {
-  EXPECT_EQ(tinydb::txn::ValidateKeySize(0), tinydb::StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::ValidateKeySize(tinydb::MAX_KEY_BYTES), tinydb::StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::ValidateKeySize(tinydb::MAX_KEY_BYTES + 1U), tinydb::StatusCode::InvalidArgument);
-  EXPECT_EQ(tinydb::txn::ValidateValueSize(tinydb::MAX_VALUE_BYTES), tinydb::StatusCode::Ok);
-  EXPECT_EQ(tinydb::txn::ValidateValueSize(tinydb::MAX_VALUE_BYTES + 1U), tinydb::StatusCode::InvalidArgument);
+  EXPECT_TRUE(tinydb::txn::ValidKeySize(0));
+  EXPECT_TRUE(tinydb::txn::ValidKeySize(tinydb::MAX_KEY_BYTES));
+  EXPECT_FALSE(tinydb::txn::ValidKeySize(tinydb::MAX_KEY_BYTES + 1U));
+  EXPECT_TRUE(tinydb::txn::ValidValueSize(tinydb::MAX_VALUE_BYTES));
+  EXPECT_FALSE(tinydb::txn::ValidValueSize(tinydb::MAX_VALUE_BYTES + 1U));
 }
 
 TEST(Contract, ByteOrder) {

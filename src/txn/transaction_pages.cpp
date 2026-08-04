@@ -37,15 +37,12 @@ auto TransactionPages::Begin(PageReader *committed, DatabaseState base_state,
 
 TransactionPages::~TransactionPages() { RequireUnpinned(); }
 
-void TransactionPages::RequireActive() const {
-  TINYDB_CHECK(!prepared_, "mutating a prepared page transaction");
-  TINYDB_CHECK(!aborted_, "mutating an aborted page transaction");
-}
+void TransactionPages::RequireActive() const { TINYDB_CHECK(!prepared_, "mutating a prepared page transaction"); }
 
 void TransactionPages::RequireUnpinned() const {
   for (const auto &[page_id, page] : pages_) {
     (void)page_id;
-    TINYDB_CHECK(page->pin_count == 0, "destroying or freezing a transaction with leased pages");
+    TINYDB_CHECK(page.pin_count == 0, "destroying or freezing a transaction with leased pages");
   }
 }
 
@@ -75,26 +72,23 @@ auto TransactionPages::PrivateHandle(PrivateFrame *frame, bool editable) -> Page
   return {frame, frame->page_id, frame->bytes->data(), editable, ReleasePrivate, frame->tree_payload_validated};
 }
 
-auto TransactionPages::ChargePage() -> Status {
-  // Charge first so failure leaves no page-map entry or logical reservation.
-  if (memory_used_bytes_ > memory_limit_bytes_ - PAGE_SIZE) {
+auto TransactionPages::Charge(std::size_t bytes) -> Status {
+  if (bytes > memory_limit_bytes_ - memory_used_bytes_) {
     return Status::ResourceExhausted("write transaction memory limit exceeded");
   }
-  memory_used_bytes_ += PAGE_SIZE;
+  memory_used_bytes_ += bytes;
   return {};
 }
 
-// The analyzer does not model unique_ptr ownership after it moves into the
-// unordered map; ASan and the map's RAII ownership cover this path.
-// NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
 auto TransactionPages::CreatePrivatePage(page_id_t page_id, bool dirty) -> Result<PrivateFrame *> {
   if (auto existing = pages_.find(page_id); existing != pages_.end()) {
-    return existing->second.get();
+    return &existing->second;
   }
-  if (auto status = ChargePage(); !status.Ok()) {
+  // Charge first so failure leaves no page-map entry or logical reservation.
+  if (auto status = Charge(PAGE_SIZE); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  auto frame = std::make_unique<PrivateFrame>(PrivateFrame{
+  auto frame = PrivateFrame{
       .page_id = page_id,
       .bytes = std::make_unique<cache::PageBytes>(),
       .pin_count = 0,
@@ -102,22 +96,19 @@ auto TransactionPages::CreatePrivatePage(page_id_t page_id, bool dirty) -> Resul
       .dirty = dirty,
       .tree_payload_validated = false,
       .sealed_header = {},
-  });
+  };
   const auto position = pages_.emplace(page_id, std::move(frame)).first;
-  return position->second.get();
+  return &position->second;
 }
 
 auto TransactionPages::Read(page_id_t page_id) -> Result<PageHandle> {
-  if (aborted_) {
-    return std::unexpected(Status::Closed("reading an aborted write transaction"));
-  }
   if (retired_page_ids_.contains(page_id)) {
     return std::unexpected(Status::Corruption("transaction read a page it already retired"));
   }
   // Read-your-writes is a map lookup; committed state is consulted only when
   // this transaction has never copied or allocated the page.
   if (const auto page = pages_.find(page_id); page != pages_.end()) {
-    return PrivateHandle(page->second.get(), false);
+    return PrivateHandle(&page->second, false);
   }
   return committed_->Read(page_id);
 }
@@ -128,7 +119,7 @@ auto TransactionPages::Edit(page_id_t page_id) -> Result<PageHandle> {
     return std::unexpected(Status::Corruption("transaction edited a page it already retired"));
   }
   if (const auto page = pages_.find(page_id); page != pages_.end()) {
-    return PrivateHandle(page->second.get(), true);
+    return PrivateHandle(&page->second, true);
   }
 
   // First edit is copy-on-write. Later edits resolve the stable private frame
@@ -219,7 +210,7 @@ auto TransactionPages::Free(page_id_t page_id) -> Status {
   // Removing it also refunds its page charge; the page ID itself remains
   // quarantined in retired_page_ids_ through the end of this transaction.
   if (const auto page = pages_.find(page_id); page != pages_.end()) {
-    if (page->second->pin_count != 0) {
+    if (page->second.pin_count != 0) {
       return Status::Corruption("transaction retired a leased page");
     }
     pages_.erase(page);
@@ -237,11 +228,7 @@ void TransactionPages::SetRootPageId(page_id_t root_page_id) {
 
 auto TransactionPages::ChargeValueBytes(std::size_t bytes) -> Status {
   RequireActive();
-  if (bytes > memory_limit_bytes_ - memory_used_bytes_) {
-    return Status::ResourceExhausted("write transaction memory limit exceeded");
-  }
-  memory_used_bytes_ += bytes;
-  return {};
+  return Charge(bytes);
 }
 
 auto TransactionPages::LoadFreeExtents() -> Status {
@@ -377,35 +364,23 @@ auto TransactionPages::PrepareCommit(std::uint64_t commit_lsn) -> Status {
   }
 
   for (auto &[page_id, page] : pages_) {
-    if (!page->dirty) {
+    if (!page.dirty) {
       continue;
     }
-    auto header = storage::RewriteDataPageLsn(std::as_writable_bytes(std::span<char, PAGE_SIZE>(*page->bytes)), page_id,
+    auto header = storage::RewriteDataPageLsn(std::as_writable_bytes(std::span<char, PAGE_SIZE>(*page.bytes)), page_id,
                                               commit_lsn);
     if (!header) {
       return std::move(header).error();
     }
-    page->sealed_header = *header;
+    page.sealed_header = *header;
   }
   resulting_state_.visible_lsn = commit_lsn;
   prepared_ = true;
   return {};
 }
 
-void TransactionPages::Abort() noexcept {
-  // Private ownership is the undo record. Dropping it restores the complete
-  // committed state without replaying inverse operations.
-  RequireUnpinned();
-  pages_.clear();
-  retired_page_ids_.clear();
-  free_extents_.clear();
-  allocator_page_ids_.clear();
-  memory_used_bytes_ = 0;
-  aborted_ = true;
-}
-
 auto TransactionPages::HasChanges() const -> bool {
-  return std::ranges::any_of(pages_, [](const auto &entry) { return entry.second->dirty; }) ||
+  return std::ranges::any_of(pages_, [](const auto &entry) { return entry.second.dirty; }) ||
          resulting_state_ != base_state_ || !retired_page_ids_.empty();
 }
 
@@ -419,13 +394,13 @@ auto TransactionPages::TakePages() -> std::vector<cache::CommittedPageImage> {
   // Ownership moves directly toward publication; page bytes are not copied.
   for (auto &[page_id, page] : pages_) {
     (void)page_id;
-    if (!page->dirty) {
+    if (!page.dirty) {
       continue;
     }
     result.push_back(cache::CommittedPageImage{
-        .header = page->sealed_header,
-        .bytes = std::move(page->bytes),
-        .tree_payload_validated = page->tree_payload_validated,
+        .header = page.sealed_header,
+        .bytes = std::move(page.bytes),
+        .tree_payload_validated = page.tree_payload_validated,
     });
   }
   // One order serves WAL adjacency validation and cache publication. The

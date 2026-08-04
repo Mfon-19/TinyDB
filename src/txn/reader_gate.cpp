@@ -30,12 +30,8 @@ struct ReaderGateControl final {
   std::size_t active_readers{0};
 };
 
-struct SnapshotLease final {
-  ReaderGateAdmission admission;
-};
-
 ReaderGateAdmission::~ReaderGateAdmission() {
-  if (!admitted) {
+  if (control == nullptr) {
     return;
   }
 
@@ -66,15 +62,15 @@ ReaderGateAdmission::~ReaderGateAdmission() {
 namespace {
 
 void Admit(std::shared_ptr<ReaderGateControl> control, ReaderGateAdmission *admission) {
-  TINYDB_CHECK(!admission->admitted, "reader gate received an active admission");
-  admission->control = std::move(control);
-  auto *const gate = admission->control.get();
+  TINYDB_CHECK(admission->control == nullptr, "reader gate received an active admission");
+  auto *const gate = control.get();
 
   auto lock = std::unique_lock(gate->mutex);
   gate->changed.wait(lock, [gate] { return !gate->publication_pending; });
 
   // Capture the state and join the active set in one critical section. A
   // publisher can therefore order this reader wholly before or after itself.
+  admission->control = std::move(control);
   admission->state = gate->state;
   admission->started_at = Clock::now();
   admission->previous = gate->newest_reader;
@@ -85,18 +81,17 @@ void Admit(std::shared_ptr<ReaderGateControl> control, ReaderGateAdmission *admi
   }
   gate->newest_reader = admission;
   ++gate->active_readers;
-  admission->admitted = true;
 }
 
 }  // namespace
 
 auto SnapshotToken::State() const -> const DatabaseState & {
-  TINYDB_CHECK(lease_ != nullptr, "reading an empty snapshot token");
-  return *lease_->admission.state;
+  TINYDB_CHECK(admission_ != nullptr, "reading an empty snapshot token");
+  return *admission_->state;
 }
 
 auto ScopedSnapshotToken::State() const -> const DatabaseState & {
-  TINYDB_CHECK(admission_.admitted, "reading an empty scoped snapshot token");
+  TINYDB_CHECK(admission_.control != nullptr, "reading an empty scoped snapshot token");
   return *admission_.state;
 }
 
@@ -107,11 +102,11 @@ ReaderGate::ReaderGate(std::shared_ptr<const DatabaseState> initial_state)
 }
 
 auto ReaderGate::BeginRead() -> SnapshotToken {
-  // Allocate the shared lease before admission. If allocation fails, the gate
-  // has not incremented its reader count and needs no rollback.
-  auto lease = std::make_shared<SnapshotLease>();
-  Admit(control_, &lease->admission);
-  return SnapshotToken(std::move(lease));
+  // Allocate the shared admission before it joins the gate. If allocation
+  // fails, the reader count has not changed and needs no rollback.
+  auto admission = std::make_shared<ReaderGateAdmission>();
+  Admit(control_, admission.get());
+  return SnapshotToken(std::move(admission));
 }
 
 void ReaderGate::BeginRead(ScopedSnapshotToken &snapshot) { Admit(control_, &snapshot.admission_); }
@@ -158,28 +153,21 @@ auto ReaderGate::Stats() const -> ReaderGateStats {
 PublicationGuard::PublicationGuard(std::shared_ptr<ReaderGateControl> control) noexcept : control_(std::move(control)) {
   auto lock = std::unique_lock(control_->mutex);
 
-  // Serializing publishers here makes the gate robust independently of the
-  // future single-writer permit. Marking pending before waiting for readers is
-  // the fairness boundary: subsequent BeginRead calls cannot prolong the wait.
-  control_->changed.wait(lock, [this] { return !control_->publication_pending; });
+  // DatabaseCore's writer permit serializes publishers. Marking pending before
+  // waiting is the fairness boundary: new readers cannot prolong this wait.
   control_->publication_pending = true;
   control_->changed.wait(lock, [this] { return control_->active_readers == 0; });
 }
 
-PublicationGuard::PublicationGuard(PublicationGuard &&other) noexcept : control_(std::move(other.control_)) {}
-
-auto PublicationGuard::operator=(PublicationGuard &&other) noexcept -> PublicationGuard & {
-  if (this != &other) {
-    Reopen();
-    control_ = std::move(other.control_);
+PublicationGuard::~PublicationGuard() {
+  {
+    auto lock = std::lock_guard(control_->mutex);
+    control_->publication_pending = false;
   }
-  return *this;
+  control_->changed.notify_all();
 }
 
-PublicationGuard::~PublicationGuard() { Reopen(); }
-
 void PublicationGuard::Publish(std::shared_ptr<const DatabaseState> state) noexcept {
-  TINYDB_CHECK(control_ != nullptr, "publishing through an empty publication guard");
   TINYDB_CHECK(state != nullptr, "publishing a null database state");
   auto lock = std::lock_guard(control_->mutex);
   TINYDB_CHECK(control_->publication_pending, "publishing while reader admission is open");
@@ -187,19 +175,6 @@ void PublicationGuard::Publish(std::shared_ptr<const DatabaseState> state) noexc
   // This pointer replacement is the visibility event. No admitted reader can
   // observe it halfway through because the active reader population is empty.
   control_->state = std::move(state);
-}
-
-void PublicationGuard::Reopen() noexcept {
-  if (control_ == nullptr) {
-    return;
-  }
-  {
-    auto lock = std::lock_guard(control_->mutex);
-    TINYDB_CHECK(control_->publication_pending, "reopening reader admission that is already open");
-    control_->publication_pending = false;
-  }
-  control_->changed.notify_all();
-  control_.reset();
 }
 
 }  // namespace tinydb::txn

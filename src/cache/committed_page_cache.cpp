@@ -18,24 +18,15 @@ namespace tinydb::cache {
 /*
 ** A frame owns exactly one immutable encoded page version. Its validated
 ** common header orders physical versions and travels with immutable handles,
-** so consumers never checksum the same bytes twice. checkpointed controls
-** eviction eligibility, not visibility.
+** so consumers never checksum the same bytes twice. The header LSN and cache
+** checkpoint LSN determine eviction eligibility, not visibility.
 */
 struct CommittedFrame final {
-  CommittedFrame(storage::DataPageHeader initial_header, std::unique_ptr<PageBytes> initial_bytes,
-                 bool initial_tree_payload_validated, bool initially_checkpointed)
-      : header(initial_header),
-        bytes(std::move(initial_bytes)),
-        tree_payload_validated(initial_tree_payload_validated),
-        checkpointed(initially_checkpointed) {}
+  CommittedFrame(storage::DataPageHeader initial_header, std::unique_ptr<PageBytes> initial_bytes)
+      : header(initial_header), bytes(std::move(initial_bytes)) {}
 
   storage::DataPageHeader header;    // checksum-authenticated common fields
   std::unique_ptr<PageBytes> bytes;  // immutable after construction
-  bool tree_payload_validated;       // complete slot/cell proof for tree pages
-
-  // Shared ownership supplies the pin count. The table owns one reference and
-  // every PageHandle keepalive owns one more.
-  bool checkpointed{false};
 
   /*
   ** CHECKPOINTED LRU LINKS
@@ -52,11 +43,15 @@ struct CommittedFrame final {
 
 namespace {
 
+auto IsTreePage(const storage::DataPageHeader &header) -> bool {
+  return header.type == storage::DataPageType::Leaf || header.type == storage::DataPageType::Internal;
+}
+
 auto Lease(std::shared_ptr<CommittedFrame> frame) -> PageHandle {
   auto *const leased = frame.get();
   auto keeper = std::static_pointer_cast<const void>(std::move(frame));
   return {leased->header.page_id, leased->bytes->data(), std::move(keeper), &leased->header,
-          leased->tree_payload_validated};
+          IsTreePage(leased->header)};
 }
 
 }  // namespace
@@ -79,11 +74,13 @@ struct CommittedPageCache::Impl final {
   Impl(DiskManager &database_file, std::size_t byte_target, std::uint64_t initial_checkpoint_lsn)
       : disk(database_file), target_bytes(byte_target), checkpoint_lsn(initial_checkpoint_lsn) {}
 
+  auto IsCheckpointed(const CommittedFrame &frame) const -> bool { return frame.header.page_lsn <= checkpoint_lsn; }
+
   void LinkMostRecent(CommittedFrame *frame) {
     TINYDB_CHECK(!frame->in_lru, "linking a page already present in the LRU");
     TINYDB_CHECK(frame->newer == nullptr, "linking a page with a stale newer LRU link");
     TINYDB_CHECK(frame->older == nullptr, "linking a page with a stale older LRU link");
-    TINYDB_CHECK(frame->checkpointed, "linking an uncheckpointed eviction candidate");
+    TINYDB_CHECK(IsCheckpointed(*frame), "linking an uncheckpointed eviction candidate");
 
     frame->older = most_recent;
     if (most_recent != nullptr) {
@@ -201,8 +198,7 @@ struct CommittedPageCache::Impl final {
       if (!header) {
         return std::unexpected(header.error());
       }
-      const auto tree_page =
-          header->type == storage::DataPageType::Leaf || header->type == storage::DataPageType::Internal;
+      const auto tree_page = IsTreePage(*header);
       if (tree_page) {
         if (auto status = ValidateTreePagePayload(bytes->data(), *header); !status.Ok()) {
           return std::unexpected(std::move(status));
@@ -211,10 +207,8 @@ struct CommittedPageCache::Impl final {
 
       if (frame != nullptr) {
         frame->header = *header;
-        frame->tree_payload_validated = tree_page;
-        frame->checkpointed = true;
       } else {
-        frame = std::make_shared<CommittedFrame>(*header, std::move(new_bytes), tree_page, true);
+        frame = std::make_shared<CommittedFrame>(*header, std::move(new_bytes));
       }
       return frame;
     } catch (const std::bad_alloc &) {
@@ -303,12 +297,12 @@ auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> imag
   for (auto &image : images) {
     const auto &header = image.header;
     if (image.bytes == nullptr || header.page_id < FIRST_DATA_PAGE_ID || header.page_id >= logical_page_count ||
-        header.page_id <= previous_page_id || header.page_lsn == 0 || header.flags != 0 ||
+        header.page_id <= previous_page_id || header.page_lsn == 0 ||
         header.payload_bytes > PAGE_SIZE - storage::data_page_offset::HEADER_BYTES) {
       return std::unexpected(Status::InvalidArgument("publication contains an invalid or duplicate page image"));
     }
     previous_page_id = header.page_id;
-    const auto tree_page = header.type == storage::DataPageType::Leaf || header.type == storage::DataPageType::Internal;
+    const auto tree_page = IsTreePage(header);
     const auto non_tree_page =
         header.type == storage::DataPageType::Allocator || header.type == storage::DataPageType::Overflow;
     if (!tree_page && !non_tree_page) {
@@ -326,8 +320,7 @@ auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> imag
     if (existing != nullptr && existing->header.page_lsn > header.page_lsn) {
       return std::unexpected(Status::InvalidArgument("committed page version moves backward"));
     }
-    frames.push_back(std::make_shared<CommittedFrame>(header, std::move(image.bytes), tree_page,
-                                                      header.page_lsn <= impl_->checkpoint_lsn));
+    frames.push_back(std::make_shared<CommittedFrame>(header, std::move(image.bytes)));
   }
   previous_page_id = HEADER_PAGE_ID;
   auto image_index = std::size_t{0};
@@ -341,7 +334,7 @@ auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> imag
     }
     previous_page_id = page_id;
   }
-  return PublicationPlan(std::move(frames), std::move(retired), logical_page_count);
+  return PublicationPlan(std::move(frames), std::move(retired));
 }
 
 void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
@@ -354,7 +347,7 @@ void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
     if (impl_->pages[page_id]->in_lru) {
       impl_->Unlink(impl_->pages[page_id].get());
     }
-    impl_->dirty_pages -= !impl_->pages[page_id]->checkpointed ? 1U : 0U;
+    impl_->dirty_pages -= !impl_->IsCheckpointed(*impl_->pages[page_id]) ? 1U : 0U;
     impl_->pages[page_id].reset();
     --impl_->resident_pages;
   }
@@ -363,14 +356,14 @@ void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
     if (current == nullptr) {
       ++impl_->resident_pages;
     } else {
-      impl_->dirty_pages -= !current->checkpointed ? 1U : 0U;
+      impl_->dirty_pages -= !impl_->IsCheckpointed(*current) ? 1U : 0U;
       if (current->in_lru) {
         impl_->Unlink(current.get());
       }
     }
     current = std::move(frame);
-    impl_->dirty_pages += !current->checkpointed ? 1U : 0U;
-    if (current->checkpointed) {
+    impl_->dirty_pages += !impl_->IsCheckpointed(*current) ? 1U : 0U;
+    if (impl_->IsCheckpointed(*current)) {
       impl_->LinkMostRecent(current.get());
     }
   }
@@ -379,13 +372,13 @@ void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
 
 void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
   auto lock = std::lock_guard(impl_->mutex);
+  const auto previous_checkpoint_lsn = impl_->checkpoint_lsn;
   impl_->checkpoint_lsn = checkpoint_lsn;
 
   // The database file now contains versions at or before checkpoint_lsn.
   // Later committed versions remain WAL-backed and non-evictable.
   for (const auto &page : impl_->pages) {
-    if (page != nullptr && !page->checkpointed && page->header.page_lsn <= checkpoint_lsn) {
-      page->checkpointed = true;
+    if (page != nullptr && page->header.page_lsn > previous_checkpoint_lsn && page->header.page_lsn <= checkpoint_lsn) {
       --impl_->dirty_pages;
       if (!page->in_lru) {
         impl_->LinkMostRecent(page.get());
@@ -395,8 +388,7 @@ void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
   impl_->TrimToTarget();
 }
 
-auto CommittedPageCache::CaptureCheckpointPages(std::uint64_t checkpoint_lsn,
-                                                std::uint64_t target_lsn) -> std::vector<PageHandle> {
+auto CommittedPageCache::CaptureDirtyPages() -> std::vector<PageHandle> {
   auto lock = std::lock_guard(impl_->mutex);
   // Return guards in page-ID order. A later publication may replace a table
   // entry, but the guard keeps this exact old immutable version alive until
@@ -404,8 +396,7 @@ auto CommittedPageCache::CaptureCheckpointPages(std::uint64_t checkpoint_lsn,
   auto result = std::vector<PageHandle>{};
   result.reserve(impl_->dirty_pages);
   for (const auto &page : impl_->pages) {
-    if (page != nullptr && page->header.page_lsn > checkpoint_lsn && page->header.page_lsn <= target_lsn) {
-      impl_->RecordAccess(page);
+    if (page != nullptr && !impl_->IsCheckpointed(*page)) {
       result.push_back(Lease(page));
     }
   }

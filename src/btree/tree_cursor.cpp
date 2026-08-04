@@ -1,6 +1,7 @@
 #include "btree/tree_cursor.h"
 
 #include "btree/navigation.h"
+#include "btree/value_storage.h"
 #include "txn/contract.h"
 
 #include "storage/page.h"
@@ -13,38 +14,35 @@ namespace tinydb {
 
 auto BTreeCursor::First(PageReader *pages, page_id_t root_page_id,
                         page_id_t logical_page_count) -> Result<BTreeCursor> {
-  auto page = FindFirstLeaf(pages, root_page_id);
-  if (!page) {
-    return std::unexpected(std::move(page).error());
-  }
-
-  auto cursor = BTreeCursor(pages, logical_page_count);
-  if (auto status = cursor.OpenInitialLeaf(std::move(*page)); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
-  if (!cursor.Valid()) {
-    const auto next_leaf = cursor.CurrentLeaf().NextLeaf();
-    if (auto status = cursor.AdvanceToNonEmptyLeaf(next_leaf); !status.Ok()) {
-      return std::unexpected(std::move(status));
-    }
-  }
-  return cursor;
+  return Position(pages, root_page_id, logical_page_count, std::nullopt);
 }
 
 auto BTreeCursor::Seek(PageReader *pages, page_id_t root_page_id, page_id_t logical_page_count,
                        std::string_view key) -> Result<BTreeCursor> {
-  // Descent finds the only leaf that may contain key; LowerBound establishes
-  // the first cursor position without copying the encoded key.
-  auto page = FindLeaf(pages, root_page_id, key);
+  return Position(pages, root_page_id, logical_page_count, key);
+}
+
+auto BTreeCursor::CopyValue() const -> Result<std::string> { return tinydb::CopyValue(pages_, Value()); }
+
+auto BTreeCursor::First() -> Status { return Reset(std::nullopt); }
+
+auto BTreeCursor::Seek(std::string_view key) -> Status { return Reset(key); }
+
+auto BTreeCursor::Position(PageReader *pages, page_id_t root_page_id, page_id_t logical_page_count,
+                           std::optional<std::string_view> lower_bound) -> Result<BTreeCursor> {
+  auto page =
+      lower_bound.has_value() ? FindLeaf(pages, root_page_id, *lower_bound) : FindFirstLeaf(pages, root_page_id);
   if (!page) {
     return std::unexpected(std::move(page).error());
   }
 
-  auto cursor = BTreeCursor(pages, logical_page_count);
+  auto cursor = BTreeCursor(pages, root_page_id, logical_page_count);
   if (auto status = cursor.OpenInitialLeaf(std::move(*page)); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  cursor.index_ = cursor.CurrentLeaf().LowerBound(key);
+  if (lower_bound.has_value()) {
+    cursor.index_ = cursor.CurrentLeaf().LowerBound(*lower_bound);
+  }
   if (cursor.Valid()) {
     return cursor;
   }
@@ -55,6 +53,15 @@ auto BTreeCursor::Seek(PageReader *pages, page_id_t root_page_id, page_id_t logi
     return std::unexpected(std::move(status));
   }
   return cursor;
+}
+
+auto BTreeCursor::Reset(std::optional<std::string_view> lower_bound) -> Status {
+  auto replacement = Position(pages_, root_page_id_, logical_page_count_, lower_bound);
+  if (!replacement) {
+    return replacement.error();
+  }
+  *this = std::move(*replacement);
+  return {};
 }
 
 auto BTreeCursor::OpenInitialLeaf(PageHandle page) -> Status {

@@ -98,8 +98,7 @@ auto DecodeDataPageHeaderFields(std::span<const std::byte> page, page_id_t expec
   if (payload_bytes > PAGE_SIZE - data_page_offset::HEADER_BYTES || flags != 0) {
     return std::unexpected(Status::Corruption("invalid data-page length or flags"));
   }
-  return DataPageHeader{
-      .type = type, .page_id = page_id, .page_lsn = page_lsn, .payload_bytes = payload_bytes, .flags = flags};
+  return DataPageHeader{.type = type, .page_id = page_id, .page_lsn = page_lsn, .payload_bytes = payload_bytes};
 }
 
 }  // namespace

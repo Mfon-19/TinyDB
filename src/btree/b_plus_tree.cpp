@@ -144,26 +144,24 @@ auto SplitAndWrite(PageSource *pages, PageHandle &page, InternalPageBuilder &nod
 
 }  // namespace
 
-// Attach to a validated tree root. An all-zero allocated page is the sole
-// bootstrap representation and is immediately initialized as an empty leaf.
+// Attach to a validated tree root or create the first empty leaf when the
+// database state has no root.
 auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusTree> {
+  if (root_page_id == HEADER_PAGE_ID) {
+    auto root_page = pages->Allocate();
+    if (!root_page) {
+      return std::unexpected(std::move(root_page).error());
+    }
+    root_page_id = root_page->Id();
+    StoreTreePage(LeafPageBuilder{}, *root_page);
+    return BPlusTree(pages, root_page_id);
+  }
+
   // Existing roots are normally read-only for the whole transaction. Do not
   // copy one into the private write overlay merely to validate it.
   auto root_page = pages->Read(root_page_id);
   if (!root_page) {
     return std::unexpected(std::move(root_page).error());
-  }
-  const auto raw_type = RawNodeType(*root_page);
-  if (raw_type == 0) {
-    // Zero cannot be a NodeType, so it unambiguously identifies the fresh page
-    // allocated during bootstrap. Release the read lease before editing it.
-    root_page = PageHandle{};
-    auto editable_root = pages->Edit(root_page_id);
-    if (!editable_root) {
-      return std::unexpected(std::move(editable_root).error());
-    }
-    StoreTreePage(LeafPageBuilder{}, *editable_root);
-    return BPlusTree(pages, root_page_id);
   }
   // Existing roots cross the full page-validation boundary before use.
   if (auto status = ValidateTreePage(*root_page); !status.Ok()) {

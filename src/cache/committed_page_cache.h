@@ -62,13 +62,11 @@ class PublicationPlan final {
   auto operator=(PublicationPlan &&) -> PublicationPlan & = delete;
 
  private:
-  PublicationPlan(std::vector<std::shared_ptr<CommittedFrame>> frames, std::vector<page_id_t> retired,
-                  page_id_t logical_page_count)
-      : frames_(std::move(frames)), retired_(std::move(retired)), logical_page_count_(logical_page_count) {}
+  PublicationPlan(std::vector<std::shared_ptr<CommittedFrame>> frames, std::vector<page_id_t> retired)
+      : frames_(std::move(frames)), retired_(std::move(retired)) {}
 
   std::vector<std::shared_ptr<CommittedFrame>> frames_;
   std::vector<page_id_t> retired_;
-  page_id_t logical_page_count_{FIRST_DATA_PAGE_ID};
 
   friend class CommittedPageCache;
 };
@@ -107,10 +105,10 @@ class CommittedPageCache final : public PageReader {
                           page_id_t logical_page_count) -> Result<PublicationPlan>;
   void Publish(PublicationPlan plan) noexcept;
 
-  // Capture strong references to exact current versions in (checkpoint_lsn,
-  // target_lsn]. The caller must serialize this call with publication so the
-  // returned versions and captured DatabaseState describe one visibility point.
-  auto CaptureCheckpointPages(std::uint64_t checkpoint_lsn, std::uint64_t target_lsn) -> std::vector<PageHandle>;
+  // Capture every current version that is newer than the database file. The
+  // caller serializes capture with publication so these pages and its captured
+  // DatabaseState describe one visibility point.
+  auto CaptureDirtyPages() -> std::vector<PageHandle>;
 
   // The caller invokes this only after the database file and superblock make
   // every page through checkpoint_lsn durable.

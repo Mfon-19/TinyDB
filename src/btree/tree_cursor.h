@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace tinydb {
@@ -18,7 +19,7 @@ namespace tinydb {
 ** Seek descends once, then iteration follows the leaf successor chain. The
 ** cursor owns one leaf lease at a time. Key and the leaf value descriptor
 ** borrow that page and expire on movement or destruction. Overflow payload
-** pages are read by the snapshot wrapper only when a value copy is requested.
+** pages are read only when an owning value copy is requested.
 **
 ** Opening each successor validates both page-local structure and global chain
 ** order. Strict key boundaries detect every cycle containing a non-empty
@@ -43,6 +44,10 @@ class BTreeCursor {
 
   auto Value() const -> LeafValueView { return CurrentLeaf().ValueAt(index_); }
 
+  auto CopyValue() const -> Result<std::string>;
+  auto First() -> Status;
+  auto Seek(std::string_view key) -> Status;
+
   auto Next() -> Status {
     ++index_;
     if (index_ < CurrentLeaf().Count()) {
@@ -52,9 +57,12 @@ class BTreeCursor {
   }
 
  private:
-  BTreeCursor(PageReader *pages, page_id_t logical_page_count)
-      : pages_(pages), logical_page_count_(logical_page_count) {}
+  BTreeCursor(PageReader *pages, page_id_t root_page_id, page_id_t logical_page_count)
+      : pages_(pages), root_page_id_(root_page_id), logical_page_count_(logical_page_count) {}
 
+  static auto Position(PageReader *pages, page_id_t root_page_id, page_id_t logical_page_count,
+                       std::optional<std::string_view> lower_bound) -> Result<BTreeCursor>;
+  auto Reset(std::optional<std::string_view> lower_bound) -> Status;
   auto OpenInitialLeaf(PageHandle page) -> Status;
   auto AdvanceToNonEmptyLeaf(page_id_t page_id) -> Status;
   auto ValidateLeafId(page_id_t page_id) const -> Status;
@@ -65,6 +73,7 @@ class BTreeCursor {
   }
 
   PageReader *pages_;
+  page_id_t root_page_id_;
   page_id_t logical_page_count_;
   PageHandle page_;
   std::optional<LeafPageView> leaf_;

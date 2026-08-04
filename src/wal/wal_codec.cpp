@@ -97,41 +97,30 @@ auto SealedPageCrc(const PageImageView &page) -> std::optional<std::uint32_t> {
                       PAGE_SIZE - storage::data_page_offset::CHECKSUM - sizeof(std::uint32_t));
 }
 
-// Appends one self-framing record to destination. The callback writes the
-// payload. An optional payload CRC avoids a second payload scan.
-template <typename EncodePayload>
-auto AppendEncodedRecord(std::vector<char> &destination, RecordType type, std::uint64_t lsn, std::size_t payload_bytes,
-                         std::optional<std::uint32_t> payload_crc, EncodePayload encode_payload) -> Status {
+auto ValidateRecordMetadata(RecordType type, std::uint64_t lsn, std::size_t payload_bytes) -> Status {
   if (!KnownRecordType(type) || lsn == 0 ||
       payload_bytes > std::numeric_limits<std::uint32_t>::max() - RECORD_HEADER_BYTES) {
     return Status::InvalidArgument("invalid WAL record metadata");
   }
-  const auto total_bytes = RECORD_HEADER_BYTES + payload_bytes;
-  const auto offset = destination.size();
-  destination.resize(offset + total_bytes, 0);
-  auto bytes = std::as_writable_bytes(std::span{destination}).subspan(offset, total_bytes);
-  storage::PutLittleEndianUnchecked(bytes, record_offset::TOTAL_BYTES, static_cast<std::uint32_t>(total_bytes));
-  storage::PutLittleEndianUnchecked(bytes, record_offset::TYPE, static_cast<std::uint16_t>(type));
-  storage::PutLittleEndianUnchecked(bytes, record_offset::FLAGS, std::uint16_t{0});
-  storage::PutLittleEndianUnchecked(bytes, record_offset::LSN, lsn);
-  storage::PutLittleEndianUnchecked(bytes, record_offset::CHECKSUM, std::uint32_t{0});
-  storage::PutLittleEndianUnchecked(bytes, record_offset::RESERVED, std::uint32_t{0});
-  encode_payload(bytes.subspan(record_offset::PAYLOAD, payload_bytes));
-  const auto checksum = payload_crc
-                            ? Crc32Combine(Crc32(bytes.first(record_offset::PAYLOAD)), *payload_crc, payload_bytes)
-                            : Crc32WithZeroedU32(bytes, record_offset::CHECKSUM);
-  storage::PutLittleEndianUnchecked(bytes, record_offset::CHECKSUM, checksum);
   return {};
 }
 
-// Appends one record whose payload already exists as a byte span. The general
-// encoder computes the record CRC from the complete encoded record.
-auto AppendRecord(std::vector<char> &destination, RecordType type, std::uint64_t lsn,
-                  std::span<const std::byte> payload) -> Status {
-  return AppendEncodedRecord(destination, type, lsn, payload.size(), std::nullopt,
-                             [payload](std::span<std::byte> destination_payload) {
-                               storage::PutBytesUnchecked(destination_payload, 0, payload);
-                             });
+// Encodes one self-framing record into its exact destination span. An optional
+// payload CRC avoids a second payload scan.
+void EncodeRecordInto(std::span<std::byte> destination, RecordType type, std::uint64_t lsn,
+                      std::span<const std::byte> payload, std::optional<std::uint32_t> payload_crc) {
+  const auto total_bytes = RECORD_HEADER_BYTES + payload.size();
+  storage::PutLittleEndianUnchecked(destination, record_offset::TOTAL_BYTES, static_cast<std::uint32_t>(total_bytes));
+  storage::PutLittleEndianUnchecked(destination, record_offset::TYPE, static_cast<std::uint16_t>(type));
+  storage::PutLittleEndianUnchecked(destination, record_offset::FLAGS, std::uint16_t{0});
+  storage::PutLittleEndianUnchecked(destination, record_offset::LSN, lsn);
+  storage::PutLittleEndianUnchecked(destination, record_offset::CHECKSUM, std::uint32_t{0});
+  storage::PutLittleEndianUnchecked(destination, record_offset::RESERVED, std::uint32_t{0});
+  storage::PutBytesUnchecked(destination, record_offset::PAYLOAD, payload);
+  const auto checksum =
+      payload_crc ? Crc32Combine(Crc32(destination.first(record_offset::PAYLOAD)), *payload_crc, payload.size())
+                  : Crc32WithZeroedU32(destination, record_offset::CHECKSUM);
+  storage::PutLittleEndianUnchecked(destination, record_offset::CHECKSUM, checksum);
 }
 
 }  // namespace
@@ -203,10 +192,11 @@ auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header> {
 
 // Encodes one checksummed WAL record into an owned byte vector.
 auto EncodeRecord(RecordType type, std::uint64_t lsn, std::span<const std::byte> payload) -> Result<std::vector<char>> {
-  auto output = std::vector<char>{};
-  if (auto status = AppendRecord(output, type, lsn, payload); !status.Ok()) {
+  if (auto status = ValidateRecordMetadata(type, lsn, payload.size()); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
+  auto output = std::vector<char>(RECORD_HEADER_BYTES + payload.size(), 0);
+  EncodeRecordInto(std::as_writable_bytes(std::span{output}), type, lsn, payload, std::nullopt);
   return output;
 }
 
@@ -252,9 +242,11 @@ auto EncodeTransaction(std::uint64_t commit_lsn, std::span<const PageImageView> 
     return std::unexpected(commit_state.error());
   }
 
-  auto output = std::vector<char>{};
-  output.reserve(pages.size() * (RECORD_HEADER_BYTES + PAGE_IMAGE_PAYLOAD_BYTES) + RECORD_HEADER_BYTES +
-                 COMMIT_STATE_PAYLOAD_BYTES);
+  constexpr auto page_record_bytes = RECORD_HEADER_BYTES + PAGE_IMAGE_PAYLOAD_BYTES;
+  constexpr auto commit_record_bytes = RECORD_HEADER_BYTES + COMMIT_STATE_PAYLOAD_BYTES;
+  auto output = std::vector<char>(pages.size() * page_record_bytes + commit_record_bytes, 0);
+  auto output_bytes = std::as_writable_bytes(std::span{output});
+  auto offset = std::size_t{0};
   auto previous_page_id = HEADER_PAGE_ID;
   for (const auto &page : pages) {
     if (page.page_id < FIRST_DATA_PAGE_ID || page.page_id <= previous_page_id) {
@@ -275,18 +267,12 @@ auto EncodeTransaction(std::uint64_t commit_lsn, std::span<const PageImageView> 
         return std::unexpected(Status::InvalidArgument("WAL page image has the wrong commit LSN"));
       }
     }
-    if (auto status = AppendEncodedRecord(output, RecordType::PageImage, commit_lsn, PAGE_IMAGE_PAYLOAD_BYTES,
-                                          SealedPageCrc(page),
-                                          [&page](std::span<std::byte> payload) {
-                                            storage::PutBytesUnchecked(payload, 0, std::as_bytes(page.bytes));
-                                          });
-        !status.Ok()) {
-      return std::unexpected(std::move(status));
-    }
+    EncodeRecordInto(output_bytes.subspan(offset, page_record_bytes), RecordType::PageImage, commit_lsn,
+                     std::as_bytes(page.bytes), SealedPageCrc(page));
+    offset += page_record_bytes;
   }
-  if (auto status = AppendRecord(output, RecordType::CommitState, commit_lsn, *commit_state); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
+  EncodeRecordInto(output_bytes.subspan(offset, commit_record_bytes), RecordType::CommitState, commit_lsn,
+                   *commit_state, std::nullopt);
   return EncodedTransaction{
       .commit_lsn = commit_lsn,
       .bytes = std::move(output),

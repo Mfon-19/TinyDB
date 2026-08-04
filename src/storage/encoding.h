@@ -63,27 +63,9 @@ constexpr auto PutBytesUnchecked(std::span<std::byte> output, std::size_t offset
   std::ranges::copy(value, output.begin() + static_cast<std::ptrdiff_t>(offset));
 }
 
-constexpr auto PutBytes(std::span<std::byte> output, std::size_t offset,
-                        std::span<const std::byte> value) noexcept -> bool {
-  if (offset > output.size() || output.size() - offset < value.size()) {
-    return false;
-  }
-  PutBytesUnchecked(output, offset, value);
-  return true;
-}
-
 constexpr auto GetBytesUnchecked(std::span<const std::byte> input, std::size_t offset,
                                  std::span<std::byte> output) noexcept -> void {
   std::ranges::copy(input.subspan(offset, output.size()), output.begin());
-}
-
-constexpr auto GetBytes(std::span<const std::byte> input, std::size_t offset,
-                        std::span<std::byte> output) noexcept -> bool {
-  if (offset > input.size() || input.size() - offset < output.size()) {
-    return false;
-  }
-  GetBytesUnchecked(input, offset, output);
-  return true;
 }
 
 }  // namespace tinydb::storage

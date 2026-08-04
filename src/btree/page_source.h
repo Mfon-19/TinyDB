@@ -60,17 +60,21 @@ class PageHandle {
   PageHandle(const PageHandle &) = delete;
   auto operator=(const PageHandle &) -> PageHandle & = delete;
 
-  PageHandle(PageHandle &&other) noexcept { Take(std::move(other)); }
+  PageHandle(PageHandle &&other) noexcept { Swap(other); }
 
   auto operator=(PageHandle &&other) noexcept -> PageHandle & {
     if (this != &other) {
-      Reset();
-      Take(std::move(other));
+      auto replacement = PageHandle(std::move(other));
+      Swap(replacement);
     }
     return *this;
   }
 
-  ~PageHandle() { Reset(); }
+  ~PageHandle() {
+    if (release_ != nullptr) {
+      release_(owner_, page_id_, dirty_, tree_payload_validated_);
+    }
+  }
 
   auto Id() const -> page_id_t { return page_id_; }
   auto Data() const -> const char * { return data_; }
@@ -101,41 +105,17 @@ class PageHandle {
   }
 
  private:
-  void Reset() noexcept {
-    // The source receives accumulated mutation state exactly once.
-    if (release_ != nullptr) {
-      release_(owner_, page_id_, dirty_, tree_payload_validated_);
-    }
-    owner_ = nullptr;
-    data_ = nullptr;
-    editable_ = false;
-    dirty_ = false;
-    release_ = nullptr;
-    keepalive_.reset();
-    validated_header_ = nullptr;
-    tree_payload_validated_ = false;
-  }
-
-  void Take(PageHandle &&other) noexcept {
-    // Page bytes do not move; only responsibility for the lease does.
-    owner_ = other.owner_;
-    page_id_ = other.page_id_;
-    data_ = other.data_;
-    editable_ = other.editable_;
-    dirty_ = other.dirty_;
-    release_ = other.release_;
-    keepalive_ = std::move(other.keepalive_);
-    validated_header_ = other.validated_header_;
-    tree_payload_validated_ = other.tree_payload_validated_;
-
-    // Ownership moves with the callback; the source object must release nothing.
-    other.owner_ = nullptr;
-    other.data_ = nullptr;
-    other.editable_ = false;
-    other.release_ = nullptr;
-    other.dirty_ = false;
-    other.validated_header_ = nullptr;
-    other.tree_payload_validated_ = false;
+  void Swap(PageHandle &other) noexcept {
+    using std::swap;
+    swap(owner_, other.owner_);
+    swap(page_id_, other.page_id_);
+    swap(data_, other.data_);
+    swap(release_, other.release_);
+    swap(keepalive_, other.keepalive_);
+    swap(validated_header_, other.validated_header_);
+    swap(editable_, other.editable_);
+    swap(dirty_, other.dirty_);
+    swap(tree_payload_validated_, other.tree_payload_validated_);
   }
 
   void *owner_{nullptr};

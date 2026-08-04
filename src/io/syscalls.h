@@ -68,11 +68,7 @@ inline auto PathForFd(int fd) -> std::filesystem::path {
 }
 
 inline auto MaybeFault(const Call &call) -> bool {
-  auto &hook = TestHookRef();
-  if (!hook) {
-    return false;
-  }
-  const auto fault = hook(call);
+  const auto fault = TestHookRef()(call);
   if (!fault.has_value()) {
     return false;
   }

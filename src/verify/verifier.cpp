@@ -9,13 +9,12 @@
 #include "txn/transaction_pages.h"
 
 #include <expected>
-#include <functional>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
-#include <vector>
 
 namespace tinydb::verify {
 namespace {
@@ -25,9 +24,9 @@ auto IsPersistentFailure(const Status &status) -> bool {
 }
 
 void AddIssue(VerifyReport *report, const VerifyOptions &options, VerifyIssueKind kind, page_id_t page_id,
-              std::string message) {
+              std::string_view message) {
   if (report->issues.size() < options.max_issues) {
-    report->issues.push_back(VerifyIssue{.kind = kind, .page_id = page_id, .message = std::move(message)});
+    report->issues.push_back(VerifyIssue{.kind = kind, .page_id = page_id, .message = std::string{message}});
   } else {
     report->complete = false;
   }
@@ -86,15 +85,14 @@ auto PageHeader(PageReader *pages, page_id_t page_id, std::uint64_t visible_lsn,
 ** complete accounting for every data page ID less than logical_page_count.
 ** The transaction overlay is never edited or committed.
 */
-auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t memory_budget,
-              VerifyOptions options) -> Result<VerifyReport> {
+auto Snapshot(PageReader *pages, const txn::DatabaseState &state, VerifyOptions options) -> Result<VerifyReport> {
   if (options.max_issues == 0) {
     return std::unexpected(Status::InvalidArgument("verification requires a positive issue limit"));
   }
   auto report = VerifyReport{};
   report.visible_lsn = state.visible_lsn;
 
-  auto transaction = txn::TransactionPages::Begin(pages, state, memory_budget);
+  auto transaction = txn::TransactionPages::Begin(pages, state, PAGE_SIZE);
   if (!transaction) {
     if (!IsPersistentFailure(transaction.error())) {
       return std::unexpected(transaction.error());
@@ -134,60 +132,42 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
     ++report.pages_checked;
   }
 
-  if (state.root_page_id < FIRST_DATA_PAGE_ID || state.root_page_id >= state.logical_page_count) {
-    AddIssue(&report, options, VerifyIssueKind::TreeStructure, state.root_page_id,
-             "root page is outside the logical page range");
-    report.complete = false;
-    return report;
-  }
-  if (free_pages.contains(state.root_page_id) || allocator_pages.contains(state.root_page_id)) {
-    AddIssue(&report, options, VerifyIssueKind::DoubleAllocation, state.root_page_id,
-             "root page is owned by the allocator");
-    report.complete = false;
-    return report;
-  }
-
-  struct Summary {
-    std::optional<std::string> minimum;
-    std::optional<std::string> maximum;
-  };
-  using Bound = std::optional<std::string>;
+  using Bound = std::optional<std::string_view>;
   auto visited = std::unordered_set<page_id_t>{};
-  auto leaves = std::vector<std::pair<page_id_t, page_id_t>>{};
+  auto previous_leaf = std::optional<std::pair<page_id_t, page_id_t>>{};
   const auto less = txn::BytewiseLess{};
 
-  std::function<Result<Summary>(page_id_t, const Bound &, const Bound &)> visit;
-  visit = [&](page_id_t page_id, const Bound &lower, const Bound &upper) -> Result<Summary> {
+  const auto visit = [&](auto &&self, page_id_t page_id, Bound lower, Bound upper) -> Status {
     if (page_id < FIRST_DATA_PAGE_ID || page_id >= state.logical_page_count) {
-      return std::unexpected(Stop(&report, options, VerifyIssueKind::TreeStructure, page_id,
-                                  Status::Corruption("tree edge lies outside the logical page range")));
+      return Stop(&report, options, VerifyIssueKind::TreeStructure, page_id,
+                  Status::Corruption("tree edge lies outside the logical page range"));
     }
     if (free_pages.contains(page_id) || allocator_pages.contains(page_id)) {
-      return std::unexpected(Stop(&report, options, VerifyIssueKind::DoubleAllocation, page_id,
-                                  Status::Corruption("reachable tree page is owned by the allocator")));
+      return Stop(&report, options, VerifyIssueKind::DoubleAllocation, page_id,
+                  Status::Corruption("reachable tree page is owned by the allocator"));
     }
     if (!visited.insert(page_id).second) {
-      return std::unexpected(Stop(&report, options, VerifyIssueKind::DoubleAllocation, page_id,
-                                  Status::Corruption("tree contains a duplicate page reference or cycle")));
+      return Stop(&report, options, VerifyIssueKind::DoubleAllocation, page_id,
+                  Status::Corruption("tree contains a duplicate page reference or cycle"));
     }
 
     auto page = PageHeader(pages, page_id, state.visible_lsn, &report, options);
     if (!page) {
-      return std::unexpected(page.error());
+      return page.error();
     }
     ++report.pages_checked;
     const auto type = RawNodeType(*page);
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
       const auto leaf = LeafPageView::Open(*page);
       if (!leaf) {
-        return std::unexpected(Stop(&report, options, VerifyIssueKind::TreeStructure, page_id, leaf.error()));
+        return Stop(&report, options, VerifyIssueKind::TreeStructure, page_id, leaf.error());
       }
       ++report.leaf_pages;
       for (std::size_t index = 0; index < leaf->Count(); ++index) {
         const auto key = leaf->KeyAt(index);
         if ((lower && less(key, *lower)) || (upper && !less(key, *upper))) {
-          return std::unexpected(Stop(&report, options, VerifyIssueKind::TreeStructure, page_id,
-                                      Status::Corruption("leaf key lies outside its parent routing range")));
+          return Stop(&report, options, VerifyIssueKind::TreeStructure, page_id,
+                      Status::Corruption("leaf key lies outside its parent routing range"));
         }
         const auto value = leaf->ValueAt(index);
         if (value.IsOverflow()) {
@@ -195,64 +175,53 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
           if (auto status = ValidateOverflowValue(pages, value.OverflowDescriptor(), state.logical_page_count,
                                                   state.visible_lsn, free_pages, allocator_pages, &visited);
               !status.Ok()) {
-            return std::unexpected(Stop(&report, options, VerifyIssueKind::OverflowValue,
-                                        value.OverflowDescriptor().first_page_id, std::move(status)));
+            return Stop(&report, options, VerifyIssueKind::OverflowValue, value.OverflowDescriptor().first_page_id,
+                        std::move(status));
           }
           const auto count = visited.size() - before;
           report.overflow_pages += count;
           report.pages_checked += count;
         }
       }
-      leaves.emplace_back(page_id, leaf->NextLeaf());
-      if (leaf->Count() == 0) {
-        return Summary{};
+      if (previous_leaf && previous_leaf->second != page_id) {
+        AddIssue(&report, options, VerifyIssueKind::LeafLink, previous_leaf->first,
+                 "leaf link does not match in-order tree traversal");
       }
-      return Summary{.minimum = std::string{leaf->KeyAt(0)}, .maximum = std::string{leaf->KeyAt(leaf->Count() - 1)}};
+      previous_leaf = std::pair{page_id, leaf->NextLeaf()};
+      return {};
     }
     if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
-      return std::unexpected(Stop(&report, options, VerifyIssueKind::TreeStructure, page_id,
-                                  Status::Corruption("reachable page is not a B+ tree node")));
+      return Stop(&report, options, VerifyIssueKind::TreeStructure, page_id,
+                  Status::Corruption("reachable page is not a B+ tree node"));
     }
 
     const auto node = InternalPageView::Open(*page);
     if (!node) {
-      return std::unexpected(Stop(&report, options, VerifyIssueKind::TreeStructure, page_id, node.error()));
+      return Stop(&report, options, VerifyIssueKind::TreeStructure, page_id, node.error());
     }
     ++report.internal_pages;
-    auto summary = Summary{};
     for (std::size_t child = 0; child <= node->SeparatorCount(); ++child) {
-      const auto child_lower = child == 0 ? lower : Bound{std::string{node->KeyAt(child - 1)}};
-      const auto child_upper = child == node->SeparatorCount() ? upper : Bound{std::string{node->KeyAt(child)}};
+      const auto child_lower = child == 0 ? lower : Bound{node->KeyAt(child - 1)};
+      const auto child_upper = child == node->SeparatorCount() ? upper : Bound{node->KeyAt(child)};
       if (child_lower && child_upper && !less(*child_lower, *child_upper)) {
-        return std::unexpected(Stop(&report, options, VerifyIssueKind::TreeStructure, page_id,
-                                    Status::Corruption("internal node has an invalid routing range")));
+        return Stop(&report, options, VerifyIssueKind::TreeStructure, page_id,
+                    Status::Corruption("internal node has an invalid routing range"));
       }
-      auto child_summary = visit(node->ChildAt(child), child_lower, child_upper);
-      if (!child_summary) {
-        return std::unexpected(child_summary.error());
-      }
-      if (!summary.minimum && child_summary->minimum) {
-        summary.minimum = child_summary->minimum;
-      }
-      if (child_summary->maximum) {
-        summary.maximum = child_summary->maximum;
+      if (auto status = self(self, node->ChildAt(child), child_lower, child_upper); !status.Ok()) {
+        return status;
       }
     }
-    return summary;
+    return {};
   };
 
-  const auto root = visit(state.root_page_id, Bound{}, Bound{});
-  if (!root) {
-    return IsPersistentFailure(root.error()) ? Result<VerifyReport>{std::move(report)}
-                                             : Result<VerifyReport>{std::unexpected(root.error())};
+  if (auto status = visit(visit, state.root_page_id, {}, {}); !status.Ok()) {
+    return IsPersistentFailure(status) ? Result<VerifyReport>{std::move(report)}
+                                       : Result<VerifyReport>{std::unexpected(std::move(status))};
   }
 
-  for (std::size_t index = 0; index < leaves.size(); ++index) {
-    const auto expected = index + 1 < leaves.size() ? leaves[index + 1].first : HEADER_PAGE_ID;
-    if (leaves[index].second != expected) {
-      AddIssue(&report, options, VerifyIssueKind::LeafLink, leaves[index].first,
-               "leaf link does not match in-order tree traversal");
-    }
+  if (previous_leaf && previous_leaf->second != HEADER_PAGE_ID) {
+    AddIssue(&report, options, VerifyIssueKind::LeafLink, previous_leaf->first,
+             "leaf link does not match in-order tree traversal");
   }
 
   for (page_id_t page_id = FIRST_DATA_PAGE_ID; page_id < state.logical_page_count; ++page_id) {

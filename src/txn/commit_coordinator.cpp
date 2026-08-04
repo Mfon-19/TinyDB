@@ -19,14 +19,10 @@
 namespace tinydb::txn {
 
 auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &readers, TransactionPages &transaction,
-                       BPlusTree &tree, CommitTiming *timing) -> Result<CommitInfo> {
+                       BPlusTree &tree, CommitTiming &timing) -> Result<CommitInfo> {
   using Clock = std::chrono::steady_clock;
   const auto prepare_started = Clock::now();
-  const auto record_prepare = [&] {
-    if (timing != nullptr) {
-      timing->prepare = Clock::now() - prepare_started;
-    }
-  };
+  const auto record_prepare = [&] { timing.prepare = Clock::now() - prepare_started; };
   transaction.SetRootPageId(tree.RootPageId());
   if (!transaction.HasChanges()) {
     record_prepare();
@@ -37,12 +33,10 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
   const auto commit_lsn = wal.NextCommitLsn();
   if (!commit_lsn) {
     record_prepare();
-    transaction.Abort();
     return std::unexpected(commit_lsn.error());
   }
   if (auto status = transaction.PrepareCommit(*commit_lsn); !status.Ok()) {
     record_prepare();
-    transaction.Abort();
     return std::unexpected(std::move(status));
   }
 
@@ -71,14 +65,12 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
   auto prepared_wal = wal.Prepare(wal_pages, state);
   if (!prepared_wal) {
     record_prepare();
-    transaction.Abort();
     return std::unexpected(prepared_wal.error());
   }
   auto publication_plan =
       cache.PreparePublication(std::move(committed_pages), std::move(retired), state.logical_page_count);
   if (!publication_plan) {
     record_prepare();
-    transaction.Abort();
     return std::unexpected(publication_plan.error());
   }
   // This object remains private through WAL synchronization.
@@ -87,11 +79,8 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
 
   const auto wal_started = Clock::now();
   const auto durable = wal.Commit(std::move(*prepared_wal));
-  if (timing != nullptr) {
-    timing->wal_sync = Clock::now() - wal_started;
-  }
+  timing.wal_sync = Clock::now() - wal_started;
   if (!durable) {
-    transaction.Abort();
     return std::unexpected(durable.error());
   }
   /*
@@ -104,9 +93,7 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
   {
     const auto publication_started = Clock::now();
     auto publication = readers.BeginPublication();
-    if (timing != nullptr) {
-      timing->publication_wait = Clock::now() - publication_started;
-    }
+    timing.publication_wait = Clock::now() - publication_started;
     cache.Publish(std::move(*publication_plan));
     publication.Publish(std::move(published_state));
   }

@@ -214,7 +214,7 @@ class DatabaseCore final {
 
   auto Commit(txn::TransactionPages &transaction, BPlusTree &tree) -> Result<CommitInfo> {
     auto timing = txn::CommitTiming{};
-    auto result = txn::CommitTransaction(*wal, *cache, *readers, transaction, tree, &timing);
+    auto result = txn::CommitTransaction(*wal, *cache, *readers, transaction, tree, timing);
     {
       auto lock = std::lock_guard(operational_stats_mutex);
       ++operational_stats.write_attempts;
@@ -263,7 +263,7 @@ class DatabaseCore final {
     if (!snapshot) {
       return std::unexpected(snapshot.error());
     }
-    return verify::Snapshot(cache.get(), snapshot->State(), write_transaction_bytes, verify_options);
+    return verify::Snapshot(cache.get(), snapshot->State(), verify_options);
   }
 
   /*
@@ -426,45 +426,15 @@ struct WriteTransaction::Impl final {
        txn::TransactionPages &&private_pages)
       : core(std::move(database)), writer(std::move(writer_permit)), transaction(std::move(private_pages)) {}
 
-  ~Impl() { Abort(); }
-
-  void Release() noexcept {
-    if (!transaction.has_value()) {
-      return;
-    }
-    tree.reset();
-    transaction.reset();
-
-    if (writer.owns_lock()) {
-      writer.unlock();
-    }
-  }
-
-  void Abort() noexcept {
-    if (!transaction.has_value()) {
-      return;
-    }
-    transaction->Abort();
-    Release();
-  }
-
-  auto Transaction() -> txn::TransactionPages & {
-    if (!transaction.has_value()) {
-      PanicAt(__FILE__, __LINE__, "write transaction has no private page state");
-    }
-    return *transaction;
-  }
-
+  auto Transaction() -> txn::TransactionPages & { return transaction; }
   auto Tree() -> BPlusTree & {
-    if (!tree.has_value()) {
-      PanicAt(__FILE__, __LINE__, "write transaction has no B+ tree");
-    }
+    TINYDB_CHECK(tree.has_value(), "write transaction tree was not initialized");
     return *tree;
   }
 
   std::shared_ptr<detail::DatabaseCore> core;
   std::unique_lock<std::mutex> writer;
-  std::optional<txn::TransactionPages> transaction;
+  txn::TransactionPages transaction;
   std::optional<BPlusTree> tree;
 };
 
@@ -544,17 +514,17 @@ WriteTransaction::WriteTransaction(WriteTransaction &&) noexcept = default;
 WriteTransaction::~WriteTransaction() = default;
 
 auto WriteTransaction::Get(BytesView key) -> Result<std::optional<Bytes>> {
-  if (impl_ == nullptr || !impl_->transaction.has_value()) {
+  if (impl_ == nullptr) {
     return std::unexpected(Status::Closed("Get on an inactive write transaction"));
   }
   return impl_->Tree().Get(key);
 }
 
 auto WriteTransaction::Put(BytesView key, BytesView value) -> Status {
-  if (impl_ == nullptr || !impl_->transaction.has_value()) {
+  if (impl_ == nullptr) {
     return Status::Closed("Put on an inactive write transaction");
   }
-  if (txn::ValidateKeySize(key.size()) != StatusCode::Ok || txn::ValidateValueSize(value.size()) != StatusCode::Ok) {
+  if (!txn::ValidKeySize(key.size()) || !txn::ValidValueSize(value.size())) {
     return Status::InvalidArgument("key or value exceeds its configured size limit");
   }
   auto status = impl_->Transaction().ChargeValueBytes(value.size());
@@ -562,39 +532,34 @@ auto WriteTransaction::Put(BytesView key, BytesView value) -> Status {
     status = impl_->Tree().Put(key, value);
   }
   if (!status.Ok() && status.Code() != StatusCode::InvalidArgument) {
-    impl_->Abort();
+    impl_.reset();
   }
   return status;
 }
 
 auto WriteTransaction::Delete(BytesView key) -> Status {
-  if (impl_ == nullptr || !impl_->transaction.has_value()) {
+  if (impl_ == nullptr) {
     return Status::Closed("Delete on an inactive write transaction");
   }
-  if (txn::ValidateKeySize(key.size()) != StatusCode::Ok) {
+  if (!txn::ValidKeySize(key.size())) {
     return Status::InvalidArgument("key exceeds the maximum key size");
   }
   auto status = impl_->Tree().Remove(key);
   if (!status.Ok() && status.Code() != StatusCode::InvalidArgument) {
-    impl_->Abort();
+    impl_.reset();
   }
   return status;
 }
 
 auto WriteTransaction::Commit() && -> Result<CommitInfo> {
-  if (impl_ == nullptr || !impl_->transaction.has_value()) {
+  if (impl_ == nullptr) {
     return std::unexpected(Status::Closed("Commit on an inactive write transaction"));
   }
-  auto result = impl_->core->Commit(impl_->Transaction(), impl_->Tree());
-  impl_->Release();
-  return result;
+  auto impl = std::move(impl_);
+  return impl->core->Commit(impl->Transaction(), impl->Tree());
 }
 
-void WriteTransaction::Abort() noexcept {
-  if (impl_ != nullptr) {
-    impl_->Abort();
-  }
-}
+void WriteTransaction::Abort() noexcept { impl_.reset(); }
 
 void DatabaseTestAccess::WaitForReadQuiescence(Database &database) noexcept {
   /* Buffered reads complete on the calling thread. */
@@ -713,19 +678,8 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
     return std::unexpected(transaction.error());
   }
   auto transaction_impl = std::make_unique<WriteTransaction::Impl>(core, std::move(writer), std::move(*transaction));
-  auto root_page_id = base->root_page_id;
-  if (root_page_id == HEADER_PAGE_ID) {
-    auto root = transaction_impl->Transaction().Allocate();
-    if (!root) {
-      transaction_impl->Abort();
-      return std::unexpected(root.error());
-    }
-    root_page_id = root->Id();
-    root = PageHandle{};
-  }
-  auto tree = BPlusTree::Open(&transaction_impl->Transaction(), root_page_id);
+  auto tree = BPlusTree::Open(&transaction_impl->Transaction(), base->root_page_id);
   if (!tree) {
-    transaction_impl->Abort();
     return std::unexpected(tree.error());
   }
   transaction_impl->tree.emplace(*tree);
