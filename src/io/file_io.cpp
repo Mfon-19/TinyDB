@@ -2,7 +2,7 @@
 
 #include "io/unique_fd.h"
 
-#include "io/syscalls.h"
+#include "io/testable_posix.h"
 
 #include <fcntl.h>
 
@@ -15,7 +15,8 @@ namespace tinydb::io {
 auto ErrnoStatus(std::string_view operation) -> Status {
   // Capture errno before constructing the message: library work may replace
   // the thread-local value and obscure the syscall that actually failed.
-  return Status::IoError(std::string(operation) + ": " + std::generic_category().message(errno));
+  const auto error = errno;
+  return Status::IoError(std::string(operation) + ": " + std::generic_category().message(error));
 }
 
 auto FullPread(int fd, void *data, std::size_t size, std::uint64_t offset) -> Result<std::size_t> {

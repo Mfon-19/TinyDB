@@ -2,7 +2,7 @@
 #include "util/check.h"
 
 #include "io/file_io.h"
-#include "io/syscalls.h"
+#include "io/testable_posix.h"
 #include "storage/superblock.h"
 
 #include <fcntl.h>

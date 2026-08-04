@@ -1,8 +1,12 @@
 #pragma once
 
-#include <unistd.h>
-
 #include <utility>
+
+namespace tinydb::io {
+
+void Close(int fd) noexcept;
+
+}  // namespace tinydb::io
 
 namespace tinydb {
 
@@ -38,8 +42,8 @@ class UniqueFd {
     if (fd_ >= 0) {
       // A close error is unreportable here and durability never depends on
       // it: fsync is the durability point, and callers invoke it explicitly.
-      static_cast<void>(::close(fd_));
-      fd_ = -1;
+      const auto fd = std::exchange(fd_, -1);
+      io::Close(fd);
     }
   }
 

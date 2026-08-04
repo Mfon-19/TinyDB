@@ -10,7 +10,7 @@
 #include "cache/committed_page_cache.h"
 #include "checkpoint/checkpoint_manager.h"
 #include "io/file_io.h"
-#include "io/syscalls.h"
+#include "io/testable_posix.h"
 #include "recovery/recovery.h"
 #include "txn/commit_coordinator.h"
 #include "txn/contract.h"
@@ -19,7 +19,6 @@
 #include "txn/reader_gate.h"
 #include "txn/transaction_pages.h"
 #include "verify/verifier.h"
-#include "wal/wal_codec.h"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -38,9 +37,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
-#include <vector>
 
 namespace tinydb {
 namespace {

@@ -1,7 +1,7 @@
 #include "recovery/recovery.h"
 
 #include "io/file_io.h"
-#include "io/syscalls.h"
+#include "io/testable_posix.h"
 #include "io/unique_fd.h"
 #include "storage/encoding.h"
 #include "storage/page.h"

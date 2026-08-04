@@ -1,7 +1,7 @@
 #include "wal/wal.h"
 
 #include "io/file_io.h"
-#include "io/syscalls.h"
+#include "io/testable_posix.h"
 #include "util/check.h"
 
 #include <fcntl.h>

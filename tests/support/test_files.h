@@ -2,7 +2,7 @@
 
 #include <tinydb/database.h>
 
-#include "io/syscalls.h"
+#include "io/testable_posix.h"
 #include "wal/wal.h"
 
 #include <unistd.h>
@@ -19,6 +19,15 @@
 #include <vector>
 
 namespace tinydb::test {
+
+class ScopedTestHook {
+ public:
+  explicit ScopedTestHook(io::TestHook hook) { io::SetTestHook(std::move(hook)); }
+  ~ScopedTestHook() { io::ClearTestHook(); }
+
+  ScopedTestHook(const ScopedTestHook &) = delete;
+  auto operator=(const ScopedTestHook &) -> ScopedTestHook & = delete;
+};
 
 inline auto Path(std::string_view name) -> std::filesystem::path {
   return std::filesystem::temp_directory_path() /
@@ -89,9 +98,8 @@ inline auto Rows(Database &database,
 
 template <typename Body>
 void WithHook(io::TestHook hook, Body body) {
-  io::SetTestHook(std::move(hook));
+  [[maybe_unused]] const auto guard = ScopedTestHook(std::move(hook));
   body();
-  io::ClearTestHook();
 }
 
 }  // namespace tinydb::test

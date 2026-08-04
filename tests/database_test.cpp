@@ -4,6 +4,7 @@
 
 #include "support/test_files.h"
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -366,6 +367,30 @@ TEST(Database, Concurrency) {
   EXPECT_EQ(failures.load(), 0U);
   EXPECT_EQ(database.Get("shared").value(), "value-40");
   Cleanup(path);
+}
+
+TEST(Database, ConcurrentOpen) {
+  constexpr auto database_count = std::size_t{4};
+  auto paths = std::array<std::filesystem::path, database_count>{};
+  auto failures = std::atomic<std::size_t>{0};
+  auto threads = std::vector<std::thread>{};
+  for (std::size_t index = 0; index < database_count; ++index) {
+    paths[index] = tinydb::test::Path("concurrent_open_" + std::to_string(index));
+    Cleanup(paths[index]);
+    threads.emplace_back([&, index] {
+      auto database = tinydb::Database::Open(paths[index]);
+      if (!database || !database->Close().Ok()) {
+        failures.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(failures.load(), 0U);
+  for (const auto &path : paths) {
+    Cleanup(path);
+  }
 }
 
 TEST(Database, Corruption) {

@@ -113,7 +113,8 @@ add_library(
   src/api/database.cpp
   src/io/file_io.cpp
   src/io/file_io.h
-  src/io/syscalls.h
+  src/io/testable_posix.cpp
+  src/io/testable_posix.h
   src/io/unique_fd.h
   src/recovery/recovery.cpp
   src/recovery/recovery.h
