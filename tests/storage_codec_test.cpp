@@ -86,7 +86,7 @@ auto Fixture(std::uint64_t generation = 0x0102030405060708ULL) -> Superblock {
       .checkpoint_lsn = 0x1112131415161718ULL,
       .root_page_id = 2,
       .allocator_root_page_id = 3,
-      .high_water_page_id = 4,
+      .logical_page_count = 4,
   };
 }
 
@@ -206,7 +206,7 @@ TEST(Format, Checksums) {
         tinydb::storage::superblock_offset::GENERATION, tinydb::storage::superblock_offset::CHECKPOINT_LSN,
         tinydb::storage::superblock_offset::RESERVED, tinydb::storage::superblock_offset::ROOT_PAGE_ID,
         tinydb::storage::superblock_offset::ALLOCATOR_ROOT_PAGE_ID,
-        tinydb::storage::superblock_offset::HIGH_WATER_PAGE_ID, tinydb::storage::superblock_offset::CHECKSUM,
+        tinydb::storage::superblock_offset::LOGICAL_PAGE_COUNT, tinydb::storage::superblock_offset::CHECKSUM,
         tinydb::storage::superblock_offset::ENCODED_BYTES}) {
     auto corrupted = *original;
     corrupted[offset] ^= std::byte{0x01};
@@ -365,7 +365,7 @@ TEST(Format, AllocatorPersistsMultipleRetirementsAcrossPages) {
                                                           tinydb::txn::DatabaseState{
                                                               .root_page_id = 4,
                                                               .allocator_root_page_id = 2,
-                                                              .high_water_page_id = 1'000,
+                                                              .logical_page_count = 1'000,
                                                               .visible_lsn = 7,
                                                               .checkpoint_lsn = 7,
                                                           },
@@ -427,7 +427,7 @@ TEST(Format, PageVersion) {
   auto unsupported_bytes = std::as_writable_bytes(std::span{unsupported});
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(unsupported_bytes, tinydb::storage::data_page_offset::FORMAT_VERSION,
                                                std::uint16_t{2}));
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(unsupported_bytes).Ok());
+  tinydb::storage::FinalizeDataPage(unsupported_bytes);
   EXPECT_EQ(tinydb::storage::DecodeDataPageHeader(std::as_bytes(std::span{unsupported}), 2).error().Code(),
             StatusCode::UnsupportedFormat);
 
@@ -436,7 +436,7 @@ TEST(Format, PageVersion) {
       std::span{opposite_endian}.subspan(tinydb::storage::data_page_offset::PAGE_ID, sizeof(tinydb::page_id_t));
   std::ranges::reverse(page_id);
   auto opposite_bytes = std::as_writable_bytes(std::span{opposite_endian});
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(opposite_bytes).Ok());
+  tinydb::storage::FinalizeDataPage(opposite_bytes);
   EXPECT_EQ(tinydb::storage::DecodeDataPageHeader(std::as_bytes(std::span{opposite_endian}), 2).error().Code(),
             StatusCode::Corruption);
 }
@@ -449,7 +449,7 @@ TEST(Format, Tree) {
   leaf.Upsert("alpha", tinydb::LeafValueView::Inline("one"));
   leaf.Upsert("omega", tinydb::LeafValueView::Inline("two"));
   leaf.Store(leaf_page.data(), 2);
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{leaf_page})).Ok());
+  tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{leaf_page}));
   EXPECT_TRUE(tinydb::ValidateTreePage(leaf_page.data(), 2).Ok());
   const auto loaded_leaf = tinydb::LeafPageView::Open(leaf_page.data(), 2).value();
   const auto alpha = loaded_leaf.Get("alpha");
@@ -462,7 +462,7 @@ TEST(Format, Tree) {
   auto internal_page = std::array<char, tinydb::PAGE_SIZE>{};
   const auto internal = tinydb::InternalPageBuilder{2, "middle", 3};
   internal.Store(internal_page.data(), 4);
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{internal_page})).Ok());
+  tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{internal_page}));
   EXPECT_TRUE(tinydb::ValidateTreePage(internal_page.data(), 4).Ok());
   const auto loaded_internal = tinydb::InternalPageView::Open(internal_page.data(), 4).value();
   EXPECT_EQ(loaded_internal.ChildAt(0), 2U);
@@ -523,7 +523,7 @@ TEST(Format, Transaction) {
                                                              tinydb::txn::DatabaseState{
                                                                  .root_page_id = 2,
                                                                  .allocator_root_page_id = tinydb::HEADER_PAGE_ID,
-                                                                 .high_water_page_id = 4,
+                                                                 .logical_page_count = 4,
                                                                  .visible_lsn = 99,
                                                                  .checkpoint_lsn = 90,
                                                              });
@@ -535,7 +535,7 @@ TEST(Format, Transaction) {
   EXPECT_EQ(decoded->commit_lsn, 100U);
   EXPECT_EQ(decoded->state.root_page_id, 2U);
   EXPECT_EQ(decoded->state.allocator_root_page_id, tinydb::HEADER_PAGE_ID);
-  EXPECT_EQ(decoded->state.high_water_page_id, 4U);
+  EXPECT_EQ(decoded->state.logical_page_count, 4U);
   EXPECT_EQ(decoded->state.visible_lsn, 100U);
   ASSERT_EQ(decoded->pages.size(), 2U);
   EXPECT_EQ(decoded->pages[0].page_id, 2U);
@@ -587,7 +587,7 @@ TEST(Format, TransactionDamage) {
   const auto encoded = tinydb::wal_format::EncodeTransaction(50, pages,
                                                              tinydb::txn::DatabaseState{
                                                                  .root_page_id = 2,
-                                                                 .high_water_page_id = 4,
+                                                                 .logical_page_count = 4,
                                                              })
                            .value();
   constexpr auto page_record_bytes =

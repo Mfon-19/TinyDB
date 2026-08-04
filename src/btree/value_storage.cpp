@@ -21,7 +21,7 @@ namespace tinydb {
 namespace {
 
 struct ChainConstraints {
-  page_id_t high_water_page_id{std::numeric_limits<page_id_t>::max()};
+  page_id_t logical_page_count{std::numeric_limits<page_id_t>::max()};
   std::uint64_t maximum_page_lsn{std::numeric_limits<std::uint64_t>::max()};
   const std::unordered_set<page_id_t> *free_pages{nullptr};
   const std::unordered_set<page_id_t> *allocator_pages{nullptr};
@@ -36,7 +36,6 @@ struct ChainConstraints {
 template <typename Visitor>
 auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor,
                        const ChainConstraints &constraints, Visitor visit) -> Status {
-  TINYDB_CHECK(pages != nullptr, "overflow traversal requires a page reader");
   if (descriptor.total_value_bytes == 0 || descriptor.total_value_bytes > MAX_VALUE_BYTES ||
       descriptor.first_page_id < FIRST_DATA_PAGE_ID) {
     return Status::Corruption("invalid overflow value descriptor");
@@ -47,8 +46,8 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
   auto expected_chunk = std::uint32_t{0};
 
   for (;;) {
-    if (page_id < FIRST_DATA_PAGE_ID || page_id >= constraints.high_water_page_id) {
-      return Status::Corruption("overflow page lies outside the allocation frontier");
+    if (page_id < FIRST_DATA_PAGE_ID || page_id >= constraints.logical_page_count) {
+      return Status::Corruption("overflow page lies outside the logical page range");
     }
     if ((constraints.free_pages != nullptr && constraints.free_pages->contains(page_id)) ||
         (constraints.allocator_pages != nullptr && constraints.allocator_pages->contains(page_id))) {
@@ -92,9 +91,6 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
     if (final_page) {
       break;
     }
-    if (expected_chunk == std::numeric_limits<std::uint32_t>::max()) {
-      return Status::Corruption("overflow chunk index exceeds its encoded range");
-    }
     ++expected_chunk;
     page_id = decoded->next_page_id;
   }
@@ -110,10 +106,6 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
 ** caller must abort its private page transaction; no committed state changed.
 */
 auto PrepareValue(PageSource *pages, std::string_view key, std::string_view value) -> Result<LeafValueView> {
-  TINYDB_CHECK(pages != nullptr, "overflow preparation requires a page source");
-  if (value.size() > MAX_VALUE_BYTES) {
-    return std::unexpected(Status::InvalidArgument("value exceeds the maximum value size"));
-  }
   const auto inline_footprint = SLOT_SIZE + LEAF_CELL_HEADER_SIZE + key.size() + value.size();
   if (inline_footprint <= MAX_LEAF_RECORD_BYTES) {
     // The builder copies this borrowed value before Put returns.
@@ -196,13 +188,13 @@ auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descr
 }
 
 /* Join chain-local validation to the verifier's global page-ownership proof. */
-auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, page_id_t high_water_page_id,
+auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, page_id_t logical_page_count,
                            std::uint64_t maximum_page_lsn, const std::unordered_set<page_id_t> &free_pages,
                            const std::unordered_set<page_id_t> &allocator_pages,
                            std::unordered_set<page_id_t> *claimed_pages) -> Status {
   return WalkOverflowValue(pages, descriptor,
                            ChainConstraints{
-                               .high_water_page_id = high_water_page_id,
+                               .logical_page_count = logical_page_count,
                                .maximum_page_lsn = maximum_page_lsn,
                                .free_pages = &free_pages,
                                .allocator_pages = &allocator_pages,

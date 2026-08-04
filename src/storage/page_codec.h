@@ -130,15 +130,15 @@ struct OverflowPage {
   std::span<const std::byte> payload;
 };
 
-auto InitializeDataPage(std::span<std::byte> page, DataPageType type, page_id_t page_id, std::uint64_t page_lsn,
-                        std::uint16_t payload_bytes) -> Status;
-auto FinalizeDataPage(std::span<std::byte> page) -> Status;
+void InitializeDataPage(std::span<std::byte, PAGE_SIZE> page, DataPageType type, page_id_t page_id,
+                        std::uint64_t page_lsn, std::uint16_t payload_bytes);
+void FinalizeDataPage(std::span<std::byte, PAGE_SIZE> page);
 
 // Assigns the durable LSN and seals trusted transaction-private bytes. Common
 // fields are checked, but the provisional checksum is deliberately not read.
 // The returned header is the proof attached to the now-immutable page image,
 // so WAL and cache preparation do not need to checksum the same bytes again.
-auto RewriteDataPageLsn(std::span<std::byte> page, page_id_t expected_page_id,
+auto RewriteDataPageLsn(std::span<std::byte, PAGE_SIZE> page, page_id_t expected_page_id,
                         std::uint64_t page_lsn) -> Result<DataPageHeader>;
 
 /*
@@ -153,7 +153,7 @@ inline constexpr std::size_t FREE_EXTENTS_PER_PAGE = 168;
 // Type-specific initializers produce canonical private bytes with a zero
 // checksum. Persistent callers use the Encode wrappers below, which finalize
 // the page before returning it.
-auto InitializeFreeExtentPage(std::span<std::byte> page, page_id_t page_id, std::uint64_t page_lsn,
+auto InitializeFreeExtentPage(std::span<std::byte, PAGE_SIZE> page, page_id_t page_id, std::uint64_t page_lsn,
                               page_id_t next_page_id, std::span<const FreeExtent> extents) -> Status;
 auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t next_page_id,
                           std::span<const FreeExtent> extents) -> Result<std::array<char, PAGE_SIZE>>;
@@ -163,7 +163,7 @@ auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_pa
 
 inline constexpr std::size_t OVERFLOW_PAGE_PAYLOAD_BYTES = PAGE_SIZE - 60;
 
-auto InitializeOverflowPage(std::span<std::byte> page, page_id_t page_id, std::uint64_t page_lsn,
+auto InitializeOverflowPage(std::span<std::byte, PAGE_SIZE> page, page_id_t page_id, std::uint64_t page_lsn,
                             page_id_t owner_value_id, std::uint32_t chunk_index, page_id_t next_page_id,
                             std::span<const std::byte> payload) -> Status;
 auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t owner_value_id, std::uint32_t chunk_index,

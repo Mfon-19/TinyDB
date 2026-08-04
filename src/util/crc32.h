@@ -144,8 +144,6 @@ inline auto Crc32(std::span<const std::byte> data) noexcept -> std::uint32_t {
 // Calculate a CRC after treating one four-byte field as zero. The input bytes
 // remain unchanged.
 inline auto Crc32WithZeroedU32(std::span<const std::byte> data, std::size_t offset) noexcept -> std::uint32_t {
-  const auto field_fits = offset <= data.size() && data.size() - offset >= sizeof(std::uint32_t);
-  TINYDB_CHECK(field_fits, "CRC field exceeds input");
   constexpr auto zero_field = std::array<std::byte, sizeof(std::uint32_t)>{};
   auto accumulator = Crc32Accumulator{};
   accumulator.Update(data.first(offset));

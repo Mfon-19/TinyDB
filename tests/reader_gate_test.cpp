@@ -27,7 +27,7 @@ auto State(std::uint64_t version, tinydb::page_id_t root_page_id) -> std::shared
   return std::make_shared<const DatabaseState>(DatabaseState{
       .root_page_id = root_page_id,
       .allocator_root_page_id = 11,
-      .high_water_page_id = 20,
+      .logical_page_count = 20,
       .visible_lsn = version * 10,
       .checkpoint_lsn = (version - 1) * 10,
   });

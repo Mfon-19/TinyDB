@@ -28,8 +28,8 @@ namespace tinydb {
 */
 class BTreeCursor {
  public:
-  static auto First(PageReader *pages, page_id_t root_page_id, page_id_t high_water_page_id) -> Result<BTreeCursor>;
-  static auto Seek(PageReader *pages, page_id_t root_page_id, page_id_t high_water_page_id,
+  static auto First(PageReader *pages, page_id_t root_page_id, page_id_t logical_page_count) -> Result<BTreeCursor>;
+  static auto Seek(PageReader *pages, page_id_t root_page_id, page_id_t logical_page_count,
                    std::string_view key) -> Result<BTreeCursor>;
 
   BTreeCursor(const BTreeCursor &) = delete;
@@ -39,18 +39,11 @@ class BTreeCursor {
 
   auto Valid() const -> bool { return leaf_.has_value() && index_ < leaf_->Count(); }
 
-  auto Key() const -> std::string_view {
-    TINYDB_CHECK(Valid(), "reading key from an invalid tree cursor");
-    return CurrentLeaf().KeyAt(index_);
-  }
+  auto Key() const -> std::string_view { return CurrentLeaf().KeyAt(index_); }
 
-  auto Value() const -> LeafValueView {
-    TINYDB_CHECK(Valid(), "reading value from an invalid tree cursor");
-    return CurrentLeaf().ValueAt(index_);
-  }
+  auto Value() const -> LeafValueView { return CurrentLeaf().ValueAt(index_); }
 
   auto Next() -> Status {
-    TINYDB_CHECK(Valid(), "advancing an invalid tree cursor");
     ++index_;
     if (index_ < CurrentLeaf().Count()) {
       return {};
@@ -59,22 +52,20 @@ class BTreeCursor {
   }
 
  private:
-  BTreeCursor(PageReader *pages, page_id_t high_water_page_id)
-      : pages_(pages), high_water_page_id_(high_water_page_id) {}
+  BTreeCursor(PageReader *pages, page_id_t logical_page_count)
+      : pages_(pages), logical_page_count_(logical_page_count) {}
 
-  auto OpenInitialLeaf(PageHandle page, std::size_t index) -> Status;
+  auto OpenInitialLeaf(PageHandle page) -> Status;
   auto AdvanceToNonEmptyLeaf(page_id_t page_id) -> Status;
   auto ValidateLeafId(page_id_t page_id) const -> Status;
   auto ValidateBoundary(const LeafPageView &next) const -> Status;
   auto CurrentLeaf() const -> const LeafPageView & {
-    if (!leaf_.has_value()) {
-      PanicAt(__FILE__, __LINE__, "tree cursor has no current leaf");
-    }
+    TINYDB_CHECK(leaf_.has_value(), "tree cursor has no current leaf");
     return *leaf_;
   }
 
   PageReader *pages_;
-  page_id_t high_water_page_id_;
+  page_id_t logical_page_count_;
   PageHandle page_;
   std::optional<LeafPageView> leaf_;
   std::size_t index_{0};

@@ -41,8 +41,8 @@ namespace tinydb::wal_format {
 **
 ** All records in one transaction carry the same commit LSN. PageImage records
 ** contain final physical pages. CommitState contains the resulting roots,
-** allocation frontier, and exact page count. Recovery accepts no page image
-** until it validates the terminal CommitState record.
+** logical page count, and number of PageImage records. Recovery accepts no
+** page image until it validates the terminal CommitState record.
 */
 
 inline constexpr auto MAGIC = std::array{
@@ -102,16 +102,22 @@ inline constexpr std::size_t PAYLOAD = RECORD_HEADER_BYTES;
 
 /*
 ** PAGE_IMAGE is exactly one final data page, never a superblock. The page's
-** authenticated common header already contains its page ID and commit LSN, so
-** the WAL does not duplicate either field. COMMIT_STATE closes the transaction
-** and carries only metadata not present in page images.
+** authenticated common header already contains its page ID and commit LSN.
+** Therefore, the WAL does not duplicate either field.
+**
+** COMMIT_STATE closes the transaction. It contains metadata that is not in the
+** page images:
+**
+**   0  B+ tree root page ID u64       16  logical page count u64
+**   8  allocator root page ID u64     24  PageImage record count u32
+**                                      28  reserved u32
 */
 inline constexpr std::size_t PAGE_IMAGE_PAYLOAD_BYTES = PAGE_SIZE;
 
 inline constexpr std::size_t COMMIT_STATE_ROOT_OFFSET = 0;
 inline constexpr std::size_t COMMIT_STATE_ALLOCATOR_ROOT_OFFSET = 8;
-inline constexpr std::size_t COMMIT_STATE_HIGH_WATER_OFFSET = 16;
-inline constexpr std::size_t COMMIT_STATE_PAGE_COUNT_OFFSET = 24;
+inline constexpr std::size_t COMMIT_STATE_LOGICAL_PAGE_COUNT_OFFSET = 16;
+inline constexpr std::size_t COMMIT_STATE_PAGE_IMAGE_COUNT_OFFSET = 24;
 inline constexpr std::size_t COMMIT_STATE_RESERVED_OFFSET = 28;
 inline constexpr std::size_t COMMIT_STATE_PAYLOAD_BYTES = 32;
 

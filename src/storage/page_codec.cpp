@@ -31,6 +31,7 @@ constexpr std::size_t EXTENT_COUNT_OFFSET = EXTENT_NEXT_PAGE_OFFSET + sizeof(pag
 constexpr std::size_t EXTENT_RESERVED_OFFSET = EXTENT_COUNT_OFFSET + sizeof(std::uint16_t);
 constexpr std::size_t EXTENT_ENTRIES_OFFSET = EXTENT_RESERVED_OFFSET + sizeof(std::uint16_t) + sizeof(std::uint32_t);
 constexpr std::size_t EXTENT_ENTRY_BYTES = sizeof(page_id_t) + sizeof(std::uint64_t) + sizeof(std::uint64_t);
+static_assert(EXTENT_ENTRIES_OFFSET + FREE_EXTENTS_PER_PAGE * EXTENT_ENTRY_BYTES <= PAGE_SIZE);
 
 /*
 ** OVERFLOW PAYLOAD
@@ -73,85 +74,58 @@ auto DecodeDataPageHeaderFields(std::span<const std::byte> page, page_id_t expec
   }
 
   if (verify_checksum) {
-    const auto stored_checksum = GetLittleEndian<std::uint32_t>(page, data_page_offset::CHECKSUM);
-    if (!stored_checksum || *stored_checksum != Crc32WithZeroedU32(page, data_page_offset::CHECKSUM)) {
+    const auto stored_checksum = GetLittleEndianUnchecked<std::uint32_t>(page, data_page_offset::CHECKSUM);
+    if (stored_checksum != Crc32WithZeroedU32(page, data_page_offset::CHECKSUM)) {
       return std::unexpected(Status::Corruption("data-page checksum mismatch"));
     }
   }
 
-  const auto raw_type = GetLittleEndian<std::uint16_t>(page, data_page_offset::TYPE);
-  const auto version = GetLittleEndian<std::uint16_t>(page, data_page_offset::FORMAT_VERSION);
-  const auto page_id = GetLittleEndian<page_id_t>(page, data_page_offset::PAGE_ID);
-  const auto page_lsn = GetLittleEndian<std::uint64_t>(page, data_page_offset::PAGE_LSN);
-  const auto payload_bytes = GetLittleEndian<std::uint16_t>(page, data_page_offset::PAYLOAD_BYTES);
-  const auto flags = GetLittleEndian<std::uint16_t>(page, data_page_offset::FLAGS);
-  if (!raw_type || !version || !page_id || !page_lsn || !payload_bytes || !flags) {
-    return std::unexpected(Status::Corruption("truncated data-page header"));
-  }
-  const auto type = static_cast<DataPageType>(*raw_type);
-  if (*version != DATA_PAGE_FORMAT_VERSION) {
+  const auto type = static_cast<DataPageType>(GetLittleEndianUnchecked<std::uint16_t>(page, data_page_offset::TYPE));
+  const auto version = GetLittleEndianUnchecked<std::uint16_t>(page, data_page_offset::FORMAT_VERSION);
+  const auto page_id = GetLittleEndianUnchecked<page_id_t>(page, data_page_offset::PAGE_ID);
+  const auto page_lsn = GetLittleEndianUnchecked<std::uint64_t>(page, data_page_offset::PAGE_LSN);
+  const auto payload_bytes = GetLittleEndianUnchecked<std::uint16_t>(page, data_page_offset::PAYLOAD_BYTES);
+  const auto flags = GetLittleEndianUnchecked<std::uint16_t>(page, data_page_offset::FLAGS);
+  if (version != DATA_PAGE_FORMAT_VERSION) {
     return std::unexpected(Status::UnsupportedFormat("unsupported data-page format version"));
   }
   if (!IsKnownType(type)) {
     return std::unexpected(Status::Corruption("unknown data-page type"));
   }
-  if (*page_id != expected_page_id || *page_id < FIRST_DATA_PAGE_ID) {
+  if (page_id != expected_page_id || page_id < FIRST_DATA_PAGE_ID) {
     return std::unexpected(Status::Corruption("data-page ID does not match its file position"));
   }
-  if (*payload_bytes > PAGE_SIZE - data_page_offset::HEADER_BYTES || *flags != 0) {
+  if (payload_bytes > PAGE_SIZE - data_page_offset::HEADER_BYTES || flags != 0) {
     return std::unexpected(Status::Corruption("invalid data-page length or flags"));
   }
   return DataPageHeader{
-      .type = type, .page_id = *page_id, .page_lsn = *page_lsn, .payload_bytes = *payload_bytes, .flags = *flags};
+      .type = type, .page_id = page_id, .page_lsn = page_lsn, .payload_bytes = payload_bytes, .flags = flags};
 }
 
 }  // namespace
 
-auto InitializeDataPage(std::span<std::byte> page, DataPageType type, page_id_t page_id, std::uint64_t page_lsn,
-                        std::uint16_t payload_bytes) -> Status {
-  // This function accepts builder-owned memory, so bad arguments are caller
-  // errors. DecodeDataPageHeader maps equivalent failures from disk to
-  // Corruption/UnsupportedFormat instead.
-  if (page.size() != PAGE_SIZE) {
-    return Status::InvalidArgument("data page is not exactly one page");
-  }
-  if (!IsKnownType(type)) {
-    return Status::InvalidArgument("unknown data page type");
-  }
-  if (page_id < FIRST_DATA_PAGE_ID) {
-    return Status::InvalidArgument("data page ID overlaps the superblocks");
-  }
-  if (payload_bytes > PAGE_SIZE - data_page_offset::HEADER_BYTES) {
-    return Status::InvalidArgument("data-page payload exceeds one page");
-  }
-
+void InitializeDataPage(std::span<std::byte, PAGE_SIZE> page, DataPageType type, page_id_t page_id,
+                        std::uint64_t page_lsn, std::uint16_t payload_bytes) {
   // Rebuilding from a zero page ensures removed records and old free-space
   // fragments do not survive into checksummed persistent bytes.
   std::ranges::fill(page, std::byte{0});
-  const auto encoded = PutBytes(page, data_page_offset::MAGIC, DATA_PAGE_MAGIC) &&
-                       PutLittleEndian(page, data_page_offset::TYPE, static_cast<std::uint16_t>(type)) &&
-                       PutLittleEndian(page, data_page_offset::FORMAT_VERSION, DATA_PAGE_FORMAT_VERSION) &&
-                       PutLittleEndian(page, data_page_offset::PAGE_ID, page_id) &&
-                       PutLittleEndian(page, data_page_offset::PAGE_LSN, page_lsn) &&
-                       PutLittleEndian(page, data_page_offset::PAYLOAD_BYTES, payload_bytes) &&
-                       PutLittleEndian(page, data_page_offset::FLAGS, std::uint16_t{0}) &&
-                       PutLittleEndian(page, data_page_offset::CHECKSUM, std::uint32_t{0});
-  return encoded ? Status{} : Status::Corruption("internal data-page layout exceeds one page");
+  PutBytesUnchecked(page, data_page_offset::MAGIC, DATA_PAGE_MAGIC);
+  PutLittleEndianUnchecked(page, data_page_offset::TYPE, static_cast<std::uint16_t>(type));
+  PutLittleEndianUnchecked(page, data_page_offset::FORMAT_VERSION, DATA_PAGE_FORMAT_VERSION);
+  PutLittleEndianUnchecked(page, data_page_offset::PAGE_ID, page_id);
+  PutLittleEndianUnchecked(page, data_page_offset::PAGE_LSN, page_lsn);
+  PutLittleEndianUnchecked(page, data_page_offset::PAYLOAD_BYTES, payload_bytes);
+  PutLittleEndianUnchecked(page, data_page_offset::FLAGS, std::uint16_t{0});
+  PutLittleEndianUnchecked(page, data_page_offset::CHECKSUM, std::uint32_t{0});
 }
 
-auto FinalizeDataPage(std::span<std::byte> page) -> Status {
-  if (page.size() != PAGE_SIZE) {
-    return Status::InvalidArgument("data page is not exactly one page");
-  }
+void FinalizeDataPage(std::span<std::byte, PAGE_SIZE> page) {
   // The calculation treats an existing checksum as zero without changing the
   // page before it stores the new value.
-  if (!PutLittleEndian(page, data_page_offset::CHECKSUM, Crc32WithZeroedU32(page, data_page_offset::CHECKSUM))) {
-    return Status::Corruption("data-page checksum field exceeds one page");
-  }
-  return {};
+  PutLittleEndianUnchecked(page, data_page_offset::CHECKSUM, Crc32WithZeroedU32(page, data_page_offset::CHECKSUM));
 }
 
-auto RewriteDataPageLsn(std::span<std::byte> page, page_id_t expected_page_id,
+auto RewriteDataPageLsn(std::span<std::byte, PAGE_SIZE> page, page_id_t expected_page_id,
                         std::uint64_t page_lsn) -> Result<DataPageHeader> {
   // This is the transaction-to-durability boundary. Private pages were either
   // copied from an authenticated frame or produced by an internal codec, so
@@ -162,12 +136,8 @@ auto RewriteDataPageLsn(std::span<std::byte> page, page_id_t expected_page_id,
   if (!header) {
     return std::unexpected(header.error());
   }
-  if (!PutLittleEndian(page, data_page_offset::PAGE_LSN, page_lsn)) {
-    return std::unexpected(Status::Corruption("data-page LSN field exceeds one page"));
-  }
-  if (auto status = FinalizeDataPage(page); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
+  PutLittleEndianUnchecked(page, data_page_offset::PAGE_LSN, page_lsn);
+  FinalizeDataPage(page);
   header->page_lsn = page_lsn;
   return *header;
 }
@@ -176,11 +146,14 @@ auto DecodeDataPageHeader(std::span<const std::byte> page, page_id_t expected_pa
   return DecodeDataPageHeaderFields(page, expected_page_id, true);
 }
 
-auto InitializeFreeExtentPage(std::span<std::byte> page, page_id_t page_id, std::uint64_t page_lsn,
+auto InitializeFreeExtentPage(std::span<std::byte, PAGE_SIZE> page, page_id_t page_id, std::uint64_t page_lsn,
                               page_id_t next_page_id, std::span<const FreeExtent> extents) -> Status {
   // Validate the complete logical page before emitting any bytes. In
   // particular, adjacent extents must already have been coalesced by the
   // transaction allocator so there is one canonical representation.
+  if (page_id < FIRST_DATA_PAGE_ID) {
+    return Status::InvalidArgument("free-extent page ID overlaps the superblocks");
+  }
   if (next_page_id != HEADER_PAGE_ID && next_page_id < FIRST_DATA_PAGE_ID) {
     return Status::InvalidArgument("free-extent link overlaps the superblocks");
   }
@@ -203,22 +176,16 @@ auto InitializeFreeExtentPage(std::span<std::byte> page, page_id_t page_id, std:
 
   const auto payload_bytes = static_cast<std::uint16_t>(EXTENT_ENTRIES_OFFSET - data_page_offset::HEADER_BYTES +
                                                         extents.size() * EXTENT_ENTRY_BYTES);
-  if (auto status = InitializeDataPage(page, DataPageType::Allocator, page_id, page_lsn, payload_bytes); !status.Ok()) {
-    return status;
-  }
-  if (!PutLittleEndian(page, EXTENT_NEXT_PAGE_OFFSET, next_page_id) ||
-      !PutLittleEndian(page, EXTENT_COUNT_OFFSET, static_cast<std::uint16_t>(extents.size())) ||
-      !PutLittleEndian(page, EXTENT_RESERVED_OFFSET, std::uint16_t{0}) ||
-      !PutLittleEndian(page, EXTENT_RESERVED_OFFSET + sizeof(std::uint16_t), std::uint32_t{0})) {
-    return Status::Corruption("free-extent page header exceeds one page");
-  }
+  InitializeDataPage(page, DataPageType::Allocator, page_id, page_lsn, payload_bytes);
+  PutLittleEndianUnchecked(page, EXTENT_NEXT_PAGE_OFFSET, next_page_id);
+  PutLittleEndianUnchecked(page, EXTENT_COUNT_OFFSET, static_cast<std::uint16_t>(extents.size()));
+  PutLittleEndianUnchecked(page, EXTENT_RESERVED_OFFSET, std::uint16_t{0});
+  PutLittleEndianUnchecked(page, EXTENT_RESERVED_OFFSET + sizeof(std::uint16_t), std::uint32_t{0});
   for (std::size_t index = 0; index < extents.size(); ++index) {
     const auto offset = EXTENT_ENTRIES_OFFSET + index * EXTENT_ENTRY_BYTES;
-    if (!PutLittleEndian(page, offset, extents[index].first_page_id) ||
-        !PutLittleEndian(page, offset + sizeof(page_id_t), extents[index].page_count) ||
-        !PutLittleEndian(page, offset + sizeof(page_id_t) + sizeof(std::uint64_t), extents[index].retire_lsn)) {
-      return Status::Corruption("free extent exceeds allocator page");
-    }
+    PutLittleEndianUnchecked(page, offset, extents[index].first_page_id);
+    PutLittleEndianUnchecked(page, offset + sizeof(page_id_t), extents[index].page_count);
+    PutLittleEndianUnchecked(page, offset + sizeof(page_id_t) + sizeof(std::uint64_t), extents[index].retire_lsn);
   }
   return {};
 }
@@ -230,9 +197,7 @@ auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t n
   if (auto status = InitializeFreeExtentPage(bytes, page_id, page_lsn, next_page_id, extents); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  if (auto status = FinalizeDataPage(bytes); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
+  FinalizeDataPage(bytes);
   return output;
 }
 
@@ -244,33 +209,33 @@ auto DecodeFreeExtentPayload(std::span<const std::byte> page, page_id_t expected
       header.payload_bytes < EXTENT_ENTRIES_OFFSET - data_page_offset::HEADER_BYTES) {
     return std::unexpected(Status::Corruption("page is not free-extent metadata"));
   }
-  const auto next = GetLittleEndian<page_id_t>(page, EXTENT_NEXT_PAGE_OFFSET);
-  const auto count = GetLittleEndian<std::uint16_t>(page, EXTENT_COUNT_OFFSET);
-  const auto reserved16 = GetLittleEndian<std::uint16_t>(page, EXTENT_RESERVED_OFFSET);
-  const auto reserved32 = GetLittleEndian<std::uint32_t>(page, EXTENT_RESERVED_OFFSET + sizeof(std::uint16_t));
-  if (!next || !count || !reserved16 || !reserved32 || *reserved16 != 0 || *reserved32 != 0 ||
-      (*next != HEADER_PAGE_ID && *next < FIRST_DATA_PAGE_ID) || *count > FREE_EXTENTS_PER_PAGE ||
-      header.payload_bytes != EXTENT_ENTRIES_OFFSET - data_page_offset::HEADER_BYTES + *count * EXTENT_ENTRY_BYTES) {
+  const auto next = GetLittleEndianUnchecked<page_id_t>(page, EXTENT_NEXT_PAGE_OFFSET);
+  const auto count = GetLittleEndianUnchecked<std::uint16_t>(page, EXTENT_COUNT_OFFSET);
+  const auto reserved16 = GetLittleEndianUnchecked<std::uint16_t>(page, EXTENT_RESERVED_OFFSET);
+  const auto reserved32 = GetLittleEndianUnchecked<std::uint32_t>(page, EXTENT_RESERVED_OFFSET + sizeof(std::uint16_t));
+  if (reserved16 != 0 || reserved32 != 0 || (next != HEADER_PAGE_ID && next < FIRST_DATA_PAGE_ID) ||
+      count > FREE_EXTENTS_PER_PAGE ||
+      header.payload_bytes != EXTENT_ENTRIES_OFFSET - data_page_offset::HEADER_BYTES + count * EXTENT_ENTRY_BYTES) {
     return std::unexpected(Status::Corruption("invalid free-extent page header"));
   }
-  auto result = FreeExtentPage{.next_page_id = *next, .extents = {}};
-  result.extents.reserve(*count);
-  for (std::size_t index = 0; index < *count; ++index) {
+  auto result = FreeExtentPage{.next_page_id = next, .extents = {}};
+  result.extents.reserve(count);
+  for (std::size_t index = 0; index < count; ++index) {
     const auto offset = EXTENT_ENTRIES_OFFSET + index * EXTENT_ENTRY_BYTES;
-    const auto first = GetLittleEndian<page_id_t>(page, offset);
-    const auto pages = GetLittleEndian<std::uint64_t>(page, offset + sizeof(page_id_t));
-    const auto retired = GetLittleEndian<std::uint64_t>(page, offset + sizeof(page_id_t) + sizeof(std::uint64_t));
-    if (!first || !pages || !retired || *first < FIRST_DATA_PAGE_ID || *pages == 0 ||
-        *first > std::numeric_limits<page_id_t>::max() - *pages) {
+    const auto first = GetLittleEndianUnchecked<page_id_t>(page, offset);
+    const auto pages = GetLittleEndianUnchecked<std::uint64_t>(page, offset + sizeof(page_id_t));
+    const auto retired =
+        GetLittleEndianUnchecked<std::uint64_t>(page, offset + sizeof(page_id_t) + sizeof(std::uint64_t));
+    if (first < FIRST_DATA_PAGE_ID || pages == 0 || first > std::numeric_limits<page_id_t>::max() - pages) {
       return std::unexpected(Status::Corruption("invalid free extent"));
     }
     if (!result.extents.empty()) {
       const auto &previous = result.extents.back();
-      if (previous.first_page_id + previous.page_count >= *first) {
+      if (previous.first_page_id + previous.page_count >= first) {
         return std::unexpected(Status::Corruption("free extents overlap or are not coalesced"));
       }
     }
-    result.extents.push_back(FreeExtent{.first_page_id = *first, .page_count = *pages, .retire_lsn = *retired});
+    result.extents.push_back(FreeExtent{.first_page_id = first, .page_count = pages, .retire_lsn = retired});
   }
   return result;
 }
@@ -292,11 +257,14 @@ auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_pa
   return DecodeFreeExtentPayload(page, expected_page_id, validated_header);
 }
 
-auto InitializeOverflowPage(std::span<std::byte> page, page_id_t page_id, std::uint64_t page_lsn,
+auto InitializeOverflowPage(std::span<std::byte, PAGE_SIZE> page, page_id_t page_id, std::uint64_t page_lsn,
                             page_id_t owner_value_id, std::uint32_t chunk_index, page_id_t next_page_id,
                             std::span<const std::byte> payload) -> Status {
   if (payload.empty() || payload.size() > OVERFLOW_PAGE_PAYLOAD_BYTES) {
     return Status::InvalidArgument("overflow payload exceeds one page");
+  }
+  if (page_id < FIRST_DATA_PAGE_ID) {
+    return Status::InvalidArgument("overflow page ID overlaps the superblocks");
   }
   if (owner_value_id < FIRST_DATA_PAGE_ID) {
     return Status::InvalidArgument("overflow owner overlaps the superblocks");
@@ -308,19 +276,14 @@ auto InitializeOverflowPage(std::span<std::byte> page, page_id_t page_id, std::u
   // the zero-filled tail of the physical page.
   const auto payload_bytes =
       static_cast<std::uint16_t>(OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES + payload.size());
-  if (auto status = InitializeDataPage(page, DataPageType::Overflow, page_id, page_lsn, payload_bytes); !status.Ok()) {
-    return status;
-  }
-  const auto encoded = PutLittleEndian(page, OVERFLOW_OWNER_OFFSET, owner_value_id) &&
-                       PutLittleEndian(page, OVERFLOW_CHUNK_INDEX_OFFSET, chunk_index) &&
-                       PutLittleEndian(page, OVERFLOW_RESERVED32_OFFSET, std::uint32_t{0}) &&
-                       PutLittleEndian(page, OVERFLOW_NEXT_PAGE_OFFSET, next_page_id) &&
-                       PutLittleEndian(page, OVERFLOW_DATA_BYTES_OFFSET, static_cast<std::uint16_t>(payload.size())) &&
-                       PutLittleEndian(page, OVERFLOW_RESERVED16_OFFSET, std::uint16_t{0}) &&
-                       PutBytes(page, OVERFLOW_DATA_OFFSET, payload);
-  if (!encoded) {
-    return Status::Corruption("overflow page layout exceeds one page");
-  }
+  InitializeDataPage(page, DataPageType::Overflow, page_id, page_lsn, payload_bytes);
+  PutLittleEndianUnchecked(page, OVERFLOW_OWNER_OFFSET, owner_value_id);
+  PutLittleEndianUnchecked(page, OVERFLOW_CHUNK_INDEX_OFFSET, chunk_index);
+  PutLittleEndianUnchecked(page, OVERFLOW_RESERVED32_OFFSET, std::uint32_t{0});
+  PutLittleEndianUnchecked(page, OVERFLOW_NEXT_PAGE_OFFSET, next_page_id);
+  PutLittleEndianUnchecked(page, OVERFLOW_DATA_BYTES_OFFSET, static_cast<std::uint16_t>(payload.size()));
+  PutLittleEndianUnchecked(page, OVERFLOW_RESERVED16_OFFSET, std::uint16_t{0});
+  PutBytesUnchecked(page, OVERFLOW_DATA_OFFSET, payload);
   return {};
 }
 
@@ -334,9 +297,7 @@ auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t own
       !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  if (auto status = FinalizeDataPage(bytes); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
+  FinalizeDataPage(bytes);
   return output;
 }
 
@@ -348,26 +309,26 @@ auto DecodeOverflowPayload(std::span<const std::byte> page, page_id_t expected_p
       header.payload_bytes < OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES) {
     return std::unexpected(Status::Corruption("page is not an overflow page"));
   }
-  const auto owner = GetLittleEndian<page_id_t>(page, OVERFLOW_OWNER_OFFSET);
-  const auto chunk_index = GetLittleEndian<std::uint32_t>(page, OVERFLOW_CHUNK_INDEX_OFFSET);
-  const auto reserved32 = GetLittleEndian<std::uint32_t>(page, OVERFLOW_RESERVED32_OFFSET);
-  const auto next = GetLittleEndian<page_id_t>(page, OVERFLOW_NEXT_PAGE_OFFSET);
-  const auto data_bytes = GetLittleEndian<std::uint16_t>(page, OVERFLOW_DATA_BYTES_OFFSET);
-  const auto reserved16 = GetLittleEndian<std::uint16_t>(page, OVERFLOW_RESERVED16_OFFSET);
+  const auto owner = GetLittleEndianUnchecked<page_id_t>(page, OVERFLOW_OWNER_OFFSET);
+  const auto chunk_index = GetLittleEndianUnchecked<std::uint32_t>(page, OVERFLOW_CHUNK_INDEX_OFFSET);
+  const auto reserved32 = GetLittleEndianUnchecked<std::uint32_t>(page, OVERFLOW_RESERVED32_OFFSET);
+  const auto next = GetLittleEndianUnchecked<page_id_t>(page, OVERFLOW_NEXT_PAGE_OFFSET);
+  const auto data_bytes = GetLittleEndianUnchecked<std::uint16_t>(page, OVERFLOW_DATA_BYTES_OFFSET);
+  const auto reserved16 = GetLittleEndianUnchecked<std::uint16_t>(page, OVERFLOW_RESERVED16_OFFSET);
   // Cross-check the inner data length against the common outer payload length.
   // Redundant lengths are useful only if inconsistent encodings are rejected.
-  if (!owner || !chunk_index || !reserved32 || !next || !data_bytes || !reserved16 || *owner < FIRST_DATA_PAGE_ID ||
-      *reserved32 != 0 || *reserved16 != 0 || *data_bytes == 0 || *data_bytes > OVERFLOW_PAGE_PAYLOAD_BYTES ||
-      header.payload_bytes != OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES + *data_bytes ||
-      (*next != HEADER_PAGE_ID && *next < FIRST_DATA_PAGE_ID)) {
+  if (owner < FIRST_DATA_PAGE_ID || reserved32 != 0 || reserved16 != 0 || data_bytes == 0 ||
+      data_bytes > OVERFLOW_PAGE_PAYLOAD_BYTES ||
+      header.payload_bytes != OVERFLOW_DATA_OFFSET - data_page_offset::HEADER_BYTES + data_bytes ||
+      (next != HEADER_PAGE_ID && next < FIRST_DATA_PAGE_ID)) {
     return std::unexpected(Status::Corruption("invalid overflow page lengths or link"));
   }
   auto result = OverflowPage{
       .page_lsn = header.page_lsn,
-      .owner_value_id = *owner,
-      .chunk_index = *chunk_index,
-      .next_page_id = *next,
-      .payload = page.subspan(OVERFLOW_DATA_OFFSET, *data_bytes),
+      .owner_value_id = owner,
+      .chunk_index = chunk_index,
+      .next_page_id = next,
+      .payload = page.subspan(OVERFLOW_DATA_OFFSET, data_bytes),
   };
   return result;
 }

@@ -4,7 +4,6 @@
 #include "txn/contract.h"
 
 #include "storage/page.h"
-#include "util/check.h"
 
 #include <expected>
 #include <unordered_set>
@@ -13,14 +12,14 @@
 namespace tinydb {
 
 auto BTreeCursor::First(PageReader *pages, page_id_t root_page_id,
-                        page_id_t high_water_page_id) -> Result<BTreeCursor> {
+                        page_id_t logical_page_count) -> Result<BTreeCursor> {
   auto page = FindFirstLeaf(pages, root_page_id);
   if (!page) {
     return std::unexpected(std::move(page).error());
   }
 
-  auto cursor = BTreeCursor(pages, high_water_page_id);
-  if (auto status = cursor.OpenInitialLeaf(std::move(*page), 0); !status.Ok()) {
+  auto cursor = BTreeCursor(pages, logical_page_count);
+  if (auto status = cursor.OpenInitialLeaf(std::move(*page)); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   if (!cursor.Valid()) {
@@ -32,7 +31,7 @@ auto BTreeCursor::First(PageReader *pages, page_id_t root_page_id,
   return cursor;
 }
 
-auto BTreeCursor::Seek(PageReader *pages, page_id_t root_page_id, page_id_t high_water_page_id,
+auto BTreeCursor::Seek(PageReader *pages, page_id_t root_page_id, page_id_t logical_page_count,
                        std::string_view key) -> Result<BTreeCursor> {
   // Descent finds the only leaf that may contain key; LowerBound establishes
   // the first cursor position without copying the encoded key.
@@ -41,8 +40,8 @@ auto BTreeCursor::Seek(PageReader *pages, page_id_t root_page_id, page_id_t high
     return std::unexpected(std::move(page).error());
   }
 
-  auto cursor = BTreeCursor(pages, high_water_page_id);
-  if (auto status = cursor.OpenInitialLeaf(std::move(*page), 0); !status.Ok()) {
+  auto cursor = BTreeCursor(pages, logical_page_count);
+  if (auto status = cursor.OpenInitialLeaf(std::move(*page)); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   cursor.index_ = cursor.CurrentLeaf().LowerBound(key);
@@ -58,7 +57,7 @@ auto BTreeCursor::Seek(PageReader *pages, page_id_t root_page_id, page_id_t high
   return cursor;
 }
 
-auto BTreeCursor::OpenInitialLeaf(PageHandle page, std::size_t index) -> Status {
+auto BTreeCursor::OpenInitialLeaf(PageHandle page) -> Status {
   if (auto status = ValidateLeafId(page.Id()); !status.Ok()) {
     return status;
   }
@@ -66,15 +65,11 @@ auto BTreeCursor::OpenInitialLeaf(PageHandle page, std::size_t index) -> Status 
   if (!leaf) {
     return leaf.error();
   }
-  if (index > leaf->Count()) {
-    return Status::Corruption("cursor position lies beyond leaf records");
-  }
-
   // Adopt the new lease before retaining the borrowed view. PageHandle move
   // preserves the address returned by the page source.
   page_ = std::move(page);
   leaf_ = *leaf;
-  index_ = index;
+  index_ = 0;
   return {};
 }
 
@@ -122,8 +117,8 @@ auto BTreeCursor::AdvanceToNonEmptyLeaf(page_id_t page_id) -> Status {
 }
 
 auto BTreeCursor::ValidateLeafId(page_id_t page_id) const -> Status {
-  if (page_id < FIRST_DATA_PAGE_ID || page_id >= high_water_page_id_) {
-    return Status::Corruption("leaf page lies outside the allocation frontier");
+  if (page_id < FIRST_DATA_PAGE_ID || page_id >= logical_page_count_) {
+    return Status::Corruption("leaf page lies outside the logical page range");
   }
   return {};
 }

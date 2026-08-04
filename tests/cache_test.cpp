@@ -31,15 +31,15 @@ namespace {
 auto Path(std::string_view name) { return tinydb::test::Path(name); }
 
 void WritePages(tinydb::DiskManager &disk, std::size_t count) {
-  const auto high_water = tinydb::FIRST_DATA_PAGE_ID + count;
-  ASSERT_TRUE(disk.EnsurePageCount(high_water).Ok());
-  for (auto page_id = tinydb::FIRST_DATA_PAGE_ID; page_id < high_water; ++page_id) {
+  const auto logical_page_count = tinydb::FIRST_DATA_PAGE_ID + count;
+  ASSERT_TRUE(disk.EnsurePageCount(logical_page_count).Ok());
+  for (auto page_id = tinydb::FIRST_DATA_PAGE_ID; page_id < logical_page_count; ++page_id) {
     const auto encoded = tinydb::storage::EncodeFreeExtentPage(page_id, 1, tinydb::HEADER_PAGE_ID, {});
     ASSERT_TRUE(encoded.has_value());
-    ASSERT_TRUE(disk.WriteCheckpointPage(page_id, encoded->data(), high_water).Ok());
+    ASSERT_TRUE(disk.WriteCheckpointPage(page_id, encoded->data(), logical_page_count).Ok());
   }
   ASSERT_TRUE(disk.Sync().Ok());
-  ASSERT_TRUE(disk.CommitCheckpoint(tinydb::FIRST_DATA_PAGE_ID, tinydb::HEADER_PAGE_ID, high_water, 1).Ok());
+  ASSERT_TRUE(disk.CommitCheckpoint(tinydb::FIRST_DATA_PAGE_ID, tinydb::HEADER_PAGE_ID, logical_page_count, 1).Ok());
 }
 
 auto Image(tinydb::page_id_t page_id, std::uint64_t page_lsn) -> tinydb::cache::CommittedPageImage {
@@ -64,7 +64,7 @@ TEST(Cache, Lru) {
   tinydb::test::Remove(path);
   auto disk = tinydb::DiskManager::Open(path).value();
   WritePages(disk, 3);
-  auto cache = tinydb::cache::CommittedPageCache(&disk, 2U * tinydb::PAGE_SIZE, 1);
+  auto cache = tinydb::cache::CommittedPageCache(disk, 2U * tinydb::PAGE_SIZE, 1);
 
   {
     auto first = cache.Read(2);  // [2]
@@ -92,7 +92,7 @@ TEST(Cache, Pins) {
   tinydb::test::Remove(path);
   auto disk = tinydb::DiskManager::Open(path).value();
   WritePages(disk, 2);
-  auto cache = tinydb::cache::CommittedPageCache(&disk, tinydb::PAGE_SIZE, 1);
+  auto cache = tinydb::cache::CommittedPageCache(disk, tinydb::PAGE_SIZE, 1);
 
   {
     auto pinned = cache.Read(2);
@@ -114,7 +114,7 @@ TEST(Cache, PinnedLruTailDoesNotBlockAnotherVictim) {
   tinydb::test::Remove(path);
   auto disk = tinydb::DiskManager::Open(path).value();
   WritePages(disk, 3);
-  auto cache = tinydb::cache::CommittedPageCache(&disk, 2U * tinydb::PAGE_SIZE, 1);
+  auto cache = tinydb::cache::CommittedPageCache(disk, 2U * tinydb::PAGE_SIZE, 1);
 
   auto pinned = cache.Read(2);
   ASSERT_TRUE(pinned.has_value());
@@ -136,7 +136,7 @@ TEST(Cache, DifferentMissesLoadConcurrently) {
   tinydb::test::Remove(path);
   auto disk = tinydb::DiskManager::Open(path).value();
   WritePages(disk, 2);
-  auto cache = tinydb::cache::CommittedPageCache(&disk, 2U * tinydb::PAGE_SIZE, 1);
+  auto cache = tinydb::cache::CommittedPageCache(disk, 2U * tinydb::PAGE_SIZE, 1);
 
   auto page2_entered = std::promise<void>{};
   auto page3_entered = std::promise<void>{};
@@ -189,7 +189,7 @@ TEST(Cache, ActiveLoadReservesCapacity) {
   tinydb::test::Remove(path);
   auto disk = tinydb::DiskManager::Open(path).value();
   WritePages(disk, 2);
-  auto cache = tinydb::cache::CommittedPageCache(&disk, tinydb::PAGE_SIZE, 1);
+  auto cache = tinydb::cache::CommittedPageCache(disk, tinydb::PAGE_SIZE, 1);
 
   auto load_entered = std::promise<void>{};
   auto release = std::promise<void>{};
@@ -237,7 +237,7 @@ TEST(Cache, FailedLoadReleasesCapacity) {
   tinydb::test::Remove(path);
   auto disk = tinydb::DiskManager::Open(path).value();
   WritePages(disk, 2);
-  auto cache = tinydb::cache::CommittedPageCache(&disk, tinydb::PAGE_SIZE, 1);
+  auto cache = tinydb::cache::CommittedPageCache(disk, tinydb::PAGE_SIZE, 1);
 
   tinydb::test::WithHook(
       [&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
@@ -262,7 +262,7 @@ TEST(Cache, Checkpoint) {
   const auto path = Path("cache_checkpoint");
   tinydb::test::Remove(path);
   auto disk = tinydb::DiskManager::Open(path).value();
-  auto cache = tinydb::cache::CommittedPageCache(&disk, tinydb::PAGE_SIZE, 0);
+  auto cache = tinydb::cache::CommittedPageCache(disk, tinydb::PAGE_SIZE, 0);
 
   auto images = std::vector<tinydb::cache::CommittedPageImage>{};
   images.push_back(Image(2, 1));

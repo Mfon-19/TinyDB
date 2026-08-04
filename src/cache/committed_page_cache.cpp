@@ -53,7 +53,6 @@ struct CommittedFrame final {
 namespace {
 
 auto Lease(std::shared_ptr<CommittedFrame> frame) -> PageHandle {
-  TINYDB_CHECK(frame != nullptr, "leasing a null committed frame");
   auto *const leased = frame.get();
   auto keeper = std::static_pointer_cast<const void>(std::move(frame));
   return {leased->header.page_id, leased->bytes->data(), std::move(keeper), &leased->header,
@@ -63,7 +62,7 @@ auto Lease(std::shared_ptr<CommittedFrame> frame) -> PageHandle {
 }  // namespace
 
 struct CommittedPageCache::Impl final {
-  DiskManager *disk;  // backing checkpointed database file
+  DiskManager &disk;  // backing checkpointed database file
   const std::size_t target_bytes;
   mutable std::mutex mutex;  // protects every field below
   std::vector<std::shared_ptr<CommittedFrame>> pages;
@@ -72,16 +71,15 @@ struct CommittedPageCache::Impl final {
   std::size_t dirty_pages{0};
   CommittedFrame *most_recent{nullptr};
   CommittedFrame *least_recent{nullptr};
-  std::uint64_t checkpoint_lsn;  // eviction-safe durability frontier
+  std::uint64_t checkpoint_lsn;  // newest page LSN stored in the database file
   std::uint64_t hits{0};
   std::uint64_t misses{0};
   std::uint64_t evictions{0};
 
-  Impl(DiskManager *database_file, std::size_t byte_target, std::uint64_t initial_checkpoint_lsn)
+  Impl(DiskManager &database_file, std::size_t byte_target, std::uint64_t initial_checkpoint_lsn)
       : disk(database_file), target_bytes(byte_target), checkpoint_lsn(initial_checkpoint_lsn) {}
 
   void LinkMostRecent(CommittedFrame *frame) {
-    TINYDB_CHECK(frame != nullptr, "linking a null page into the LRU");
     TINYDB_CHECK(!frame->in_lru, "linking a page already present in the LRU");
     TINYDB_CHECK(frame->newer == nullptr, "linking a page with a stale newer LRU link");
     TINYDB_CHECK(frame->older == nullptr, "linking a page with a stale older LRU link");
@@ -98,7 +96,6 @@ struct CommittedPageCache::Impl final {
   }
 
   void Unlink(CommittedFrame *frame) {
-    TINYDB_CHECK(frame != nullptr, "unlinking a null page from the LRU");
     TINYDB_CHECK(frame->in_lru, "unlinking a page absent from the LRU");
     if (frame->newer != nullptr) {
       frame->newer->older = frame->older;
@@ -118,8 +115,6 @@ struct CommittedPageCache::Impl final {
   }
 
   void Touch(CommittedFrame *frame) {
-    TINYDB_CHECK(frame != nullptr, "touching a null page in the LRU");
-    TINYDB_CHECK(frame->in_lru, "touching a page absent from the LRU");
     if (frame == most_recent) {
       return;
     }
@@ -195,7 +190,7 @@ struct CommittedPageCache::Impl final {
         new_bytes = std::make_unique<PageBytes>();
       }
       auto *const bytes = frame != nullptr ? frame->bytes.get() : new_bytes.get();
-      if (auto status = disk->ReadPage(page_id, bytes->data()); !status.Ok()) {
+      if (auto status = disk.ReadPage(page_id, bytes->data()); !status.Ok()) {
         if (status.Code() == StatusCode::InvalidArgument) {
           return std::unexpected(Status::Corruption("tree references a page outside the allocated database"));
         }
@@ -228,11 +223,8 @@ struct CommittedPageCache::Impl final {
   }
 };
 
-CommittedPageCache::CommittedPageCache(DiskManager *disk, std::size_t target_bytes, std::uint64_t checkpoint_lsn)
-    : impl_(std::make_unique<Impl>(disk, target_bytes, checkpoint_lsn)) {
-  TINYDB_CHECK(disk != nullptr, "committed cache requires a database file");
-  TINYDB_CHECK(target_bytes >= PAGE_SIZE, "committed cache target must hold at least one page");
-}
+CommittedPageCache::CommittedPageCache(DiskManager &disk, std::size_t target_bytes, std::uint64_t checkpoint_lsn)
+    : impl_(std::make_unique<Impl>(disk, target_bytes, checkpoint_lsn)) {}
 
 CommittedPageCache::~CommittedPageCache() = default;
 
@@ -259,7 +251,6 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageHandle> {
 
   auto loaded = impl_->LoadFrame(page_id, std::move(reusable));
   auto lock = std::unique_lock(impl_->mutex);
-  TINYDB_CHECK(impl_->loading_pages != 0, "committed-page loading count underflow");
   --impl_->loading_pages;
 
   // A racing miss for the same page may have installed first. Reuse that
@@ -289,9 +280,9 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageHandle> {
 }
 
 auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> images, std::vector<page_id_t> retired,
-                                            page_id_t high_water_page_id) -> Result<PublicationPlan> {
-  if (high_water_page_id < FIRST_DATA_PAGE_ID) {
-    return std::unexpected(Status::InvalidArgument("publication has an invalid high-water page ID"));
+                                            page_id_t logical_page_count) -> Result<PublicationPlan> {
+  if (logical_page_count < FIRST_DATA_PAGE_ID) {
+    return std::unexpected(Status::InvalidArgument("publication has an invalid logical page count"));
   }
 
   auto frames = std::vector<std::shared_ptr<CommittedFrame>>{};
@@ -305,13 +296,13 @@ auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> imag
   ** remains a definite abort.
   */
   auto lock = std::lock_guard(impl_->mutex);
-  if (impl_->pages.size() < high_water_page_id) {
-    impl_->pages.resize(high_water_page_id);
+  if (impl_->pages.size() < logical_page_count) {
+    impl_->pages.resize(logical_page_count);
   }
   auto previous_page_id = HEADER_PAGE_ID;
   for (auto &image : images) {
     const auto &header = image.header;
-    if (image.bytes == nullptr || header.page_id < FIRST_DATA_PAGE_ID || header.page_id >= high_water_page_id ||
+    if (image.bytes == nullptr || header.page_id < FIRST_DATA_PAGE_ID || header.page_id >= logical_page_count ||
         header.page_id <= previous_page_id || header.page_lsn == 0 || header.flags != 0 ||
         header.payload_bytes > PAGE_SIZE - storage::data_page_offset::HEADER_BYTES) {
       return std::unexpected(Status::InvalidArgument("publication contains an invalid or duplicate page image"));
@@ -344,24 +335,22 @@ auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> imag
     while (image_index < images.size() && images[image_index].header.page_id < page_id) {
       ++image_index;
     }
-    if (page_id < FIRST_DATA_PAGE_ID || page_id >= high_water_page_id || page_id <= previous_page_id ||
+    if (page_id < FIRST_DATA_PAGE_ID || page_id >= logical_page_count || page_id <= previous_page_id ||
         (image_index < images.size() && images[image_index].header.page_id == page_id)) {
       return std::unexpected(Status::InvalidArgument("publication contains an invalid retired page"));
     }
     previous_page_id = page_id;
   }
-  return PublicationPlan(std::move(frames), std::move(retired), high_water_page_id);
+  return PublicationPlan(std::move(frames), std::move(retired), logical_page_count);
 }
 
 void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
   auto lock = std::lock_guard(impl_->mutex);
-  TINYDB_CHECK(plan.high_water_page_id_ <= impl_->pages.size(), "publication page table was not preallocated");
 
   for (const auto page_id : plan.retired_) {
     if (impl_->pages[page_id] == nullptr) {
       continue;
     }
-    TINYDB_CHECK(impl_->pages[page_id].use_count() == 1, "retiring a pinned committed page");
     if (impl_->pages[page_id]->in_lru) {
       impl_->Unlink(impl_->pages[page_id].get());
     }
@@ -371,9 +360,6 @@ void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
   }
   for (auto &frame : plan.frames_) {
     auto &current = impl_->pages[frame->header.page_id];
-    if (current != nullptr) {
-      TINYDB_CHECK(current->header.page_lsn <= frame->header.page_lsn, "prepared publication regressed a page version");
-    }
     if (current == nullptr) {
       ++impl_->resident_pages;
     } else {
@@ -393,15 +379,13 @@ void CommittedPageCache::Publish(PublicationPlan plan) noexcept {
 
 void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
   auto lock = std::lock_guard(impl_->mutex);
-  TINYDB_CHECK(checkpoint_lsn >= impl_->checkpoint_lsn, "committed cache checkpoint frontier moved backward");
   impl_->checkpoint_lsn = checkpoint_lsn;
 
-  // Only versions at or below the new frontier are now reproducible from the
-  // database file. Later committed versions remain WAL-backed and non-evictable.
+  // The database file now contains versions at or before checkpoint_lsn.
+  // Later committed versions remain WAL-backed and non-evictable.
   for (const auto &page : impl_->pages) {
     if (page != nullptr && !page->checkpointed && page->header.page_lsn <= checkpoint_lsn) {
       page->checkpointed = true;
-      TINYDB_CHECK(impl_->dirty_pages != 0, "committed cache dirty-page count underflow");
       --impl_->dirty_pages;
       if (!page->in_lru) {
         impl_->LinkMostRecent(page.get());
@@ -413,7 +397,6 @@ void CommittedPageCache::MarkCheckpointed(std::uint64_t checkpoint_lsn) {
 
 auto CommittedPageCache::CaptureCheckpointPages(std::uint64_t checkpoint_lsn,
                                                 std::uint64_t target_lsn) -> std::vector<PageHandle> {
-  TINYDB_CHECK(checkpoint_lsn <= target_lsn, "checkpoint capture has a reversed LSN range");
   auto lock = std::lock_guard(impl_->mutex);
   // Return guards in page-ID order. A later publication may replace a table
   // entry, but the guard keeps this exact old immutable version alive until

@@ -51,7 +51,7 @@ struct Stats {
 **
 **   extend file -> write captured pages -> fsync data
 **   -> write inactive superblock -> fsync superblock
-**   -> advance in-memory frontier -> mark cache versions checkpointed
+**   -> publish checkpoint LSN -> mark cache versions checkpointed
 **   -> reset covered WAL -> fsync clean WAL header
 **
 ** Failure before the superblock fsync leaves the old superblock and WAL
@@ -60,7 +60,7 @@ struct Stats {
 */
 class Manager final {
  public:
-  Manager(DiskManager *disk, cache::CommittedPageCache *cache, txn::ReaderGate *readers, Wal *wal,
+  Manager(DiskManager &disk, cache::CommittedPageCache &cache, txn::ReaderGate &readers, Wal &wal,
           CheckpointOptions options = {});
 
   Manager(const Manager &) = delete;
@@ -74,10 +74,10 @@ class Manager final {
  private:
   auto Record(Status status) -> Status;
 
-  DiskManager *disk_;
-  cache::CommittedPageCache *cache_;
-  txn::ReaderGate *readers_;
-  Wal *wal_;
+  DiskManager &disk_;
+  cache::CommittedPageCache &cache_;
+  txn::ReaderGate &readers_;
+  Wal &wal_;
   CheckpointOptions options_;
 
   mutable std::mutex state_mutex_;  // protects failure/time diagnostics

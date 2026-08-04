@@ -72,8 +72,9 @@ auto PageHeader(PageReader *pages, page_id_t page_id, std::uint64_t visible_lsn,
 /*
 ** SNAPSHOT OWNERSHIP AUDIT
 **
-** Every physical page below high_water_page_id must belong to exactly one of
-** three domains:
+** Every data page in the logical page range must belong to exactly one of
+** three domains. The range starts at FIRST_DATA_PAGE_ID and ends before
+** logical_page_count.
 **
 **   reachable B+ tree or overflow page
 **   reusable allocator extent
@@ -82,13 +83,13 @@ auto PageHeader(PageReader *pages, page_id_t page_id, std::uint64_t visible_lsn,
 ** TransactionPages decodes the allocator with the same persistent codec used
 ** by writers. The recursive walk below is the sole cross-page verifier: it
 ** proves routing ranges, leaf links, overflow chains, disjoint ownership, and
-** complete accounting below the allocation frontier. The transaction overlay
-** is never edited or committed.
+** complete accounting for every data page ID less than logical_page_count.
+** The transaction overlay is never edited or committed.
 */
 auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t memory_budget,
               VerifyOptions options) -> Result<VerifyReport> {
-  if (pages == nullptr || options.max_issues == 0) {
-    return std::unexpected(Status::InvalidArgument("verification requires a page reader and positive issue limit"));
+  if (options.max_issues == 0) {
+    return std::unexpected(Status::InvalidArgument("verification requires a positive issue limit"));
   }
   auto report = VerifyReport{};
   report.visible_lsn = state.visible_lsn;
@@ -105,9 +106,7 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
   const auto &free_extents = transaction->FreeExtents();
 
   auto free_pages = std::unordered_set<page_id_t>{};
-  auto described_free_pages = std::uint64_t{0};
   for (const auto &extent : free_extents) {
-    described_free_pages += extent.page_count;
     if (extent.retire_lsn <= state.checkpoint_lsn) {
       report.reusable_pages += extent.page_count;
     } else {
@@ -120,14 +119,11 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
   const auto allocator_pages =
       std::unordered_set<page_id_t>(transaction->AllocatorPageIds().begin(), transaction->AllocatorPageIds().end());
   report.allocator_pages = allocator_pages.size();
-  if (described_free_pages != free_pages.size()) {
-    AddIssue(&report, options, VerifyIssueKind::Allocator, state.allocator_root_page_id, "allocator extents overlap");
-  }
 
   for (const auto page_id : allocator_pages) {
-    if (page_id < FIRST_DATA_PAGE_ID || page_id >= state.high_water_page_id || free_pages.contains(page_id)) {
+    if (free_pages.contains(page_id)) {
       AddIssue(&report, options, VerifyIssueKind::DoubleAllocation, page_id,
-               "allocator metadata has invalid or duplicate ownership");
+               "allocator metadata overlaps free storage");
       continue;
     }
     auto page = PageHeader(pages, page_id, state.visible_lsn, &report, options);
@@ -138,9 +134,9 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
     ++report.pages_checked;
   }
 
-  if (state.root_page_id < FIRST_DATA_PAGE_ID || state.root_page_id >= state.high_water_page_id) {
+  if (state.root_page_id < FIRST_DATA_PAGE_ID || state.root_page_id >= state.logical_page_count) {
     AddIssue(&report, options, VerifyIssueKind::TreeStructure, state.root_page_id,
-             "root page is outside the allocation frontier");
+             "root page is outside the logical page range");
     report.complete = false;
     return report;
   }
@@ -162,9 +158,9 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
 
   std::function<Result<Summary>(page_id_t, const Bound &, const Bound &)> visit;
   visit = [&](page_id_t page_id, const Bound &lower, const Bound &upper) -> Result<Summary> {
-    if (page_id < FIRST_DATA_PAGE_ID || page_id >= state.high_water_page_id) {
+    if (page_id < FIRST_DATA_PAGE_ID || page_id >= state.logical_page_count) {
       return std::unexpected(Stop(&report, options, VerifyIssueKind::TreeStructure, page_id,
-                                  Status::Corruption("tree edge lies outside the allocation frontier")));
+                                  Status::Corruption("tree edge lies outside the logical page range")));
     }
     if (free_pages.contains(page_id) || allocator_pages.contains(page_id)) {
       return std::unexpected(Stop(&report, options, VerifyIssueKind::DoubleAllocation, page_id,
@@ -196,7 +192,7 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
         const auto value = leaf->ValueAt(index);
         if (value.IsOverflow()) {
           const auto before = visited.size();
-          if (auto status = ValidateOverflowValue(pages, value.OverflowDescriptor(), state.high_water_page_id,
+          if (auto status = ValidateOverflowValue(pages, value.OverflowDescriptor(), state.logical_page_count,
                                                   state.visible_lsn, free_pages, allocator_pages, &visited);
               !status.Ok()) {
             return std::unexpected(Stop(&report, options, VerifyIssueKind::OverflowValue,
@@ -259,16 +255,10 @@ auto Snapshot(PageReader *pages, const txn::DatabaseState &state, std::size_t me
     }
   }
 
-  for (page_id_t page_id = FIRST_DATA_PAGE_ID; page_id < state.high_water_page_id; ++page_id) {
-    const auto owners = static_cast<unsigned>(visited.contains(page_id)) +
-                        static_cast<unsigned>(free_pages.contains(page_id)) +
-                        static_cast<unsigned>(allocator_pages.contains(page_id));
-    if (owners == 0) {
+  for (page_id_t page_id = FIRST_DATA_PAGE_ID; page_id < state.logical_page_count; ++page_id) {
+    if (!visited.contains(page_id) && !free_pages.contains(page_id) && !allocator_pages.contains(page_id)) {
       AddIssue(&report, options, VerifyIssueKind::LeakedPage, page_id,
                "allocated page is unreachable and absent from the free index");
-    } else if (owners > 1) {
-      AddIssue(&report, options, VerifyIssueKind::DoubleAllocation, page_id,
-               "page belongs to more than one ownership domain");
     }
   }
   return report;

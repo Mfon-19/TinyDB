@@ -1,6 +1,5 @@
 #include "txn/commit_coordinator.h"
 
-#include "util/check.h"
 #include "wal/wal.h"
 
 #include "btree/b_plus_tree.h"
@@ -76,7 +75,7 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
     return std::unexpected(prepared_wal.error());
   }
   auto publication_plan =
-      cache.PreparePublication(std::move(committed_pages), std::move(retired), state.high_water_page_id);
+      cache.PreparePublication(std::move(committed_pages), std::move(retired), state.logical_page_count);
   if (!publication_plan) {
     record_prepare();
     transaction.Abort();
@@ -95,8 +94,6 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
     transaction.Abort();
     return std::unexpected(durable.error());
   }
-  TINYDB_CHECK(*durable == state.visible_lsn, "WAL committed a different transaction frontier");
-
   /*
   ** INFALLIBLE PUBLICATION
   **

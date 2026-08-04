@@ -16,15 +16,15 @@ namespace tinydb {
 **
 ** DiskManager owns the database file descriptor and the metadata represented
 ** by the newest durable superblock. It performs physical page I/O and durable
-** superblock selection; it does not track the newer state visible only through
+** superblock selection. It does not track the newer state visible only through
 ** the committed cache and WAL. Logical allocation, retirement, and reuse
 ** belong to TransactionPages.
 **
-** Checkpoint data pages are written against an explicit captured high-water
-** frontier. CommitCheckpoint then writes only the inactive superblock and
+** Checkpoint data pages are written against a captured logical page count.
+** CommitCheckpoint then writes only the inactive superblock and
 ** synchronizes it before adopting the captured metadata in memory. Until that
 ** synchronization succeeds, the previously selected superblock and WAL remain
-** the recovery basis. Superblocks are checkpoint artifacts; they are never
+** the recovery basis. Superblocks are checkpoint artifacts. They are never
 ** transaction page images.
 */
 
@@ -40,16 +40,16 @@ class DiskManager {
 
   auto GetRootPageId() const -> page_id_t;
   auto GetAllocatorRootPageId() const -> page_id_t;
-  auto HighWaterPageId() const -> page_id_t;
+  auto LogicalPageCount() const -> page_id_t;
   auto CheckpointLsn() const -> std::uint64_t;
   auto Uuid() const -> const DatabaseUuid &;
 
-  // Checkpoint data-page writes may need to extend the file to the published
-  // logical frontier. Allocation itself never performs this physical growth.
-  auto EnsurePageCount(page_id_t high_water_page_id) -> Status;
+  // Checkpoint data-page writes can extend the file to the committed logical
+  // page count. Allocation itself never performs this physical growth.
+  auto EnsurePageCount(page_id_t logical_page_count) -> Status;
 
-  auto WriteCheckpointPage(page_id_t page_id, const char *data, page_id_t captured_high_water_page_id) const -> Status;
-  auto CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t high_water_page_id,
+  auto WriteCheckpointPage(page_id_t page_id, const char *data, page_id_t captured_logical_page_count) const -> Status;
+  auto CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t logical_page_count,
                         std::uint64_t checkpoint_lsn) -> Status;
   auto Sync() const -> Status;
 

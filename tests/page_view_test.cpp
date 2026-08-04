@@ -26,7 +26,7 @@
 namespace {
 
 void Seal(std::array<char, tinydb::PAGE_SIZE> &page) {
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{page})).Ok());
+  tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{page}));
 }
 
 TEST(Page, LeafSearch) {
@@ -126,7 +126,7 @@ TEST(Page, Identity) {
   const auto slot = tinydb::storage::GetLittleEndian<tinydb::slot_t>(bytes, tinydb::LEAF_HEADER_SIZE);
   ASSERT_TRUE(slot.has_value());
   bytes[slot.value_or(0) + tinydb::leaf_cell_offset::VALUE_KIND] = std::byte{0x7f};
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
+  tinydb::storage::FinalizeDataPage(bytes);
   EXPECT_EQ(tinydb::LeafPageView::Open(leaf_page.data(), 2).error().Code(), tinydb::StatusCode::Corruption);
 }
 
@@ -139,7 +139,7 @@ TEST(Page, Slots) {
 
   auto bytes = std::as_writable_bytes(std::span{page});
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::LEAF_HEADER_SIZE, tinydb::slot_t{1}));
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
+  tinydb::storage::FinalizeDataPage(bytes);
   const auto view = tinydb::LeafPageView::Open(page.data(), 2);
   ASSERT_FALSE(view.has_value());
   EXPECT_EQ(view.error().Code(), tinydb::StatusCode::Corruption);
@@ -155,7 +155,7 @@ TEST(Page, Links) {
   // The header link is the mandatory leftmost child of an internal page.
   auto bytes = std::as_writable_bytes(std::span{internal_page});
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::node_page_offset::LINK, tinydb::HEADER_PAGE_ID));
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
+  tinydb::storage::FinalizeDataPage(bytes);
   EXPECT_EQ(tinydb::InternalPageView::Open(internal_page.data(), 5).error().Code(), tinydb::StatusCode::Corruption);
 
   internal.Store(internal_page.data(), 5);
@@ -168,7 +168,7 @@ TEST(Page, Links) {
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::INTERNAL_HEADER_SIZE, second_slot.value_or(0)));
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::INTERNAL_HEADER_SIZE + tinydb::SLOT_SIZE,
                                                first_slot.value_or(0)));
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
+  tinydb::storage::FinalizeDataPage(bytes);
   EXPECT_EQ(tinydb::InternalPageView::Open(internal_page.data(), 5).error().Code(), tinydb::StatusCode::Corruption);
 
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
@@ -176,7 +176,7 @@ TEST(Page, Links) {
   Seal(leaf_page);
   bytes = std::as_writable_bytes(std::span{leaf_page});
   ASSERT_TRUE(tinydb::storage::PutLittleEndian(bytes, tinydb::node_page_offset::LINK, tinydb::SUPERBLOCK_B_PAGE_ID));
-  ASSERT_TRUE(tinydb::storage::FinalizeDataPage(bytes).Ok());
+  tinydb::storage::FinalizeDataPage(bytes);
   EXPECT_EQ(tinydb::LeafPageView::Open(leaf_page.data(), 6).error().Code(), tinydb::StatusCode::Corruption);
 }
 
@@ -202,7 +202,7 @@ TEST(Page, Mutations) {
     for (int mutation = 0; mutation < mutation_count(rng); ++mutation) {
       page[offset(rng)] = static_cast<char>(byte(rng));
     }
-    ASSERT_TRUE(tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{page})).Ok());
+    tinydb::storage::FinalizeDataPage(std::as_writable_bytes(std::span{page}));
 
     const auto view = tinydb::LeafPageView::Open(page.data(), 2);
     if (!view) {

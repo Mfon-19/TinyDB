@@ -2,7 +2,6 @@
 
 #include "storage/encoding.h"
 #include "storage/page_codec.h"
-#include "util/check.h"
 #include "util/crc32.h"
 
 #include <algorithm>
@@ -17,6 +16,10 @@
 namespace tinydb::wal_format {
 namespace {
 
+static_assert(COMMIT_STATE_RESERVED_OFFSET + sizeof(std::uint32_t) <= COMMIT_STATE_PAYLOAD_BYTES);
+static_assert(header_offset::ENCODED_BYTES <= HEADER_BYTES);
+static_assert(record_offset::PAYLOAD == RECORD_HEADER_BYTES);
+
 auto NonzeroUuid(const DatabaseUuid &uuid) -> bool {
   return std::ranges::any_of(uuid, [](std::byte byte) { return byte != std::byte{0}; });
 }
@@ -27,9 +30,9 @@ auto KnownRecordType(RecordType type) -> bool {
 
 auto ValidState(const txn::DatabaseState &state) -> bool {
   const auto valid_reference = [&](page_id_t page_id) {
-    return page_id == HEADER_PAGE_ID || (page_id >= FIRST_DATA_PAGE_ID && page_id < state.high_water_page_id);
+    return page_id == HEADER_PAGE_ID || (page_id >= FIRST_DATA_PAGE_ID && page_id < state.logical_page_count);
   };
-  return state.visible_lsn != 0 && state.high_water_page_id >= FIRST_DATA_PAGE_ID &&
+  return state.visible_lsn != 0 && state.logical_page_count >= FIRST_DATA_PAGE_ID &&
          valid_reference(state.root_page_id) && valid_reference(state.allocator_root_page_id) &&
          state.checkpoint_lsn <= state.visible_lsn;
 }
@@ -37,19 +40,16 @@ auto ValidState(const txn::DatabaseState &state) -> bool {
 // Validates the final database state and encodes the terminal CommitState
 // payload. The payload also records the number of page images.
 auto EncodeCommitState(const txn::DatabaseState &state,
-                       std::size_t page_count) -> Result<std::array<std::byte, COMMIT_STATE_PAYLOAD_BYTES>> {
-  if (!ValidState(state) || page_count == 0 || page_count > std::numeric_limits<std::uint32_t>::max()) {
+                       std::size_t page_image_count) -> Result<std::array<std::byte, COMMIT_STATE_PAYLOAD_BYTES>> {
+  if (!ValidState(state) || page_image_count == 0 || page_image_count > std::numeric_limits<std::uint32_t>::max()) {
     return std::unexpected(Status::InvalidArgument("invalid WAL commit state"));
   }
   auto payload = std::array<std::byte, COMMIT_STATE_PAYLOAD_BYTES>{};
-  const auto encoded =
-      storage::PutLittleEndian(payload, COMMIT_STATE_ROOT_OFFSET, state.root_page_id) &&
-      storage::PutLittleEndian(payload, COMMIT_STATE_ALLOCATOR_ROOT_OFFSET, state.allocator_root_page_id) &&
-      storage::PutLittleEndian(payload, COMMIT_STATE_HIGH_WATER_OFFSET, state.high_water_page_id) &&
-      storage::PutLittleEndian(payload, COMMIT_STATE_PAGE_COUNT_OFFSET, static_cast<std::uint32_t>(page_count));
-  if (!encoded) {
-    return std::unexpected(Status::Corruption("internal WAL commit-state layout exceeds its buffer"));
-  }
+  storage::PutLittleEndianUnchecked(payload, COMMIT_STATE_ROOT_OFFSET, state.root_page_id);
+  storage::PutLittleEndianUnchecked(payload, COMMIT_STATE_ALLOCATOR_ROOT_OFFSET, state.allocator_root_page_id);
+  storage::PutLittleEndianUnchecked(payload, COMMIT_STATE_LOGICAL_PAGE_COUNT_OFFSET, state.logical_page_count);
+  storage::PutLittleEndianUnchecked(payload, COMMIT_STATE_PAGE_IMAGE_COUNT_OFFSET,
+                                    static_cast<std::uint32_t>(page_image_count));
   return payload;
 }
 
@@ -60,25 +60,27 @@ auto DecodeCommitState(std::span<const std::byte> payload,
   if (payload.size() != COMMIT_STATE_PAYLOAD_BYTES) {
     return std::unexpected(Status::Corruption("WAL commit-state record has the wrong length"));
   }
-  const auto root = storage::GetLittleEndian<page_id_t>(payload, COMMIT_STATE_ROOT_OFFSET);
-  const auto allocator = storage::GetLittleEndian<page_id_t>(payload, COMMIT_STATE_ALLOCATOR_ROOT_OFFSET);
-  const auto high_water = storage::GetLittleEndian<page_id_t>(payload, COMMIT_STATE_HIGH_WATER_OFFSET);
-  const auto page_count = storage::GetLittleEndian<std::uint32_t>(payload, COMMIT_STATE_PAGE_COUNT_OFFSET);
-  const auto reserved = storage::GetLittleEndian<std::uint32_t>(payload, COMMIT_STATE_RESERVED_OFFSET);
-  if (!root || !allocator || !high_water || !page_count || !reserved || *page_count == 0 || *reserved != 0) {
+  const auto root = storage::GetLittleEndianUnchecked<page_id_t>(payload, COMMIT_STATE_ROOT_OFFSET);
+  const auto allocator = storage::GetLittleEndianUnchecked<page_id_t>(payload, COMMIT_STATE_ALLOCATOR_ROOT_OFFSET);
+  const auto logical_page_count =
+      storage::GetLittleEndianUnchecked<page_id_t>(payload, COMMIT_STATE_LOGICAL_PAGE_COUNT_OFFSET);
+  const auto page_image_count =
+      storage::GetLittleEndianUnchecked<std::uint32_t>(payload, COMMIT_STATE_PAGE_IMAGE_COUNT_OFFSET);
+  const auto reserved = storage::GetLittleEndianUnchecked<std::uint32_t>(payload, COMMIT_STATE_RESERVED_OFFSET);
+  if (page_image_count == 0 || reserved != 0) {
     return std::unexpected(Status::Corruption("invalid WAL commit-state fields"));
   }
   auto state = txn::DatabaseState{
-      .root_page_id = *root,
-      .allocator_root_page_id = *allocator,
-      .high_water_page_id = *high_water,
+      .root_page_id = root,
+      .allocator_root_page_id = allocator,
+      .logical_page_count = logical_page_count,
       .visible_lsn = commit_lsn,
       .checkpoint_lsn = 0,
   };
   if (!ValidState(state)) {
     return std::unexpected(Status::Corruption("invalid WAL database state"));
   }
-  return std::pair{state, *page_count};
+  return std::pair{state, page_image_count};
 }
 
 // Reuses a validated page checksum to avoid a second scan of the page bytes.
@@ -88,10 +90,9 @@ auto SealedPageCrc(const PageImageView &page) -> std::optional<std::uint32_t> {
     return std::nullopt;
   }
   const auto bytes = std::as_bytes(page.bytes);
-  const auto checksum = storage::GetLittleEndian<std::uint32_t>(bytes, storage::data_page_offset::CHECKSUM);
-  TINYDB_CHECK(checksum.has_value(), "sealed page checksum field exceeds one page");
+  const auto checksum = storage::GetLittleEndianUnchecked<std::uint32_t>(bytes, storage::data_page_offset::CHECKSUM);
   constexpr auto zero_checksum = std::array<std::byte, sizeof(std::uint32_t)>{};
-  return Crc32Replace(*checksum, zero_checksum,
+  return Crc32Replace(checksum, zero_checksum,
                       bytes.subspan(storage::data_page_offset::CHECKSUM, sizeof(std::uint32_t)),
                       PAGE_SIZE - storage::data_page_offset::CHECKSUM - sizeof(std::uint32_t));
 }
@@ -109,25 +110,17 @@ auto AppendEncodedRecord(std::vector<char> &destination, RecordType type, std::u
   const auto offset = destination.size();
   destination.resize(offset + total_bytes, 0);
   auto bytes = std::as_writable_bytes(std::span{destination}).subspan(offset, total_bytes);
-  const auto encoded =
-      storage::PutLittleEndian(bytes, record_offset::TOTAL_BYTES, static_cast<std::uint32_t>(total_bytes)) &&
-      storage::PutLittleEndian(bytes, record_offset::TYPE, static_cast<std::uint16_t>(type)) &&
-      storage::PutLittleEndian(bytes, record_offset::FLAGS, std::uint16_t{0}) &&
-      storage::PutLittleEndian(bytes, record_offset::LSN, lsn) &&
-      storage::PutLittleEndian(bytes, record_offset::CHECKSUM, std::uint32_t{0}) &&
-      storage::PutLittleEndian(bytes, record_offset::RESERVED, std::uint32_t{0}) &&
-      encode_payload(bytes.subspan(record_offset::PAYLOAD, payload_bytes));
-  if (!encoded) {
-    destination.resize(offset);
-    return Status::Corruption("internal WAL record layout exceeds its buffer");
-  }
+  storage::PutLittleEndianUnchecked(bytes, record_offset::TOTAL_BYTES, static_cast<std::uint32_t>(total_bytes));
+  storage::PutLittleEndianUnchecked(bytes, record_offset::TYPE, static_cast<std::uint16_t>(type));
+  storage::PutLittleEndianUnchecked(bytes, record_offset::FLAGS, std::uint16_t{0});
+  storage::PutLittleEndianUnchecked(bytes, record_offset::LSN, lsn);
+  storage::PutLittleEndianUnchecked(bytes, record_offset::CHECKSUM, std::uint32_t{0});
+  storage::PutLittleEndianUnchecked(bytes, record_offset::RESERVED, std::uint32_t{0});
+  encode_payload(bytes.subspan(record_offset::PAYLOAD, payload_bytes));
   const auto checksum = payload_crc
                             ? Crc32Combine(Crc32(bytes.first(record_offset::PAYLOAD)), *payload_crc, payload_bytes)
                             : Crc32WithZeroedU32(bytes, record_offset::CHECKSUM);
-  if (!storage::PutLittleEndian(bytes, record_offset::CHECKSUM, checksum)) {
-    destination.resize(offset);
-    return Status::Corruption("internal WAL checksum field exceeds its buffer");
-  }
+  storage::PutLittleEndianUnchecked(bytes, record_offset::CHECKSUM, checksum);
   return {};
 }
 
@@ -137,7 +130,7 @@ auto AppendRecord(std::vector<char> &destination, RecordType type, std::uint64_t
                   std::span<const std::byte> payload) -> Status {
   return AppendEncodedRecord(destination, type, lsn, payload.size(), std::nullopt,
                              [payload](std::span<std::byte> destination_payload) {
-                               return storage::PutBytes(destination_payload, 0, payload);
+                               storage::PutBytesUnchecked(destination_payload, 0, payload);
                              });
 }
 
@@ -155,20 +148,16 @@ auto EncodeHeader(const Header &header) -> Result<std::vector<char>> {
 
   auto output = std::vector<char>(HEADER_BYTES, 0);
   auto bytes = std::as_writable_bytes(std::span{output});
-  const auto encoded =
-      storage::PutBytes(bytes, header_offset::MAGIC, MAGIC) &&
-      storage::PutLittleEndian(bytes, header_offset::FORMAT_MAJOR, FORMAT_MAJOR) &&
-      storage::PutLittleEndian(bytes, header_offset::FORMAT_MINOR, FORMAT_MINOR) &&
-      storage::PutLittleEndian(bytes, header_offset::HEADER_BYTES, static_cast<std::uint32_t>(HEADER_BYTES)) &&
-      storage::PutLittleEndian(bytes, header_offset::REQUIRED_FEATURES, header.required_features) &&
-      storage::PutLittleEndian(bytes, header_offset::OPTIONAL_FEATURES, header.optional_features) &&
-      storage::PutBytes(bytes, header_offset::DATABASE_UUID, header.database_uuid) &&
-      storage::PutLittleEndian(bytes, header_offset::STARTING_LSN, header.starting_lsn) &&
-      storage::PutLittleEndian(bytes, header_offset::CHECKSUM, std::uint32_t{0});
-  if (!encoded ||
-      !storage::PutLittleEndian(bytes, header_offset::CHECKSUM, Crc32WithZeroedU32(bytes, header_offset::CHECKSUM))) {
-    return std::unexpected(Status::Corruption("internal WAL header layout exceeds its buffer"));
-  }
+  storage::PutBytesUnchecked(bytes, header_offset::MAGIC, MAGIC);
+  storage::PutLittleEndianUnchecked(bytes, header_offset::FORMAT_MAJOR, FORMAT_MAJOR);
+  storage::PutLittleEndianUnchecked(bytes, header_offset::FORMAT_MINOR, FORMAT_MINOR);
+  storage::PutLittleEndianUnchecked(bytes, header_offset::HEADER_BYTES, static_cast<std::uint32_t>(HEADER_BYTES));
+  storage::PutLittleEndianUnchecked(bytes, header_offset::REQUIRED_FEATURES, header.required_features);
+  storage::PutLittleEndianUnchecked(bytes, header_offset::OPTIONAL_FEATURES, header.optional_features);
+  storage::PutBytesUnchecked(bytes, header_offset::DATABASE_UUID, header.database_uuid);
+  storage::PutLittleEndianUnchecked(bytes, header_offset::STARTING_LSN, header.starting_lsn);
+  storage::PutLittleEndianUnchecked(bytes, header_offset::CHECKSUM, std::uint32_t{0});
+  storage::PutLittleEndianUnchecked(bytes, header_offset::CHECKSUM, Crc32WithZeroedU32(bytes, header_offset::CHECKSUM));
   return output;
 }
 
@@ -182,30 +171,26 @@ auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header> {
   if (!std::ranges::equal(MAGIC, bytes.subspan(header_offset::MAGIC, MAGIC.size()))) {
     return std::unexpected(Status::UnsupportedFormat("unrecognized TinyDB WAL magic"));
   }
-  const auto checksum = storage::GetLittleEndian<std::uint32_t>(bytes, header_offset::CHECKSUM);
-  if (!checksum || *checksum != Crc32WithZeroedU32(bytes, header_offset::CHECKSUM)) {
+  const auto checksum = storage::GetLittleEndianUnchecked<std::uint32_t>(bytes, header_offset::CHECKSUM);
+  if (checksum != Crc32WithZeroedU32(bytes, header_offset::CHECKSUM)) {
     return std::unexpected(Status::Corruption("WAL header checksum mismatch"));
   }
-  const auto major = storage::GetLittleEndian<std::uint16_t>(bytes, header_offset::FORMAT_MAJOR);
-  const auto minor = storage::GetLittleEndian<std::uint16_t>(bytes, header_offset::FORMAT_MINOR);
-  const auto encoded_header_bytes = storage::GetLittleEndian<std::uint32_t>(bytes, header_offset::HEADER_BYTES);
-  const auto required = storage::GetLittleEndian<std::uint64_t>(bytes, header_offset::REQUIRED_FEATURES);
-  const auto optional = storage::GetLittleEndian<std::uint64_t>(bytes, header_offset::OPTIONAL_FEATURES);
-  const auto starting_lsn = storage::GetLittleEndian<std::uint64_t>(bytes, header_offset::STARTING_LSN);
-  if (!major || !minor || !encoded_header_bytes || !required || !optional || !starting_lsn) {
-    return std::unexpected(Status::Corruption("truncated WAL header fields"));
-  }
-  if (*major != FORMAT_MAJOR || *minor > FORMAT_MINOR || *encoded_header_bytes != HEADER_BYTES ||
-      (*required & ~SUPPORTED_REQUIRED_FEATURES) != 0) {
+  const auto major = storage::GetLittleEndianUnchecked<std::uint16_t>(bytes, header_offset::FORMAT_MAJOR);
+  const auto minor = storage::GetLittleEndianUnchecked<std::uint16_t>(bytes, header_offset::FORMAT_MINOR);
+  const auto encoded_header_bytes =
+      storage::GetLittleEndianUnchecked<std::uint32_t>(bytes, header_offset::HEADER_BYTES);
+  const auto required = storage::GetLittleEndianUnchecked<std::uint64_t>(bytes, header_offset::REQUIRED_FEATURES);
+  const auto optional = storage::GetLittleEndianUnchecked<std::uint64_t>(bytes, header_offset::OPTIONAL_FEATURES);
+  const auto starting_lsn = storage::GetLittleEndianUnchecked<std::uint64_t>(bytes, header_offset::STARTING_LSN);
+  if (major != FORMAT_MAJOR || minor > FORMAT_MINOR || encoded_header_bytes != HEADER_BYTES ||
+      (required & ~SUPPORTED_REQUIRED_FEATURES) != 0) {
     return std::unexpected(Status::UnsupportedFormat("unsupported TinyDB WAL version or features"));
   }
   auto result = Header{};
-  if (!storage::GetBytes(bytes, header_offset::DATABASE_UUID, result.database_uuid)) {
-    return std::unexpected(Status::Corruption("truncated WAL database UUID"));
-  }
-  result.starting_lsn = *starting_lsn;
-  result.required_features = *required;
-  result.optional_features = *optional;
+  storage::GetBytesUnchecked(bytes, header_offset::DATABASE_UUID, result.database_uuid);
+  result.starting_lsn = starting_lsn;
+  result.required_features = required;
+  result.optional_features = optional;
   if (!NonzeroUuid(result.database_uuid) || result.starting_lsn == 0) {
     return std::unexpected(Status::Corruption("invalid WAL identity or starting LSN"));
   }
@@ -231,24 +216,23 @@ auto DecodeRecord(std::span<const std::byte> bytes) -> Result<Record> {
   if (bytes.size() < RECORD_HEADER_BYTES) {
     return std::unexpected(Status::Corruption("truncated WAL record header"));
   }
-  const auto total = storage::GetLittleEndian<std::uint32_t>(bytes, record_offset::TOTAL_BYTES);
-  const auto raw_type = storage::GetLittleEndian<std::uint16_t>(bytes, record_offset::TYPE);
-  const auto flags = storage::GetLittleEndian<std::uint16_t>(bytes, record_offset::FLAGS);
-  const auto lsn = storage::GetLittleEndian<std::uint64_t>(bytes, record_offset::LSN);
-  const auto checksum = storage::GetLittleEndian<std::uint32_t>(bytes, record_offset::CHECKSUM);
-  const auto reserved = storage::GetLittleEndian<std::uint32_t>(bytes, record_offset::RESERVED);
-  if (!total || !raw_type || !flags || !lsn || !checksum || !reserved || *total != bytes.size() ||
-      *total < RECORD_HEADER_BYTES) {
+  const auto total = storage::GetLittleEndianUnchecked<std::uint32_t>(bytes, record_offset::TOTAL_BYTES);
+  const auto raw_type = storage::GetLittleEndianUnchecked<std::uint16_t>(bytes, record_offset::TYPE);
+  const auto flags = storage::GetLittleEndianUnchecked<std::uint16_t>(bytes, record_offset::FLAGS);
+  const auto lsn = storage::GetLittleEndianUnchecked<std::uint64_t>(bytes, record_offset::LSN);
+  const auto checksum = storage::GetLittleEndianUnchecked<std::uint32_t>(bytes, record_offset::CHECKSUM);
+  const auto reserved = storage::GetLittleEndianUnchecked<std::uint32_t>(bytes, record_offset::RESERVED);
+  if (total != bytes.size()) {
     return std::unexpected(Status::Corruption("invalid WAL record length"));
   }
-  if (*checksum != Crc32WithZeroedU32(bytes, record_offset::CHECKSUM)) {
+  if (checksum != Crc32WithZeroedU32(bytes, record_offset::CHECKSUM)) {
     return std::unexpected(Status::Corruption("WAL record checksum mismatch"));
   }
-  const auto type = static_cast<RecordType>(*raw_type);
-  if (!KnownRecordType(type) || *flags != 0 || *reserved != 0 || *lsn == 0) {
+  const auto type = static_cast<RecordType>(raw_type);
+  if (!KnownRecordType(type) || flags != 0 || reserved != 0 || lsn == 0) {
     return std::unexpected(Status::Corruption("invalid WAL record metadata"));
   }
-  return Record{.type = type, .lsn = *lsn, .payload = bytes.subspan(record_offset::PAYLOAD)};
+  return Record{.type = type, .lsn = lsn, .payload = bytes.subspan(record_offset::PAYLOAD)};
 }
 
 // Validates and encodes one complete WAL transaction. Ordered page images come
@@ -291,9 +275,11 @@ auto EncodeTransaction(std::uint64_t commit_lsn, std::span<const PageImageView> 
         return std::unexpected(Status::InvalidArgument("WAL page image has the wrong commit LSN"));
       }
     }
-    if (auto status = AppendEncodedRecord(
-            output, RecordType::PageImage, commit_lsn, PAGE_IMAGE_PAYLOAD_BYTES, SealedPageCrc(page),
-            [&page](std::span<std::byte> payload) { return storage::PutBytes(payload, 0, std::as_bytes(page.bytes)); });
+    if (auto status = AppendEncodedRecord(output, RecordType::PageImage, commit_lsn, PAGE_IMAGE_PAYLOAD_BYTES,
+                                          SealedPageCrc(page),
+                                          [&page](std::span<std::byte> payload) {
+                                            storage::PutBytesUnchecked(payload, 0, std::as_bytes(page.bytes));
+                                          });
         !status.Ok()) {
       return std::unexpected(std::move(status));
     }
@@ -327,11 +313,11 @@ auto DecodeTransaction(std::span<const std::byte> bytes,
     if (remaining.size() < RECORD_HEADER_BYTES) {
       return std::unexpected(Status::Corruption("truncated WAL transaction record"));
     }
-    const auto total = storage::GetLittleEndian<std::uint32_t>(remaining, record_offset::TOTAL_BYTES);
-    if (!total || *total < RECORD_HEADER_BYTES || *total > remaining.size()) {
+    const auto total = storage::GetLittleEndianUnchecked<std::uint32_t>(remaining, record_offset::TOTAL_BYTES);
+    if (total < RECORD_HEADER_BYTES || total > remaining.size()) {
       return std::unexpected(Status::Corruption("invalid WAL transaction record length"));
     }
-    const auto encoded_record = remaining.first(*total);
+    const auto encoded_record = remaining.first(total);
     const auto record = DecodeRecord(encoded_record);
     if (!record) {
       return std::unexpected(record.error());
@@ -344,20 +330,21 @@ auto DecodeTransaction(std::span<const std::byte> bytes,
       if (record->payload.size() != PAGE_IMAGE_PAYLOAD_BYTES) {
         return std::unexpected(Status::Corruption("WAL page image has the wrong length"));
       }
-      const auto page_id = storage::GetLittleEndian<page_id_t>(record->payload, storage::data_page_offset::PAGE_ID);
-      if (!page_id || *page_id < FIRST_DATA_PAGE_ID || *page_id <= previous_page_id) {
+      const auto page_id =
+          storage::GetLittleEndianUnchecked<page_id_t>(record->payload, storage::data_page_offset::PAGE_ID);
+      if (page_id < FIRST_DATA_PAGE_ID || page_id <= previous_page_id) {
         return std::unexpected(Status::Corruption("unordered, invalid, or duplicate WAL page-image ID"));
       }
-      auto page = DecodedPageImage{.page_id = *page_id, .bytes = {}};
+      auto page = DecodedPageImage{.page_id = page_id, .bytes = {}};
       std::ranges::copy(record->payload, reinterpret_cast<std::byte *>(page.bytes.data()));
-      const auto decoded = storage::DecodeDataPageHeader(std::as_bytes(std::span{page.bytes}), *page_id);
+      const auto decoded = storage::DecodeDataPageHeader(std::as_bytes(std::span{page.bytes}), page_id);
       if (!decoded) {
         return std::unexpected(decoded.error());
       }
       if (decoded->page_lsn != expected_commit_lsn) {
         return std::unexpected(Status::Corruption("WAL page image has the wrong commit LSN"));
       }
-      previous_page_id = *page_id;
+      previous_page_id = page_id;
       result.pages.push_back(page);
     } else {
       if (result.pages.empty() || offset + encoded_record.size() != bytes.size()) {

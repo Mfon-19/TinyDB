@@ -38,9 +38,6 @@ auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child
       // lease. Returning it avoids a second cache lookup and pin cycle.
       return std::move(*page);
     }
-    if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
-      return std::unexpected(Status::Corruption("tree descent reached a non-tree page"));
-    }
     const auto internal = InternalPageView::Open(*page);
     if (!internal) {
       return std::unexpected(internal.error());

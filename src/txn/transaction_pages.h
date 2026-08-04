@@ -21,10 +21,11 @@ namespace tinydb::txn {
 **
 ** TransactionPages is the complete mutable page universe of one writer. A
 ** read first consults the private map and otherwise borrows committed bytes.
-** The first Edit copies a committed page once; later edits reuse the same
-** stable heap-owned frame. Allocate reserves either a checkpoint-safe free ID
-** or the private high-water frontier. Free removes a private image and records
-** a retirement without changing committed allocator state.
+** The first Edit copies a committed page once. Later edits reuse the same
+** stable heap-owned frame. Allocate reuses a checkpoint-safe page ID when one
+** is available. Otherwise, it extends the private logical page count. Free
+** removes a private image and records a retirement. It does not change the
+** committed allocator state.
 **
 ** Nothing owned here is reachable through the committed cache. Therefore
 ** abort requires no undo: dropping the overlay restores the base state.
@@ -32,7 +33,7 @@ namespace tinydb::txn {
 **
 ** Memory accounting covers private pages and retained value bytes. All page
 ** handles must be released before PrepareCommit, Abort, ownership transfer, or
-** destruction, because those operations may invalidate frame ownership.
+** destruction. Those operations can invalidate frame ownership.
 */
 class TransactionPages final : public PageSource {
  public:
@@ -89,7 +90,7 @@ class TransactionPages final : public PageSource {
   static void ReleasePrivate(void *owner, page_id_t page_id, bool dirty, bool tree_payload_validated);
   static auto PrivateHandle(PrivateFrame *frame, bool editable) -> PageHandle;
   auto CreatePrivatePage(page_id_t page_id, bool dirty) -> Result<PrivateFrame *>;
-  auto AllocateHighWaterPage() -> Result<PrivateFrame *>;
+  auto AllocateNewPage() -> Result<PrivateFrame *>;
   auto LoadFreeExtents() -> Status;
   auto AllocateReusablePage() -> std::optional<page_id_t>;
   void AddRetiredExtents(std::uint64_t retire_lsn);
@@ -101,7 +102,7 @@ class TransactionPages final : public PageSource {
 
   PageReader *committed_;           // immutable fallback for reads
   DatabaseState base_state_;        // captured at Begin
-  DatabaseState resulting_state_;   // private roots/frontiers
+  DatabaseState resulting_state_;   // private roots and logical page count
   std::size_t memory_limit_bytes_;  // pages plus retained values
   std::size_t memory_used_bytes_{0};
   bool prepared_{false};         // final page set carries the exact commit LSN

@@ -58,14 +58,14 @@ Wal::Wal(Wal &&other) noexcept
       next_lsn_(other.next_lsn_),
       needs_recovery_(other.needs_recovery_) {}
 
-// Opens or creates a header-only WAL for the specified database and LSN
-// frontier. An empty file receives a new durable header. A nonempty file must
+// Opens or creates a header-only WAL for the specified database and starting
+// LSN. An empty file receives a new durable header. A nonempty file must
 // contain only a supported header with the specified database UUID and starting
 // LSN.
 auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &database_uuid,
                std::uint64_t starting_lsn) -> Result<Wal> {
   if (starting_lsn == 0) {
-    return std::unexpected(Status::InvalidArgument("invalid WAL LSN frontier"));
+    return std::unexpected(Status::InvalidArgument("WAL starting LSN must be nonzero"));
   }
   auto fd = UniqueFd(io::Open(wal_path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
   if (!fd.Valid()) {
@@ -118,11 +118,11 @@ auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &databa
   return wal;
 }
 
-// Returns the LSN that Prepare and Commit expect next. It does not advance the
-// frontier and reports resource exhaustion before the LSN space ends.
+// Returns the LSN that Prepare and Commit expect next. It does not consume the
+// LSN. It reports resource exhaustion before the LSN space ends.
 auto Wal::NextCommitLsn() const -> Result<std::uint64_t> {
   auto lock = std::lock_guard(mutex_);
-  if (next_lsn_ == 0 || next_lsn_ == std::numeric_limits<std::uint64_t>::max()) {
+  if (next_lsn_ == std::numeric_limits<std::uint64_t>::max()) {
     return std::unexpected(Status::ResourceExhausted("WAL LSN space exhausted"));
   }
   return next_lsn_;
@@ -189,7 +189,7 @@ auto Wal::Reset(std::uint64_t checkpoint_lsn) -> Status {
     return Status::NeedsRecovery("WAL tail is not trustworthy; reopen the database");
   }
   if (checkpoint_lsn == std::numeric_limits<std::uint64_t>::max() || checkpoint_lsn + 1U != next_lsn_) {
-    return Status::InvalidArgument("WAL reset frontier does not cover the complete durable tail");
+    return Status::InvalidArgument("checkpoint LSN does not cover the complete durable WAL tail");
   }
   if (size_bytes_ == wal_format::HEADER_BYTES) {
     return {};

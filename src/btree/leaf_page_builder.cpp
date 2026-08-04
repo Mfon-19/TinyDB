@@ -104,12 +104,9 @@ auto LeafPageBuilder::From(const LeafPageView &page) -> LeafPageBuilder {
 // from the end downward. Rebuilding removes fragmentation and stale bytes.
 void LeafPageBuilder::Store(char *page, page_id_t page_id) const {
   TINYDB_CHECK(Fits(), "records do not fit in a page");
-  auto bytes = std::as_writable_bytes(std::span{page, PAGE_SIZE});
-  TINYDB_CHECK(
-      storage::InitializeDataPage(bytes, storage::DataPageType::Leaf, page_id, 0,
-                                  static_cast<std::uint16_t>(PAGE_SIZE - storage::data_page_offset::HEADER_BYTES))
-          .Ok(),
-      "failed to initialize leaf page");
+  auto bytes = std::as_writable_bytes(std::span<char, PAGE_SIZE>{page, PAGE_SIZE});
+  storage::InitializeDataPage(bytes, storage::DataPageType::Leaf, page_id, 0,
+                              static_cast<std::uint16_t>(PAGE_SIZE - storage::data_page_offset::HEADER_BYTES));
 
   std::size_t free_end = PAGE_SIZE;
   for (std::size_t i = 0; i < records_.size(); ++i) {
@@ -119,38 +116,33 @@ void LeafPageBuilder::Store(char *page, page_id_t page_id) const {
     const auto value_bytes = value.IsOverflow() ? OVERFLOW_VALUE_DESCRIPTOR_BYTES : value.InlineBytes().size();
     const std::size_t cell_size = LEAF_CELL_HEADER_SIZE + key.size() + value_bytes;
     const std::size_t offset = free_end - cell_size;
-    TINYDB_CHECK(
-        storage::PutLittleEndian(bytes, offset + leaf_cell_offset::KEY_BYTES, static_cast<std::uint16_t>(key.size())) &&
-            storage::PutLittleEndian(bytes, offset + leaf_cell_offset::VALUE_BYTES,
-                                     static_cast<std::uint16_t>(value_bytes)),
-        "leaf cell header exceeds page");
+    storage::PutLittleEndianUnchecked(bytes, offset + leaf_cell_offset::KEY_BYTES,
+                                      static_cast<std::uint16_t>(key.size()));
+    storage::PutLittleEndianUnchecked(bytes, offset + leaf_cell_offset::VALUE_BYTES,
+                                      static_cast<std::uint16_t>(value_bytes));
     bytes[offset + leaf_cell_offset::VALUE_KIND] = static_cast<std::byte>(value.Kind());
     std::copy_n(key.data(), key.size(), page + offset + LEAF_CELL_HEADER_SIZE);
     const auto value_offset = offset + LEAF_CELL_HEADER_SIZE + key.size();
     if (value.IsOverflow()) {
       const auto &descriptor = value.OverflowDescriptor();
-      TINYDB_CHECK(storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES,
-                                            descriptor.total_value_bytes) &&
-                       storage::PutLittleEndian(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID,
-                                                descriptor.first_page_id),
-                   "overflow descriptor exceeds leaf cell");
+      storage::PutLittleEndianUnchecked(bytes, value_offset + overflow_descriptor_offset::TOTAL_VALUE_BYTES,
+                                        descriptor.total_value_bytes);
+      storage::PutLittleEndianUnchecked(bytes, value_offset + overflow_descriptor_offset::FIRST_PAGE_ID,
+                                        descriptor.first_page_id);
     } else {
       const auto inline_bytes = value.InlineBytes();
       std::copy_n(inline_bytes.data(), inline_bytes.size(), page + value_offset);
     }
-    TINYDB_CHECK(storage::PutLittleEndian(bytes, LEAF_HEADER_SIZE + i * SLOT_SIZE, static_cast<slot_t>(offset)),
-                 "leaf slot exceeds page");
+    storage::PutLittleEndianUnchecked(bytes, LEAF_HEADER_SIZE + i * SLOT_SIZE, static_cast<slot_t>(offset));
     free_end = offset;
   }
 
-  TINYDB_CHECK(
-      storage::PutLittleEndian(bytes, node_page_offset::CELL_COUNT, static_cast<std::uint16_t>(records_.size())) &&
-          storage::PutLittleEndian(bytes, node_page_offset::FREE_START,
-                                   static_cast<std::uint16_t>(LEAF_HEADER_SIZE + records_.size() * SLOT_SIZE)) &&
-          storage::PutLittleEndian(bytes, node_page_offset::FREE_END, static_cast<std::uint16_t>(free_end)) &&
-          storage::PutLittleEndian(bytes, node_page_offset::RESERVED, std::uint16_t{0}) &&
-          storage::PutLittleEndian(bytes, node_page_offset::LINK, next_leaf_),
-      "failed to encode leaf page");
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::CELL_COUNT, static_cast<std::uint16_t>(records_.size()));
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::FREE_START,
+                                    static_cast<std::uint16_t>(LEAF_HEADER_SIZE + records_.size() * SLOT_SIZE));
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::FREE_END, static_cast<std::uint16_t>(free_end));
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::RESERVED, std::uint16_t{0});
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::LINK, next_leaf_);
 }
 
 auto LeafPageBuilder::Upsert(std::string_view key, LeafValueView value) -> UpsertResult {

@@ -32,8 +32,8 @@ struct CommittedFrame;
 **
 ** Frames newer than checkpoint_lsn are dirty in the cache sense: WAL contains
 ** their durable image, but the database file does not yet. Such frames cannot
-** be evicted. The byte target is consequently soft; publication may exceed it
-** until checkpointing advances the frontier.
+** be evicted. The byte target is soft. Publication can exceed it until
+** checkpointing stores those page versions in the database file.
 **
 ** PageHandle is the sole byte lease for reads and checkpoints. Its shared
 ** keepalive both retains the immutable frame and supplies the exact cache pin.
@@ -63,12 +63,12 @@ class PublicationPlan final {
 
  private:
   PublicationPlan(std::vector<std::shared_ptr<CommittedFrame>> frames, std::vector<page_id_t> retired,
-                  page_id_t high_water_page_id)
-      : frames_(std::move(frames)), retired_(std::move(retired)), high_water_page_id_(high_water_page_id) {}
+                  page_id_t logical_page_count)
+      : frames_(std::move(frames)), retired_(std::move(retired)), logical_page_count_(logical_page_count) {}
 
   std::vector<std::shared_ptr<CommittedFrame>> frames_;
   std::vector<page_id_t> retired_;
-  page_id_t high_water_page_id_{FIRST_DATA_PAGE_ID};
+  page_id_t logical_page_count_{FIRST_DATA_PAGE_ID};
 
   friend class CommittedPageCache;
 };
@@ -95,7 +95,7 @@ struct CommittedCacheStats {
 */
 class CommittedPageCache final : public PageReader {
  public:
-  CommittedPageCache(DiskManager *disk, std::size_t target_bytes, std::uint64_t checkpoint_lsn);
+  CommittedPageCache(DiskManager &disk, std::size_t target_bytes, std::uint64_t checkpoint_lsn);
   CommittedPageCache(const CommittedPageCache &) = delete;
   auto operator=(const CommittedPageCache &) -> CommittedPageCache & = delete;
   ~CommittedPageCache() override;
@@ -104,7 +104,7 @@ class CommittedPageCache final : public PageReader {
   auto Read(page_id_t page_id) -> Result<PageHandle> override;
 
   auto PreparePublication(std::vector<CommittedPageImage> images, std::vector<page_id_t> retired,
-                          page_id_t high_water_page_id) -> Result<PublicationPlan>;
+                          page_id_t logical_page_count) -> Result<PublicationPlan>;
   void Publish(PublicationPlan plan) noexcept;
 
   // Capture strong references to exact current versions in (checkpoint_lsn,

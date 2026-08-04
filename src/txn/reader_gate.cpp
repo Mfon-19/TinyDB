@@ -66,8 +66,6 @@ ReaderGateAdmission::~ReaderGateAdmission() {
 namespace {
 
 void Admit(std::shared_ptr<ReaderGateControl> control, ReaderGateAdmission *admission) {
-  TINYDB_CHECK(control != nullptr, "reader gate received a null control");
-  TINYDB_CHECK(admission != nullptr, "reader gate received a null admission");
   TINYDB_CHECK(!admission->admitted, "reader gate received an active admission");
   admission->control = std::move(control);
   auto *const gate = admission->control.get();
@@ -127,7 +125,7 @@ auto ReaderGate::CurrentState() const -> std::shared_ptr<const DatabaseState> {
 
 void ReaderGate::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
   /*
-  ** CHECKPOINT FRONTIER PUBLICATION
+  ** CHECKPOINT LSN PUBLICATION
   **
   ** The database file is already durable through checkpoint_lsn. The caller's
   ** writer permit excludes transaction publication, while old readers may
@@ -135,7 +133,7 @@ void ReaderGate::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
   */
   auto lock = std::lock_guard(control_->mutex);
   const auto &current = control_->state;
-  TINYDB_CHECK(checkpoint_lsn >= current->checkpoint_lsn, "visible checkpoint frontier moved backward");
+  TINYDB_CHECK(checkpoint_lsn >= current->checkpoint_lsn, "visible checkpoint LSN moved backward");
   TINYDB_CHECK(checkpoint_lsn <= current->visible_lsn, "checkpoint advanced beyond visible state");
   if (checkpoint_lsn != current->checkpoint_lsn) {
     auto next = std::make_shared<DatabaseState>(*current);

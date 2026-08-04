@@ -24,8 +24,8 @@ class PageSource;
 **
 ** CopyValue and RetireOverflowValue validate the complete chain before
 ** returning bytes or changing reachability. Integrity validation additionally
-** supplies the allocation frontier and a global ownership set, proving that
-** every physical overflow page belongs to exactly one leaf value.
+** supplies the logical page count and a global ownership set. These values
+** prove that each physical overflow page belongs to exactly one leaf value.
 */
 auto PrepareValue(PageSource *pages, std::string_view key, std::string_view value) -> Result<LeafValueView>;
 auto CopyOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor) -> Result<std::string>;
@@ -39,7 +39,7 @@ inline auto CopyValue(PageReader *pages, LeafValueView value) -> Result<std::str
 
 auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descriptor) -> Status;
 
-auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, page_id_t high_water_page_id,
+auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, page_id_t logical_page_count,
                            std::uint64_t maximum_page_lsn, const std::unordered_set<page_id_t> &free_pages,
                            const std::unordered_set<page_id_t> &allocator_pages,
                            std::unordered_set<page_id_t> *claimed_pages) -> Status;

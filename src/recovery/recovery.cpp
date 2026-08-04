@@ -40,7 +40,7 @@ struct LoadedLog final {
 struct RecoveryPlan final {
   DatabaseUuid database_uuid{};
   std::vector<wal_format::DecodedTransaction> transactions;
-  std::optional<storage::SuperblockPage> recovered_superblock;
+  storage::SuperblockPage recovered_superblock{};
   page_id_t superblock_page_id{SUPERBLOCK_A_PAGE_ID};
   std::uint64_t durable_lsn{0};
   bool cleanup_needed{false};
@@ -124,7 +124,7 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
     return std::unexpected(header.error());
   }
 
-  auto log = LoadedLog{.header = *header, .transactions = {}, .cleanup_needed = false};
+  auto log = LoadedLog{.header = *header, .transactions = {}, .cleanup_needed = all.size() != wal_format::HEADER_BYTES};
   auto offset = std::size_t{wal_format::HEADER_BYTES};
   auto run_offset = offset;
   auto current_lsn = std::uint64_t{0};
@@ -136,7 +136,6 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
       if (HasValidRecordAfter(all, offset)) {
         return std::unexpected(Status::Corruption("invalid WAL framing before a complete later record"));
       }
-      log.cleanup_needed = true;
       break;
     }
     const auto encoded_record = remaining.first(*total);
@@ -145,7 +144,6 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
       const auto torn_final_record = record.error().Message() == "WAL record checksum mismatch" &&
                                      offset + *total == all.size() && !HasValidRecordAfter(all, offset);
       if (torn_final_record) {
-        log.cleanup_needed = true;
         break;
       }
       return std::unexpected(record.error());
@@ -175,10 +173,6 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
       current_lsn = 0;
     }
   }
-  if (current_lsn != 0) {
-    log.cleanup_needed = true;
-  }
-  log.cleanup_needed = log.cleanup_needed || all.size() != wal_format::HEADER_BYTES;
   return std::optional{std::move(log)};
 }
 
@@ -221,12 +215,9 @@ auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optio
   if (!selected) {
     return std::unexpected(selected.error());
   }
-  if (selected->value.high_water_page_id >
+  if (selected->value.logical_page_count >
       static_cast<std::uint64_t>(file_stat.st_size) / static_cast<std::uint64_t>(PAGE_SIZE)) {
-    return std::unexpected(Status::Corruption("superblock allocation frontier exceeds the database file"));
-  }
-  if (selected->value.high_water_page_id > MAX_FILE_PAGES) {
-    return std::unexpected(Status::Corruption("superblock allocation frontier exceeds the platform file limit"));
+    return std::unexpected(Status::Corruption("superblock logical page count exceeds the database file"));
   }
   return std::optional{*selected};
 }
@@ -242,7 +233,7 @@ auto EncodeRecoveredSuperblock(const wal_format::DecodedTransaction &transaction
       .checkpoint_lsn = transaction.commit_lsn,
       .root_page_id = transaction.state.root_page_id,
       .allocator_root_page_id = transaction.state.allocator_root_page_id,
-      .high_water_page_id = transaction.state.high_water_page_id,
+      .logical_page_count = transaction.state.logical_page_count,
       .required_features = base.value.required_features,
       .optional_features = base.value.optional_features,
   });
@@ -256,51 +247,47 @@ auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result
     return std::unexpected(Status::ResourceExhausted("checkpoint LSN space exhausted"));
   }
   if (log.header.starting_lsn > base.value.checkpoint_lsn + 1U) {
-    return std::unexpected(Status::Corruption("WAL begins after the database checkpoint frontier"));
+    return std::unexpected(Status::Corruption("WAL starting LSN leaves a gap after the database checkpoint"));
   }
 
   auto plan = RecoveryPlan{
       .database_uuid = log.header.database_uuid,
       .transactions = {},
-      .recovered_superblock = std::nullopt,
+      .recovered_superblock = {},
       .superblock_page_id = SUPERBLOCK_A_PAGE_ID,
       .durable_lsn = base.value.checkpoint_lsn,
       .cleanup_needed = log.cleanup_needed,
   };
-  auto previous_high_water = base.value.high_water_page_id;
+  auto previous_logical_page_count = base.value.logical_page_count;
   auto saw_checkpoint_transaction = log.header.starting_lsn == base.value.checkpoint_lsn + 1U;
-  auto expected_lsn = log.header.starting_lsn;
   for (auto &transaction : log.transactions) {
-    if (transaction.commit_lsn != expected_lsn) {
-      return std::unexpected(Status::Corruption("WAL transaction LSN sequence is missing or reordered"));
-    }
-    if (expected_lsn == std::numeric_limits<std::uint64_t>::max()) {
-      return std::unexpected(Status::Corruption("WAL transaction LSN sequence overflows"));
-    }
-    ++expected_lsn;
-
     if (transaction.commit_lsn <= base.value.checkpoint_lsn) {
       if (transaction.commit_lsn == base.value.checkpoint_lsn) {
         saw_checkpoint_transaction = true;
         if (transaction.state.root_page_id != base.value.root_page_id ||
             transaction.state.allocator_root_page_id != base.value.allocator_root_page_id ||
-            transaction.state.high_water_page_id != base.value.high_water_page_id) {
+            transaction.state.logical_page_count != base.value.logical_page_count) {
           return std::unexpected(Status::Corruption("covered WAL state disagrees with the database checkpoint"));
         }
       }
       continue;
     }
-    if (transaction.commit_lsn != plan.durable_lsn + 1U || transaction.state.high_water_page_id < previous_high_water ||
-        transaction.state.high_water_page_id > MAX_FILE_PAGES) {
-      return std::unexpected(Status::Corruption("WAL live transaction frontier is inconsistent with its base"));
+    if (transaction.commit_lsn != plan.durable_lsn + 1U) {
+      return std::unexpected(Status::Corruption("WAL live transaction LSN does not follow its durable base"));
+    }
+    if (transaction.state.logical_page_count < previous_logical_page_count) {
+      return std::unexpected(Status::Corruption("WAL logical page count decreases between transactions"));
+    }
+    if (transaction.state.logical_page_count > MAX_FILE_PAGES) {
+      return std::unexpected(Status::Corruption("WAL logical page count exceeds the platform file limit"));
     }
     for (const auto &page : transaction.pages) {
-      if (page.page_id >= transaction.state.high_water_page_id) {
-        return std::unexpected(Status::Corruption("WAL page image lies beyond its allocation frontier"));
+      if (page.page_id >= transaction.state.logical_page_count) {
+        return std::unexpected(Status::Corruption("WAL page image lies outside its logical page range"));
       }
     }
     transaction.state.checkpoint_lsn = base.value.checkpoint_lsn;
-    previous_high_water = transaction.state.high_water_page_id;
+    previous_logical_page_count = transaction.state.logical_page_count;
     plan.durable_lsn = transaction.commit_lsn;
     plan.transactions.push_back(std::move(transaction));
   }
@@ -323,16 +310,13 @@ auto Redo(const std::filesystem::path &db_path, const RecoveryPlan &plan) -> Sta
   if (plan.transactions.empty()) {
     return {};
   }
-  if (!plan.recovered_superblock) {
-    return Status::Corruption("recovery plan is missing its final superblock");
-  }
-  const auto &recovered_superblock = *plan.recovered_superblock;
+  const auto &recovered_superblock = plan.recovered_superblock;
   auto fd = UniqueFd(io::Open(db_path, O_RDWR | O_CLOEXEC));
   if (!fd.Valid()) {
     return io::ErrnoStatus("open database for recovery");
   }
   const auto &final_state = plan.transactions.back().state;
-  if (io::Ftruncate(fd.Get(), final_state.high_water_page_id * PAGE_SIZE) < 0) {
+  if (io::Ftruncate(fd.Get(), final_state.logical_page_count * PAGE_SIZE) < 0) {
     return io::ErrnoStatus("extend database during recovery");
   }
   for (const auto &transaction : plan.transactions) {

@@ -66,7 +66,7 @@ inline constexpr page_id_t FIRST_FORMAT_DATA_PAGE_ID = FIRST_DATA_PAGE_ID;
 **   12  page size u32            64  reserved u64
 **   16  required features u64    72  B+ tree root page ID u64
 **   24  optional features u64    80  allocator root page ID u64
-**   32  database UUID[16]        88  high-water page ID u64
+**   32  database UUID[16]        88  logical page count u64
 **   96  CRC-32 u32              100..4095 reserved zero bytes
 */
 namespace superblock_offset {
@@ -82,7 +82,7 @@ inline constexpr std::size_t CHECKPOINT_LSN = 56;
 inline constexpr std::size_t RESERVED = 64;
 inline constexpr std::size_t ROOT_PAGE_ID = 72;
 inline constexpr std::size_t ALLOCATOR_ROOT_PAGE_ID = 80;
-inline constexpr std::size_t HIGH_WATER_PAGE_ID = 88;
+inline constexpr std::size_t LOGICAL_PAGE_COUNT = 88;
 inline constexpr std::size_t CHECKSUM = 96;
 inline constexpr std::size_t ENCODED_BYTES = 100;
 }  // namespace superblock_offset
@@ -94,19 +94,19 @@ struct Superblock {
   // Generation chooses the newest valid slot. Zero is never valid.
   std::uint64_t generation{1};
 
-  // Recovery can ignore WAL history at or before this durable frontier.
+  // Recovery can ignore WAL records at or before this LSN.
   std::uint64_t checkpoint_lsn{0};
 
   // Zero means the corresponding persistent tree/index is currently absent.
   page_id_t root_page_id{0};
   page_id_t allocator_root_page_id{0};
 
-  // First page ID not yet allocated. Every nonzero reference must be below
-  // this value and at or above FIRST_FORMAT_DATA_PAGE_ID.
-  page_id_t high_water_page_id{FIRST_FORMAT_DATA_PAGE_ID};
+  // Number of logical page slots, including both superblocks and reusable
+  // data-page slots. Valid data-page references are less than this count.
+  page_id_t logical_page_count{FIRST_FORMAT_DATA_PAGE_ID};
 
-  // Unknown required bits make the format unsafe to interpret; unknown
-  // optional bits may be preserved and ignored.
+  // Unknown required bits make the format unsafe to interpret. TinyDB
+  // preserves and ignores unknown optional bits.
   std::uint64_t required_features{0};
   std::uint64_t optional_features{0};
 

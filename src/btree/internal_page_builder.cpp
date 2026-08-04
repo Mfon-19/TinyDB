@@ -84,12 +84,9 @@ auto InternalPageBuilder::From(const InternalPageView &page) -> InternalPageBuil
 // cells from the end downward. The header link stores first_child_.
 void InternalPageBuilder::Store(char *page, page_id_t page_id) const {
   TINYDB_CHECK(Fits(), "records do not fit in a page");
-  auto bytes = std::as_writable_bytes(std::span{page, PAGE_SIZE});
-  TINYDB_CHECK(
-      storage::InitializeDataPage(bytes, storage::DataPageType::Internal, page_id, 0,
-                                  static_cast<std::uint16_t>(PAGE_SIZE - storage::data_page_offset::HEADER_BYTES))
-          .Ok(),
-      "failed to initialize internal page");
+  auto bytes = std::as_writable_bytes(std::span<char, PAGE_SIZE>{page, PAGE_SIZE});
+  storage::InitializeDataPage(bytes, storage::DataPageType::Internal, page_id, 0,
+                              static_cast<std::uint16_t>(PAGE_SIZE - storage::data_page_offset::HEADER_BYTES));
 
   std::size_t free_end = PAGE_SIZE;
   for (std::size_t i = 0; i < records_.size(); ++i) {
@@ -97,24 +94,20 @@ void InternalPageBuilder::Store(char *page, page_id_t page_id) const {
     const auto key = Key(record);
     const std::size_t cell_size = INTERNAL_CELL_HEADER_SIZE + key.size();
     const std::size_t offset = free_end - cell_size;
-    TINYDB_CHECK(storage::PutLittleEndian(bytes, offset + internal_cell_offset::RIGHT_CHILD, record.right_child) &&
-                     storage::PutLittleEndian(bytes, offset + internal_cell_offset::KEY_BYTES,
-                                              static_cast<std::uint16_t>(key.size())),
-                 "internal cell header exceeds page");
+    storage::PutLittleEndianUnchecked(bytes, offset + internal_cell_offset::RIGHT_CHILD, record.right_child);
+    storage::PutLittleEndianUnchecked(bytes, offset + internal_cell_offset::KEY_BYTES,
+                                      static_cast<std::uint16_t>(key.size()));
     std::copy_n(key.data(), key.size(), page + offset + INTERNAL_CELL_HEADER_SIZE);
-    TINYDB_CHECK(storage::PutLittleEndian(bytes, INTERNAL_HEADER_SIZE + i * SLOT_SIZE, static_cast<slot_t>(offset)),
-                 "internal slot exceeds page");
+    storage::PutLittleEndianUnchecked(bytes, INTERNAL_HEADER_SIZE + i * SLOT_SIZE, static_cast<slot_t>(offset));
     free_end = offset;
   }
 
-  TINYDB_CHECK(
-      storage::PutLittleEndian(bytes, node_page_offset::CELL_COUNT, static_cast<std::uint16_t>(records_.size())) &&
-          storage::PutLittleEndian(bytes, node_page_offset::FREE_START,
-                                   static_cast<std::uint16_t>(INTERNAL_HEADER_SIZE + records_.size() * SLOT_SIZE)) &&
-          storage::PutLittleEndian(bytes, node_page_offset::FREE_END, static_cast<std::uint16_t>(free_end)) &&
-          storage::PutLittleEndian(bytes, node_page_offset::RESERVED, std::uint16_t{0}) &&
-          storage::PutLittleEndian(bytes, node_page_offset::LINK, first_child_),
-      "failed to encode internal page");
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::CELL_COUNT, static_cast<std::uint16_t>(records_.size()));
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::FREE_START,
+                                    static_cast<std::uint16_t>(INTERNAL_HEADER_SIZE + records_.size() * SLOT_SIZE));
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::FREE_END, static_cast<std::uint16_t>(free_end));
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::RESERVED, std::uint16_t{0});
+  storage::PutLittleEndianUnchecked(bytes, node_page_offset::LINK, first_child_);
 }
 
 void InternalPageBuilder::InsertSeparator(std::string_view key, page_id_t right_child) {

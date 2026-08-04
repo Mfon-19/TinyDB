@@ -2,7 +2,6 @@
 
 #include "storage/disk_manager.h"
 #include "storage/page.h"
-#include "storage/page_codec.h"
 #include "util/check.h"
 #include "wal/wal.h"
 
@@ -10,35 +9,12 @@
 #include "txn/database_state.h"
 #include "txn/reader_gate.h"
 
-#include <limits>
 #include <utility>
 
 namespace tinydb::checkpoint {
-namespace {
-
-auto DirtyBytes(std::size_t dirty_pages) -> std::size_t {
-  if (dirty_pages > std::numeric_limits<std::size_t>::max() / PAGE_SIZE) {
-    return std::numeric_limits<std::size_t>::max();
-  }
-  return dirty_pages * PAGE_SIZE;
-}
-
-}  // namespace
-
-Manager::Manager(DiskManager *disk, cache::CommittedPageCache *cache, txn::ReaderGate *readers, Wal *wal,
+Manager::Manager(DiskManager &disk, cache::CommittedPageCache &cache, txn::ReaderGate &readers, Wal &wal,
                  CheckpointOptions options)
-    : disk_(disk), cache_(cache), readers_(readers), wal_(wal), options_(options) {
-  TINYDB_CHECK(disk_ != nullptr, "checkpoint manager requires a database file");
-  TINYDB_CHECK(cache_ != nullptr, "checkpoint manager requires a committed cache");
-  TINYDB_CHECK(readers_ != nullptr, "checkpoint manager requires a reader gate");
-  TINYDB_CHECK(wal_ != nullptr, "checkpoint manager requires a WAL");
-  TINYDB_CHECK(options_.wal_trigger_bytes != 0, "checkpoint WAL trigger must be nonzero");
-  TINYDB_CHECK(options_.dirty_trigger_bytes != 0, "checkpoint dirty trigger must be nonzero");
-  TINYDB_CHECK(options_.hard_wal_bytes >= options_.wal_trigger_bytes, "checkpoint hard WAL limit precedes its trigger");
-  TINYDB_CHECK(options_.hard_dirty_bytes >= options_.dirty_trigger_bytes,
-               "checkpoint hard dirty limit precedes its trigger");
-  TINYDB_CHECK(options_.failures_before_backpressure != 0, "checkpoint failure threshold must be nonzero");
-}
+    : disk_(disk), cache_(cache), readers_(readers), wal_(wal), options_(options) {}
 
 auto Manager::Record(Status status) -> Status {
   auto lock = std::lock_guard(state_mutex_);
@@ -47,9 +23,7 @@ auto Manager::Record(Status status) -> Status {
     last_success_ = std::chrono::steady_clock::now();
     last_failure_.reset();
   } else {
-    if (consecutive_failures_ != std::numeric_limits<std::size_t>::max()) {
-      ++consecutive_failures_;
-    }
+    ++consecutive_failures_;
     last_failure_ = status;
   }
   return status;
@@ -58,31 +32,28 @@ auto Manager::Record(Status status) -> Status {
 auto Manager::Checkpoint() -> Status {
   // The DatabaseCore writer permit excludes publication throughout capture,
   // I/O, and cleanup. Reader activity cannot replace immutable current pages.
-  const auto state = readers_->CurrentState();
-  const auto durable_lsn = disk_->CheckpointLsn();
+  const auto state = readers_.CurrentState();
+  const auto durable_lsn = disk_.CheckpointLsn();
   TINYDB_CHECK(durable_lsn <= state->visible_lsn, "database file is newer than visible state");
-  auto pages = cache_->CaptureCheckpointPages(durable_lsn, state->visible_lsn);
+  auto pages = cache_.CaptureCheckpointPages(durable_lsn, state->visible_lsn);
 
   const auto target_lsn = state->visible_lsn;
-  if (target_lsn > disk_->CheckpointLsn()) {
+  if (target_lsn > disk_.CheckpointLsn()) {
     // File growth is harmless before the recovery root advances. A failure can
-    // leave trailing zero pages, but the old high-water frontier ignores them.
-    if (auto status = disk_->EnsurePageCount(state->high_water_page_id); !status.Ok()) {
+    // leave trailing zero pages. The old logical page count excludes them.
+    if (auto status = disk_.EnsurePageCount(state->logical_page_count); !status.Ok()) {
       return Record(std::move(status));
     }
     for (const auto &page : pages) {
-      const auto *const header = page.ValidatedHeader();
-      TINYDB_CHECK(header != nullptr, "checkpoint captured an unvalidated page version");
-      TINYDB_CHECK(header->page_lsn <= target_lsn, "checkpoint captured a future page version");
-      if (auto status = disk_->WriteCheckpointPage(page.Id(), page.Data(), state->high_water_page_id); !status.Ok()) {
+      if (auto status = disk_.WriteCheckpointPage(page.Id(), page.Data(), state->logical_page_count); !status.Ok()) {
         return Record(std::move(status));
       }
     }
-    if (auto status = disk_->Sync(); !status.Ok()) {
+    if (auto status = disk_.Sync(); !status.Ok()) {
       return Record(std::move(status));
     }
-    if (auto status = disk_->CommitCheckpoint(state->root_page_id, state->allocator_root_page_id,
-                                              state->high_water_page_id, target_lsn);
+    if (auto status = disk_.CommitCheckpoint(state->root_page_id, state->allocator_root_page_id,
+                                             state->logical_page_count, target_lsn);
         !status.Ok()) {
       return Record(std::move(status));
     }
@@ -91,23 +62,23 @@ auto Manager::Checkpoint() -> Status {
   /*
   ** POST-DURABILITY PHASE
   **
-  ** Publish the completed persistence frontier without draining readers. Old
-  ** snapshots may retain the prior frontier, which does not affect their
-  ** logical contents.
+  ** Publish the new checkpoint LSN without draining readers. Old snapshots can
+  ** retain the prior checkpoint LSN because their logical contents do not
+  ** change.
   */
-  readers_->AdvanceCheckpoint(target_lsn);
-  cache_->MarkCheckpointed(target_lsn);
-  if (auto status = wal_->Reset(target_lsn); !status.Ok()) {
+  readers_.AdvanceCheckpoint(target_lsn);
+  cache_.MarkCheckpointed(target_lsn);
+  if (auto status = wal_.Reset(target_lsn); !status.Ok()) {
     return Record(std::move(status));
   }
   return Record({});
 }
 
 auto Manager::ShouldCheckpoint() const -> bool {
-  const auto dirty_pages = cache_->DirtyPages();
-  const auto wal_bytes = wal_->SizeBytes();
+  const auto dirty_pages = cache_.DirtyPages();
+  const auto wal_bytes = wal_.SizeBytes();
   auto lock = std::lock_guard(state_mutex_);
-  const auto dirty_bytes = DirtyBytes(dirty_pages);
+  const auto dirty_bytes = dirty_pages * PAGE_SIZE;
   const auto age_expired = dirty_pages != 0 && std::chrono::steady_clock::now() - last_success_ >= options_.maximum_age;
   return consecutive_failures_ != 0 || wal_bytes >= options_.wal_trigger_bytes ||
          dirty_bytes >= options_.dirty_trigger_bytes || age_expired;
@@ -118,9 +89,9 @@ auto Manager::WriteAdmissionStatus() const -> Status {
   if (consecutive_failures_ < options_.failures_before_backpressure) {
     return {};
   }
-  const auto dirty_pages = cache_->DirtyPages();
-  const auto wal_bytes = wal_->SizeBytes();
-  const auto dirty_bytes = DirtyBytes(dirty_pages);
+  const auto dirty_pages = cache_.DirtyPages();
+  const auto wal_bytes = wal_.SizeBytes();
+  const auto dirty_bytes = dirty_pages * PAGE_SIZE;
   if (wal_bytes < options_.hard_wal_bytes && dirty_bytes < options_.hard_dirty_bytes) {
     return {};
   }
@@ -129,14 +100,14 @@ auto Manager::WriteAdmissionStatus() const -> Status {
 }
 
 auto Manager::GetStats() const -> Stats {
-  const auto dirty_pages = cache_->DirtyPages();
-  const auto wal_bytes = wal_->SizeBytes();
+  const auto dirty_pages = cache_.DirtyPages();
+  const auto wal_bytes = wal_.SizeBytes();
   auto lock = std::lock_guard(state_mutex_);
   const auto age_expired = dirty_pages != 0 && std::chrono::steady_clock::now() - last_success_ >= options_.maximum_age;
   return Stats{
       .consecutive_failures = consecutive_failures_,
       .checkpoint_requested = consecutive_failures_ != 0 || wal_bytes >= options_.wal_trigger_bytes ||
-                              DirtyBytes(dirty_pages) >= options_.dirty_trigger_bytes || age_expired,
+                              dirty_pages * PAGE_SIZE >= options_.dirty_trigger_bytes || age_expired,
       .age_since_success = std::chrono::steady_clock::now() - last_success_,
       .last_error = last_failure_ ? std::optional<std::string>{last_failure_->ToString()} : std::nullopt,
   };

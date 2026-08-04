@@ -88,7 +88,7 @@ auto ToBytes(const std::array<char, PAGE_SIZE> &page) -> std::span<const std::by
 ** Open may create and initialize an absent database. O_CREAT can leave an
 ** empty directory entry before initialization begins, so the zero-file and
 ** two-zero-superblock states are explicitly retryable. Existing nonempty
-** files pass superblock and physical-frontier validation before any mutation.
+** files pass superblock and file-size validation before any mutation.
 */
 auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager> {
   auto fd = UniqueFd(io::Open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
@@ -182,15 +182,15 @@ auto DiskManager::Open(const std::filesystem::path &path) -> Result<DiskManager>
   // The superblock may not claim pages beyond the physical file. It may claim
   // fewer pages because a failed checkpoint can leave harmless trailing data.
   const auto file_pages = static_cast<std::uint64_t>(file_stat.st_size) / PAGE_SIZE;
-  if (disk.HighWaterPageId() < FIRST_DATA_PAGE_ID || disk.HighWaterPageId() > file_pages) {
-    return std::unexpected(Status::Corruption("superblock allocation frontier lies outside the database file"));
+  if (disk.LogicalPageCount() > file_pages) {
+    return std::unexpected(Status::Corruption("superblock logical page count exceeds the database file"));
   }
   return disk;
 }
 
 auto DiskManager::GetRootPageId() const -> page_id_t { return selected_.value.root_page_id; }
 auto DiskManager::GetAllocatorRootPageId() const -> page_id_t { return selected_.value.allocator_root_page_id; }
-auto DiskManager::HighWaterPageId() const -> page_id_t { return selected_.value.high_water_page_id; }
+auto DiskManager::LogicalPageCount() const -> page_id_t { return selected_.value.logical_page_count; }
 auto DiskManager::CheckpointLsn() const -> std::uint64_t { return selected_.value.checkpoint_lsn; }
 auto DiskManager::Uuid() const -> const DatabaseUuid & { return selected_.value.database_uuid; }
 
@@ -200,34 +200,34 @@ auto DiskManager::EncodeCurrentSuperblock() const -> storage::SuperblockPage {
   return *encoded;
 }
 
-auto DiskManager::EnsurePageCount(page_id_t high_water_page_id) -> Status {
+auto DiskManager::EnsurePageCount(page_id_t logical_page_count) -> Status {
   TINYDB_CHECK(fd_.Valid(), "extending a closed disk manager");
-  if (high_water_page_id < FIRST_DATA_PAGE_ID) {
-    return Status::InvalidArgument("allocation frontier overlaps superblocks");
+  if (logical_page_count < FIRST_DATA_PAGE_ID) {
+    return Status::InvalidArgument("logical page count must include both superblocks");
   }
   // File growth is physical preparation for checkpoint, not page allocation.
-  // The logical frontier was already committed before this call.
-  if (io::Ftruncate(fd_.Get(), high_water_page_id * PAGE_SIZE) < 0) {
+  // The logical page count was already committed before this call.
+  if (io::Ftruncate(fd_.Get(), logical_page_count * PAGE_SIZE) < 0) {
     return ErrnoStatus("ftruncate");
   }
   return {};
 }
 
 auto DiskManager::WriteCheckpointPage(page_id_t page_id, const char *data,
-                                      page_id_t captured_high_water_page_id) const -> Status {
+                                      page_id_t captured_logical_page_count) const -> Status {
   TINYDB_CHECK(fd_.Valid(), "writing through a closed disk manager");
-  if (data == nullptr || captured_high_water_page_id < FIRST_DATA_PAGE_ID || page_id < FIRST_DATA_PAGE_ID ||
-      page_id >= captured_high_water_page_id) {
-    return Status::InvalidArgument("checkpoint page lies outside its captured allocation frontier");
+  if (data == nullptr || captured_logical_page_count < FIRST_DATA_PAGE_ID || page_id < FIRST_DATA_PAGE_ID ||
+      page_id >= captured_logical_page_count) {
+    return Status::InvalidArgument("checkpoint page lies outside its captured logical page range");
   }
   return io::FullPwrite(fd_.Get(), data, PAGE_SIZE, page_id * PAGE_SIZE);
 }
 
 auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id,
-                                   page_id_t high_water_page_id, std::uint64_t checkpoint_lsn) -> Status {
+                                   page_id_t logical_page_count, std::uint64_t checkpoint_lsn) -> Status {
   TINYDB_CHECK(fd_.Valid(), "checkpointing a closed disk manager");
   if (checkpoint_lsn < CheckpointLsn()) {
-    return Status::InvalidArgument("checkpoint frontier moved backward");
+    return Status::InvalidArgument("checkpoint LSN moved backward");
   }
   if (selected_.value.generation == std::numeric_limits<std::uint64_t>::max()) {
     return Status::ResourceExhausted("superblock generation space exhausted");
@@ -238,7 +238,7 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
   **
   ** Data pages were synchronized by CheckpointManager before this call. Write
   ** the inactive slot, then synchronize that one new recovery root. The old
-  ** slot is deliberately left untouched.
+  ** slot is left untouched.
   ** In-memory metadata changes only after fsync succeeds.
   */
   auto next = selected_.value;
@@ -246,7 +246,7 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
   next.checkpoint_lsn = checkpoint_lsn;
   next.root_page_id = root_page_id;
   next.allocator_root_page_id = allocator_root_page_id;
-  next.high_water_page_id = high_water_page_id;
+  next.logical_page_count = logical_page_count;
   const auto encoded = storage::EncodeSuperblock(next);
   if (!encoded) {
     return encoded.error();
@@ -276,9 +276,7 @@ auto DiskManager::Sync() const -> Status {
 
 auto DiskManager::ReadPage(page_id_t page_id, char *data) const -> Status {
   TINYDB_CHECK(fd_.Valid(), "reading from a closed disk manager");
-  if (page_id < FIRST_DATA_PAGE_ID || page_id >= HighWaterPageId()) {
-    // Invalid requests are programming/API errors; short or malformed bytes
-    // inside an allocated page are persistent corruption.
+  if (page_id < FIRST_DATA_PAGE_ID || page_id >= LogicalPageCount()) {
     return Status::InvalidArgument("reading a page that was never allocated");
   }
   const auto bytes_read = io::FullPread(fd_.Get(), data, PAGE_SIZE, page_id * PAGE_SIZE);

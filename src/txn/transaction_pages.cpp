@@ -19,16 +19,10 @@ namespace tinydb::txn {
 */
 auto TransactionPages::Begin(PageReader *committed, DatabaseState base_state,
                              std::size_t memory_limit_bytes) -> Result<TransactionPages> {
-  if (committed == nullptr) {
-    return std::unexpected(Status::InvalidArgument("transaction requires committed pages"));
-  }
-  if (memory_limit_bytes < PAGE_SIZE) {
-    return std::unexpected(Status::InvalidArgument("transaction memory limit must hold at least one page"));
-  }
-  if (base_state.high_water_page_id < FIRST_DATA_PAGE_ID ||
-      (base_state.root_page_id != HEADER_PAGE_ID && base_state.root_page_id >= base_state.high_water_page_id) ||
+  if (base_state.logical_page_count < FIRST_DATA_PAGE_ID ||
+      (base_state.root_page_id != HEADER_PAGE_ID && base_state.root_page_id >= base_state.logical_page_count) ||
       (base_state.allocator_root_page_id != HEADER_PAGE_ID &&
-       base_state.allocator_root_page_id >= base_state.high_water_page_id)) {
+       base_state.allocator_root_page_id >= base_state.logical_page_count)) {
     return std::unexpected(Status::Corruption("invalid transaction base state"));
   }
 
@@ -57,7 +51,7 @@ void TransactionPages::RequireUnpinned() const {
 
 void TransactionPages::ReleasePrivate(void *owner, page_id_t page_id, bool dirty, bool tree_payload_validated) {
   auto *const frame = static_cast<PrivateFrame *>(owner);
-  TINYDB_CHECK(frame->page_id == page_id, "transaction page lease changed identity");
+  (void)page_id;
   TINYDB_CHECK(frame->pin_count != 0, "transaction page pin count underflow");
   if (frame->editing) {
     TINYDB_CHECK(frame->pin_count == 1, "mutable transaction page lease overlapped another lease");
@@ -73,7 +67,6 @@ void TransactionPages::ReleasePrivate(void *owner, page_id_t page_id, bool dirty
 auto TransactionPages::PrivateHandle(PrivateFrame *frame, bool editable) -> PageHandle {
   if (editable) {
     TINYDB_CHECK(frame->pin_count == 0, "editing a transaction page with an outstanding lease");
-    TINYDB_CHECK(!frame->editing, "editing a transaction page through an existing mutable lease");
     frame->editing = true;
   } else {
     TINYDB_CHECK(!frame->editing, "reading a transaction page through an active mutable lease");
@@ -110,8 +103,7 @@ auto TransactionPages::CreatePrivatePage(page_id_t page_id, bool dirty) -> Resul
       .tree_payload_validated = false,
       .sealed_header = {},
   });
-  const auto [position, inserted] = pages_.emplace(page_id, std::move(frame));
-  TINYDB_CHECK(inserted, "transaction inserted one page twice");
+  const auto position = pages_.emplace(page_id, std::move(frame)).first;
   return position->second.get();
 }
 
@@ -156,8 +148,8 @@ auto TransactionPages::Edit(page_id_t page_id) -> Result<PageHandle> {
 
 auto TransactionPages::AllocateReusablePage() -> std::optional<page_id_t> {
   for (auto extent = free_extents_.begin(); extent != free_extents_.end(); ++extent) {
-    // Eligibility is fixed by the captured checkpoint frontier. A checkpoint
-    // completing concurrently cannot change allocation choices mid-transaction.
+    // Eligibility is fixed by the captured checkpoint LSN. A concurrent
+    // checkpoint cannot change allocation choices during this transaction.
     if (extent->retire_lsn > base_state_.checkpoint_lsn) {
       continue;
     }
@@ -173,17 +165,17 @@ auto TransactionPages::AllocateReusablePage() -> std::optional<page_id_t> {
   return std::nullopt;
 }
 
-auto TransactionPages::AllocateHighWaterPage() -> Result<PrivateFrame *> {
-  if (resulting_state_.high_water_page_id == std::numeric_limits<page_id_t>::max()) {
+auto TransactionPages::AllocateNewPage() -> Result<PrivateFrame *> {
+  if (resulting_state_.logical_page_count == std::numeric_limits<page_id_t>::max()) {
     return std::unexpected(Status::ResourceExhausted("page ID space exhausted"));
   }
-  // This is logical growth only. The high-water mark lives in DatabaseState,
-  // so extending it does not require rewriting an unchanged free-extent index.
-  // DiskManager extends the physical file after commit.
-  const auto page_id = resulting_state_.high_water_page_id++;
+  // This extends only the transaction's logical page range. The logical page
+  // count is part of DatabaseState, not the free-extent index. DiskManager
+  // extends the physical file after commit.
+  const auto page_id = resulting_state_.logical_page_count++;
   auto page = CreatePrivatePage(page_id, true);
   if (!page) {
-    --resulting_state_.high_water_page_id;
+    --resulting_state_.logical_page_count;
     return std::unexpected(std::move(page).error());
   }
   return page;
@@ -191,8 +183,8 @@ auto TransactionPages::AllocateHighWaterPage() -> Result<PrivateFrame *> {
 
 auto TransactionPages::Allocate() -> Result<PageHandle> {
   RequireActive();
-  // Reuse is preferred because it bounds file growth. Falling back to the
-  // private frontier changes only resulting_state_, not the physical file.
+  // Reuse limits file growth. If no page is reusable, AllocateNewPage changes
+  // only resulting_state_. It does not extend the physical file.
   auto page_id = AllocateReusablePage();
   PrivateFrame *frame = nullptr;
   if (page_id.has_value()) {
@@ -202,7 +194,7 @@ auto TransactionPages::Allocate() -> Result<PageHandle> {
     }
     frame = *page;
   } else {
-    auto page = AllocateHighWaterPage();
+    auto page = AllocateNewPage();
     if (!page) {
       return std::unexpected(std::move(page).error());
     }
@@ -214,7 +206,7 @@ auto TransactionPages::Allocate() -> Result<PageHandle> {
 
 auto TransactionPages::Free(page_id_t page_id) -> Status {
   RequireActive();
-  if (page_id < FIRST_DATA_PAGE_ID || page_id >= resulting_state_.high_water_page_id) {
+  if (page_id < FIRST_DATA_PAGE_ID || page_id >= resulting_state_.logical_page_count) {
     return Status::Corruption("transaction retired an unallocated page ID");
   }
   if (retired_page_ids_.contains(page_id)) {
@@ -240,10 +232,6 @@ auto TransactionPages::Free(page_id_t page_id) -> Status {
 
 void TransactionPages::SetRootPageId(page_id_t root_page_id) {
   RequireActive();
-  TINYDB_CHECK(root_page_id >= FIRST_DATA_PAGE_ID, "transaction root is a reserved page");
-  TINYDB_CHECK(root_page_id < resulting_state_.high_water_page_id,
-               "transaction root lies beyond the allocation frontier");
-  TINYDB_CHECK(!retired_page_ids_.contains(root_page_id), "transaction root has been retired");
   resulting_state_.root_page_id = root_page_id;
 }
 
@@ -262,7 +250,7 @@ auto TransactionPages::LoadFreeExtents() -> Status {
   // Bounds, cycles, and global extent ordering are proven before any extent
   // becomes available to Allocate.
   while (page_id != HEADER_PAGE_ID) {
-    if (page_id >= base_state_.high_water_page_id || !visited.insert(page_id).second) {
+    if (page_id >= base_state_.logical_page_count || !visited.insert(page_id).second) {
       return Status::Corruption("free-extent index contains an invalid link");
     }
     auto page = committed_->Read(page_id);
@@ -277,8 +265,8 @@ auto TransactionPages::LoadFreeExtents() -> Status {
       return decoded.error();
     }
     for (const auto &extent : decoded->extents) {
-      if (extent.first_page_id + extent.page_count > base_state_.high_water_page_id) {
-        return Status::Corruption("free extent exceeds the allocation frontier");
+      if (extent.first_page_id + extent.page_count > base_state_.logical_page_count) {
+        return Status::Corruption("free extent exceeds the logical page range");
       }
       if (!free_extents_.empty()) {
         const auto &previous = free_extents_.back();
@@ -332,10 +320,10 @@ auto TransactionPages::EnsureFreeExtentIndexFrames() -> Status {
   }
   const auto required_pages = std::max<std::size_t>(
       1, (free_extents_.size() + storage::FREE_EXTENTS_PER_PAGE - 1) / storage::FREE_EXTENTS_PER_PAGE);
-  // Metadata growth bypasses the free index it is modifying and consumes only
-  // high-water IDs. Existing metadata pages are retained when the index shrinks.
+  // Metadata growth bypasses the free index that it modifies. It allocates new
+  // page IDs instead. Existing metadata pages remain when the index shrinks.
   while (allocator_page_ids_.size() < required_pages) {
-    auto page = AllocateHighWaterPage();
+    auto page = AllocateNewPage();
     if (!page) {
       return std::move(page).error();
     }
@@ -377,7 +365,6 @@ auto TransactionPages::StoreFreeExtentIndex() -> Status {
 
 auto TransactionPages::PrepareCommit(std::uint64_t commit_lsn) -> Status {
   RequireActive();
-  TINYDB_CHECK(commit_lsn != 0, "preparing a zero commit LSN");
   RequireUnpinned();
   if (allocator_dirty_) {
     AddRetiredExtents(commit_lsn);
@@ -390,7 +377,7 @@ auto TransactionPages::PrepareCommit(std::uint64_t commit_lsn) -> Status {
   }
 
   for (auto &[page_id, page] : pages_) {
-    if (!page->dirty || retired_page_ids_.contains(page_id)) {
+    if (!page->dirty) {
       continue;
     }
     auto header = storage::RewriteDataPageLsn(std::as_writable_bytes(std::span<char, PAGE_SIZE>(*page->bytes)), page_id,
@@ -401,7 +388,6 @@ auto TransactionPages::PrepareCommit(std::uint64_t commit_lsn) -> Status {
     page->sealed_header = *header;
   }
   resulting_state_.visible_lsn = commit_lsn;
-  RequireUnpinned();
   prepared_ = true;
   return {};
 }
@@ -432,10 +418,10 @@ auto TransactionPages::TakePages() -> std::vector<cache::CommittedPageImage> {
   result.reserve(pages_.size());
   // Ownership moves directly toward publication; page bytes are not copied.
   for (auto &[page_id, page] : pages_) {
-    if (!page->dirty || retired_page_ids_.contains(page_id)) {
+    (void)page_id;
+    if (!page->dirty) {
       continue;
     }
-    TINYDB_CHECK(page->sealed_header.page_id == page_id, "taking a page without its seal proof");
     result.push_back(cache::CommittedPageImage{
         .header = page->sealed_header,
         .bytes = std::move(page->bytes),

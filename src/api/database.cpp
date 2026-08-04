@@ -115,7 +115,7 @@ auto InitialState(const DiskManager &disk) -> std::shared_ptr<const txn::Databas
   return std::make_shared<const txn::DatabaseState>(txn::DatabaseState{
       .root_page_id = disk.GetRootPageId(),
       .allocator_root_page_id = disk.GetAllocatorRootPageId(),
-      .high_water_page_id = disk.HighWaterPageId(),
+      .logical_page_count = disk.LogicalPageCount(),
       .visible_lsn = disk.CheckpointLsn(),
       .checkpoint_lsn = disk.CheckpointLsn(),
   });
@@ -136,7 +136,7 @@ auto LifecycleError(Lifecycle lifecycle, bool diagnostics = false) -> Status {
     case Lifecycle::Closed:
       return Status::Closed("operation on a closed database handle");
   }
-  TINYDB_CHECK(false, "unknown database lifecycle status");
+  std::unreachable();
 }
 
 }  // namespace
@@ -197,8 +197,8 @@ class DatabaseCore final {
         cache(std::move(page_cache)),
         readers(std::move(reader_gate)),
         wal(std::move(write_ahead_log)),
-        checkpoints(std::make_unique<checkpoint::Manager>(disk.get(), cache.get(), readers.get(), wal.get(),
-                                                          database_options.checkpoint)) {}
+        checkpoints(std::make_unique<checkpoint::Manager>(*disk, *cache, *readers, *wal, database_options.checkpoint)) {
+  }
 
   DatabaseCore(const DatabaseCore &) = delete;
   auto operator=(const DatabaseCore &) -> DatabaseCore & = delete;
@@ -629,7 +629,7 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
     return std::unexpected(disk_result.error());
   }
   auto disk = std::make_unique<DiskManager>(*std::move(disk_result));
-  auto cache = std::make_unique<cache::CommittedPageCache>(disk.get(), options.page_cache_bytes, disk->CheckpointLsn());
+  auto cache = std::make_unique<cache::CommittedPageCache>(*disk, options.page_cache_bytes, disk->CheckpointLsn());
   auto readers = std::make_unique<txn::ReaderGate>(InitialState(*disk));
   auto wal_result = Wal::Open(wal_path, disk->Uuid(), disk->CheckpointLsn() + 1);
   if (!wal_result) {
@@ -695,8 +695,8 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
     }
   }
 
-  // The writer permit makes checkpoint capture, I/O, and frontier publication
-  // one simple maintenance phase before private transaction preparation.
+  // The writer permit makes checkpoint capture, I/O, and checkpoint-LSN
+  // publication one maintenance phase before private transaction preparation.
   if (core->checkpoints->ShouldCheckpoint()) {
     const auto status = core->checkpoints->Checkpoint();
     if (status.Code() == StatusCode::NeedsRecovery || status.Code() == StatusCode::IndeterminateCommit ||

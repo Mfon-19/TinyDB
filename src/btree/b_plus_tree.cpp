@@ -1,5 +1,4 @@
 #include "btree/b_plus_tree.h"
-#include "util/check.h"
 
 #include <array>
 #include <cstddef>
@@ -16,7 +15,6 @@
 #include "page_format.h"
 #include "page_source.h"
 #include "page_view.h"
-#include "txn/contract.h"
 #include "value_storage.h"
 
 /*
@@ -49,25 +47,21 @@ namespace {
 struct DescentPath final {
   static constexpr auto MAX_DEPTH = std::size_t{64};
 
-  auto Back() const -> page_id_t {
-    TINYDB_CHECK(size != 0, "reading an empty tree descent path");
-    return pages[size - 1];
-  }
+  auto Back() const -> page_id_t { return pages[size - 1]; }
 
   std::array<page_id_t, MAX_DEPTH> pages;
   std::size_t size{0};
 };
 
-auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key, DescentPath *path) -> Status {
+auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key, DescentPath &path) -> Status {
   // Retain page ids, not page handles: each level is released before the next
   // read. Sixty-four levels exceed the representable page population at
   // minimum fanout, so the fixed path also turns a corrupt child cycle into a
   // finite error without allocating on every Put.
-  TINYDB_CHECK(path != nullptr, "tree descent requires a result path");
-  path->pages[0] = root_page_id;
-  path->size = 1;
+  path.pages[0] = root_page_id;
+  path.size = 1;
   for (;;) {
-    auto page = pages->Read(path->Back());
+    auto page = pages->Read(path.Back());
     if (!page) {
       return std::move(page).error();
     }
@@ -75,18 +69,15 @@ auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view k
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
       return {};
     }
-    if (type != static_cast<std::uint16_t>(NodeType::Internal)) {
-      return Status::Corruption("tree descent reached a non-tree page");
-    }
     const auto node = InternalPageView::Open(*page);
     if (!node) {
       return node.error();
     }
-    if (path->size == path->pages.size()) {
+    if (path.size == path.pages.size()) {
       return Status::Corruption("tree descent is too deep or cyclic");
     }
     const auto child = node->ChildAt(node->FindChildIndex(key));
-    path->pages[path->size++] = child;
+    path.pages[path.size++] = child;
   }
 }
 
@@ -156,9 +147,6 @@ auto SplitAndWrite(PageSource *pages, PageHandle &page, InternalPageBuilder &nod
 // Attach to a validated tree root. An all-zero allocated page is the sole
 // bootstrap representation and is immediately initialized as an empty leaf.
 auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusTree> {
-  TINYDB_CHECK(pages != nullptr, "page source is null");
-  TINYDB_CHECK(root_page_id != HEADER_PAGE_ID, "root page id is the reserved header page");
-
   // Existing roots are normally read-only for the whole transaction. Do not
   // copy one into the private write overlay merely to validate it.
   auto root_page = pages->Read(root_page_id);
@@ -174,14 +162,8 @@ auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusT
     if (!editable_root) {
       return std::unexpected(std::move(editable_root).error());
     }
-    TINYDB_CHECK(RawNodeType(*editable_root) == 0, "fresh tree root changed before initialization");
     StoreTreePage(LeafPageBuilder{}, *editable_root);
     return BPlusTree(pages, root_page_id);
-  }
-  const bool is_node = raw_type == static_cast<std::uint16_t>(NodeType::Leaf) ||
-                       raw_type == static_cast<std::uint16_t>(NodeType::Internal);
-  if (!is_node) {
-    return std::unexpected(Status::Corruption("root page is not a b+ tree node"));
   }
   // Existing roots cross the full page-validation boundary before use.
   if (auto status = ValidateTreePage(*root_page); !status.Ok()) {
@@ -193,11 +175,8 @@ auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusT
 auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   // Upsert the destination leaf, then carry at most one separator upward. Each
   // ancestor either absorbs that edge or splits and replaces it with another.
-  TINYDB_CHECK(txn::ValidateKeySize(key.size()) == StatusCode::Ok,
-               "Put key size must be validated at the public boundary");
-  TINYDB_CHECK(value.size() <= MAX_VALUE_BYTES, "Put value size must be validated at the public boundary");
   DescentPath path;
-  if (auto status = DescendToLeaf(pages_, root_page_id_, key, &path); !status.Ok()) {
+  if (auto status = DescendToLeaf(pages_, root_page_id_, key, path); !status.Ok()) {
     return status;
   }
 
@@ -248,7 +227,7 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
 
   // level names the child that just split; decrementing selects its parent.
   std::size_t level = path.size - 1;
-  while (pending.has_value() && level > 0) {
+  while (level > 0) {
     --level;
     auto page = pages_->Edit(path.pages[level]);
     if (!page) {
@@ -272,16 +251,14 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     pending = std::move(*split);
   }
 
-  if (pending.has_value()) {
-    // No parent absorbed the final edge. The old root is already its left half.
-    auto new_root = pages_->Allocate();
-    if (!new_root) {
-      return std::move(new_root).error();
-    }
-    const auto root = InternalPageBuilder(root_page_id_, pending->key, pending->right_child);
-    StoreTreePage(root, *new_root);
-    root_page_id_ = new_root->Id();
+  // No parent absorbed the final edge. The old root is already its left half.
+  auto new_root = pages_->Allocate();
+  if (!new_root) {
+    return std::move(new_root).error();
   }
+  const auto root = InternalPageBuilder(root_page_id_, pending->key, pending->right_child);
+  StoreTreePage(root, *new_root);
+  root_page_id_ = new_root->Id();
   return {};
 }
 
@@ -289,7 +266,6 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
 // present value into the API result.
 auto BPlusTree::Read(PageReader *pages, page_id_t root_page_id,
                      std::string_view key) -> Result<std::optional<std::string>> {
-  TINYDB_CHECK(pages != nullptr, "point lookup requires a page reader");
   auto leaf_page = FindLeaf(pages, root_page_id, key);
   if (!leaf_page) {
     return std::unexpected(std::move(leaf_page).error());
