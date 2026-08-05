@@ -108,7 +108,6 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
 auto PrepareValue(PageSource *pages, std::string_view key, std::string_view value) -> Result<LeafValueView> {
   const auto inline_footprint = SLOT_SIZE + LEAF_CELL_HEADER_SIZE + key.size() + value.size();
   if (inline_footprint <= MAX_LEAF_RECORD_BYTES) {
-    // The builder copies this borrowed value before Put returns.
     return LeafValueView::Inline(value);
   }
 

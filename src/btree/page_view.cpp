@@ -1,7 +1,5 @@
 #include "btree/page_view.h"
 
-#include "util/check.h"
-
 #include "btree/page_format.h"
 #include "btree/page_source.h"
 #include "txn/contract.h"

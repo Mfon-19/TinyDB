@@ -12,12 +12,24 @@ namespace tinydb {
 /*
 ** LEAF VALUE REPRESENTATION
 **
-** Inline values borrow bytes from their leaf. Overflow values store one fixed
-** descriptor in the leaf and place the logical bytes in separately checksummed
-** pages. The first page ID is also the value identifier recorded by every page
-** in the chain. The owner and chunk index reject cross-value or cross-position
-** links; canonical payload lengths and each page's checksum protect the chain
-** geometry and physical bytes.
+** A leaf cell stores a value in one of two forms.
+**
+** An inline cell contains the complete value bytes. LeafValueView borrows
+** these bytes directly from the leaf page.
+**
+** An overflow cell contains a fixed 16-byte descriptor instead. The
+** descriptor gives the total value size and the first overflow page ID. TinyDB
+** stores the value bytes in a chain of overflow pages.
+**
+** The first overflow page ID also identifies the complete value. Every page
+** repeats this ID as owner_value_id and stores its zero-based position as
+** chunk_index.
+** TinyDB rejects pages with an unexpected owner_value_id or chunk_index.
+**
+** Every page except the final page contains a full-size chunk. The final page
+** contains exactly the remaining bytes. These rules reject a chain with the
+** wrong total length or a short intermediate chunk. Each overflow page also
+** has a checksum that covers the complete page.
 */
 enum class LeafValueKind : std::uint8_t {
   Inline = 0,

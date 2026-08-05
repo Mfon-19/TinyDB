@@ -4,7 +4,6 @@
 
 #include <tinydb/status.h>
 
-#include <cstddef>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -20,7 +19,7 @@ class PageSource;
 ** PrepareValue chooses inline storage when one record remains below the
 ** byte-split safety bound. Otherwise it allocates and completely encodes a
 ** private chain. A failure leaves partial pages private; the write transaction
-** must abort, just like a tree split that runs out of memory.
+** must abort.
 **
 ** CopyValue and RetireOverflowValue validate the complete chain before
 ** returning bytes or changing reachability. Integrity validation additionally
