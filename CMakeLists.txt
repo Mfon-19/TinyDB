@@ -8,6 +8,7 @@ project(
 option(TINYDB_ENABLE_CLANG_TIDY "Run clang-tidy while compiling local targets" OFF)
 option(TINYDB_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(TINYDB_BUILD_BENCHMARKS "Build the workload benchmarks in bench/" OFF)
+option(TINYDB_BUILD_MICROBENCHMARKS "Build component microbenchmarks in microbench/" OFF)
 set(TINYDB_SANITIZER "none" CACHE STRING "Sanitizer: none, address, or thread")
 set_property(CACHE TINYDB_SANITIZER PROPERTY STRINGS none address thread)
 
@@ -213,4 +214,8 @@ endif()
 if(TINYDB_BUILD_BENCHMARKS)
   set(TINYDB_ENGINE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
   add_subdirectory(bench)
+endif()
+
+if(TINYDB_BUILD_MICROBENCHMARKS)
+  add_subdirectory(microbench)
 endif()

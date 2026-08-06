@@ -30,6 +30,7 @@
       "displayName": "Debug + clang-tidy",
       "inherits": "debug",
       "cacheVariables": {
+        "TINYDB_BUILD_MICROBENCHMARKS": "ON",
         "TINYDB_ENABLE_CLANG_TIDY": "ON"
       }
     },
@@ -80,7 +81,8 @@
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "clang++",
         "CMAKE_CXX_FLAGS": "-D__cpp_concepts=202002L -Wno-builtin-macro-redefined",
-        "CMAKE_EXE_LINKER_FLAGS": ""
+        "CMAKE_EXE_LINKER_FLAGS": "",
+        "TINYDB_BUILD_MICROBENCHMARKS": "ON"
       }
     },
     {

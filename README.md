@@ -224,6 +224,16 @@ tinydb_dump <database>
 
 ## Benchmarking
 
+TinyDB has a component microbenchmark suite for CRC, page search, overflow
+values, WAL codecs, and resident cache hits:
+
+```sh
+make microbench
+```
+
+These measurements isolate in-memory implementation costs. The workload
+benchmark below measures complete database behavior and system resources.
+
 The benchmark worker has one operation protocol, result schema, metrics
 implementation, and runner. Its portable workloads use db_bench conventions
 and native YCSB A-F mixes; backend adapters let the same code measure TinyDB,
@@ -307,5 +317,6 @@ TinyDB-only CRUD matrix are not directly comparable.
 | `src/verify` | Read-only structural integrity verification |
 | `src/cli` | One-shot command-line interface |
 | `tests` | Guarantee-oriented tests and format fixtures |
+| `microbench` | In-memory component microbenchmarks |
 | `bench` | Repeatable TinyDB measurement harness |
 | `tools` | Binary-safe inspection utilities |
