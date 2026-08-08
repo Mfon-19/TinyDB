@@ -172,4 +172,9 @@ auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page
 auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id,
                         const DataPageHeader &validated_header) -> Result<OverflowPage>;
 
+// Decode canonical transaction-private bytes whose PageHandle carries an
+// overflow payload proof. Common fields and overflow structure are checked,
+// but the checksum is deferred until commit seals the final page image.
+auto DecodePrivateOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<OverflowPage>;
+
 }  // namespace tinydb::storage

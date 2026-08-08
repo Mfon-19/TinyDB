@@ -215,6 +215,30 @@ TEST(Database, LargeValues) {
   Cleanup(path);
 }
 
+TEST(Database, LargeValueReadYourWrites) {
+  const auto path = tinydb::test::Path("large_value_read_your_writes");
+  auto database = Fresh("large_value_read_your_writes").value();
+  const auto first = std::string(3U * tinydb::PAGE_SIZE, 'a');
+  const auto replacement = std::string(2U * tinydb::PAGE_SIZE + 17U, 'b');
+  auto write = database.BeginWrite().value();
+
+  ASSERT_TRUE(write.Put("large", first).Ok());
+  const auto first_read = write.Get("large");
+  ASSERT_TRUE(first_read.has_value());
+  EXPECT_EQ(*first_read, first);
+
+  ASSERT_TRUE(write.Put("large", replacement).Ok());
+  const auto replacement_read = write.Get("large");
+  ASSERT_TRUE(replacement_read.has_value());
+  EXPECT_EQ(*replacement_read, replacement);
+
+  ASSERT_TRUE(write.Delete("large").Ok());
+  EXPECT_EQ(write.Get("large").value(), std::nullopt);
+  ASSERT_TRUE(std::move(write).Commit().has_value());
+  EXPECT_EQ(database.Get("large").value(), std::nullopt);
+  Cleanup(path);
+}
+
 TEST(Database, Model) {
   const auto path = tinydb::test::Path("model");
   Cleanup(path);

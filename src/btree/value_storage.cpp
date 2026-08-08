@@ -28,10 +28,21 @@ struct ChainConstraints {
   std::unordered_set<page_id_t> *claimed_pages{nullptr};
 };
 
+auto DecodeOverflow(const PageHandle &page) -> Result<storage::OverflowPage> {
+  const auto bytes = std::as_bytes(std::span{page.Data(), PAGE_SIZE});
+  if (const auto *const header = page.ValidatedHeader(); header != nullptr) {
+    return storage::DecodeOverflowPage(bytes, page.Id(), *header);
+  }
+  if (page.OverflowPayloadValidated()) {
+    return storage::DecodePrivateOverflowPage(bytes, page.Id());
+  }
+  return storage::DecodeOverflowPage(bytes, page.Id());
+}
+
 /*
-** Walk one descriptor without trusting any link or redundant field. The
-** visitor runs only after the current page's checksum, identity, owner, chunk
-** index, and canonical payload length have been checked.
+** Walk one descriptor without trusting any link or redundant field. A page
+** crosses either the persistent checksum boundary or its transaction-private
+** payload proof before the visitor sees its validated chain fields.
 */
 template <typename Visitor>
 auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor,
@@ -61,10 +72,7 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
     if (!page) {
       return std::move(page).error();
     }
-    const auto bytes = std::as_bytes(std::span{page->Data(), PAGE_SIZE});
-    const auto *const validated_header = page->ValidatedHeader();
-    const auto decoded = validated_header != nullptr ? storage::DecodeOverflowPage(bytes, page->Id(), *validated_header)
-                                                     : storage::DecodeOverflowPage(bytes, page->Id());
+    const auto decoded = DecodeOverflow(*page);
     if (!decoded) {
       return decoded.error();
     }
@@ -136,6 +144,7 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
         !status.Ok()) {
       return std::unexpected(std::move(status));
     }
+    allocated[index].MarkOverflowPayloadValidated();
     allocated[index].MarkDirty();
   }
 
@@ -145,7 +154,7 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
   });
 }
 
-/* Copy and authenticate one overflow value. No borrowed page bytes escape. */
+/* Copy one validated overflow value. No borrowed page bytes escape. */
 auto CopyOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor) -> Result<std::string> {
   auto output = std::string{};
   output.reserve(static_cast<std::size_t>(descriptor.total_value_bytes));

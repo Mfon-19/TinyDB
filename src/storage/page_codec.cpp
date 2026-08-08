@@ -347,4 +347,12 @@ auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page
   return DecodeOverflowPayload(page, expected_page_id, validated_header);
 }
 
+auto DecodePrivateOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<OverflowPage> {
+  const auto header = DecodeDataPageHeaderFields(page, expected_page_id, false);
+  if (!header) {
+    return std::unexpected(header.error());
+  }
+  return DecodeOverflowPayload(page, expected_page_id, *header);
+}
+
 }  // namespace tinydb::storage

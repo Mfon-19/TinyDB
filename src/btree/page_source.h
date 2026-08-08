@@ -4,6 +4,7 @@
 #include "storage/page.h"
 #include "util/check.h"
 
+#include <cstdint>
 #include <memory>
 #include <utility>
 
@@ -12,6 +13,15 @@ namespace tinydb {
 namespace storage {
 struct DataPageHeader;
 }
+
+// Transaction-private pages can defer their checksum until commit when an
+// internal builder or codec has proved the complete type-specific payload.
+// Any later mutable access clears this proof.
+enum class PagePayloadProof : std::uint8_t {
+  None,
+  Tree,
+  Overflow,
+};
 
 /*
 ** PAGE ACCESS BOUNDARY
@@ -31,7 +41,7 @@ struct DataPageHeader;
 */
 class PageHandle {
  public:
-  using Release = void (*)(void *owner, page_id_t page_id, bool dirty, bool tree_payload_validated);
+  using Release = void (*)(void *owner, page_id_t page_id, bool dirty, PagePayloadProof payload_proof);
 
   PageHandle() = default;
   // Mutable typing is the construction-time proof that an editable handle
@@ -39,23 +49,24 @@ class PageHandle {
   // so all later writes still pass through MutableData().
   // NOLINTNEXTLINE(readability-non-const-parameter)
   PageHandle(void *owner, page_id_t page_id, char *data, bool editable, Release release,
-             bool tree_payload_validated = false)
+             PagePayloadProof payload_proof = PagePayloadProof::None)
       : owner_(owner),
         page_id_(page_id),
         data_(data),
         release_(release),
         editable_(editable),
-        tree_payload_validated_(tree_payload_validated) {}
+        payload_proof_(payload_proof) {}
 
   // Immutable caches retain a frame through keepalive. Its shared ownership is
   // also the exact eviction pin, so release needs no owner callback.
   PageHandle(page_id_t page_id, const char *data, std::shared_ptr<const void> keepalive,
-             const storage::DataPageHeader *validated_header = nullptr, bool tree_payload_validated = false)
+             const storage::DataPageHeader *validated_header = nullptr,
+             PagePayloadProof payload_proof = PagePayloadProof::None)
       : page_id_(page_id),
         data_(data),
         keepalive_(std::move(keepalive)),
         validated_header_(validated_header),
-        tree_payload_validated_(tree_payload_validated) {}
+        payload_proof_(payload_proof) {}
 
   PageHandle(const PageHandle &) = delete;
   auto operator=(const PageHandle &) -> PageHandle & = delete;
@@ -72,7 +83,7 @@ class PageHandle {
 
   ~PageHandle() {
     if (release_ != nullptr) {
-      release_(owner_, page_id_, dirty_, tree_payload_validated_);
+      release_(owner_, page_id_, dirty_, payload_proof_);
     }
   }
 
@@ -83,20 +94,27 @@ class PageHandle {
   // bytes first crossed the persistent validation boundary. Transaction
   // handles may instead carry a structural proof for their private bytes.
   auto ValidatedHeader() const noexcept -> const storage::DataPageHeader * { return validated_header_; }
-  auto TreePayloadValidated() const noexcept -> bool { return tree_payload_validated_; }
+  auto PayloadProof() const noexcept -> PagePayloadProof { return payload_proof_; }
+  auto TreePayloadValidated() const noexcept -> bool { return payload_proof_ == PagePayloadProof::Tree; }
+  auto OverflowPayloadValidated() const noexcept -> bool { return payload_proof_ == PagePayloadProof::Overflow; }
 
   // Only Edit and Allocate may produce an editable handle.
   auto MutableData() -> char * {
     TINYDB_CHECK(editable_, "mutable access through a read-only page handle");
-    // Any write invalidates the source's previous structural proof. A tree
-    // builder restores it after emitting one complete canonical node.
-    tree_payload_validated_ = false;
+    // Any write invalidates the previous structural proof. The responsible
+    // builder or codec restores it after emitting one canonical payload.
+    payload_proof_ = PagePayloadProof::None;
     return const_cast<char *>(data_);
   }
 
   void MarkTreePayloadValidated() {
     TINYDB_CHECK(editable_, "marking a read-only page as structurally validated");
-    tree_payload_validated_ = true;
+    payload_proof_ = PagePayloadProof::Tree;
+  }
+
+  void MarkOverflowPayloadValidated() {
+    TINYDB_CHECK(editable_, "marking a read-only overflow page as structurally validated");
+    payload_proof_ = PagePayloadProof::Overflow;
   }
 
   void MarkDirty() {
@@ -115,7 +133,7 @@ class PageHandle {
     swap(validated_header_, other.validated_header_);
     swap(editable_, other.editable_);
     swap(dirty_, other.dirty_);
-    swap(tree_payload_validated_, other.tree_payload_validated_);
+    swap(payload_proof_, other.payload_proof_);
   }
 
   void *owner_{nullptr};
@@ -126,7 +144,7 @@ class PageHandle {
   const storage::DataPageHeader *validated_header_{nullptr};
   bool editable_{false};
   bool dirty_{false};
-  bool tree_payload_validated_{false};
+  PagePayloadProof payload_proof_{PagePayloadProof::None};
 };
 
 /* Read algorithms depend only on stable immutable leases. */

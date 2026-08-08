@@ -46,7 +46,7 @@ void TransactionPages::RequireUnpinned() const {
   }
 }
 
-void TransactionPages::ReleasePrivate(void *owner, page_id_t page_id, bool dirty, bool tree_payload_validated) {
+void TransactionPages::ReleasePrivate(void *owner, page_id_t page_id, bool dirty, PagePayloadProof payload_proof) {
   auto *const frame = static_cast<PrivateFrame *>(owner);
   (void)page_id;
   TINYDB_CHECK(frame->pin_count != 0, "transaction page pin count underflow");
@@ -58,7 +58,7 @@ void TransactionPages::ReleasePrivate(void *owner, page_id_t page_id, bool dirty
   // and is replaced only by the sole mutable lease.
   --frame->pin_count;
   frame->dirty = frame->dirty || dirty;
-  frame->tree_payload_validated = tree_payload_validated;
+  frame->payload_proof = payload_proof;
 }
 
 auto TransactionPages::PrivateHandle(PrivateFrame *frame, bool editable) -> PageHandle {
@@ -69,7 +69,7 @@ auto TransactionPages::PrivateHandle(PrivateFrame *frame, bool editable) -> Page
     TINYDB_CHECK(!frame->editing, "reading a transaction page through an active mutable lease");
   }
   ++frame->pin_count;
-  return {frame, frame->page_id, frame->bytes->data(), editable, ReleasePrivate, frame->tree_payload_validated};
+  return {frame, frame->page_id, frame->bytes->data(), editable, ReleasePrivate, frame->payload_proof};
 }
 
 auto TransactionPages::Charge(std::size_t bytes) -> Status {
@@ -94,7 +94,7 @@ auto TransactionPages::CreatePrivatePage(page_id_t page_id, bool dirty) -> Resul
       .pin_count = 0,
       .editing = false,
       .dirty = dirty,
-      .tree_payload_validated = false,
+      .payload_proof = PagePayloadProof::None,
       .sealed_header = {},
   };
   const auto position = pages_.emplace(page_id, std::move(frame)).first;
@@ -133,7 +133,7 @@ auto TransactionPages::Edit(page_id_t page_id) -> Result<PageHandle> {
     return std::unexpected(std::move(private_page).error());
   }
   std::memcpy((*private_page)->bytes->data(), committed->Data(), PAGE_SIZE);
-  (*private_page)->tree_payload_validated = committed->TreePayloadValidated();
+  (*private_page)->payload_proof = committed->PayloadProof();
   return PrivateHandle(*private_page, true);
 }
 
@@ -400,7 +400,7 @@ auto TransactionPages::TakePages() -> std::vector<cache::CommittedPageImage> {
     result.push_back(cache::CommittedPageImage{
         .header = page.sealed_header,
         .bytes = std::move(page.bytes),
-        .tree_payload_validated = page.tree_payload_validated,
+        .tree_payload_validated = page.payload_proof == PagePayloadProof::Tree,
     });
   }
   // One order serves WAL adjacency validation and cache publication. The

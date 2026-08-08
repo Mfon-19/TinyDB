@@ -409,6 +409,10 @@ TEST(Format, Overflow) {
   EXPECT_EQ(tinydb::storage::GetLittleEndian<std::uint32_t>(std::as_bytes(std::span{provisional}),
                                                             tinydb::storage::data_page_offset::CHECKSUM),
             std::optional<std::uint32_t>{0U});
+  const auto private_decoded = tinydb::storage::DecodePrivateOverflowPage(std::as_bytes(std::span{provisional}), 7);
+  ASSERT_TRUE(private_decoded.has_value());
+  EXPECT_TRUE(std::ranges::equal(private_decoded->payload, payload));
+  EXPECT_FALSE(tinydb::storage::DecodeOverflowPage(std::as_bytes(std::span{provisional}), 7).has_value());
   ASSERT_TRUE(tinydb::storage::RewriteDataPageLsn(std::as_writable_bytes(std::span{provisional}), 7, 99).has_value());
   EXPECT_EQ(provisional, *encoded);
 

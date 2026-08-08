@@ -51,7 +51,7 @@ auto Lease(std::shared_ptr<CommittedFrame> frame) -> PageHandle {
   auto *const leased = frame.get();
   auto keeper = std::static_pointer_cast<const void>(std::move(frame));
   return {leased->header.page_id, leased->bytes->data(), std::move(keeper), &leased->header,
-          IsTreePage(leased->header)};
+          IsTreePage(leased->header) ? PagePayloadProof::Tree : PagePayloadProof::None};
 }
 
 }  // namespace
