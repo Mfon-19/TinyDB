@@ -2,13 +2,14 @@
 
 #include <tinydb/status.h>
 #include "btree/page_source.h"
+#include "cache/page_arena.h"
 #include "storage/page.h"
 #include "storage/page_codec.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -17,8 +18,6 @@ namespace tinydb {
 class DiskManager;
 
 namespace cache {
-
-using PageBytes = std::array<char, PAGE_SIZE>;
 
 struct CommittedFrame;
 
@@ -45,7 +44,7 @@ struct CommittedFrame;
 */
 struct CommittedPageImage {
   storage::DataPageHeader header;
-  std::unique_ptr<PageBytes> bytes;
+  PageArena::Lease bytes;
   bool tree_payload_validated{false};
 };
 
@@ -80,6 +79,9 @@ struct CommittedCacheStats {
   std::uint64_t hits{0};
   std::uint64_t misses{0};
   std::uint64_t evictions{0};
+  std::uint64_t read_ahead_plans{0};
+  std::uint64_t read_ahead_pages_scheduled{0};
+  std::uint64_t read_ahead_pages_consumed{0};
 };
 
 /*
@@ -100,6 +102,13 @@ class CommittedPageCache final : public PageReader {
 
   // A miss validates the complete common page header before caching bytes.
   auto Read(page_id_t page_id) -> Result<PageHandle> override;
+  // When the native engine is available, a direct stream accepts exact-page
+  // plans. Buffered and unavailable engines use the ordinary read path.
+  auto BeginReadStream() -> PageReadStream override;
+
+  // Write transactions use this same arena. Commit can therefore transfer an
+  // aligned direct page into the cache without a page-sized copy.
+  auto SharedPageArena() const noexcept -> std::shared_ptr<PageArena>;
 
   auto PreparePublication(std::vector<CommittedPageImage> images, std::vector<page_id_t> retired,
                           page_id_t logical_page_count) -> Result<PublicationPlan>;
@@ -109,6 +118,13 @@ class CommittedPageCache final : public PageReader {
   // caller serializes capture with publication so these pages and its captured
   // DatabaseState describe one visibility point.
   auto CaptureDirtyPages() -> std::vector<PageHandle>;
+  // Direct mode first uses the native checkpoint queue. If no native write
+  // starts, the method writes the complete page set synchronously.
+  auto WriteCheckpointPages(std::span<const PageHandle> pages, page_id_t captured_logical_page_count) -> Status;
+
+  // Wait until the native direct-I/O queue has no queued or active work.
+  // Buffered caches have no engine, so this returns immediately.
+  void DrainIoForTesting();
 
   // The caller invokes this only after the database file and superblock make
   // every page through checkpoint_lsn durable.

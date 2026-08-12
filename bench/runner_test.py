@@ -65,6 +65,45 @@ class RunnerTest(unittest.TestCase):
             args = target.parse_args()
         self.assertEqual(target.resolve_page_cache_overrides(args), {"current": 8 << 20})
 
+    def test_standalone_run_uses_buffered_io_by_default(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["runner.py", "run", "tinydb"],
+        ):
+            args = target.parse_args()
+        self.assertEqual(target.resolve_io_modes(args), {"current": "buffered"})
+
+    def test_standalone_run_accepts_direct_io(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["runner.py", "run", "tinydb", "--io-mode", "direct"],
+        ):
+            args = target.parse_args()
+        self.assertEqual(target.resolve_io_modes(args), {"current": "direct"})
+
+    def test_compare_accepts_independent_io_modes(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "runner.py",
+                "compare",
+                "tinydb",
+                "tinydb",
+                "--baseline-io-mode",
+                "buffered",
+                "--candidate-io-mode",
+                "direct",
+            ],
+        ):
+            args = target.parse_args()
+        self.assertEqual(
+            target.resolve_io_modes(args),
+            {"baseline": "buffered", "candidate": "direct"},
+        )
+
     def test_variant_cache_override_takes_precedence_over_common_value(self) -> None:
         with mock.patch.object(
             sys,
@@ -264,6 +303,92 @@ class RunnerTest(unittest.TestCase):
 
     def test_nonpositive_diagnostic_has_no_ratio_interval(self) -> None:
         self.assertIsNone(target.paired_log_interval([0.0, 0.0], [0.0, 1.0]))
+
+    def test_comparison_ignores_variant_specific_diagnostics(self) -> None:
+        rows = [
+            sample("baseline", 10.0),
+            sample("candidate", 11.0),
+            sample("candidate", 7.0, metric="candidate_only", unit="pages"),
+        ]
+        matrix = [
+            {
+                "scenario": "read.engine_hot",
+                "primary_metric": "throughput",
+                "primary_direction": "higher",
+                "meaningful_difference": "0.05",
+            }
+        ]
+
+        comparison = target.compare_trials(rows, matrix, "baseline", ["candidate"])
+
+        self.assertEqual(len(comparison), 1)
+        self.assertEqual(comparison[0]["metric"], "throughput")
+
+    def test_report_uses_current_read_ahead_counters(self) -> None:
+        scenario = {
+            "scenario": "read.cold",
+            "workload": "io_read",
+            "primary_metric": "throughput",
+            "page_cache_bytes": str(16 << 20),
+        }
+        summary = [
+            {
+                "scenario": "read.cold",
+                "metric": "throughput",
+                "unit": "reads/second",
+                "p50": 100.0,
+                "p95": 110.0,
+                "samples": 3,
+            },
+            {
+                "scenario": "read.cold",
+                "metric": "readahead_plans",
+                "unit": "plans",
+                "p50": 2.0,
+            },
+            {
+                "scenario": "read.cold",
+                "metric": "readahead_pages_scheduled",
+                "unit": "pages",
+                "p50": 40.0,
+            },
+            {
+                "scenario": "read.cold",
+                "metric": "readahead_pages_consumed",
+                "unit": "pages",
+                "p50": 30.0,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target.write_report(
+                root,
+                "run",
+                [scenario],
+                summary,
+                [],
+                [
+                    {
+                        "scenario": "read.cold",
+                        "fixture_seconds": 1.0,
+                        "trial_seconds": 2.0,
+                        "total_seconds": 3.0,
+                    }
+                ],
+                3.0,
+                {"current": None},
+                None,
+                "quick",
+                "native",
+                {"current": "direct"},
+            )
+            report = (root / "report.md").read_text()
+
+        self.assertIn(
+            "| `read.cold` | 2 | 40 | 30 | 75.0% |",
+            report,
+        )
+        self.assertNotIn("read_streams_started", report)
 
     def test_practical_assessment(self) -> None:
         self.assertEqual(target.assessment("higher", 0.03, 1.04, 1.08), "improved")

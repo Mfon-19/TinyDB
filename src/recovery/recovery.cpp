@@ -1,6 +1,7 @@
 #include "recovery/recovery.h"
 
 #include "io/file_io.h"
+#include "io/page_file.h"
 #include "io/testable_posix.h"
 #include "io/unique_fd.h"
 #include "storage/encoding.h"
@@ -176,17 +177,10 @@ auto LoadLog(const std::filesystem::path &wal_path) -> Result<std::optional<Load
   return std::optional{std::move(log)};
 }
 
-auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optional<storage::SelectedSuperblock>> {
-  auto fd = UniqueFd(io::Open(db_path, O_RDONLY | O_CLOEXEC));
-  if (!fd.Valid()) {
-    if (errno == ENOENT) {
-      return std::optional<storage::SelectedSuperblock>{};
-    }
-    return std::unexpected(io::ErrnoStatus("open database"));
-  }
+auto ReadDatabaseBase(io::PageFile &database) -> Result<std::optional<storage::SelectedSuperblock>> {
   struct stat file_stat {};
-  if (io::Fstat(fd.Get(), &file_stat) < 0) {
-    return std::unexpected(io::ErrnoStatus("fstat database"));
+  if (auto status = database.Stat(&file_stat); !status.Ok()) {
+    return std::unexpected(std::move(status));
   }
   if (file_stat.st_size == 0) {
     return std::optional<storage::SelectedSuperblock>{};
@@ -198,20 +192,22 @@ auto ReadDatabaseBase(const std::filesystem::path &db_path) -> Result<std::optio
     return std::unexpected(Status::Corruption("database file ends in a partial page"));
   }
 
-  auto prefix = std::array<char, FIRST_DATA_PAGE_ID * PAGE_SIZE>{};
-  const auto read = io::FullPread(fd.Get(), prefix.data(), prefix.size(), 0);
-  if (!read) {
-    return std::unexpected(read.error());
+  auto page_a = storage::SuperblockPage{};
+  auto page_b = storage::SuperblockPage{};
+  if (auto status = database.ReadPage(SUPERBLOCK_A_PAGE_ID, page_a); !status.Ok()) {
+    return std::unexpected(std::move(status));
   }
-  if (*read != prefix.size()) {
-    return std::unexpected(Status::Corruption("database superblocks are truncated"));
+  if (auto status = database.ReadPage(SUPERBLOCK_B_PAGE_ID, page_b); !status.Ok()) {
+    return std::unexpected(std::move(status));
   }
-  if (std::ranges::all_of(prefix, [](char byte) { return byte == 0; })) {
+  const auto all_zero = [](const storage::SuperblockPage &page) {
+    return std::ranges::all_of(page, [](std::byte byte) { return byte == std::byte{0}; });
+  };
+  if (all_zero(page_a) && all_zero(page_b)) {
     return std::optional<storage::SelectedSuperblock>{};
   }
 
-  const auto bytes = std::as_bytes(std::span{prefix});
-  auto selected = storage::SelectSuperblock(bytes.first(PAGE_SIZE), bytes.subspan(PAGE_SIZE, PAGE_SIZE));
+  auto selected = storage::SelectSuperblock(page_a, page_b);
   if (!selected) {
     return std::unexpected(selected.error());
   }
@@ -258,6 +254,8 @@ auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result
       .durable_lsn = base.value.checkpoint_lsn,
       .cleanup_needed = log.cleanup_needed,
   };
+  // durable_lsn starts at the database frontier. It advances only across
+  // contiguous, complete WAL transactions that follow that frontier.
   auto previous_logical_page_count = base.value.logical_page_count;
   auto saw_checkpoint_transaction = log.header.starting_lsn == base.value.checkpoint_lsn + 1U;
   for (auto &transaction : log.transactions) {
@@ -306,39 +304,66 @@ auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result
   return plan;
 }
 
-auto Redo(const std::filesystem::path &db_path, const RecoveryPlan &plan) -> Status {
+/*
+** RECOVERY PAGE I/O
+**
+** Recovery runs before construction of the cache and native I/O engine.
+** PageFile therefore uses buffered I/O or synchronous direct I/O for redo.
+**
+** The decoded transactions own all source pages until Redo returns. Each batch
+** contains pointers into this stable ownership. If direct I/O needs alignment
+** staging, PageFile supplies a bounded buffer.
+*/
+auto Redo(io::PageFile &database, const RecoveryPlan &plan) -> Status {
   if (plan.transactions.empty()) {
     return {};
   }
-  const auto &recovered_superblock = plan.recovered_superblock;
-  auto fd = UniqueFd(io::Open(db_path, O_RDWR | O_CLOEXEC));
-  if (!fd.Valid()) {
-    return io::ErrnoStatus("open database for recovery");
-  }
   const auto &final_state = plan.transactions.back().state;
-  if (io::Ftruncate(fd.Get(), final_state.logical_page_count * PAGE_SIZE) < 0) {
-    return io::ErrnoStatus("extend database during recovery");
-  }
-  for (const auto &transaction : plan.transactions) {
-    for (const auto &page : transaction.pages) {
-      if (auto status = io::FullPwrite(fd.Get(), page.bytes.data(), page.bytes.size(), page.page_id * PAGE_SIZE);
-          !status.Ok()) {
-        return status;
-      }
-    }
-  }
-  if (io::Fsync(fd.Get()) < 0) {
-    return io::ErrnoStatus("fsync recovered database pages");
-  }
-  if (auto status = io::FullPwrite(fd.Get(), recovered_superblock.data(), recovered_superblock.size(),
-                                   plan.superblock_page_id * PAGE_SIZE);
-      !status.Ok()) {
+  if (auto status = database.EnsurePageCount(final_state.logical_page_count); !status.Ok()) {
     return status;
   }
-  if (io::Fsync(fd.Get()) < 0) {
-    return io::ErrnoStatus("fsync recovered superblock");
+
+  // Batches keep authenticated WAL order. Only adjacent physical IDs share a write.
+  // A gap, repeated page, or full bounded run flushes before the next image.
+  // Thus, batching does not reorder repeated updates across transactions.
+  auto batch = std::array<const std::byte *, io::MAX_PAGE_WRITE_BATCH_PAGES>{};
+  auto batch_first = page_id_t{0};
+  auto batch_size = std::size_t{0};
+  const auto flush_batch = [&]() -> Status {
+    if (batch_size == 0) {
+      return {};
+    }
+    const auto status = database.WritePages(batch_first, std::span<const std::byte *const>{batch.data(), batch_size});
+    batch_size = 0;
+    return status;
+  };
+
+  for (const auto &transaction : plan.transactions) {
+    for (const auto &page : transaction.pages) {
+      const auto continues = batch_size != 0 && page.page_id == batch_first + batch_size;
+      if (batch_size == batch.size() || (batch_size != 0 && !continues)) {
+        if (auto status = flush_batch(); !status.Ok()) {
+          return status;
+        }
+      }
+      if (batch_size == 0) {
+        batch_first = page.page_id;
+      }
+      batch[batch_size++] = std::as_bytes(std::span{page.bytes}).data();
+    }
   }
-  return {};
+  if (auto status = flush_batch(); !status.Ok()) {
+    return status;
+  }
+  // The first sync makes every recovered page image durable. The second sync
+  // publishes the recovered superblock and its new durable LSN frontier.
+  if (auto status = database.Sync(); !status.Ok()) {
+    return status;
+  }
+  if (auto status = database.WritePage(plan.superblock_page_id, plan.recovered_superblock); !status.Ok()) {
+    return status;
+  }
+  return database.Sync();
 }
 
 auto ResetWal(const std::filesystem::path &wal_path, const RecoveryPlan &plan) -> Status {
@@ -348,6 +373,8 @@ auto ResetWal(const std::filesystem::path &wal_path, const RecoveryPlan &plan) -
   if (plan.durable_lsn == std::numeric_limits<std::uint64_t>::max()) {
     return Status::ResourceExhausted("WAL LSN space exhausted during recovery");
   }
+  // Redo synchronized the recovered superblock before this reset. The new WAL
+  // header therefore starts after the complete database frontier.
   auto fd = UniqueFd(io::Open(wal_path, O_RDWR | O_CLOEXEC));
   if (!fd.Valid() || io::Ftruncate(fd.Get(), 0) < 0) {
     return io::ErrnoStatus("reset recovered WAL");
@@ -370,7 +397,7 @@ auto ResetWal(const std::filesystem::path &wal_path, const RecoveryPlan &plan) -
 
 }  // namespace
 
-auto Recover(const std::filesystem::path &db_path, const std::filesystem::path &wal_path) -> Status {
+auto Recover(io::PageFile &database, const std::filesystem::path &wal_path) -> Status {
   auto loaded_result = LoadLog(wal_path);
   if (!loaded_result) {
     return loaded_result.error();
@@ -379,7 +406,7 @@ auto Recover(const std::filesystem::path &db_path, const std::filesystem::path &
   if (!loaded) {
     return {};
   }
-  auto base_result = ReadDatabaseBase(db_path);
+  auto base_result = ReadDatabaseBase(database);
   if (!base_result) {
     return base_result.error();
   }
@@ -391,7 +418,7 @@ auto Recover(const std::filesystem::path &db_path, const std::filesystem::path &
   if (!plan) {
     return plan.error();
   }
-  if (auto status = Redo(db_path, *plan); !status.Ok()) {
+  if (auto status = Redo(database, *plan); !status.Ok()) {
     return status;
   }
   return ResetWal(wal_path, *plan);

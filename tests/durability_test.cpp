@@ -2,6 +2,7 @@
 
 #include <tinydb/database.h>
 
+#include "io/page_file.h"
 #include "storage/page.h"
 #include "support/test_files.h"
 #include "wal/wal_codec.h"
@@ -38,8 +39,8 @@ auto Find(const std::vector<tinydb::io::Call> &calls, tinydb::io::Syscall syscal
 
 auto FindDataWrite(const std::vector<tinydb::io::Call> &calls, const std::filesystem::path &path) -> std::size_t {
   for (std::size_t index = 0; index < calls.size(); ++index) {
-    if (calls[index].syscall == tinydb::io::Syscall::Pwrite && calls[index].path == path &&
-        calls[index].offset >= tinydb::FIRST_DATA_PAGE_ID * tinydb::PAGE_SIZE) {
+    if ((calls[index].syscall == tinydb::io::Syscall::Pwrite || calls[index].syscall == tinydb::io::Syscall::Pwritev) &&
+        calls[index].path == path && calls[index].offset >= tinydb::FIRST_DATA_PAGE_ID * tinydb::PAGE_SIZE) {
       return index;
     }
   }
@@ -127,6 +128,157 @@ TEST(Durability, CheckpointOrder) {
   EXPECT_LT(metadata_sync, wal_reset);
   EXPECT_LT(wal_reset, wal_header);
   EXPECT_LT(wal_header, wal_sync);
+  tinydb::test::Remove(path);
+}
+
+TEST(Durability, DirectCheckpointSynchronousFallbackPreservesOrder) {
+  const auto path = tinydb::test::Path("direct_checkpoint_fallback_order");
+  tinydb::test::Remove(path);
+  auto options = tinydb::Options{};
+  options.page_io_mode = tinydb::PageIoMode::Direct;
+  auto opened = tinydb::Database::Open(path, options);
+  if (!opened) {
+    const auto reason = opened.error().ToString();
+    tinydb::test::Remove(path);
+    GTEST_SKIP() << "direct I/O is unavailable on the test filesystem: " << reason;
+  }
+  auto database = std::move(*opened);
+  ASSERT_TRUE(database.Put("key", "value").Ok());
+
+  auto calls = std::vector<tinydb::io::Call>{};
+  tinydb::test::WithHook(
+      [&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+        calls.push_back(call);
+        return std::nullopt;
+      },
+      [&] { EXPECT_TRUE(database.Checkpoint().Ok()); });
+
+  const auto data = FindDataWrite(calls, path);
+  const auto data_sync = Find(calls, tinydb::io::Syscall::Fsync, path, data + 1U);
+  const auto superblock = Find(calls, tinydb::io::Syscall::Pwrite, path, data_sync + 1U);
+  const auto metadata_sync = Find(calls, tinydb::io::Syscall::Fsync, path, superblock + 1U);
+  const auto wal_reset = Find(calls, tinydb::io::Syscall::Ftruncate, tinydb::Wal::PathFor(path), metadata_sync + 1U);
+  ASSERT_NE(data, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(data_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(superblock, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(metadata_sync, std::numeric_limits<std::size_t>::max());
+  ASSERT_NE(wal_reset, std::numeric_limits<std::size_t>::max());
+  EXPECT_LT(data, data_sync);
+  EXPECT_LT(data_sync, superblock);
+  EXPECT_LT(superblock, metadata_sync);
+  EXPECT_LT(metadata_sync, wal_reset);
+  tinydb::test::Remove(path);
+}
+
+TEST(Durability, DirectRecoveryBatchesConsecutiveWalPages) {
+  const auto source_path = tinydb::test::Path("direct_recovery_batch_source");
+  const auto recovered_path = tinydb::test::Path("direct_recovery_batch_target");
+  tinydb::test::Remove(source_path);
+  tinydb::test::Remove(recovered_path);
+  const auto first_value = std::string(40U * tinydb::PAGE_SIZE + 17U, 'q');
+  const auto value = std::string(40U * tinydb::PAGE_SIZE + 37U, 'r');
+
+  auto options = tinydb::Options{};
+  options.checkpoint.wal_trigger_bytes = 64U << 20U;
+  options.checkpoint.dirty_trigger_bytes = 8U << 20U;
+  options.checkpoint.hard_wal_bytes = 128U << 20U;
+  auto source = tinydb::Database::Open(source_path, options).value();
+  ASSERT_TRUE(source.Put("key", first_value).Ok());
+  ASSERT_TRUE(source.Put("key", value).Ok());
+  tinydb::test::Copy(source_path, recovered_path);
+
+  options.page_io_mode = tinydb::PageIoMode::Direct;
+  auto write_batches = std::size_t{0};
+  auto written_pages = std::size_t{0};
+  auto largest_batch = std::size_t{0};
+  auto root_runs = std::size_t{0};
+  auto recovered = [&] {
+    const auto hook =
+        tinydb::test::ScopedTestHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+          if (call.syscall == tinydb::io::Syscall::Pwritev && call.path == recovered_path &&
+              call.offset >= tinydb::FIRST_DATA_PAGE_ID * tinydb::PAGE_SIZE) {
+            ++write_batches;
+            written_pages += call.Vectors().size();
+            largest_batch = std::max(largest_batch, call.Vectors().size());
+            root_runs += call.offset == tinydb::FIRST_DATA_PAGE_ID * tinydb::PAGE_SIZE ? 1U : 0U;
+            EXPECT_LE(call.Vectors().size(), tinydb::io::MAX_PAGE_WRITE_BATCH_PAGES);
+            for (const auto &vector : call.Vectors()) {
+              EXPECT_EQ(vector.iov_len, tinydb::PAGE_SIZE);
+              EXPECT_EQ(reinterpret_cast<std::uintptr_t>(vector.iov_base) % tinydb::PAGE_SIZE, 0U);
+            }
+          }
+          return std::nullopt;
+        }};
+    return tinydb::Database::Open(recovered_path, options);
+  }();
+
+  if (!recovered) {
+    const auto reason = recovered.error().ToString();
+    EXPECT_TRUE(source.Close().Ok());
+    tinydb::test::Remove(source_path);
+    tinydb::test::Remove(recovered_path);
+    GTEST_SKIP() << "direct I/O is unavailable on the test filesystem: " << reason;
+  }
+  EXPECT_GT(write_batches, 0U);
+  EXPECT_GT(written_pages, write_batches);
+  EXPECT_EQ(largest_batch, tinydb::io::MAX_PAGE_WRITE_BATCH_PAGES);
+  EXPECT_GE(root_runs, 2U);
+  auto database = std::move(*recovered);
+  EXPECT_EQ(database.Get("key").value(), value);
+  EXPECT_TRUE(database.Close().Ok());
+  EXPECT_TRUE(source.Close().Ok());
+  tinydb::test::Remove(source_path);
+  tinydb::test::Remove(recovered_path);
+}
+
+TEST(Durability, CheckpointPageWriteFailureStopsPublication) {
+  const auto path = tinydb::test::Path("checkpoint_page_write_failure");
+  tinydb::test::Remove(path);
+  auto database = tinydb::Database::Open(path).value();
+  ASSERT_TRUE(database.Put("key", "value").Ok());
+
+  auto calls = std::vector<tinydb::io::Call>{};
+  tinydb::test::WithHook(
+      [&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
+        calls.push_back(call);
+        if ((call.syscall == tinydb::io::Syscall::Pwrite || call.syscall == tinydb::io::Syscall::Pwritev) &&
+            call.path == path && call.offset >= tinydb::FIRST_DATA_PAGE_ID * tinydb::PAGE_SIZE) {
+          return tinydb::io::Fault{.error = EIO};
+        }
+        return std::nullopt;
+      },
+      [&] { EXPECT_EQ(database.Checkpoint().Code(), tinydb::StatusCode::IoError); });
+
+  EXPECT_NE(FindDataWrite(calls, path), std::numeric_limits<std::size_t>::max());
+  EXPECT_EQ(Find(calls, tinydb::io::Syscall::Fsync, path), std::numeric_limits<std::size_t>::max());
+  EXPECT_EQ(Find(calls, tinydb::io::Syscall::Ftruncate, tinydb::Wal::PathFor(path)),
+            std::numeric_limits<std::size_t>::max());
+  const auto stats = database.Stats();
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_LT(stats->checkpoint_lsn, stats->visible_lsn);
+  EXPECT_GT(stats->dirty_pages, 0U);
+  EXPECT_TRUE(database.Checkpoint().Ok());
+  tinydb::test::Remove(path);
+}
+
+TEST(Durability, CheckpointReleasesCapturedPagesBeforeCacheTrim) {
+  const auto path = tinydb::test::Path("checkpoint_releases_captured_pages");
+  tinydb::test::Remove(path);
+  auto options = tinydb::Options{};
+  options.page_cache_bytes = tinydb::PAGE_SIZE;
+  auto database = tinydb::Database::Open(path, options).value();
+  ASSERT_TRUE(database.Put("large", std::string(5U * tinydb::PAGE_SIZE, 'v')).Ok());
+
+  const auto before = database.Stats();
+  ASSERT_TRUE(before.has_value());
+  ASSERT_GT(before->cache_resident_pages, 1U);
+  ASSERT_GT(before->dirty_pages, 1U);
+
+  ASSERT_TRUE(database.Checkpoint().Ok());
+  const auto after = database.Stats();
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(after->dirty_pages, 0U);
+  EXPECT_LE(after->cache_resident_pages, 1U);
   tinydb::test::Remove(path);
 }
 

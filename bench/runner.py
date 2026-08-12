@@ -72,6 +72,8 @@ T_CRITICAL_95 = {
     30: 2.042,
 }
 
+IO_MODES = ("buffered", "direct")
+
 
 def positive_integer(value: str) -> int:
     parsed = int(value)
@@ -95,12 +97,19 @@ def parse_args() -> argparse.Namespace:
 
     run = subparsers.add_parser("run", help="measure one engine revision")
     run.add_argument("binary", type=pathlib.Path)
+    run.add_argument("--io-mode", choices=IO_MODES, default="buffered")
 
     compare = subparsers.add_parser("compare", help="run a paired A/B comparison")
     compare.add_argument("baseline", type=pathlib.Path)
     compare.add_argument("candidate", type=pathlib.Path)
     compare.add_argument("--baseline-cache-mib", type=positive_integer)
     compare.add_argument("--candidate-cache-mib", type=positive_integer)
+    compare.add_argument(
+        "--baseline-io-mode", choices=IO_MODES, default="buffered"
+    )
+    compare.add_argument(
+        "--candidate-io-mode", choices=IO_MODES, default="buffered"
+    )
 
     cross = subparsers.add_parser("cross", help="compare two or more backend workers")
     cross.add_argument(
@@ -160,6 +169,17 @@ def resolve_page_cache_overrides(args: argparse.Namespace) -> dict[str, int | No
     return {
         "baseline": args.baseline_cache_mib << 20 if args.baseline_cache_mib is not None else common,
         "candidate": args.candidate_cache_mib << 20 if args.candidate_cache_mib is not None else common,
+    }
+
+
+def resolve_io_modes(args: argparse.Namespace) -> dict[str, str]:
+    if args.mode == "run":
+        return {"current": args.io_mode}
+    if args.mode == "cross":
+        return {label: "buffered" for label, _ in args.engine}
+    return {
+        "baseline": args.baseline_io_mode,
+        "candidate": args.candidate_io_mode,
     }
 
 
@@ -339,6 +359,7 @@ def build_fixture(
     seed: int,
     profile: str,
     semantics: str,
+    io_mode: str,
 ) -> dict[str, object]:
     database.parent.mkdir(parents=True, exist_ok=False)
     subprocess.run(
@@ -354,6 +375,8 @@ def build_fixture(
             profile,
             "--semantics",
             semantics,
+            "--io-mode",
+            io_mode,
         ],
         check=True,
         stdout=subprocess.DEVNULL,
@@ -417,6 +440,7 @@ def run_trial(
     page_cache_bytes: int | None,
     profile: str,
     semantics: str,
+    io_mode: str,
 ) -> list[dict[str, str]]:
     working_directory = workspace / "trials" / variant / scenario / f"trial-{trial:02d}"
     working_database = working_directory / "database"
@@ -438,6 +462,8 @@ def run_trial(
         profile,
         "--semantics",
         semantics,
+        "--io-mode",
+        io_mode,
     ]
     if page_cache_bytes is not None:
         command += ["--page-cache-bytes", str(page_cache_bytes)]
@@ -610,8 +636,25 @@ def compare_trials(
         tuple[str, str, str, str], tuple[list[float], list[float]]
     ] = {}
     for candidate_variant in candidate_variants:
+        baseline_metrics = {
+            (row["scenario"], row["metric"])
+            for row in rows
+            if row["variant"] == baseline_variant
+        }
+        candidate_metrics = {
+            (row["scenario"], row["metric"])
+            for row in rows
+            if row["variant"] == candidate_variant
+        }
+        common_metrics = baseline_metrics & candidate_metrics
+        comparable_rows = [
+            row
+            for row in rows
+            if row["variant"] in (baseline_variant, candidate_variant)
+            and (row["scenario"], row["metric"]) in common_metrics
+        ]
         for key, baseline, candidate in pair_trial_samples(
-            rows, baseline_variant, candidate_variant
+            comparable_rows, baseline_variant, candidate_variant
         ):
             identity = (candidate_variant, key[0], key[3], key[4])
             if identity not in groups:
@@ -723,6 +766,7 @@ def write_report(
     comparison_baseline: str | None,
     profile: str,
     semantics: str,
+    io_modes: dict[str, str],
 ) -> None:
     title = (
         "# TinyDB cross-engine benchmark report"
@@ -735,6 +779,9 @@ def write_report(
         f"Mode: `{mode}`  ",
         f"Profile: `{profile}`  ",
         f"Semantics: `{semantics}`  ",
+        "I/O modes: "
+        + ", ".join(f"{variant} `{mode}`" for variant, mode in io_modes.items())
+        + "  ",
         f"Wall time: {elapsed / 60.0:.1f} minutes",
         "",
     ]
@@ -924,52 +971,67 @@ def write_report(
     if mode != "run":
         lines.append("Primary confidence intervals use paired trial log-ratios.")
     lines += ["Commit and churn observations remain nested diagnostics and are not treated as independent trials.", ""]
-    read_scenarios = [
-        scenario for scenario, spec in specs.items() if spec["workload"] == "io_read"
-    ]
-    if read_scenarios:
-        if mode == "run":
-            readahead_lookup = {
-                (str(row["scenario"]), str(row["metric"])): float(row["p50"])
-                for row in variant_summary
-            }
-            readahead_variant = "current"
-        else:
-            readahead_candidate = next(
+    read_ahead_metrics = (
+        "readahead_plans",
+        "readahead_pages_scheduled",
+        "readahead_pages_consumed",
+    )
+    if mode == "run":
+        readahead_variant = "current"
+        readahead_lookup = {
+            (str(row["scenario"]), str(row["metric"])): float(row["p50"])
+            for row in variant_summary
+        }
+    else:
+        preferred_variants = list(
+            dict.fromkeys(
                 str(row["candidate"])
                 for row in comparisons
                 if row["role"] == "primary"
             )
-            readahead_lookup = {
-                (str(row["scenario"]), str(row["metric"])): float(row["candidate_median"])
-                for row in comparisons
-                if row["candidate"] == readahead_candidate
-            }
-            readahead_variant = readahead_candidate
+        )
+        if comparison_baseline is not None:
+            preferred_variants.append(comparison_baseline)
+        variants_with_read_ahead = {
+            str(row["variant"])
+            for row in variant_summary
+            if row["metric"] == "readahead_plans"
+        }
+        readahead_variant = next(
+            (variant for variant in preferred_variants if variant in variants_with_read_ahead),
+            "",
+        )
+        readahead_lookup = {
+            (str(row["scenario"]), str(row["metric"])): float(row["p50"])
+            for row in variant_summary
+            if row["variant"] == readahead_variant
+        }
+    read_scenarios = [
+        scenario
+        for scenario, spec in specs.items()
+        if spec["workload"] == "io_read"
+        and all((scenario, metric) in readahead_lookup for metric in read_ahead_metrics)
+    ]
+    if read_scenarios:
         lines += [
             "## Read-ahead behavior",
             "",
             f"Values below describe the `{readahead_variant}` engine.",
             "",
-            "| Scenario | Streams active/started | Pages submitted | Ready | Waited | Unused | Drops queue/budget | I/O failures | Peak staging |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Scenario | Plans | Pages scheduled | Pages consumed | Consumption |",
+            "|---|---:|---:|---:|---:|",
         ]
     for scenario in read_scenarios:
 
         def read_metric(metric: str) -> float:
             return readahead_lookup[(scenario, metric)]
 
+        scheduled = read_metric("readahead_pages_scheduled")
+        consumed = read_metric("readahead_pages_consumed")
+        consumption = f"{consumed / scheduled:.1%}" if scheduled > 0.0 else "—"
         lines.append(
-            f"| `{scenario}` | {read_metric('read_streams_activated'):,.0f}/"
-            f"{read_metric('read_streams_started'):,.0f} | "
-            f"{read_metric('readahead_pages_submitted'):,.0f} | "
-            f"{read_metric('readahead_pages_ready'):,.0f} | "
-            f"{read_metric('readahead_pages_waited'):,.0f} | "
-            f"{read_metric('readahead_pages_unused'):,.0f} | "
-            f"{read_metric('readahead_queue_drops'):,.0f}/"
-            f"{read_metric('readahead_budget_drops'):,.0f} | "
-            f"{read_metric('readahead_io_failures'):,.0f} | "
-            f"{format_value(read_metric('readahead_maximum_staging_bytes'), 'bytes')} |"
+            f"| `{scenario}` | {read_metric('readahead_plans'):,.0f} | "
+            f"{scheduled:,.0f} | {consumed:,.0f} | {consumption} |"
         )
     if read_scenarios:
         lines.append("")
@@ -1086,6 +1148,7 @@ def main() -> None:
     )
     root = managed_output.path if managed_output is not None else args.output
     page_cache_overrides = resolve_page_cache_overrides(args)
+    io_modes = resolve_io_modes(args)
     if managed_output is None:
         root.mkdir(parents=True, exist_ok=False)
     workspace = root / ".work"
@@ -1103,6 +1166,7 @@ def main() -> None:
         for variant, binary in binaries.items()
     }
     for variant, record in engines.items():
+        record["io_mode"] = io_modes[variant]
         record["effective_durable"] = bool(
             record["always_durable"] or args.semantics == "durable"
         )
@@ -1163,6 +1227,7 @@ def main() -> None:
                 args.seed,
                 args.profile,
                 args.semantics,
+                io_modes[builder_variant],
             )
             physical_fixtures[layout] = (fixture, manifest)
             fixture_families.append(
@@ -1172,6 +1237,7 @@ def main() -> None:
                     "dataset_id": logical_dataset_id,
                     "layout": layout,
                     "builder_variant": builder_variant,
+                    "builder_io_mode": io_modes[builder_variant],
                     "family_id": manifest["family_id"],
                     "files": len(manifest["files"]),
                     "bytes": sum(
@@ -1221,6 +1287,7 @@ def main() -> None:
                     page_cache_overrides[variant],
                     args.profile,
                     args.semantics,
+                    io_modes[variant],
                 )
                 trial_record["seconds"][variant] = (
                     time.monotonic() - run_started
@@ -1267,12 +1334,13 @@ def main() -> None:
         comparison_baseline,
         args.profile,
         args.semantics,
+        io_modes,
     )
     for variant, binary in binaries.items():
         if sha256(binary) != engines[variant]["sha256"]:
             raise ValueError(f"benchmark binary changed during the run: {binary}")
     metadata = {
-        "suite_version": 12,
+        "suite_version": 13,
         "mode": args.mode,
         "profile": args.profile,
         "semantics": args.semantics,
@@ -1280,6 +1348,7 @@ def main() -> None:
         "seed": args.seed,
         "started_utc": started_utc,
         "page_cache_overrides_bytes": page_cache_overrides,
+        "io_modes": io_modes,
         "elapsed_seconds": elapsed,
         "engines": engines,
         "host": host_record(root),

@@ -37,8 +37,8 @@ namespace tinydb::txn {
 */
 class TransactionPages final : public PageSource {
  public:
-  static auto Begin(PageReader *committed, DatabaseState base_state,
-                    std::size_t memory_limit_bytes) -> Result<TransactionPages>;
+  static auto Begin(PageReader *committed, DatabaseState base_state, std::size_t memory_limit_bytes,
+                    std::shared_ptr<cache::PageArena> page_arena = {}) -> Result<TransactionPages>;
 
   TransactionPages(const TransactionPages &) = delete;
   auto operator=(const TransactionPages &) -> TransactionPages & = delete;
@@ -72,7 +72,7 @@ class TransactionPages final : public PageSource {
  private:
   struct PrivateFrame {
     page_id_t page_id{HEADER_PAGE_ID};                       // immutable identity of this frame
-    std::unique_ptr<cache::PageBytes> bytes;                 // stable address until transfer
+    cache::PageArena::Lease bytes;                           // stable address until transfer
     std::size_t pin_count{0};                                // outstanding PageHandles
     bool editing{false};                                     // mutable leases are exclusive
     bool dirty{false};                                       // needs WAL/publication image
@@ -80,11 +80,13 @@ class TransactionPages final : public PageSource {
     storage::DataPageHeader sealed_header{};                 // page_id zero means not sealed
   };
 
-  TransactionPages(PageReader *committed, DatabaseState base_state, std::size_t memory_limit_bytes)
+  TransactionPages(PageReader *committed, DatabaseState base_state, std::size_t memory_limit_bytes,
+                   std::shared_ptr<cache::PageArena> page_arena)
       : committed_(committed),
         base_state_(base_state),
         resulting_state_(base_state),
-        memory_limit_bytes_(memory_limit_bytes) {}
+        memory_limit_bytes_(memory_limit_bytes),
+        page_arena_(std::move(page_arena)) {}
 
   static void ReleasePrivate(void *owner, page_id_t page_id, bool dirty, PagePayloadProof payload_proof);
   static auto PrivateHandle(PrivateFrame *frame, bool editable) -> PageHandle;
@@ -103,6 +105,7 @@ class TransactionPages final : public PageSource {
   DatabaseState base_state_;        // captured at Begin
   DatabaseState resulting_state_;   // private roots and logical page count
   std::size_t memory_limit_bytes_;  // pages plus retained values
+  std::shared_ptr<cache::PageArena> page_arena_;
   std::size_t memory_used_bytes_{0};
   bool prepared_{false};         // final page set carries the exact commit LSN
   bool allocator_dirty_{false};  // extent index needs rewriting

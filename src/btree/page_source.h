@@ -4,8 +4,10 @@
 #include "storage/page.h"
 #include "util/check.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <utility>
 
 namespace tinydb {
@@ -147,12 +149,88 @@ class PageHandle {
   PagePayloadProof payload_proof_{PagePayloadProof::None};
 };
 
+/*
+** TRAVERSAL READ STREAM
+**
+** A traversal uses one stream for semantic reads and exact read advice. The
+** reader can ignore the advice and preserve the same read results. An active
+** backend copies each advised page set before PrimeExactPages returns.
+*/
+class PageReadStream final {
+ public:
+  using ReadFunction = Result<PageHandle> (*)(void *owner, const std::shared_ptr<void> &state, page_id_t page_id);
+  using PrimeFunction = void (*)(void *owner, const std::shared_ptr<void> &state,
+                                 std::span<const page_id_t> page_ids) noexcept;
+  using CloseFunction = void (*)(void *owner, const std::shared_ptr<void> &state) noexcept;
+
+  PageReadStream() = default;
+  PageReadStream(void *owner, std::shared_ptr<void> state, ReadFunction read, PrimeFunction prime, CloseFunction close)
+      : owner_(owner), state_(std::move(state)), read_(read), prime_(prime), close_(close) {}
+
+  PageReadStream(const PageReadStream &) = delete;
+  auto operator=(const PageReadStream &) -> PageReadStream & = delete;
+  PageReadStream(PageReadStream &&other) noexcept { Take(std::move(other)); }
+  auto operator=(PageReadStream &&other) noexcept -> PageReadStream & {
+    if (this != &other) {
+      Reset();
+      Take(std::move(other));
+    }
+    return *this;
+  }
+  ~PageReadStream() { Reset(); }
+
+  auto Read(page_id_t page_id) -> Result<PageHandle>;
+
+  // A false result means that PrimeExactPages has no effect. Semantic reads
+  // still use the ordinary PageReader path.
+  auto AcceptsExactPagePlan() const noexcept -> bool { return state_ != nullptr && prime_ != nullptr; }
+
+  void PrimeExactPages(std::span<const page_id_t> page_ids) noexcept {
+    if (AcceptsExactPagePlan() && !page_ids.empty()) {
+      prime_(owner_, state_, page_ids);
+    }
+  }
+
+  // Stop advice and release its private state. Semantic reads remain valid and
+  // use the reader's ordinary demand path.
+  void CancelAdvice() noexcept {
+    if (state_ != nullptr && close_ != nullptr) {
+      close_(owner_, state_);
+    }
+    state_.reset();
+    prime_ = nullptr;
+    close_ = nullptr;
+  }
+
+ private:
+  void Reset() noexcept {
+    CancelAdvice();
+    owner_ = nullptr;
+    read_ = nullptr;
+  }
+
+  void Take(PageReadStream &&other) noexcept {
+    owner_ = std::exchange(other.owner_, nullptr);
+    state_ = std::move(other.state_);
+    read_ = std::exchange(other.read_, nullptr);
+    prime_ = std::exchange(other.prime_, nullptr);
+    close_ = std::exchange(other.close_, nullptr);
+  }
+
+  void *owner_{nullptr};
+  std::shared_ptr<void> state_;
+  ReadFunction read_{nullptr};
+  PrimeFunction prime_{nullptr};
+  CloseFunction close_{nullptr};
+};
+
 /* Read algorithms depend only on stable immutable leases. */
 class PageReader {
  public:
   virtual ~PageReader() = default;
 
   virtual auto Read(page_id_t page_id) -> Result<PageHandle> = 0;
+  virtual auto BeginReadStream() -> PageReadStream;
 };
 
 /*

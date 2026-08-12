@@ -10,6 +10,7 @@
 #include "cache/committed_page_cache.h"
 #include "checkpoint/checkpoint_manager.h"
 #include "io/file_io.h"
+#include "io/page_file.h"
 #include "io/testable_posix.h"
 #include "recovery/recovery.h"
 #include "txn/commit_coordinator.h"
@@ -34,6 +35,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -67,6 +69,13 @@ using io::ErrnoStatus;
 using io::SyncParentDirectory;
 
 auto ValidateOptions(const Options &options) -> Status {
+  switch (options.page_io_mode) {
+    case PageIoMode::Buffered:
+    case PageIoMode::Direct:
+      break;
+    default:
+      return Status::InvalidArgument("unknown database page I/O mode");
+  }
   if (options.page_cache_bytes < PAGE_SIZE) {
     return Status::InvalidArgument("page cache must hold at least one database page");
   }
@@ -346,6 +355,8 @@ class DatabaseCore final {
   void ReleaseResources() noexcept {
     checkpoints.reset();
     readers.reset();
+    // The cache stops its direct-I/O reactor before DiskManager closes the
+    // descriptor that the reactor borrows.
     cache.reset();
     disk.reset();
     wal.reset();
@@ -382,7 +393,9 @@ class DatabaseCore final {
 
 struct Cursor::Impl final {
   Impl(std::shared_ptr<detail::DatabaseCore> database, txn::SnapshotCursor snapshot_cursor, KeyRange key_range)
-      : core(std::move(database)), cursor(std::move(snapshot_cursor)), range(std::move(key_range)) {}
+      : core(std::move(database)), cursor(std::move(snapshot_cursor)), range(std::move(key_range)) {
+    FinishIfUpperReached();
+  }
 
   auto Valid() const -> bool {
     if (!cursor.Valid()) {
@@ -394,7 +407,11 @@ struct Cursor::Impl final {
 
   auto First() -> Status {
     const auto lower = range.Lower();
-    return lower ? cursor.Seek(*lower) : cursor.First();
+    auto status = lower ? cursor.Seek(*lower) : cursor.First();
+    if (status.Ok()) {
+      FinishIfUpperReached();
+    }
+    return status;
   }
 
   auto Seek(std::string_view key) -> Status {
@@ -402,7 +419,26 @@ struct Cursor::Impl final {
     if (lower && txn::BytewiseLess{}(key, *lower)) {
       key = *lower;
     }
-    return cursor.Seek(key);
+    auto status = cursor.Seek(key);
+    if (status.Ok()) {
+      FinishIfUpperReached();
+    }
+    return status;
+  }
+
+  auto Next() -> Status {
+    auto status = cursor.Next(range.Upper());
+    if (status.Ok()) {
+      FinishIfUpperReached();
+    }
+    return status;
+  }
+
+  void FinishIfUpperReached() noexcept {
+    const auto upper = range.Upper();
+    if (cursor.Valid() && upper && !txn::BytewiseLess{}(cursor.Key(), *upper)) {
+      cursor.FinishScan();
+    }
   }
 
   std::shared_ptr<detail::DatabaseCore> core;
@@ -484,7 +520,7 @@ auto Cursor::Next() -> Status {
   if (!impl_->Valid()) {
     return Status::InvalidArgument("Next requires a valid cursor position");
   }
-  return impl_->cursor.Next();
+  return impl_->Next();
 }
 
 auto Cursor::Valid() const -> bool { return impl_ != nullptr && impl_->Valid(); }
@@ -559,8 +595,29 @@ auto WriteTransaction::Commit() && -> Result<CommitInfo> {
 void WriteTransaction::Abort() noexcept { impl_.reset(); }
 
 void DatabaseTestAccess::WaitForReadQuiescence(Database &database) noexcept {
-  /* Buffered reads complete on the calling thread. */
-  (void)database;
+  if (database.core_ == nullptr) {
+    return;
+  }
+  auto lock = std::lock_guard(database.core_->lifecycle_mutex);
+  if (database.core_->cache != nullptr) {
+    database.core_->cache->DrainIoForTesting();
+  }
+}
+
+auto DatabaseTestAccess::ReadAhead(Database &database) noexcept -> ReadAheadCounters {
+  if (database.core_ == nullptr) {
+    return {};
+  }
+  auto lock = std::lock_guard(database.core_->lifecycle_mutex);
+  if (database.core_->cache == nullptr) {
+    return {};
+  }
+  const auto stats = database.core_->cache->Stats();
+  return {
+      .plans = stats.read_ahead_plans,
+      .pages_scheduled = stats.read_ahead_pages_scheduled,
+      .pages_consumed = stats.read_ahead_pages_consumed,
+  };
 }
 
 Database::Database(std::shared_ptr<detail::DatabaseCore> core) : core_(std::move(core)) {}
@@ -583,15 +640,26 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
     return std::unexpected(lock.error());
   }
   const auto wal_path = Wal::PathFor(path);
-  if (auto status = recovery::Recover(path, wal_path); !status.Ok()) {
+  // Both modes use the buffered lock descriptor above. The selected page
+  // descriptor then stays open through recovery and normal operation.
+  auto page_file = io::PageFile::Open(path, options.page_io_mode);
+  if (!page_file) {
+    return std::unexpected(page_file.error());
+  }
+  if (auto status = recovery::Recover(*page_file, wal_path); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
-  auto disk_result = DiskManager::Open(path);
+  auto disk_result = DiskManager::Open(path, std::move(*page_file));
   if (!disk_result) {
     return std::unexpected(disk_result.error());
   }
   auto disk = std::make_unique<DiskManager>(*std::move(disk_result));
-  auto cache = std::make_unique<cache::CommittedPageCache>(*disk, options.page_cache_bytes, disk->CheckpointLsn());
+  auto cache = std::unique_ptr<cache::CommittedPageCache>{};
+  try {
+    cache = std::make_unique<cache::CommittedPageCache>(*disk, options.page_cache_bytes, disk->CheckpointLsn());
+  } catch (const std::bad_alloc &) {
+    return std::unexpected(Status::ResourceExhausted("allocating database page cache"));
+  }
   auto readers = std::make_unique<txn::ReaderGate>(InitialState(*disk));
   auto wal_result = Wal::Open(wal_path, disk->Uuid(), disk->CheckpointLsn() + 1);
   if (!wal_result) {
@@ -670,7 +738,10 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
     return std::unexpected(std::move(status));
   }
   const auto base = core->readers->CurrentState();
-  auto transaction = txn::TransactionPages::Begin(core->cache.get(), *base, core->write_transaction_bytes);
+  // Direct mode shares one aligned arena between private and committed pages.
+  // Publication can therefore transfer page ownership without a payload copy.
+  auto transaction = txn::TransactionPages::Begin(core->cache.get(), *base, core->write_transaction_bytes,
+                                                  core->cache->SharedPageArena());
   if (!transaction) {
     return std::unexpected(transaction.error());
   }

@@ -43,6 +43,7 @@ class SelectedBackend final : public Backend {
   SelectedBackend(const std::filesystem::path &root, const Config &config, const Scenario &scenario) {
     std::filesystem::create_directories(root);
     auto options = Options{};
+    options.page_io_mode = config.io_mode == IoMode::Direct ? PageIoMode::Direct : PageIoMode::Buffered;
     if (config.page_cache_bytes) {
       options.page_cache_bytes = *config.page_cache_bytes;
     }

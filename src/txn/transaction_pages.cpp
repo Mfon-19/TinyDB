@@ -6,6 +6,7 @@
 #include <cstring>
 #include <expected>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <utility>
@@ -17,8 +18,8 @@ namespace tinydb::txn {
 ** decoded eagerly so corruption is reported before callers begin modifying
 ** tree pages. A successful return owns no page lease.
 */
-auto TransactionPages::Begin(PageReader *committed, DatabaseState base_state,
-                             std::size_t memory_limit_bytes) -> Result<TransactionPages> {
+auto TransactionPages::Begin(PageReader *committed, DatabaseState base_state, std::size_t memory_limit_bytes,
+                             std::shared_ptr<cache::PageArena> page_arena) -> Result<TransactionPages> {
   if (base_state.logical_page_count < FIRST_DATA_PAGE_ID ||
       (base_state.root_page_id != HEADER_PAGE_ID && base_state.root_page_id >= base_state.logical_page_count) ||
       (base_state.allocator_root_page_id != HEADER_PAGE_ID &&
@@ -28,14 +29,30 @@ auto TransactionPages::Begin(PageReader *committed, DatabaseState base_state,
 
   // Decode the captured allocator before returning a write context. Corrupt
   // metadata can never yield a partially usable transaction.
-  auto transaction = TransactionPages(committed, base_state, memory_limit_bytes);
+  try {
+    if (page_arena == nullptr) {
+      page_arena = cache::PageArena::CreateHeap();
+    }
+  } catch (const std::bad_alloc &) {
+    return std::unexpected(Status::ResourceExhausted("transaction page arena allocation failed"));
+  }
+  auto transaction = TransactionPages(committed, base_state, memory_limit_bytes, std::move(page_arena));
   if (auto status = transaction.LoadFreeExtents(); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   return transaction;
 }
 
-TransactionPages::~TransactionPages() { RequireUnpinned(); }
+TransactionPages::~TransactionPages() {
+  RequireUnpinned();
+  // A failed or aborted direct transaction may be the last owner to touch a
+  // large group of mmap-backed pages. Release them as one batch after their
+  // leases have returned to the arena.
+  pages_.clear();
+  if (page_arena_ != nullptr) {
+    page_arena_->ReleaseFreeMemory();
+  }
+}
 
 void TransactionPages::RequireActive() const { TINYDB_CHECK(!prepared_, "mutating a prepared page transaction"); }
 
@@ -88,9 +105,14 @@ auto TransactionPages::CreatePrivatePage(page_id_t page_id, bool dirty) -> Resul
   if (auto status = Charge(PAGE_SIZE); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
+  auto bytes = page_arena_->Acquire();
+  if (!bytes) {
+    memory_used_bytes_ -= PAGE_SIZE;
+    return std::unexpected(Status::ResourceExhausted("transaction page allocation failed"));
+  }
   auto frame = PrivateFrame{
       .page_id = page_id,
-      .bytes = std::make_unique<cache::PageBytes>(),
+      .bytes = std::move(bytes),
       .pin_count = 0,
       .editing = false,
       .dirty = dirty,
@@ -409,6 +431,7 @@ auto TransactionPages::TakePages() -> std::vector<cache::CommittedPageImage> {
   // Any clean private copy served read-your-writes but has no committed image
   // to transfer. Clearing the map releases those copies with the dirty ones.
   pages_.clear();
+  page_arena_->ReleaseFreeMemory();
   memory_used_bytes_ = 0;
   return result;
 }

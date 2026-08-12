@@ -39,15 +39,25 @@ auto Manager::Checkpoint() -> Status {
 
   const auto target_lsn = state->visible_lsn;
   if (target_lsn > durable_lsn) {
-    // File growth is harmless before the recovery root advances. A failure can
-    // leave trailing zero pages. The old logical page count excludes them.
+    /*
+    ** CHECKPOINT DURABLE FRONTIER
+    **
+    ** File growth is harmless before the recovery root advances. A failure
+    ** can leave trailing pages, but the old logical page count excludes them.
+    **
+    ** The cache groups adjacent page IDs into bounded batches. When the native
+    ** queue is available, direct mode uses it. If no native write starts, the
+    ** cache uses synchronous direct I/O for the complete page set.
+    **
+    ** All page writes complete before the first Sync. CommitCheckpoint then
+    ** writes and synchronizes the inactive superblock. The WAL remains the
+    ** recovery basis until that superblock becomes durable.
+    */
     if (auto status = disk_.EnsurePageCount(state->logical_page_count); !status.Ok()) {
       return Record(std::move(status));
     }
-    for (const auto &page : pages) {
-      if (auto status = disk_.WriteCheckpointPage(page.Id(), page.Data(), state->logical_page_count); !status.Ok()) {
-        return Record(std::move(status));
-      }
+    if (auto status = cache_.WriteCheckpointPages(pages, state->logical_page_count); !status.Ok()) {
+      return Record(std::move(status));
     }
     if (auto status = disk_.Sync(); !status.Ok()) {
       return Record(std::move(status));
@@ -58,6 +68,10 @@ auto Manager::Checkpoint() -> Status {
       return Record(std::move(status));
     }
   }
+
+  // These handles pin the exact checkpoint images during I/O. pages.clear
+  // releases them before MarkCheckpointed releases free arena memory.
+  pages.clear();
 
   /*
   ** POST-DURABILITY PHASE

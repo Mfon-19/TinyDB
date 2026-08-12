@@ -6,6 +6,13 @@
 
 namespace tinydb {
 
+// This setting selects only the database page-file transport. Both modes use
+// the same persistent format, and the WAL remains buffered.
+enum class PageIoMode {
+  Buffered,
+  Direct,
+};
+
 /*
 ** CHECKPOINT PRESSURE POLICY
 **
@@ -42,6 +49,7 @@ struct Options final {
   std::size_t page_cache_bytes{16U << 20U};
   std::size_t max_write_transaction_bytes{16U << 20U};
   CheckpointOptions checkpoint{};
+  PageIoMode page_io_mode{PageIoMode::Buffered};
 };
 
 }  // namespace tinydb

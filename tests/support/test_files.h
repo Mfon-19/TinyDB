@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -30,8 +31,10 @@ class ScopedTestHook {
 };
 
 inline auto Path(std::string_view name) -> std::filesystem::path {
-  return std::filesystem::temp_directory_path() /
-         ("tinydb_test_" + std::string(name) + "_" + std::to_string(::getpid()) + ".db");
+  const auto *const configured_root = std::getenv("TINYDB_TEST_ROOT");
+  const auto root = configured_root == nullptr || *configured_root == '\0' ? std::filesystem::temp_directory_path()
+                                                                           : std::filesystem::path{configured_root};
+  return root / ("tinydb_test_" + std::string(name) + "_" + std::to_string(::getpid()) + ".db");
 }
 
 inline void Remove(const std::filesystem::path &path) {

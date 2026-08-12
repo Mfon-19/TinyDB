@@ -136,6 +136,14 @@ TEST(Database, Snapshots) {
 TEST(Database, Limits) {
   const auto path = tinydb::test::Path("limits");
   Cleanup(path);
+  auto unknown_io_mode = tinydb::Options{};
+  unknown_io_mode.page_io_mode =
+      static_cast<tinydb::PageIoMode>(127);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
+  const auto unknown_mode = tinydb::Database::Open(path, unknown_io_mode);
+  ASSERT_FALSE(unknown_mode.has_value());
+  EXPECT_EQ(unknown_mode.error().Code(), tinydb::StatusCode::InvalidArgument);
+  EXPECT_FALSE(std::filesystem::exists(path));
+
   auto invalid = tinydb::Options{};
   invalid.page_cache_bytes = tinydb::PAGE_SIZE - 1U;
   const auto rejected = tinydb::Database::Open(path, invalid);

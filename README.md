@@ -56,6 +56,36 @@ auto main() -> int {
 `Put` replaces an existing value, `Delete` succeeds when a key is absent, and
 ranges use half-open bounds: `[lower, upper)`.
 
+### Page I/O mode
+
+TinyDB uses buffered page I/O by default. The following option selects direct
+I/O:
+
+```cpp
+auto options = tinydb::Options{};
+options.page_io_mode = tinydb::PageIoMode::Direct;
+auto database = Must(tinydb::Database::Open("notes.db", options));
+```
+
+Direct mode uses `O_DIRECT` only for the database file. The WAL continues to
+use buffered I/O. Ordinary page reads use synchronous `O_DIRECT`. TinyDB uses
+`io_uring` for read-ahead and checkpoint batches on supported kernels. If
+`io_uring` is unavailable, direct mode uses synchronous `O_DIRECT` for all
+page transfers. It never changes to buffered page I/O.
+
+TinyDB limits active direct read-ahead pages to one quarter of the cache or
+4 MiB, whichever is smaller.
+
+Direct mode requires Linux and a file system that reports compatible
+`STATX_DIOALIGN` values. If the host does not support direct I/O,
+`Database::Open` returns an I/O error.
+
+Both modes use the same persistent format. You can reopen one database with
+either mode.
+
+CAUTION: After `fork()`, the child must not use or destroy an inherited
+direct-mode handle. The child must call `exec()` or `_exit()`.
+
 ## Application contract
 
 | Property | Contract |
@@ -209,6 +239,7 @@ tinydb <database> get <key>
 tinydb <database> del <key>
 tinydb <database> scan
 tinydb <database> scan <lower> <upper>
+tinydb --direct-io <database> get <key>
 ```
 
 Bounded scans use `[lower, upper)`. Unbounded scans stream the entire database.
@@ -219,7 +250,7 @@ shell.
 writing every key and value as reversible hexadecimal:
 
 ```text
-tinydb_dump <database>
+tinydb_dump [--direct-io] <database>
 ```
 
 ## Benchmarking
@@ -234,7 +265,11 @@ Measure the current checkout:
 
 ```sh
 make bench
+make bench-compare
 ```
+
+`make bench` uses buffered I/O. `make bench-compare` runs the same binary with
+buffered I/O and direct I/O.
 
 The command builds a Release worker and replaces
 `/tmp/tinydb-benchmark-latest` only after a complete successful run. Fixture

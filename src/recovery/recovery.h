@@ -4,6 +4,10 @@
 
 #include <filesystem>
 
+namespace tinydb::io {
+class PageFile;
+}
+
 namespace tinydb::recovery {
 
 /*
@@ -16,6 +20,6 @@ namespace tinydb::recovery {
 ** written.  Environmental failures during redo leave the previous
 ** superblock and complete WAL sufficient to repeat recovery.
 */
-auto Recover(const std::filesystem::path &db_path, const std::filesystem::path &wal_path) -> Status;
+auto Recover(io::PageFile &database, const std::filesystem::path &wal_path) -> Status;
 
 }  // namespace tinydb::recovery

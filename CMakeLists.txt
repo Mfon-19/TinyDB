@@ -20,6 +20,7 @@ include(CTest)
 include(CMakePackageConfigHelpers)
 include(FetchContent)
 include(GNUInstallDirs)
+find_package(Threads REQUIRED)
 
 add_library(TinyDB_warnings INTERFACE)
 target_compile_options(
@@ -98,6 +99,7 @@ add_library(
   src/btree/navigation.h
   src/btree/page_format.cpp
   src/btree/page_format.h
+  src/btree/page_source.cpp
   src/btree/page_source.h
   src/btree/page_view.cpp
   src/btree/page_view.h
@@ -108,11 +110,21 @@ add_library(
   src/btree/value_storage.h
   src/cache/committed_page_cache.cpp
   src/cache/committed_page_cache.h
+  src/cache/direct_io_engine.cpp
+  src/cache/direct_io_engine.h
+  src/cache/page_arena.cpp
+  src/cache/page_arena.h
   src/checkpoint/checkpoint_manager.cpp
   src/checkpoint/checkpoint_manager.h
   src/api/database.cpp
+  src/io/direct_file.cpp
+  src/io/direct_file.h
+  src/io/direct_io_fork_gate.cpp
+  src/io/direct_io_fork_gate.h
   src/io/file_io.cpp
   src/io/file_io.h
+  src/io/page_file.cpp
+  src/io/page_file.h
   src/io/testable_posix.cpp
   src/io/testable_posix.h
   src/io/unique_fd.h
@@ -164,6 +176,7 @@ target_sources(
          include/tinydb/status.h
          include/tinydb/transaction.h)
 target_compile_features(TinyDB PUBLIC cxx_std_23)
+target_link_libraries(TinyDB PRIVATE Threads::Threads)
 target_include_directories(
   TinyDB
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>

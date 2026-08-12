@@ -19,7 +19,7 @@
 namespace {
 
 void PrintUsage(std::string_view program) {
-  std::cerr << "usage: " << program << " <db-file> <command> [arguments]\n"
+  std::cerr << "usage: " << program << " [--direct-io] <db-file> <command> [arguments]\n"
             << "commands:\n"
             << "  put <key> <value>    insert a row or replace its value\n"
             << "  get <key>            print the value stored under key\n"
@@ -101,12 +101,18 @@ auto main(int argc, char **argv) -> int {
       args.emplace_back(argv[i]);
     }
 
+    auto options = tinydb::Options{};
+    if (!args.empty() && args.front() == "--direct-io") {
+      options.page_io_mode = tinydb::PageIoMode::Direct;
+      args.erase(args.begin());
+    }
+
     if (args.size() < 2) {
       PrintUsage(program);
       return 2;
     }
 
-    auto engine = tinydb::Database::Open(std::filesystem::path{args[0]});
+    auto engine = tinydb::Database::Open(std::filesystem::path{args[0]}, options);
     if (!engine) {
       return ReportError(engine.error());
     }

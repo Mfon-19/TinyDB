@@ -40,7 +40,8 @@ class SnapshotCursor final {
   auto CopyValue() const -> Result<std::string>;
   auto First() -> Status;
   auto Seek(std::string_view key) -> Status;
-  auto Next() -> Status { return cursor_.Next(); }
+  auto Next(std::optional<std::string_view> upper = std::nullopt) -> Status { return cursor_.Next(upper); }
+  void FinishScan() noexcept { cursor_.FinishScan(); }
 
  private:
   SnapshotCursor(SnapshotToken snapshot, BTreeCursor cursor)

@@ -6,12 +6,15 @@ the handle before exiting. It contains no storage logic and is not an
 interactive shell.
 
 ```text
-tinydb <database> put <key> <value>
-tinydb <database> get <key>
-tinydb <database> del <key>
-tinydb <database> scan
-tinydb <database> scan <lower> <upper>
+tinydb [--direct-io] <database> put <key> <value>
+tinydb [--direct-io] <database> get <key>
+tinydb [--direct-io] <database> del <key>
+tinydb [--direct-io] <database> scan
+tinydb [--direct-io] <database> scan <lower> <upper>
 ```
+
+The command uses buffered page I/O by default. The `--direct-io` option must
+occur before the database path.
 
 `scan` streams rows from a `ReadTransaction` cursor. Two bounds describe the
 half-open range `[lower, upper)`; no bounds scan the complete keyspace. Keys
@@ -25,7 +28,7 @@ failure rather than the mutation durability boundary.
 One binary-safe companion program is installed with the CLI:
 
 ```text
-tinydb_dump <database>
+tinydb_dump [--direct-io] <database>
 ```
 
 `tinydb_dump` performs normal recovery and full verification, then writes one

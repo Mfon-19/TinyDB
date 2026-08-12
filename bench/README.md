@@ -16,8 +16,8 @@ make bench
 make bench-compare
 ```
 
-`make bench` measures the current checkout. `make bench-compare` compares it
-with `direct-io` (override that with `DIRECT_IO_REVISION`).
+`make bench` measures buffered I/O in the current checkout.
+`make bench-compare` compares buffered I/O with direct I/O in the same binary.
 
 Useful focused runs:
 
@@ -27,10 +27,11 @@ make bench BENCH_ARGS='--family ycsb'
 make bench-compare BENCH_ARGS='--filter readrandom'
 make bench-compare CACHE_MIB=8
 make bench BENCH_OUTPUT=/tmp/tinydb-buffered
+make bench BENCH_IO_MODE=direct BENCH_OUTPUT=/tmp/tinydb-direct
 ```
 
-The normal TinyDB cache is 16 MiB. `CACHE_MIB` overrides both sides of a
-comparison; `BASELINE_CACHE_MIB` and `DIRECT_CACHE_MIB` override one side.
+The normal TinyDB cache is 16 MiB. `CACHE_MIB` overrides both modes in a
+comparison. `BUFFERED_CACHE_MIB` and `DIRECT_CACHE_MIB` override one mode.
 
 ## Workloads
 
@@ -62,14 +63,16 @@ measure:
 - checkpoint, WAL recovery, and overflow-value delete/reinsert churn that
   exercises retirement, checkpoint quarantine, and page reuse;
 - verified-cold sequential, random, and overflow-value reads; and
-- direct-I/O prefetch activity, usefulness, drops, failures, and memory.
+- direct-I/O read-ahead scheduling, consumption, and process memory.
 
 ## Fair comparisons
 
-Each scenario is built once per compatible on-disk format. Buffered and direct
-TinyDB therefore start from byte-identical canonical files. Other engines get
-the same logical keys and values in their own format. Every trial receives a
-private byte-for-byte copy, which is hashed before use and deleted afterwards.
+Shared-fixture scenarios build one canonical file per compatible on-disk
+format. Buffered and direct TinyDB start these scenarios from byte-identical
+files. Native-fixture scenarios build logically identical files for each I/O
+mode. Other engines get the same logical keys and values in their own format.
+Every trial receives a private byte-for-byte copy. The runner hashes the copy
+before use and deletes it afterwards.
 
 Engines run sequentially in balanced rotating order. Scenario order, operation
 plans, and trial seeds are deterministic. Setup, cache priming, and validation

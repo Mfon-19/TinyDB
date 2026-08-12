@@ -53,6 +53,11 @@ enum class BenchmarkMode {
   RunTrial,
 };
 
+enum class IoMode {
+  Buffered,
+  Direct,
+};
+
 enum class SampleScope {
   Trial,
   Observation,
@@ -92,6 +97,7 @@ struct Scenario final {
 
 struct Config final {
   BenchmarkMode mode{BenchmarkMode::List};
+  IoMode io_mode{IoMode::Buffered};
   std::filesystem::path fixture;
   std::optional<std::string> filter;
   std::optional<std::string> scenario;
@@ -243,7 +249,7 @@ void BuildPortableFixture(const std::filesystem::path &root, const Scenario &sce
 void RunPortableTrial(const std::filesystem::path &root, const Scenario &scenario, const Config &config,
                       Results &results);
 #if defined(KVBENCH_TINYDB)
-void BuildTinyDbFixture(const std::filesystem::path &root, const Scenario &scenario);
+void BuildTinyDbFixture(const std::filesystem::path &root, const Scenario &scenario, const Config &config);
 void RunTinyDbTrial(const std::filesystem::path &root, const Scenario &scenario, const Config &config,
                     Results &results);
 #endif

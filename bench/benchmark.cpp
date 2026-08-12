@@ -209,7 +209,8 @@ void Usage() {
       "       TinyDB_bench --scenario NAME --build-fixture ROOT\n"
       "       TinyDB_bench --scenario NAME --run-trial ROOT --dataset-id SHA256\n"
       "                    --trial-index N --seed N\n"
-      "                    [--page-cache-bytes BYTES] [--semantics durable|native]\n");
+      "                    [--io-mode buffered|direct] [--page-cache-bytes BYTES]\n"
+      "                    [--semantics durable|native]\n");
 }
 
 auto JsonEscape(std::string_view value) -> std::string {
@@ -301,6 +302,14 @@ auto ParseConfig(int argc, char **argv) -> Config {
       config.page_cache_bytes = AsSize(ParseUnsigned(value, flag), flag);
       if (*config.page_cache_bytes == 0) {
         Fail("--page-cache-bytes must be greater than zero");
+      }
+    } else if (flag == "--io-mode") {
+      if (value == "buffered") {
+        config.io_mode = IoMode::Buffered;
+      } else if (value == "direct") {
+        config.io_mode = IoMode::Direct;
+      } else {
+        Fail("--io-mode must be buffered or direct");
       }
     } else if (flag == "--seed") {
       config.seed = ParseUnsigned(value, flag);
@@ -482,7 +491,7 @@ void BuildScenarioFixture(const std::filesystem::path &path, const Scenario &sce
     return;
   }
 #if defined(KVBENCH_TINYDB)
-  BuildTinyDbFixture(path, scenario);
+  BuildTinyDbFixture(path, scenario, config);
 #else
   Fail("selected backend does not support TinyDB qualification workloads");
 #endif

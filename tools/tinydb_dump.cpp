@@ -26,11 +26,17 @@ auto Error(const tinydb::Status &status) -> int {
 }  // namespace
 
 auto main(int argc, char **argv) -> int {
-  if (argc != 2) {
-    std::cerr << "usage: tinydb_dump <database>\n";
+  auto options = tinydb::Options{};
+  auto database_argument = 1;
+  if (argc > 1 && std::string_view{argv[1]} == "--direct-io") {
+    options.page_io_mode = tinydb::PageIoMode::Direct;
+    database_argument = 2;
+  }
+  if (argc != database_argument + 1) {
+    std::cerr << "usage: tinydb_dump [--direct-io] <database>\n";
     return 2;
   }
-  auto database = tinydb::Database::Open(std::filesystem::path{argv[1]});
+  auto database = tinydb::Database::Open(std::filesystem::path{argv[database_argument]}, options);
   if (!database) {
     return Error(database.error());
   }

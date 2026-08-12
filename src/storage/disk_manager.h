@@ -1,12 +1,15 @@
 #pragma once
 
+#include <tinydb/options.h>
 #include <tinydb/status.h>
-#include "io/unique_fd.h"
+#include "io/page_file.h"
 #include "storage/page.h"
 #include "storage/superblock.h"
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <utility>
 
 namespace tinydb {
@@ -26,15 +29,20 @@ namespace tinydb {
 ** synchronization succeeds, the previously selected superblock and WAL remain
 ** the recovery basis. Superblocks are checkpoint artifacts. They are never
 ** transaction page images.
+**
+** PageFile keeps the selected buffered or direct transport. Synchronous page
+** operations work in both modes. Native requests are optional direct-mode
+** acceleration.
 */
 
 class DiskManager {
  public:
-  static auto Open(const std::filesystem::path &path) -> Result<DiskManager>;
+  static auto Open(const std::filesystem::path &path, PageIoMode mode = PageIoMode::Buffered) -> Result<DiskManager>;
+  static auto Open(const std::filesystem::path &path, io::PageFile file) -> Result<DiskManager>;
 
   DiskManager(const DiskManager &) = delete;
   auto operator=(const DiskManager &) -> DiskManager & = delete;
-  DiskManager(DiskManager &&) noexcept = default;
+  DiskManager(DiskManager &&other) noexcept;
   auto operator=(DiskManager &&) -> DiskManager & = delete;
   ~DiskManager() = default;
 
@@ -49,19 +57,31 @@ class DiskManager {
   auto EnsurePageCount(page_id_t logical_page_count) -> Status;
 
   auto WriteCheckpointPage(page_id_t page_id, const char *data, page_id_t captured_logical_page_count) const -> Status;
+  auto WriteCheckpointPages(page_id_t first_page_id, std::span<const std::byte *const> pages,
+                            page_id_t captured_logical_page_count) const -> Status;
   auto CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t logical_page_count,
                         std::uint64_t checkpoint_lsn) -> Status;
   auto Sync() const -> Status;
 
-  auto ReadPage(page_id_t page_id, char *data) const -> Status;
+  auto ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> data) const -> Status;
+  auto UsesDirectIo() const noexcept -> bool;
+  // Direct reads use the current durable page frontier. Direct checkpoint
+  // writes use the captured frontier that the checkpoint will publish.
+  auto BeginDirectReadPages(std::span<const page_id_t> page_ids,
+                            std::span<std::byte> contiguous_pages) const -> Result<io::DirectReadRequest>;
+  auto BeginDirectCheckpointWrite(page_id_t first_page_id, std::span<const struct iovec> vectors,
+                                  page_id_t captured_logical_page_count) const -> Result<io::DirectWriteRequest>;
 
  private:
-  explicit DiskManager(UniqueFd fd) : fd_(std::move(fd)) {}
+  explicit DiskManager(io::PageFile file) : file_(std::move(file)) {}
 
   auto EncodeCurrentSuperblock() const -> storage::SuperblockPage;
 
-  UniqueFd fd_;
+  io::PageFile file_;
   storage::SelectedSuperblock selected_{};
+  // Native reactor threads read this frontier without access to selected_. A
+  // successful superblock synchronization publishes the new value.
+  std::atomic<page_id_t> durable_logical_page_count_{FIRST_DATA_PAGE_ID};
 };
 
 }  // namespace tinydb

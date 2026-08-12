@@ -73,8 +73,10 @@ auto PersistentBytes(const std::filesystem::path &root) -> std::uint64_t {
   return bytes;
 }
 
-auto BenchmarkOptions(const Scenario &scenario, std::optional<std::size_t> page_cache_bytes = std::nullopt) -> Options {
+auto BenchmarkOptions(const Scenario &scenario, std::optional<std::size_t> page_cache_bytes = std::nullopt,
+                      IoMode io_mode = IoMode::Buffered) -> Options {
   auto options = Options{};
+  options.page_io_mode = io_mode == IoMode::Direct ? PageIoMode::Direct : PageIoMode::Buffered;
   options.page_cache_bytes = page_cache_bytes.value_or(scenario.page_cache_bytes);
   const auto transaction_payload =
       CheckedMultiply(scenario.batch, scenario.key_bytes + scenario.value_bytes, "transaction payload");
@@ -122,27 +124,6 @@ struct ResourceStart final {
   ProcessIo io;
 };
 
-struct ReadDiagnostics final {
-  std::uint64_t streams_started{0};
-  std::uint64_t streams_activated{0};
-  std::uint64_t runs_queued{0};
-  std::uint64_t runs_submitted{0};
-  std::uint64_t pages_queued{0};
-  std::uint64_t pages_submitted{0};
-  std::uint64_t read_bytes{0};
-  std::uint64_t pages_ready{0};
-  std::uint64_t pages_waited{0};
-  std::uint64_t pages_bypassed{0};
-  std::uint64_t pages_unused{0};
-  std::uint64_t queue_drops{0};
-  std::uint64_t budget_drops{0};
-  std::uint64_t io_failures{0};
-  std::size_t staging_bytes{0};
-  std::size_t maximum_staging_bytes{0};
-  std::size_t maximum_in_flight_operations{0};
-  std::size_t maximum_in_flight_bytes{0};
-};
-
 struct LifecycleObservation final {
   double seconds{0};
   double milliseconds{0};
@@ -173,7 +154,7 @@ struct IoReadObservation final {
   ProcessMemory memory_before_open;
   ProcessMemory memory_endpoint;
   double logical_read_bytes{0};
-  ReadDiagnostics diagnostics;
+  ReadAheadCounters read_ahead;
 };
 
 auto StartResources() -> ResourceStart { return ResourceStart{ObserveProcessUsage(), ObserveProcessIo()}; }
@@ -187,48 +168,19 @@ auto FinishResources(const ResourceStart &start, ProcessMemory before_open) -> R
   };
 }
 
-[[maybe_unused]] auto CounterDelta(std::uint64_t after, std::uint64_t before, std::string_view name) -> std::uint64_t {
+auto CounterDelta(std::uint64_t after, std::uint64_t before, std::string_view name) -> std::uint64_t {
   if (after < before) {
     Fail(std::string(name) + " counter moved backward");
   }
   return after - before;
 }
 
-template <typename Stats>
-auto CaptureReadDiagnostics(const Stats &before, const Stats &after) -> ReadDiagnostics {
-  if constexpr (requires { before.read_streams_started; }) {
-    return ReadDiagnostics{
-        .streams_started = CounterDelta(after.read_streams_started, before.read_streams_started, "read streams"),
-        .streams_activated =
-            CounterDelta(after.read_streams_activated, before.read_streams_activated, "activated read streams"),
-        .runs_queued = CounterDelta(after.readahead_runs_queued, before.readahead_runs_queued, "queued readahead runs"),
-        .runs_submitted =
-            CounterDelta(after.readahead_runs_submitted, before.readahead_runs_submitted, "submitted readahead runs"),
-        .pages_queued =
-            CounterDelta(after.readahead_pages_queued, before.readahead_pages_queued, "queued readahead pages"),
-        .pages_submitted = CounterDelta(after.readahead_pages_submitted, before.readahead_pages_submitted,
-                                        "submitted readahead pages"),
-        .read_bytes = CounterDelta(after.readahead_read_bytes, before.readahead_read_bytes, "readahead bytes"),
-        .pages_ready = CounterDelta(after.readahead_pages_ready, before.readahead_pages_ready, "ready readahead pages"),
-        .pages_waited =
-            CounterDelta(after.readahead_pages_waited, before.readahead_pages_waited, "waited readahead pages"),
-        .pages_bypassed =
-            CounterDelta(after.readahead_pages_bypassed, before.readahead_pages_bypassed, "bypassed readahead pages"),
-        .pages_unused =
-            CounterDelta(after.readahead_pages_unused, before.readahead_pages_unused, "unused readahead pages"),
-        .queue_drops = CounterDelta(after.readahead_queue_drops, before.readahead_queue_drops, "readahead queue drops"),
-        .budget_drops =
-            CounterDelta(after.readahead_budget_drops, before.readahead_budget_drops, "readahead budget drops"),
-        .io_failures =
-            CounterDelta(after.readahead_io_failures, before.readahead_io_failures, "readahead I/O failures"),
-        .staging_bytes = after.readahead_staging_bytes,
-        .maximum_staging_bytes = after.readahead_maximum_staging_bytes,
-        .maximum_in_flight_operations = after.readahead_maximum_in_flight_operations,
-        .maximum_in_flight_bytes = after.readahead_maximum_in_flight_bytes,
-    };
-  } else {
-    return {};
-  }
+auto SubtractReadAhead(const ReadAheadCounters &after, const ReadAheadCounters &before) -> ReadAheadCounters {
+  return {
+      .plans = CounterDelta(after.plans, before.plans, "read-ahead plans"),
+      .pages_scheduled = CounterDelta(after.pages_scheduled, before.pages_scheduled, "scheduled read-ahead pages"),
+      .pages_consumed = CounterDelta(after.pages_consumed, before.pages_consumed, "consumed read-ahead pages"),
+  };
 }
 
 auto NearestRank(std::vector<double> values, double percentile) -> double {
@@ -282,34 +234,12 @@ void AddCache(const Scenario &scenario, Results &results, std::size_t trial, std
                    static_cast<double>(cache_resident_bytes + residency.resident_bytes));
 }
 
-void AddReadDiagnostics(const Scenario &scenario, Results &results, std::size_t trial,
-                        const ReadDiagnostics &diagnostics) {
-  results.AddTrial(scenario, "read_streams_started", "streams", trial,
-                   static_cast<double>(diagnostics.streams_started));
-  results.AddTrial(scenario, "read_streams_activated", "streams", trial,
-                   static_cast<double>(diagnostics.streams_activated));
-  results.AddTrial(scenario, "readahead_runs_queued", "runs", trial, static_cast<double>(diagnostics.runs_queued));
-  results.AddTrial(scenario, "readahead_runs_submitted", "runs", trial,
-                   static_cast<double>(diagnostics.runs_submitted));
-  results.AddTrial(scenario, "readahead_pages_queued", "pages", trial, static_cast<double>(diagnostics.pages_queued));
-  results.AddTrial(scenario, "readahead_pages_submitted", "pages", trial,
-                   static_cast<double>(diagnostics.pages_submitted));
-  results.AddTrial(scenario, "readahead_read_bytes", "bytes", trial, static_cast<double>(diagnostics.read_bytes));
-  results.AddTrial(scenario, "readahead_pages_ready", "pages", trial, static_cast<double>(diagnostics.pages_ready));
-  results.AddTrial(scenario, "readahead_pages_waited", "pages", trial, static_cast<double>(diagnostics.pages_waited));
-  results.AddTrial(scenario, "readahead_pages_bypassed", "pages", trial,
-                   static_cast<double>(diagnostics.pages_bypassed));
-  results.AddTrial(scenario, "readahead_pages_unused", "pages", trial, static_cast<double>(diagnostics.pages_unused));
-  results.AddTrial(scenario, "readahead_queue_drops", "pages", trial, static_cast<double>(diagnostics.queue_drops));
-  results.AddTrial(scenario, "readahead_budget_drops", "pages", trial, static_cast<double>(diagnostics.budget_drops));
-  results.AddTrial(scenario, "readahead_io_failures", "pages", trial, static_cast<double>(diagnostics.io_failures));
-  results.AddTrial(scenario, "readahead_staging_bytes", "bytes", trial, static_cast<double>(diagnostics.staging_bytes));
-  results.AddTrial(scenario, "readahead_maximum_staging_bytes", "bytes", trial,
-                   static_cast<double>(diagnostics.maximum_staging_bytes));
-  results.AddTrial(scenario, "readahead_maximum_in_flight_operations", "operations", trial,
-                   static_cast<double>(diagnostics.maximum_in_flight_operations));
-  results.AddTrial(scenario, "readahead_maximum_in_flight_bytes", "bytes", trial,
-                   static_cast<double>(diagnostics.maximum_in_flight_bytes));
+void AddReadAhead(const Scenario &scenario, Results &results, std::size_t trial, const ReadAheadCounters &read_ahead) {
+  results.AddTrial(scenario, "readahead_plans", "plans", trial, static_cast<double>(read_ahead.plans));
+  results.AddTrial(scenario, "readahead_pages_scheduled", "pages", trial,
+                   static_cast<double>(read_ahead.pages_scheduled));
+  results.AddTrial(scenario, "readahead_pages_consumed", "pages", trial,
+                   static_cast<double>(read_ahead.pages_consumed));
 }
 
 void AddCommitLatencies(const Scenario &scenario, Results &results, std::size_t trial,
@@ -485,8 +415,10 @@ auto ObserveCheckpoint(const std::filesystem::path &path, const Scenario &scenar
   };
 }
 
-[[noreturn]] void RecoveryWriter(const std::filesystem::path &path, const Dataset &data, const Scenario &scenario) {
-  auto database = Take(Database::Open(DatabasePath(path), BenchmarkOptions(scenario)), "Open recovery writer");
+[[noreturn]] void RecoveryWriter(const std::filesystem::path &path, const Dataset &data, const Scenario &scenario,
+                                 IoMode io_mode) {
+  auto database = Take(Database::Open(DatabasePath(path), BenchmarkOptions(scenario, std::nullopt, io_mode)),
+                       "Open recovery writer");
   StoreDataset(database, data, false, scenario);
   ::_exit(0);
 }
@@ -539,6 +471,7 @@ auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, 
   DatabaseTestAccess::WaitForReadQuiescence(database);
   const auto open_io = SubtractProcessIo(ObserveProcessIo(), open_io_before);
   const auto stats_before = Take(database.Stats(), "Stats before cold reads");
+  const auto read_ahead_before = DatabaseTestAccess::ReadAhead(database);
 
   const auto before_workload_residency = DropAndRequireCold(path, "pre-workload");
   const auto workload_io_before = ObserveProcessIo();
@@ -577,6 +510,7 @@ auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, 
   const auto workload_usage = SubtractProcessUsage(ObserveProcessUsage(), workload_usage_before);
   const auto workload_io = SubtractProcessIo(ObserveProcessIo(), workload_io_before);
   const auto stats_after = Take(database.Stats(), "Stats after cold reads");
+  const auto read_ahead_after = DatabaseTestAccess::ReadAhead(database);
   const auto memory_endpoint = ObserveProcessMemory();
   const auto pre_close_residency = ObserveFileResidency(path);
   const auto close_io_before = ObserveProcessIo();
@@ -608,7 +542,7 @@ auto ObserveIoRead(const std::filesystem::path &path, const Scenario &scenario, 
       .memory_endpoint = memory_endpoint,
       .logical_read_bytes =
           static_cast<double>(operations) * static_cast<double>(scenario.key_bytes + scenario.value_bytes),
-      .diagnostics = CaptureReadDiagnostics(stats_before, stats_after),
+      .read_ahead = SubtractReadAhead(read_ahead_after, read_ahead_before),
   };
 }
 
@@ -766,12 +700,12 @@ void AddIoReadResults(const Scenario &scenario, Results &results, std::size_t tr
   };
   AddResources(scenario, results, trial, resources, observation.workload_seconds);
   AddCache(scenario, results, trial, observation.cache_resident_bytes, observation.pre_close_residency);
-  AddReadDiagnostics(scenario, results, trial, observation.diagnostics);
+  AddReadAhead(scenario, results, trial, observation.read_ahead);
 }
 
 }  // namespace
 
-void BuildTinyDbFixture(const std::filesystem::path &path, const Scenario &scenario) {
+void BuildTinyDbFixture(const std::filesystem::path &path, const Scenario &scenario, const Config &config) {
   auto error = std::error_code{};
   if (std::filesystem::exists(path, error) || PersistentBytes(path) != 0) {
     Fail("fixture database family already exists");
@@ -788,7 +722,7 @@ void BuildTinyDbFixture(const std::filesystem::path &path, const Scenario &scena
   if (scenario.workload == Workload::Recovery) {
     const auto child = ::fork();
     if (child == 0) {
-      RecoveryWriter(path, data, scenario);
+      RecoveryWriter(path, data, scenario, config.io_mode);
     }
     if (child < 0) {
       Fail("fork failed");
@@ -800,7 +734,8 @@ void BuildTinyDbFixture(const std::filesystem::path &path, const Scenario &scena
     return;
   }
 
-  auto database = Take(Database::Open(DatabasePath(path), BenchmarkOptions(scenario)), "Open fixture database");
+  auto database = Take(Database::Open(DatabasePath(path), BenchmarkOptions(scenario, std::nullopt, config.io_mode)),
+                       "Open fixture database");
   StoreDataset(database, data, false, scenario);
   Check(database.Checkpoint(), "Checkpoint fixture");
   Check(database.Close(), "Close fixture database");
@@ -817,7 +752,7 @@ void RunTinyDbTrial(const std::filesystem::path &path, const Scenario &scenario,
   }
   const auto trial = config.trial_index;
   const auto data = MakeDataset(scenario.rows, scenario.key_bytes, scenario.value_bytes);
-  const auto options = BenchmarkOptions(scenario, config.page_cache_bytes);
+  const auto options = BenchmarkOptions(scenario, config.page_cache_bytes, config.io_mode);
 
   switch (scenario.workload) {
     case Workload::Portable:
