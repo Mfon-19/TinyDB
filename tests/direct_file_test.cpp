@@ -207,7 +207,7 @@ TEST(DirectFile, RejectsOffsetOverflowBeforeTransfer) {
     return std::nullopt;
   }};
   auto page = DirectPageBuffer{};
-  const auto status = created->ReadPage(std::numeric_limits<tinydb::page_id_t>::max(), page);
+  const auto status = created->ReadPage(std::numeric_limits<tinydb::page_id_t>::max(), page.bytes);
 
   EXPECT_EQ(status.Code(), StatusCode::InvalidArgument);
   EXPECT_EQ(pread_calls, 0U);
@@ -222,7 +222,7 @@ TEST(DirectFile, EmptyPageReadIsCorruption) {
   }
 
   auto page = DirectPageBuffer{};
-  const auto status = created->ReadPage(0, page);
+  const auto status = created->ReadPage(0, page.bytes);
   EXPECT_EQ(status.Code(), StatusCode::Corruption);
   EXPECT_NE(status.Message().find("short read"), std::string::npos);
 }
@@ -250,12 +250,12 @@ TEST(DirectFile, RetriesInterruptedWriteAndReportsReadFailure) {
           }
           return std::nullopt;
         }};
-    EXPECT_TRUE(created->WritePage(0, expected).Ok());
+    EXPECT_TRUE(created->WritePage(0, expected.bytes).Ok());
   }
   EXPECT_EQ(write_calls, 2U);
 
   auto actual = DirectPageBuffer{};
-  ASSERT_TRUE(created->ReadPage(0, actual).Ok());
+  ASSERT_TRUE(created->ReadPage(0, actual.bytes).Ok());
   EXPECT_EQ(actual.bytes, expected.bytes);
 
   const auto hook = tinydb::test::ScopedTestHook{[&](const tinydb::io::Call &call) -> std::optional<tinydb::io::Fault> {
@@ -264,7 +264,7 @@ TEST(DirectFile, RetriesInterruptedWriteAndReportsReadFailure) {
     }
     return std::nullopt;
   }};
-  const auto failed = created->ReadPage(0, actual);
+  const auto failed = created->ReadPage(0, actual.bytes);
   EXPECT_EQ(failed.Code(), StatusCode::IoError);
   EXPECT_NE(failed.Message().find("pread"), std::string::npos);
 }
@@ -402,7 +402,7 @@ TEST(DirectFile, SynchronousBatchStagesUnalignedPagesAndRetriesShortProgress) {
   EXPECT_EQ(vector_counts, (std::vector<std::size_t>{3, 3, 2}));
   for (auto index = std::size_t{0}; index < pages.size(); ++index) {
     auto actual = DirectPageBuffer{};
-    ASSERT_TRUE(created->ReadPage(index, actual).Ok());
+    ASSERT_TRUE(created->ReadPage(index, actual.bytes).Ok());
     EXPECT_TRUE(std::ranges::all_of(actual.bytes, [&](std::byte byte) {
       return byte == static_cast<std::byte>(static_cast<unsigned char>(index + 1U));
     }));

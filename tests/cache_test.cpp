@@ -4,6 +4,7 @@
 #include "cache/committed_page_cache.h"
 #include "storage/disk_manager.h"
 #include "storage/page_codec.h"
+#include "support/page_encodings.h"
 #include "support/test_files.h"
 #include "txn/transaction_pages.h"
 
@@ -36,13 +37,19 @@ namespace {
 
 auto Path(std::string_view name) { return tinydb::test::Path(name); }
 
+auto WriteCheckpointPage(tinydb::DiskManager &disk, tinydb::page_id_t page_id, const char *data,
+                         tinydb::page_id_t captured_logical_page_count) -> tinydb::Status {
+  const auto pages = std::array{reinterpret_cast<const std::byte *>(data)};
+  return disk.WriteCheckpointPages(page_id, pages, captured_logical_page_count);
+}
+
 void WritePages(tinydb::DiskManager &disk, std::size_t count) {
   const auto logical_page_count = tinydb::FIRST_DATA_PAGE_ID + count;
   ASSERT_TRUE(disk.EnsurePageCount(logical_page_count).Ok());
   for (auto page_id = tinydb::FIRST_DATA_PAGE_ID; page_id < logical_page_count; ++page_id) {
-    const auto encoded = tinydb::storage::EncodeFreeExtentPage(page_id, 1, tinydb::HEADER_PAGE_ID, {});
+    const auto encoded = tinydb::test::EncodeFreeExtentPage(page_id, 1, tinydb::HEADER_PAGE_ID, {});
     ASSERT_TRUE(encoded.has_value());
-    ASSERT_TRUE(disk.WriteCheckpointPage(page_id, encoded->data(), logical_page_count).Ok());
+    ASSERT_TRUE(WriteCheckpointPage(disk, page_id, encoded->data(), logical_page_count).Ok());
   }
   ASSERT_TRUE(disk.Sync().Ok());
   ASSERT_TRUE(disk.CommitCheckpoint(tinydb::FIRST_DATA_PAGE_ID, tinydb::HEADER_PAGE_ID, logical_page_count, 1).Ok());
@@ -65,7 +72,7 @@ void WriteLeafPages(tinydb::DiskManager &disk, std::size_t count) {
   ASSERT_TRUE(disk.EnsurePageCount(logical_page_count).Ok());
   for (auto page_id = tinydb::FIRST_DATA_PAGE_ID; page_id < logical_page_count; ++page_id) {
     const auto encoded = EncodedLeaf(page_id);
-    ASSERT_TRUE(disk.WriteCheckpointPage(page_id, encoded.data(), logical_page_count).Ok());
+    ASSERT_TRUE(WriteCheckpointPage(disk, page_id, encoded.data(), logical_page_count).Ok());
   }
   ASSERT_TRUE(disk.Sync().Ok());
   ASSERT_TRUE(disk.CommitCheckpoint(tinydb::FIRST_DATA_PAGE_ID, tinydb::HEADER_PAGE_ID, logical_page_count, 1).Ok());
@@ -73,7 +80,7 @@ void WriteLeafPages(tinydb::DiskManager &disk, std::size_t count) {
 
 auto Image(tinydb::page_id_t page_id, std::uint64_t page_lsn,
            const std::shared_ptr<tinydb::cache::PageArena> &arena) -> tinydb::cache::CommittedPageImage {
-  const auto encoded = tinydb::storage::EncodeFreeExtentPage(page_id, page_lsn, tinydb::HEADER_PAGE_ID, {});
+  const auto encoded = tinydb::test::EncodeFreeExtentPage(page_id, page_lsn, tinydb::HEADER_PAGE_ID, {});
   if (!encoded) {
     throw std::runtime_error(encoded.error().ToString());
   }
@@ -517,7 +524,7 @@ TEST(Cache, DirectReadStreamTreatsCorruptAdviceAsNonAuthoritative) {
   ASSERT_TRUE(disk.EnsurePageCount(3).Ok());
   auto corrupt = EncodedLeaf(2);
   corrupt[128] ^= 0x01;
-  ASSERT_TRUE(disk.WriteCheckpointPage(2, corrupt.data(), 3).Ok());
+  ASSERT_TRUE(WriteCheckpointPage(disk, 2, corrupt.data(), 3).Ok());
   ASSERT_TRUE(disk.Sync().Ok());
   ASSERT_TRUE(disk.CommitCheckpoint(2, tinydb::HEADER_PAGE_ID, 3, 1).Ok());
   auto cache = tinydb::cache::CommittedPageCache(disk, 16U * tinydb::PAGE_SIZE, 1);

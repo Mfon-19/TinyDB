@@ -56,7 +56,6 @@ class DiskManager {
   // page count. Allocation itself never performs this physical growth.
   auto EnsurePageCount(page_id_t logical_page_count) -> Status;
 
-  auto WriteCheckpointPage(page_id_t page_id, const char *data, page_id_t captured_logical_page_count) const -> Status;
   auto WriteCheckpointPages(page_id_t first_page_id, std::span<const std::byte *const> pages,
                             page_id_t captured_logical_page_count) const -> Status;
   auto CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t logical_page_count,

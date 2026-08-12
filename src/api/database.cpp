@@ -32,7 +32,6 @@
 #include <cstdio>
 #include <expected>
 #include <filesystem>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -303,9 +302,7 @@ class DatabaseCore final {
         .cache_resident_pages = cache_stats.resident_pages,
         .cache_pinned_pages = cache_stats.pinned_pages,
         .dirty_pages = cache_stats.dirty_pages,
-        .dirty_bytes = cache_stats.dirty_pages > std::numeric_limits<std::size_t>::max() / PAGE_SIZE
-                           ? std::numeric_limits<std::size_t>::max()
-                           : cache_stats.dirty_pages * PAGE_SIZE,
+        .dirty_bytes = cache_stats.dirty_pages * PAGE_SIZE,
         .cache_hits = cache_stats.hits,
         .cache_misses = cache_stats.misses,
         .cache_evictions = cache_stats.evictions,
@@ -392,8 +389,12 @@ class DatabaseCore final {
 }  // namespace detail
 
 struct Cursor::Impl final {
-  Impl(std::shared_ptr<detail::DatabaseCore> database, txn::SnapshotCursor snapshot_cursor, KeyRange key_range)
-      : core(std::move(database)), cursor(std::move(snapshot_cursor)), range(std::move(key_range)) {
+  Impl(std::shared_ptr<detail::DatabaseCore> database, txn::SnapshotToken admission, BTreeCursor tree_cursor,
+       KeyRange key_range)
+      : core(std::move(database)),
+        snapshot(std::move(admission)),
+        cursor(std::move(tree_cursor)),
+        range(std::move(key_range)) {
     FinishIfUpperReached();
   }
 
@@ -442,7 +443,10 @@ struct Cursor::Impl final {
   }
 
   std::shared_ptr<detail::DatabaseCore> core;
-  txn::SnapshotCursor cursor;
+  // The token is declared before the cursor so the cursor's page lease is
+  // released before the final reader admission.
+  txn::SnapshotToken snapshot;
+  BTreeCursor cursor;
   KeyRange range;
 };
 
@@ -487,12 +491,15 @@ auto ReadTransaction::Scan(KeyRange range) -> Result<Cursor> {
     return std::unexpected(Status::Closed("Scan on an inactive read transaction"));
   }
   const auto lower = range.Lower();
-  auto snapshot_cursor = lower.has_value() ? impl_->snapshot.Seek(lower.value()) : impl_->snapshot.First();
-  if (!snapshot_cursor) {
-    return std::unexpected(snapshot_cursor.error());
+  auto tree_cursor = lower.has_value() ? impl_->snapshot.Seek(lower.value()) : impl_->snapshot.First();
+  if (!tree_cursor) {
+    return std::unexpected(tree_cursor.error());
   }
 
-  return Cursor(std::make_unique<Cursor::Impl>(impl_->core, std::move(*snapshot_cursor), std::move(range)));
+  // The token copy ties the cursor to this transaction's reader admission, so
+  // the cursor keeps its stable snapshot even if the transaction is destroyed.
+  return Cursor(std::make_unique<Cursor::Impl>(impl_->core, impl_->snapshot.Token(), std::move(*tree_cursor),
+                                               std::move(range)));
 }
 
 Cursor::Cursor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -532,7 +539,7 @@ auto Cursor::Key() const -> BytesView {
 
 auto Cursor::ValueSize() const -> std::uint64_t {
   TINYDB_CHECK(Valid(), "ValueSize requires a valid cursor position");
-  return impl_->cursor.ValueSize();
+  return impl_->cursor.Value().Size();
 }
 
 auto Cursor::CopyValue() const -> Result<Bytes> {

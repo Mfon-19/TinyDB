@@ -240,8 +240,9 @@ TEST(TreeCursor, PlanMismatchFallsBackToLeafChain) {
   ASSERT_TRUE(cursor.has_value()) << cursor.error().ToString();
   ASSERT_TRUE(cursor->Next().Ok());
   ASSERT_TRUE(cursor->Next().Ok());
-  ASSERT_EQ(pages.Plans().size(), 1U);
-  EXPECT_EQ(pages.Plans().front(), (std::vector<tinydb::page_id_t>{19}));
+  // The plan's first leaf disagrees with the authenticated link, so the
+  // cursor issues no advice and the leaf chain remains authoritative.
+  EXPECT_TRUE(pages.Plans().empty());
 
   while (cursor->Valid() && cursor->Key() != next_key) {
     ASSERT_TRUE(cursor->Next().Ok());

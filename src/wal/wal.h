@@ -19,7 +19,9 @@ namespace tinydb {
 ** Wal manages one active redo-log file. TinyDB does not create WAL segments or
 ** archive files.
 **
-** Prepare encodes one transaction in memory. It performs no file I/O.
+** Prepare encodes one transaction in memory with the caller's commit LSN,
+** the same LSN the caller obtained from NextCommitLsn and sealed into its
+** page images. It performs no file I/O.
 **
 ** Commit appends the prepared transaction. It then calls fsync once. Commit
 ** reports success only after this fsync succeeds. This fsync is the transaction
@@ -45,7 +47,7 @@ class Wal {
   ~Wal() = default;
 
   auto NextCommitLsn() const -> Result<std::uint64_t>;
-  auto Prepare(std::span<const wal_format::PageImageView> pages,
+  auto Prepare(std::uint64_t commit_lsn, std::span<const wal_format::PageImageView> pages,
                txn::DatabaseState state) const -> Result<wal_format::EncodedTransaction>;
   auto Commit(wal_format::EncodedTransaction transaction) -> Result<std::uint64_t>;
 

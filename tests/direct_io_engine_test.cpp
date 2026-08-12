@@ -25,6 +25,12 @@
 
 namespace {
 
+auto WriteCheckpointPage(tinydb::DiskManager &disk, tinydb::page_id_t page_id, const char *data,
+                         tinydb::page_id_t captured_logical_page_count) -> tinydb::Status {
+  const auto pages = std::array{reinterpret_cast<const std::byte *>(data)};
+  return disk.WriteCheckpointPages(page_id, pages, captured_logical_page_count);
+}
+
 class ScopedDatabase final {
  public:
   explicit ScopedDatabase(const char *name) : path_(tinydb::test::Path(name)) { tinydb::test::Remove(path_); }
@@ -179,8 +185,8 @@ TEST(DirectIoEngine, ExactRunOwnsAndTransfersReadyArenaPages) {
   auto second = std::array<char, tinydb::PAGE_SIZE>{};
   std::ranges::fill(first, 'x');
   std::ranges::fill(second, 'y');
-  ASSERT_TRUE(disk->WriteCheckpointPage(2, first.data(), logical_page_count).Ok());
-  ASSERT_TRUE(disk->WriteCheckpointPage(3, second.data(), logical_page_count).Ok());
+  ASSERT_TRUE(WriteCheckpointPage(*disk, 2, first.data(), logical_page_count).Ok());
+  ASSERT_TRUE(WriteCheckpointPage(*disk, 3, second.data(), logical_page_count).Ok());
   ASSERT_TRUE(disk->Sync().Ok());
   ASSERT_TRUE(disk->CommitCheckpoint(0, 0, logical_page_count, 0).Ok());
 
@@ -227,7 +233,7 @@ TEST(DirectIoEngine, ExactRunTransfersScatteredPagesOnlyAfterReady) {
     page_ids.push_back(page_id);
     auto stored = std::array<char, tinydb::PAGE_SIZE>{};
     std::ranges::fill(stored, static_cast<char>('a' + index));
-    ASSERT_TRUE(disk->WriteCheckpointPage(page_id, stored.data(), logical_page_count).Ok());
+    ASSERT_TRUE(WriteCheckpointPage(*disk, page_id, stored.data(), logical_page_count).Ok());
   }
   ASSERT_TRUE(disk->Sync().Ok());
   ASSERT_TRUE(disk->CommitCheckpoint(0, 0, logical_page_count, 0).Ok());
@@ -401,7 +407,7 @@ TEST(DirectIoEngine, DiskReadsRaceSafelyWithLogicalFrontierPublication) {
   ASSERT_TRUE(disk->EnsurePageCount(3).Ok());
   auto stored = std::array<char, tinydb::PAGE_SIZE>{};
   std::ranges::fill(stored, 'p');
-  ASSERT_TRUE(disk->WriteCheckpointPage(2, stored.data(), 3).Ok());
+  ASSERT_TRUE(WriteCheckpointPage(*disk, 2, stored.data(), 3).Ok());
   ASSERT_TRUE(disk->Sync().Ok());
 
   auto stop = std::atomic<bool>{false};

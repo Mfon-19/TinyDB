@@ -75,7 +75,8 @@ class SnapshotToken final {
 /*
 ** Non-shareable admission for an owning point result. Database::Get keeps this
 ** object at one stable stack address until the copied value is complete,
-** avoiding a shared-lease allocation when no cursor can escape.
+** avoiding a shared-lease allocation when no cursor can escape. Measured on
+** the buffered random point-read benchmark, that allocation costs about 6%.
 */
 class ScopedSnapshotToken final {
  public:

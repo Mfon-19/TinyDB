@@ -128,16 +128,18 @@ auto Wal::NextCommitLsn() const -> Result<std::uint64_t> {
   return next_lsn_;
 }
 
-// Encodes one transaction with the current next_lsn_. It performs no file I/O.
+// Encodes one transaction with the caller's commit LSN and performs no file
+// I/O. The caller sealed its page images with this same LSN; Commit later
+// rejects the prepared transaction if the durable tail no longer expects it.
 // The function rejects a WAL that needs recovery.
-auto Wal::Prepare(std::span<const wal_format::PageImageView> pages,
+auto Wal::Prepare(std::uint64_t commit_lsn, std::span<const wal_format::PageImageView> pages,
                   txn::DatabaseState state) const -> Result<wal_format::EncodedTransaction> {
   auto lock = std::lock_guard(mutex_);
   TINYDB_CHECK(fd_.Valid(), "preparing through a moved-from log");
   if (needs_recovery_) {
     return std::unexpected(Status::NeedsRecovery("WAL tail is not trustworthy; reopen the database"));
   }
-  return wal_format::EncodeTransaction(next_lsn_, pages, state);
+  return wal_format::EncodeTransaction(commit_lsn, pages, state);
 }
 
 // Appends one prepared transaction at the known-good WAL tail and synchronizes

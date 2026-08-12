@@ -62,7 +62,7 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
         .validated_header = &image.header,
     });
   }
-  auto prepared_wal = wal.Prepare(wal_pages, state);
+  auto prepared_wal = wal.Prepare(*commit_lsn, wal_pages, state);
   if (!prepared_wal) {
     record_prepare();
     return std::unexpected(prepared_wal.error());

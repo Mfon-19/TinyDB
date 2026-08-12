@@ -189,17 +189,6 @@ auto InitializeFreeExtentPage(std::span<std::byte, PAGE_SIZE> page, page_id_t pa
   return {};
 }
 
-auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t next_page_id,
-                          std::span<const FreeExtent> extents) -> Result<std::array<char, PAGE_SIZE>> {
-  auto output = std::array<char, PAGE_SIZE>{};
-  auto bytes = std::as_writable_bytes(std::span{output});
-  if (auto status = InitializeFreeExtentPage(bytes, page_id, page_lsn, next_page_id, extents); !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
-  FinalizeDataPage(bytes);
-  return output;
-}
-
 namespace {
 
 auto DecodeFreeExtentPayload(std::span<const std::byte> page, page_id_t expected_page_id,
@@ -284,20 +273,6 @@ auto InitializeOverflowPage(std::span<std::byte, PAGE_SIZE> page, page_id_t page
   PutLittleEndianUnchecked(page, OVERFLOW_RESERVED16_OFFSET, std::uint16_t{0});
   PutBytesUnchecked(page, OVERFLOW_DATA_OFFSET, payload);
   return {};
-}
-
-auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t owner_value_id, std::uint32_t chunk_index,
-                        page_id_t next_page_id,
-                        std::span<const std::byte> payload) -> Result<std::array<char, PAGE_SIZE>> {
-  auto output = std::array<char, PAGE_SIZE>{};
-  auto bytes = std::as_writable_bytes(std::span{output});
-  if (auto status =
-          InitializeOverflowPage(bytes, page_id, page_lsn, owner_value_id, chunk_index, next_page_id, payload);
-      !status.Ok()) {
-    return std::unexpected(std::move(status));
-  }
-  FinalizeDataPage(bytes);
-  return output;
 }
 
 namespace {

@@ -4,13 +4,15 @@
 #include <tinydb/status.h>
 
 #include "io/direct_file.h"
+#include "io/unique_fd.h"
 #include "storage/page.h"
 
 #include <sys/stat.h>
 
 #include <filesystem>
-#include <memory>
 #include <span>
+#include <utility>
+#include <variant>
 
 namespace tinydb::io {
 
@@ -20,12 +22,17 @@ inline constexpr std::size_t MAX_PAGE_WRITE_BATCH_PAGES = MAX_DIRECT_WRITE_BATCH
 ** DATABASE PAGE-FILE TRANSPORT
 **
 ** When the database opens, PageFile selects one physical transport. Buffered
-** mode uses ordinary pread and pwrite. Direct mode uses fail-closed O_DIRECT
-** transfers. Direct mode never changes to buffered mode after an open error.
-** The selected backend remains fixed for the PageFile lifetime. Both modes
-** expose the same fixed-page and durability operations to recovery and
-** DiskManager. The transport never selects a persistent format or WAL
-** protocol.
+** mode uses ordinary pread and pwrite on one descriptor. Direct mode uses
+** fail-closed O_DIRECT transfers. Direct mode never changes to buffered mode
+** after an open error. The selected backend remains fixed for the PageFile
+** lifetime. Both modes expose the same fixed-page and durability operations
+** to recovery and DiskManager. The transport never selects a persistent
+** format or WAL protocol.
+**
+** Prepared direct requests borrow the DirectFile descriptor and diagnostic
+** path, so every request token must complete before this object moves or is
+** destroyed. DiskManager moves its PageFile only during open, before any
+** request can exist.
 */
 class PageFile final {
  public:
@@ -33,9 +40,9 @@ class PageFile final {
 
   PageFile(const PageFile &) = delete;
   auto operator=(const PageFile &) -> PageFile & = delete;
-  PageFile(PageFile &&) noexcept;
-  auto operator=(PageFile &&) noexcept -> PageFile &;
-  ~PageFile();
+  PageFile(PageFile &&) noexcept = default;
+  auto operator=(PageFile &&) noexcept -> PageFile & = default;
+  ~PageFile() = default;
 
   auto ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> page) const -> Status;
   auto WritePage(page_id_t page_id, std::span<const std::byte, PAGE_SIZE> page) const -> Status;
@@ -51,10 +58,12 @@ class PageFile final {
   auto Sync() const -> Status;
 
  private:
-  struct Impl;
-  explicit PageFile(std::unique_ptr<Impl> impl);
+  // The buffered transport is one ordinary descriptor.
+  using Transport = std::variant<UniqueFd, DirectFile>;
 
-  std::unique_ptr<Impl> impl_;
+  explicit PageFile(Transport transport) : transport_(std::move(transport)) {}
+
+  Transport transport_;
 };
 
 }  // namespace tinydb::io

@@ -209,15 +209,6 @@ auto DiskManager::EnsurePageCount(page_id_t logical_page_count) -> Status {
   return file_.EnsurePageCount(logical_page_count);
 }
 
-auto DiskManager::WriteCheckpointPage(page_id_t page_id, const char *data,
-                                      page_id_t captured_logical_page_count) const -> Status {
-  if (data == nullptr) {
-    return Status::InvalidArgument("checkpoint page lies outside its captured logical page range");
-  }
-  const auto pages = std::array{reinterpret_cast<const std::byte *>(data)};
-  return WriteCheckpointPages(page_id, pages, captured_logical_page_count);
-}
-
 auto DiskManager::WriteCheckpointPages(page_id_t first_page_id, std::span<const std::byte *const> pages,
                                        page_id_t captured_logical_page_count) const -> Status {
   // The captured count can exceed the durable frontier after file growth.

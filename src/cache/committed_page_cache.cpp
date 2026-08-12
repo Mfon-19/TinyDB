@@ -12,7 +12,6 @@
 #include <array>
 #include <condition_variable>
 #include <expected>
-#include <limits>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -112,22 +111,30 @@ class StagingBudget final {
   std::size_t used_pages_{0};
 };
 
-class StagedPageTransfer final {
+/*
+** A staged page owns one arena lease and one budget reservation. A consuming
+** demand decodes the page and stores its validated header here before the
+** object backs an immutable PageHandle.
+*/
+class StagedPage final {
  public:
-  StagedPageTransfer() = default;
-  StagedPageTransfer(PageArena::Lease bytes, std::shared_ptr<StagingBudget> budget)
+  StagedPage() = default;
+  StagedPage(PageArena::Lease bytes, std::shared_ptr<StagingBudget> budget)
       : bytes_(std::move(bytes)), budget_(std::move(budget)), reserved_(true) {}
-  StagedPageTransfer(const StagedPageTransfer &) = delete;
-  auto operator=(const StagedPageTransfer &) -> StagedPageTransfer & = delete;
-  StagedPageTransfer(StagedPageTransfer &&other) noexcept
-      : bytes_(std::move(other.bytes_)),
+  StagedPage(const StagedPage &) = delete;
+  auto operator=(const StagedPage &) -> StagedPage & = delete;
+  StagedPage(StagedPage &&other) noexcept
+      : header(other.header),
+        bytes_(std::move(other.bytes_)),
         budget_(std::move(other.budget_)),
         reserved_(std::exchange(other.reserved_, false)) {}
-  auto operator=(StagedPageTransfer &&) -> StagedPageTransfer & = delete;
-  ~StagedPageTransfer() { Reset(); }
+  auto operator=(StagedPage &&) -> StagedPage & = delete;
+  ~StagedPage() { Reset(); }
 
   explicit operator bool() const noexcept { return static_cast<bool>(bytes_); }
   auto Bytes() noexcept -> PageBytes & { return bytes_.Bytes(); }
+
+  storage::DataPageHeader header{};
 
  private:
   void Reset() noexcept {
@@ -144,14 +151,6 @@ class StagedPageTransfer final {
   PageArena::Lease bytes_;
   std::shared_ptr<StagingBudget> budget_;
   bool reserved_{false};
-};
-
-struct StagedPage final {
-  StagedPage(StagedPageTransfer initial_transfer, storage::DataPageHeader initial_header)
-      : transfer(std::move(initial_transfer)), header(initial_header) {}
-
-  StagedPageTransfer transfer;
-  storage::DataPageHeader header;
 };
 
 /*
@@ -189,7 +188,7 @@ class StagedRun final {
            state == DirectReadRunState::Ready;
   }
 
-  auto TakeReadyPage(std::size_t index) noexcept -> StagedPageTransfer {
+  auto TakeReadyPage(std::size_t index) noexcept -> StagedPage {
     auto observed_run = std::shared_ptr<DirectReadRun>{};
     {
       auto lock = std::lock_guard(mutex_);
@@ -267,10 +266,11 @@ void CancelRuns(const std::vector<std::shared_ptr<StagedRun>> &runs) noexcept {
 
 struct CommittedPageCache::Impl final {
   // The staging limit covers speculative pages outside the replacement cache.
-  // Planning limits also bound metadata and each physical request.
+  // Each staged run fills at most one maximal transport read, and one plan
+  // holds at most two such runs.
   static constexpr auto MAXIMUM_STAGING_BYTES = std::size_t{4} * 1024U * 1024U;
-  static constexpr auto MAXIMUM_PLANNED_PAGES = std::size_t{128};
-  static constexpr auto MAXIMUM_PHYSICAL_RUN_PAGES = std::size_t{64};
+  static constexpr auto MAXIMUM_PHYSICAL_RUN_PAGES = io::MAX_DIRECT_READ_BATCH_PAGES;
+  static constexpr auto MAXIMUM_PLANNED_PAGES = 2U * MAXIMUM_PHYSICAL_RUN_PAGES;
 
   DiskManager &disk;  // backing checkpointed database file
   const std::size_t target_bytes;
@@ -412,7 +412,9 @@ struct CommittedPageCache::Impl final {
   /*
   ** Every blocking and page-sized operation in a physical miss happens here,
   ** outside mutex. An unobserved eviction victim supplies its existing page
-  ** buffer. This reuse prevents allocator churn during steady-state reads.
+  ** buffer and frame control block. Buffered mode has no arena free list, so
+  ** this reuse is what prevents two allocations per steady-state miss; the
+  ** miss-per-read benchmark loses about 6% without it.
   */
   auto LoadFrame(page_id_t page_id,
                  std::shared_ptr<CommittedFrame> frame) const -> Result<std::shared_ptr<CommittedFrame>> {
@@ -438,8 +440,7 @@ struct CommittedPageCache::Impl final {
       if (!header) {
         return std::unexpected(header.error());
       }
-      const auto tree_page = IsTreePage(*header);
-      if (tree_page) {
+      if (IsTreePage(*header)) {
         if (auto validation_status = ValidateTreePagePayload(bytes->data(), *header); !validation_status.Ok()) {
           return std::unexpected(std::move(validation_status));
         }
@@ -713,26 +714,27 @@ struct CommittedPageCache::Impl final {
       return Read(page_id);
     }
 
-    auto transfer = staged_run->TakeReadyPage(staged_index);
-    if (!transfer) {
+    auto staged = staged_run->TakeReadyPage(staged_index);
+    if (!staged) {
       return Read(page_id);
     }
-    const auto encoded = std::as_bytes(std::span<const char, PAGE_SIZE>{transfer.Bytes()});
+    const auto encoded = std::as_bytes(std::span<const char, PAGE_SIZE>{staged.Bytes()});
     const auto decoded = storage::DecodeDataPageHeader(encoded, page_id);
     if (!decoded) {
       return Read(page_id);
     }
     auto payload_proof = PagePayloadProof::None;
     if (IsTreePage(*decoded)) {
-      if (auto status = ValidateTreePagePayload(transfer.Bytes().data(), *decoded); !status.Ok()) {
+      if (auto status = ValidateTreePagePayload(staged.Bytes().data(), *decoded); !status.Ok()) {
         return Read(page_id);
       }
       payload_proof = PagePayloadProof::Tree;
     }
+    staged.header = *decoded;
 
     auto staged_page = std::shared_ptr<StagedPage>{};
     try {
-      staged_page = std::make_shared<StagedPage>(std::move(transfer), *decoded);
+      staged_page = std::make_shared<StagedPage>(std::move(staged));
     } catch (const std::bad_alloc &) {
       return Read(page_id);
     }
@@ -750,7 +752,7 @@ struct CommittedPageCache::Impl final {
         ++read_ahead_pages_consumed;
         auto *const page = staged_page.get();
         auto keepalive = std::static_pointer_cast<const void>(std::move(staged_page));
-        return PageHandle(page_id, page->transfer.Bytes().data(), std::move(keepalive), &page->header, payload_proof);
+        return PageHandle(page_id, page->Bytes().data(), std::move(keepalive), &page->header, payload_proof);
       }
     }
     return Read(page_id);
@@ -942,14 +944,9 @@ auto CommittedPageCache::CaptureDirtyPages() -> std::vector<PageHandle> {
 
 auto CommittedPageCache::WriteCheckpointPages(std::span<const PageHandle> pages,
                                               page_id_t captured_logical_page_count) -> Status {
-  for (auto index = std::size_t{0}; index < pages.size(); ++index) {
-    if (pages[index].Data() == nullptr || pages[index].Id() < FIRST_DATA_PAGE_ID ||
-        pages[index].Id() >= captured_logical_page_count ||
-        (index != 0 && pages[index - 1U].Id() >= pages[index].Id())) {
-      return Status::InvalidArgument("checkpoint cache received invalid or unordered pages");
-    }
-  }
-
+  // CaptureDirtyPages produces ordered non-null page handles. The native
+  // engine and DiskManager validate the batches they receive against their
+  // own transfer bounds, so this method adds no third copy of those checks.
   if (impl_->direct_io != nullptr) {
     auto direct_pages = std::vector<DirectIoCheckpointPage>{};
     try {

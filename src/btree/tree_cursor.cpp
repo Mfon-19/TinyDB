@@ -6,7 +6,6 @@
 
 #include "storage/page.h"
 
-#include <array>
 #include <expected>
 #include <limits>
 #include <unordered_set>
@@ -206,30 +205,21 @@ void BTreeCursor::PrimeSuccessor(page_id_t page_id, std::optional<std::string_vi
   if (planned_successor_index_ < planned_successors_.size()) {
     return;
   }
-  if (!range_planning_disabled_ && Valid() && CurrentLeaf().NextLeaf() == page_id && stream_.AcceptsExactPagePlan()) {
-    // Internal edges provide the batch. The first planned leaf must also
-    // match the authenticated link from the current leaf.
-    auto pages = PlanLeafPageSuccessorsForReadAhead(pages_, root_page_id_, page_.Id(), logical_page_count_, Key(),
-                                                    RANGE_READ_AHEAD_PAGES, upper);
-    if (!pages.empty() && pages.front() == page_id) {
-      planned_successors_ = std::move(pages);
-      planned_successor_index_ = 0;
-      stream_.PrimeExactPages(planned_successors_);
-      return;
-    }
-    if (!pages.empty()) {
-      range_planning_disabled_ = true;
-    }
-    // An upper bound can exclude the complete next subtree. Do not read one
-    // page beyond that bound when the planner returns no successors.
-    if (upper.has_value()) {
-      return;
-    }
+  if (range_planning_disabled_ || !Valid() || CurrentLeaf().NextLeaf() != page_id || !stream_.AcceptsExactPagePlan()) {
+    return;
   }
-  // The current leaf proves this one link. A backend can still stage the
-  // successor when a larger internal-tree plan is unavailable.
-  const auto successor = std::array{page_id};
-  stream_.PrimeExactPages(successor);
+  // Internal edges provide the batch. The first planned leaf must also match
+  // the authenticated link from the current leaf, which stays authoritative;
+  // a mismatch proves no plan and the cursor follows the chain without advice.
+  auto pages = PlanLeafPageSuccessorsForReadAhead(pages_, root_page_id_, page_.Id(), logical_page_count_, Key(),
+                                                  RANGE_READ_AHEAD_PAGES, upper);
+  if (!pages.empty() && pages.front() == page_id) {
+    planned_successors_ = std::move(pages);
+    planned_successor_index_ = 0;
+    stream_.PrimeExactPages(planned_successors_);
+  } else if (!pages.empty()) {
+    range_planning_disabled_ = true;
+  }
 }
 
 auto BTreeCursor::ValidateLeafId(page_id_t page_id) const -> Status {

@@ -28,7 +28,12 @@ static_assert(sizeof(DirectPageBuffer) == PAGE_SIZE);
 static_assert(alignof(DirectPageBuffer) == PAGE_SIZE);
 
 inline constexpr std::size_t MAX_DIRECT_WRITE_BATCH_PAGES = 32;
-inline constexpr std::size_t MAX_DIRECT_READ_BATCH_PAGES = 544;
+// One prepared asynchronous read names at most this many pages. The native
+// engine schedules whole runs against this same bound and the cache sizes its
+// staging runs to it, so every layer shares one limit. A fully scattered run
+// of this size needs one SQE per page and still fits the reactor's in-flight
+// budget.
+inline constexpr std::size_t MAX_DIRECT_READ_BATCH_PAGES = 64;
 inline constexpr std::size_t MAX_DIRECT_READ_PAGES_PER_SQE = 32;
 
 /*
@@ -114,10 +119,6 @@ class DirectFile final {
 
   auto ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> page) const -> Status;
   auto WritePage(page_id_t page_id, std::span<const std::byte, PAGE_SIZE> page) const -> Status;
-  auto ReadPage(page_id_t page_id, DirectPageBuffer &page) const -> Status { return ReadPage(page_id, page.bytes); }
-  auto WritePage(page_id_t page_id, const DirectPageBuffer &page) const -> Status {
-    return WritePage(page_id, page.bytes);
-  }
   // Write one physically consecutive run. Each pointer names one PAGE_SIZE
   // source page. Aligned sources go directly to pwritev. If one source is
   // misaligned, one bounded staging array holds the complete batch.

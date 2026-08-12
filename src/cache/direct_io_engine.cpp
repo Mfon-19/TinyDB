@@ -173,7 +173,6 @@ constexpr auto MAXIMUM_QUEUED_OPERATIONS = std::size_t{256};
 constexpr auto MAXIMUM_ACTIVE_OPERATIONS = std::size_t{64};
 constexpr auto MAXIMUM_IN_FLIGHT_SQES = std::size_t{64};
 constexpr auto MAXIMUM_ACTIVE_WRITES = std::size_t{16};
-constexpr auto MAXIMUM_EXACT_READ_PAGES = std::size_t{128};
 constexpr auto RING_ENTRIES = std::uint32_t{256};
 constexpr auto WAKE_USER_DATA = std::uint64_t{0};
 constexpr auto INCOMPLETE_RESULT = std::numeric_limits<int>::min();
@@ -200,30 +199,37 @@ auto SubmissionCount(std::span<const page_id_t> page_ids) noexcept -> std::size_
   return submissions;
 }
 
-struct Operation final {
-  enum class Kind {
-    Read,
-    Write,
-  };
-
-  Operation(std::shared_ptr<DirectReadRun::Impl> run, io::DirectReadRequest request)
-      : kind(Kind::Read),
-        first_page_id(run->page_ids.front()),
-        page_count(run->page_ids.size()),
-        read_destination(reinterpret_cast<std::byte *>(run->pages.front().Bytes().data())),
-        exact_read_run(std::move(run)),
-        prepared_read(std::move(request)) {
-    const auto valid =
-        !exact_read_run->page_ids.empty() && exact_read_run->pages.size() == page_count && read_destination != nullptr;
+/*
+** An exact read completes through its shared run, whose own mutex and
+** condition already serve every waiter, so the operation carries no
+** synchronization of its own. A checkpoint write is waited on directly by
+** the scheduling thread and therefore owns one-shot completion state.
+*/
+struct ExactReadOperation final {
+  ExactReadOperation(std::shared_ptr<DirectReadRun::Impl> requested_run, io::DirectReadRequest request)
+      : run(std::move(requested_run)),
+        destination(reinterpret_cast<std::byte *>(run->pages.front().Bytes().data())),
+        prepared(std::move(request)) {
+    const auto valid = !run->page_ids.empty() && run->pages.size() == run->page_ids.size() && destination != nullptr;
     TINYDB_CHECK(valid, "constructing an invalid exact direct-read operation");
   }
 
-  Operation(page_id_t write_page_id, std::span<const DirectIoCheckpointPage> pages)
-      : kind(Kind::Write), first_page_id(write_page_id), page_count(pages.size()) {
+  auto FirstPageId() const noexcept -> page_id_t { return run->page_ids.front(); }
+  auto PageCount() const noexcept -> std::size_t { return run->page_ids.size(); }
+  void Complete(const Status &status) noexcept { run->Complete(status); }
+
+  std::shared_ptr<DirectReadRun::Impl> run;
+  std::byte *destination{nullptr};
+  std::optional<io::DirectReadRequest> prepared;
+};
+
+struct CheckpointWriteOperation final {
+  CheckpointWriteOperation(page_id_t write_page_id, std::span<const DirectIoCheckpointPage> pages)
+      : first_page_id(write_page_id), page_count(pages.size()) {
     const auto valid = !pages.empty() && pages.size() <= io::MAX_DIRECT_WRITE_BATCH_PAGES;
     TINYDB_CHECK(valid, "constructing an invalid direct checkpoint operation");
     for (auto index = std::size_t{0}; index < pages.size(); ++index) {
-      write_vectors[index] = iovec{
+      vectors[index] = iovec{
           .iov_base = const_cast<char *>(pages[index].data),
           .iov_len = PAGE_SIZE,
       };
@@ -231,42 +237,32 @@ struct Operation final {
   }
 
   void Complete(Status completion_status) {
-    if (exact_read_run != nullptr) {
-      exact_read_run->Complete(completion_status);
-      return;
-    }
     auto lock = std::lock_guard(mutex);
-    TINYDB_CHECK(!done, "completing one direct-I/O operation twice");
-    prepared_read.reset();
-    prepared_write.reset();
+    TINYDB_CHECK(!done, "completing one direct checkpoint write twice");
+    prepared.reset();
     status = std::move(completion_status);
     done = true;
     changed.notify_one();
   }
 
   auto Wait() -> Status {
-    TINYDB_CHECK(exact_read_run == nullptr, "waiting directly on an exact-read operation");
     auto lock = std::unique_lock(mutex);
     changed.wait(lock, [this] { return done; });
     return std::move(status);
   }
 
-  Kind kind;
   page_id_t first_page_id;
-  std::size_t page_count{1};
+  std::size_t page_count;
   page_id_t captured_logical_page_count{FIRST_DATA_PAGE_ID};
-  std::byte *read_destination{nullptr};
-  std::shared_ptr<DirectReadRun::Impl> exact_read_run;
-  std::array<struct iovec, io::MAX_DIRECT_WRITE_BATCH_PAGES> write_vectors{};
-  std::optional<io::DirectReadRequest> prepared_read;
-  std::optional<io::DirectWriteRequest> prepared_write;
+  std::array<struct iovec, io::MAX_DIRECT_WRITE_BATCH_PAGES> vectors{};
+  std::optional<io::DirectWriteRequest> prepared;
   std::mutex mutex;
   std::condition_variable changed;
   Status status;
   bool done{false};
 };
 
-template <std::size_t Capacity>
+template <typename Operation, std::size_t Capacity>
 class OperationQueue final {
  public:
   auto Size() const noexcept -> std::size_t { return size_; }
@@ -616,14 +612,18 @@ class NativeRing final {
 struct DirectIoEngine::Impl final {
   struct ActiveSlot final {
     // A slot owns its operation and transfer token while the kernel can access
-    // their buffers. One logical read can produce several CQEs.
-    std::shared_ptr<Operation> operation;
+    // their buffers. One logical read can produce several CQEs. Exactly one of
+    // read and write is set while the slot is occupied.
+    std::shared_ptr<ExactReadOperation> read;
+    std::shared_ptr<CheckpointWriteOperation> write;
     std::optional<io::DirectReadRequest> read_request;
     std::optional<io::DirectWriteRequest> write_request;
     std::array<int, MAXIMUM_IN_FLIGHT_SQES> completion_results{};
     std::array<std::size_t, MAXIMUM_IN_FLIGHT_SQES> expected_bytes{};
     std::size_t completion_count{0};
     std::size_t completions_received{0};
+
+    auto Occupied() const noexcept -> bool { return read != nullptr || write != nullptr; }
   };
 
   struct DispatchItem final {
@@ -752,7 +752,7 @@ struct DirectIoEngine::Impl final {
 
   auto FindFreeSlotLocked() const noexcept -> std::size_t {
     for (auto index = std::size_t{0}; index < active.size(); ++index) {
-      if (active[index].operation == nullptr) {
+      if (!active[index].Occupied()) {
         return index;
       }
     }
@@ -762,34 +762,46 @@ struct DirectIoEngine::Impl final {
   auto DispatchLocked(NativeRing &ring) -> DispatchBatch {
     auto batch = DispatchBatch{};
     while (active_count < MAXIMUM_ACTIVE_OPERATIONS && active_sqes < MAXIMUM_IN_FLIGHT_SQES) {
-      auto operation = std::shared_ptr<Operation>{};
       // Keep one checkpoint write active so it can make progress. After that,
       // exact reads have priority. Extra writes use depth only when reads are absent.
       const auto write_needs_progress = !writes.Empty() && active_writes == 0;
       const auto write_can_fill_idle_depth =
           exact_reads.Empty() && !writes.Empty() && active_writes < MAXIMUM_ACTIVE_WRITES;
       if (write_needs_progress || write_can_fill_idle_depth) {
-        operation = writes.Pop();
-      } else if (!exact_reads.Empty()) {
-        operation = exact_reads.Pop();
-      } else {
+        // A write needs exactly one SQE and the loop condition proves depth.
+        auto operation = writes.Pop();
+        const auto slot_index = FindFreeSlotLocked();
+        TINYDB_CHECK(slot_index != active.size(), "direct-I/O engine lost an active slot");
+        auto &slot = active[slot_index];
+        // The active slot owns the operation and its request token. Together,
+        // they keep the file state and transfer memory valid until completion.
+        std::ranges::fill(slot.completion_results, INCOMPLETE_RESULT);
+        const auto vectors = std::span<const struct iovec>{operation->vectors}.first(operation->page_count);
+        TINYDB_CHECK(operation->prepared.has_value(), "queued checkpoint write has no prepared request");
+        slot.write_request = std::move(operation->prepared);
+        slot.completion_count = 1;
+        slot.expected_bytes[0] = operation->page_count * PAGE_SIZE;
+        ring.QueueWrite(slot.write_request.value(), operation->first_page_id, vectors, slot_index);
+        slot.write = std::move(operation);
+        batch.items[batch.count++] = DispatchItem{.slot_index = slot_index, .submission_count = 1};
+        ++active_count;
+        ++active_sqes;
+        ++active_writes;
+        continue;
+      }
+      if (exact_reads.Empty()) {
         break;
       }
 
-      const auto needed_submissions =
-          operation->kind == Operation::Kind::Read ? SubmissionCount(operation->exact_read_run->page_ids) : 1U;
+      auto operation = exact_reads.Pop();
+      const auto needed_submissions = SubmissionCount(operation->run->page_ids);
       if (needed_submissions > MAXIMUM_IN_FLIGHT_SQES - active_sqes) {
         // A read run publishes its pages as one unit. Keep its SQEs together
         // until enough ring depth becomes free.
-        if (operation->kind == Operation::Kind::Write) {
-          writes.Push(std::move(operation));
-        } else {
-          exact_reads.Push(std::move(operation));
-        }
+        exact_reads.Push(std::move(operation));
         break;
       }
-
-      if (operation->kind == Operation::Kind::Read && !operation->exact_read_run->BeginLoading()) {
+      if (!operation->run->BeginLoading()) {
         operation->Complete(Status::Closed("exact direct-read run was cancelled before transfer"));
         continue;
       }
@@ -797,41 +809,19 @@ struct DirectIoEngine::Impl final {
       const auto slot_index = FindFreeSlotLocked();
       TINYDB_CHECK(slot_index != active.size(), "direct-I/O engine lost an active slot");
       auto &slot = active[slot_index];
-      // The active slot owns the operation and its request token. Together,
-      // they keep the file state and transfer memory valid until completion.
-      slot.operation = operation;
       std::ranges::fill(slot.completion_results, INCOMPLETE_RESULT);
-      if (operation->kind == Operation::Kind::Read) {
-        const auto &page_ids = operation->exact_read_run->page_ids;
-        TINYDB_CHECK(operation->prepared_read.has_value(), "queued direct read has no prepared request");
-        slot.read_request = std::move(operation->prepared_read);
-        if (!slot.read_request.has_value()) {
-          TINYDB_CHECK(false, "prepared direct read was lost during transfer");
-        }
-        slot.completion_count = ring.QueueRead(slot.read_request.value(), page_ids, operation->read_destination,
-                                               slot_index, slot.expected_bytes);
-      } else {
-        const auto vectors = std::span<const struct iovec>{operation->write_vectors}.first(operation->page_count);
-        TINYDB_CHECK(operation->prepared_write.has_value(), "queued checkpoint write has no prepared request");
-        slot.write_request = std::move(operation->prepared_write);
-        if (!slot.write_request.has_value()) {
-          TINYDB_CHECK(false, "prepared checkpoint write was lost during transfer");
-        }
-        slot.completion_count = 1;
-        slot.expected_bytes[0] = operation->page_count * PAGE_SIZE;
-        ring.QueueWrite(slot.write_request.value(), operation->first_page_id, vectors, slot_index);
-      }
-
+      TINYDB_CHECK(operation->prepared.has_value(), "queued direct read has no prepared request");
+      slot.read_request = std::move(operation->prepared);
+      slot.completion_count = ring.QueueRead(slot.read_request.value(), operation->run->page_ids,
+                                             operation->destination, slot_index, slot.expected_bytes);
       TINYDB_CHECK(slot.completion_count == needed_submissions, "direct-I/O request changed its submission count");
+      slot.read = std::move(operation);
       batch.items[batch.count++] = DispatchItem{
           .slot_index = slot_index,
           .submission_count = needed_submissions,
       };
       ++active_count;
       active_sqes += needed_submissions;
-      if (operation->kind == Operation::Kind::Write) {
-        ++active_writes;
-      }
     }
     state_changed.notify_all();
     return batch;
@@ -841,7 +831,7 @@ struct DirectIoEngine::Impl final {
     // This function records one CQE but does not publish an operation result.
     // FinishSlot publishes the result after the last CQE.
     auto lock = std::lock_guard(mutex);
-    const auto known_slot = completion.slot_index < active.size() && active[completion.slot_index].operation != nullptr;
+    const auto known_slot = completion.slot_index < active.size() && active[completion.slot_index].Occupied();
     TINYDB_CHECK(known_slot, "native ring completed an unknown direct-I/O slot");
     auto &slot = active[completion.slot_index];
     const auto new_completion = completion.submission_index < slot.completion_count &&
@@ -853,7 +843,8 @@ struct DirectIoEngine::Impl final {
   }
 
   void FinishSlot(std::size_t slot_index) {
-    auto operation = std::shared_ptr<Operation>{};
+    auto read = std::shared_ptr<ExactReadOperation>{};
+    auto write = std::shared_ptr<CheckpointWriteOperation>{};
     auto read_request = std::optional<io::DirectReadRequest>{};
     auto write_request = std::optional<io::DirectWriteRequest>{};
     auto completion_results = std::array<int, MAXIMUM_IN_FLIGHT_SQES>{};
@@ -865,12 +856,13 @@ struct DirectIoEngine::Impl final {
       // Remove the active slot before transport completion. finishing_count
       // prevents DrainForTesting from observing a false idle state.
       auto lock = std::lock_guard(mutex);
-      const auto known_slot = slot_index < active.size() && active[slot_index].operation != nullptr;
+      const auto known_slot = slot_index < active.size() && active[slot_index].Occupied();
       TINYDB_CHECK(known_slot, "native ring completed an unknown direct-I/O slot");
       auto &slot = active[slot_index];
       const auto completed = slot.completion_count != 0 && slot.completions_received == slot.completion_count;
       TINYDB_CHECK(completed, "finishing an incomplete direct-I/O slot");
-      operation = slot.operation;
+      read = std::move(slot.read);
+      write = std::move(slot.write);
       read_request = std::move(slot.read_request);
       write_request = std::move(slot.write_request);
       completion_count = slot.completion_count;
@@ -883,7 +875,7 @@ struct DirectIoEngine::Impl final {
       TINYDB_CHECK(active_counts_valid, "direct-I/O active count underflow");
       --active_count;
       active_sqes -= completion_count;
-      if (operation->kind == Operation::Kind::Write) {
+      if (write != nullptr) {
         TINYDB_CHECK(active_writes != 0, "direct-I/O active write count underflow");
         --active_writes;
       }
@@ -891,11 +883,12 @@ struct DirectIoEngine::Impl final {
       state_changed.notify_all();
     }
 
+    const auto writing = write != nullptr;
     auto results = std::span<int>{completion_results}.first(completion_count);
     if (hook != nullptr) {
       const auto original = results.front();
-      hook(hook_context, operation->kind == Operation::Kind::Write, operation->first_page_id, operation->page_count,
-           &results.front());
+      hook(hook_context, writing, writing ? write->first_page_id : read->FirstPageId(),
+           writing ? write->page_count : read->PageCount(), &results.front());
       if (results.front() != original && results.size() != 1U) {
         std::ranges::fill(results, results.front());
       }
@@ -911,7 +904,11 @@ struct DirectIoEngine::Impl final {
     }
     // Complete the transfer token before publishing the logical operation.
     // This order releases fork admission before pages become available.
-    operation->Complete(std::move(status));
+    if (writing) {
+      write->Complete(std::move(status));
+    } else {
+      read->Complete(status);
+    }
     {
       auto lock = std::lock_guard(mutex);
       TINYDB_CHECK(finishing_count != 0, "direct-I/O finishing count underflow");
@@ -931,7 +928,7 @@ struct DirectIoEngine::Impl final {
       for (auto index = std::size_t{0}; index < batch.count; ++index) {
         const auto item = batch.items[index];
         auto &slot = active[item.slot_index];
-        const auto valid_item = slot.operation != nullptr && slot.completion_count == item.submission_count;
+        const auto valid_item = slot.Occupied() && slot.completion_count == item.submission_count;
         TINYDB_CHECK(valid_item, "failing an invalid direct-I/O dispatch item");
         const auto accepted = std::min(remaining_submitted, item.submission_count);
         remaining_submitted -= accepted;
@@ -966,7 +963,7 @@ struct DirectIoEngine::Impl final {
           Status::IoError("io_uring completion wait failed: " + std::generic_category().message(error)));
       for (auto index = std::size_t{0}; index < active.size(); ++index) {
         auto &slot = active[index];
-        if (slot.operation == nullptr) {
+        if (!slot.Occupied()) {
           continue;
         }
         for (auto submission = std::size_t{0}; submission < slot.completion_count; ++submission) {
@@ -1078,7 +1075,7 @@ struct DirectIoEngine::Impl final {
 
   auto ScheduleExact(std::vector<page_id_t> page_ids,
                      std::vector<PageArena::Lease> pages) noexcept -> std::shared_ptr<DirectReadRun::Impl> {
-    if (io::TestHookInstalledForTesting() || page_ids.empty() || page_ids.size() > MAXIMUM_EXACT_READ_PAGES ||
+    if (io::TestHookInstalledForTesting() || page_ids.empty() || page_ids.size() > io::MAX_DIRECT_READ_BATCH_PAGES ||
         pages.size() != page_ids.size() ||
         std::ranges::any_of(page_ids, [](const auto page_id) { return page_id < FIRST_DATA_PAGE_ID; }) ||
         std::ranges::any_of(pages, [](const auto &page) { return !page; }) ||
@@ -1105,7 +1102,7 @@ struct DirectIoEngine::Impl final {
       if (!request) {
         return {};
       }
-      auto operation = std::make_shared<Operation>(run, std::move(*request));
+      auto operation = std::make_shared<ExactReadOperation>(run, std::move(*request));
       {
         // Request preparation acquires fork admission. Recheck engine state
         // because Stop can race with preparation.
@@ -1153,7 +1150,7 @@ struct DirectIoEngine::Impl final {
       }
     }
 
-    auto operations = std::vector<std::shared_ptr<Operation>>{};
+    auto operations = std::vector<std::shared_ptr<CheckpointWriteOperation>>{};
     try {
       operations.reserve((pages.size() - 1U) / io::MAX_DIRECT_WRITE_BATCH_PAGES + 1U);
       for (auto first = std::size_t{0}; first < pages.size();) {
@@ -1162,7 +1159,8 @@ struct DirectIoEngine::Impl final {
                pages[end].page_id == pages[end - 1U].page_id + 1U) {
           ++end;
         }
-        auto operation = std::make_shared<Operation>(pages[first].page_id, pages.subspan(first, end - first));
+        auto operation =
+            std::make_shared<CheckpointWriteOperation>(pages[first].page_id, pages.subspan(first, end - first));
         operation->captured_logical_page_count = captured_logical_page_count;
         operations.push_back(std::move(operation));
         first = end;
@@ -1178,8 +1176,24 @@ struct DirectIoEngine::Impl final {
     auto scheduling_failed = false;
     auto use_fallback = false;
     for (auto index = std::size_t{0}; index < operations.size(); ++index) {
+      auto &operation = operations[index];
+      const auto vectors = std::span<const struct iovec>{operation->vectors}.first(operation->page_count);
+      auto request =
+          disk->BeginDirectCheckpointWrite(operation->first_page_id, vectors, operation->captured_logical_page_count);
+      if (!request) {
+        scheduling_failure = std::move(request).error();
+        scheduling_failed = true;
+        break;
+      }
+      operation->prepared = std::move(*request);
+
       {
         auto lock = std::unique_lock(mutex);
+        // Waiting here holds this request's fork-gate admission while the
+        // queue drains. That only lengthens a concurrent fork's wait: the
+        // reactor consumes the queue without acquiring admissions, so
+        // capacity reappears and this admission is later released through
+        // ordinary completion.
         state_changed.wait(
             lock, [this] { return stopping || backend_failed || QueueSizeLocked() < MAXIMUM_QUEUED_OPERATIONS; });
         if (stopping) {
@@ -1190,34 +1204,6 @@ struct DirectIoEngine::Impl final {
         if (backend_failed) {
           // Synchronous fallback is safe only before the first batch enters
           // the reactor queue.
-          use_fallback = queued == 0;
-          scheduling_failure = Status::IoError("direct-I/O engine failed during checkpoint");
-          scheduling_failed = true;
-          break;
-        }
-      }
-
-      auto &operation = operations[index];
-      const auto vectors = std::span<const struct iovec>{operation->write_vectors}.first(operation->page_count);
-      auto request =
-          disk->BeginDirectCheckpointWrite(operation->first_page_id, vectors, operation->captured_logical_page_count);
-      if (!request) {
-        scheduling_failure = std::move(request).error();
-        scheduling_failed = true;
-        break;
-      }
-      operation->prepared_write = std::move(*request);
-
-      {
-        auto lock = std::unique_lock(mutex);
-        state_changed.wait(
-            lock, [this] { return stopping || backend_failed || QueueSizeLocked() < MAXIMUM_QUEUED_OPERATIONS; });
-        if (stopping) {
-          scheduling_failure = Status::Closed("direct-I/O engine stopped during checkpoint");
-          scheduling_failed = true;
-          break;
-        }
-        if (backend_failed) {
           use_fallback = queued == 0;
           scheduling_failure = Status::IoError("direct-I/O engine failed during checkpoint");
           scheduling_failed = true;
@@ -1298,8 +1284,8 @@ struct DirectIoEngine::Impl final {
   // fields below. wake_pending only protects eventfd write coalescing.
   mutable std::mutex mutex;
   std::condition_variable state_changed;
-  OperationQueue<MAXIMUM_QUEUED_OPERATIONS> exact_reads;
-  OperationQueue<MAXIMUM_QUEUED_OPERATIONS> writes;
+  OperationQueue<ExactReadOperation, MAXIMUM_QUEUED_OPERATIONS> exact_reads;
+  OperationQueue<CheckpointWriteOperation, MAXIMUM_QUEUED_OPERATIONS> writes;
   std::array<ActiveSlot, MAXIMUM_ACTIVE_OPERATIONS> active;
   std::size_t active_count{0};
   std::size_t active_sqes{0};

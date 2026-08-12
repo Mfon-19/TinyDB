@@ -150,12 +150,10 @@ auto DecodeDataPageHeader(std::span<const std::byte> page, page_id_t expected_pa
 inline constexpr std::size_t FREE_EXTENTS_PER_PAGE = 168;
 
 // Type-specific initializers produce canonical private bytes with a zero
-// checksum. Persistent callers use the Encode wrappers below, which finalize
-// the page before returning it.
+// checksum. Commit sealing or an explicit FinalizeDataPage supplies the
+// persistent checksum.
 auto InitializeFreeExtentPage(std::span<std::byte, PAGE_SIZE> page, page_id_t page_id, std::uint64_t page_lsn,
                               page_id_t next_page_id, std::span<const FreeExtent> extents) -> Status;
-auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t next_page_id,
-                          std::span<const FreeExtent> extents) -> Result<std::array<char, PAGE_SIZE>>;
 auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<FreeExtentPage>;
 auto DecodeFreeExtentPage(std::span<const std::byte> page, page_id_t expected_page_id,
                           const DataPageHeader &validated_header) -> Result<FreeExtentPage>;
@@ -165,9 +163,6 @@ inline constexpr std::size_t OVERFLOW_PAGE_PAYLOAD_BYTES = PAGE_SIZE - 60;
 auto InitializeOverflowPage(std::span<std::byte, PAGE_SIZE> page, page_id_t page_id, std::uint64_t page_lsn,
                             page_id_t owner_value_id, std::uint32_t chunk_index, page_id_t next_page_id,
                             std::span<const std::byte> payload) -> Status;
-auto EncodeOverflowPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t owner_value_id, std::uint32_t chunk_index,
-                        page_id_t next_page_id,
-                        std::span<const std::byte> payload) -> Result<std::array<char, PAGE_SIZE>>;
 auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id) -> Result<OverflowPage>;
 auto DecodeOverflowPage(std::span<const std::byte> page, page_id_t expected_page_id,
                         const DataPageHeader &validated_header) -> Result<OverflowPage>;

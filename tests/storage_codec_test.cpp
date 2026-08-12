@@ -7,6 +7,7 @@
 #include "storage/encoding.h"
 #include "storage/page_codec.h"
 #include "storage/superblock.h"
+#include "support/page_encodings.h"
 #include "txn/transaction_pages.h"
 #include "util/crc32.h"
 #include "wal/wal_codec.h"
@@ -318,7 +319,7 @@ TEST(Format, Allocator) {
       tinydb::storage::FreeExtent{.first_page_id = 4, .page_count = 3, .retire_lsn = 11},
       tinydb::storage::FreeExtent{.first_page_id = 20, .page_count = 5, .retire_lsn = 17},
   };
-  const auto encoded = tinydb::storage::EncodeFreeExtentPage(2, 0x0102030405060708ULL, 3, extents);
+  const auto encoded = tinydb::test::EncodeFreeExtentPage(2, 0x0102030405060708ULL, 3, extents);
   ASSERT_TRUE(encoded.has_value());
   const auto bytes = std::as_bytes(std::span{*encoded});
   const auto decoded = tinydb::storage::DecodeFreeExtentPage(bytes, 2);
@@ -340,7 +341,7 @@ TEST(Format, Allocator) {
 
   auto adjacent = extents;
   adjacent[1].first_page_id = 7;
-  EXPECT_EQ(tinydb::storage::EncodeFreeExtentPage(2, 0, 0, adjacent).error().Code(), StatusCode::InvalidArgument);
+  EXPECT_EQ(tinydb::test::EncodeFreeExtentPage(2, 0, 0, adjacent).error().Code(), StatusCode::InvalidArgument);
 }
 
 TEST(Format, AllocatorPersistsMultipleRetirementsAcrossPages) {
@@ -351,9 +352,9 @@ TEST(Format, AllocatorPersistsMultipleRetirementsAcrossPages) {
   }
 
   auto pages = FixedPageReader{};
-  const auto first = tinydb::storage::EncodeFreeExtentPage(
+  const auto first = tinydb::test::EncodeFreeExtentPage(
       2, 7, 3, std::span<const tinydb::storage::FreeExtent>{extents}.first(tinydb::storage::FREE_EXTENTS_PER_PAGE));
-  const auto second = tinydb::storage::EncodeFreeExtentPage(
+  const auto second = tinydb::test::EncodeFreeExtentPage(
       3, 7, tinydb::HEADER_PAGE_ID,
       std::span<const tinydb::storage::FreeExtent>{extents}.subspan(tinydb::storage::FREE_EXTENTS_PER_PAGE));
   ASSERT_TRUE(first.has_value());
@@ -391,7 +392,7 @@ TEST(Format, Overflow) {
   // Include NUL and high-bit bytes to prove values are opaque bytes rather
   // than C strings or signed characters.
   const auto payload = std::array{std::byte{0x00}, std::byte{0x7F}, std::byte{0x80}, std::byte{0xFF}};
-  const auto encoded = tinydb::storage::EncodeOverflowPage(7, 99, 7, 3, 8, payload);
+  const auto encoded = tinydb::test::EncodeOverflowPage(7, 99, 7, 3, 8, payload);
   ASSERT_TRUE(encoded.has_value());
   const auto bytes = std::as_bytes(std::span{*encoded});
   const auto decoded = tinydb::storage::DecodeOverflowPage(bytes, 7);
@@ -424,7 +425,7 @@ TEST(Format, Overflow) {
 }
 
 TEST(Format, PageVersion) {
-  const auto encoded = tinydb::storage::EncodeFreeExtentPage(2, 0, 0, std::span<const tinydb::storage::FreeExtent>{});
+  const auto encoded = tinydb::test::EncodeFreeExtentPage(2, 0, 0, std::span<const tinydb::storage::FreeExtent>{});
   ASSERT_TRUE(encoded.has_value());
 
   auto unsupported = *encoded;
@@ -516,9 +517,9 @@ TEST(Format, WalRecord) {
 
 TEST(Format, Transaction) {
   const auto first =
-      tinydb::storage::EncodeOverflowPage(2, 100, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
+      tinydb::test::EncodeOverflowPage(2, 100, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
   const auto second =
-      tinydb::storage::EncodeOverflowPage(3, 100, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
+      tinydb::test::EncodeOverflowPage(3, 100, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
   const auto pages = std::array{
       tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
       tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},
@@ -548,9 +549,9 @@ TEST(Format, Transaction) {
   EXPECT_EQ(decoded->pages[1].bytes, second);
 
   const auto sealed_first =
-      tinydb::storage::EncodeOverflowPage(2, 100, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
+      tinydb::test::EncodeOverflowPage(2, 100, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
   const auto sealed_second =
-      tinydb::storage::EncodeOverflowPage(3, 100, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
+      tinydb::test::EncodeOverflowPage(3, 100, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
   const auto first_header = tinydb::storage::DecodeDataPageHeader(std::as_bytes(std::span{sealed_first}), 2).value();
   const auto second_header = tinydb::storage::DecodeDataPageHeader(std::as_bytes(std::span{sealed_second}), 3).value();
   const auto fallback_sealed_pages = std::array{
@@ -581,9 +582,9 @@ TEST(Format, Transaction) {
 
 TEST(Format, TransactionDamage) {
   const auto first =
-      tinydb::storage::EncodeOverflowPage(2, 50, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
+      tinydb::test::EncodeOverflowPage(2, 50, 2, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'a'}}).value();
   const auto second =
-      tinydb::storage::EncodeOverflowPage(3, 50, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
+      tinydb::test::EncodeOverflowPage(3, 50, 3, 0, tinydb::HEADER_PAGE_ID, std::array{std::byte{'b'}}).value();
   const auto pages = std::array{
       tinydb::wal_format::PageImageView{.page_id = 2, .bytes = first},
       tinydb::wal_format::PageImageView{.page_id = 3, .bytes = second},
