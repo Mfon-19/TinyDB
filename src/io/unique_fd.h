@@ -7,13 +7,13 @@ namespace tinydb::io {
 void Close(int fd) noexcept;
 
 }  // namespace tinydb::io
-
 namespace tinydb {
 
-// Owns a POSIX file descriptor: closes it on destruction and on move
-// assignment, so a descriptor cannot leak — not even when a constructor
-// throws after acquiring one (members are destroyed; the half-built object's
-// destructor is not run). -1 means "no descriptor".
+/*
+** Own one POSIX descriptor. Move assignment and destruction close the old
+** descriptor, including when construction of an enclosing object fails after
+** this member has acquired it. A value of -1 means that no descriptor is held.
+*/
 class UniqueFd {
  public:
   UniqueFd() = default;

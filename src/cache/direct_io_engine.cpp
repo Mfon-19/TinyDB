@@ -291,8 +291,10 @@ class OperationQueue final {
 
 #if TINYDB_HAS_NATIVE_IO_URING
 
-// Only the reactor accesses these mappings. The atomic operations synchronize
-// the reactor with the kernel, not with API threads.
+/*
+** Only the reactor accesses these mappings. The atomic operations below
+** synchronize the reactor with the kernel, not with API threads.
+*/
 class NativeRing final {
  public:
   struct Completion final {
@@ -608,7 +610,6 @@ class NativeRing final {
 #endif
 
 }  // namespace
-
 struct DirectIoEngine::Impl final {
   struct ActiveSlot final {
     // A slot owns its operation and transfer token while the kernel can access
@@ -763,12 +764,12 @@ struct DirectIoEngine::Impl final {
     auto batch = DispatchBatch{};
     while (active_count < MAXIMUM_ACTIVE_OPERATIONS && active_sqes < MAXIMUM_IN_FLIGHT_SQES) {
       // Keep one checkpoint write active so it can make progress. After that,
-      // exact reads have priority. Extra writes use depth only when reads are absent.
+      // exact reads have priority. Extra writes use depth only when reads are
+      // absent.
       const auto write_needs_progress = !writes.Empty() && active_writes == 0;
       const auto write_can_fill_idle_depth =
           exact_reads.Empty() && !writes.Empty() && active_writes < MAXIMUM_ACTIVE_WRITES;
       if (write_needs_progress || write_can_fill_idle_depth) {
-        // A write needs exactly one SQE and the loop condition proves depth.
         auto operation = writes.Pop();
         const auto slot_index = FindFreeSlotLocked();
         TINYDB_CHECK(slot_index != active.size(), "direct-I/O engine lost an active slot");
@@ -1007,8 +1008,6 @@ struct DirectIoEngine::Impl final {
     }
 
     auto wake_armed = true;
-    // Each iteration consumes all CQEs, dispatches queued work, submits the
-    // batch, and then waits for the next CQE.
     for (;;) {
       auto completion = NativeRing::Completion{};
       while (native_ring->TryPop(&completion)) {

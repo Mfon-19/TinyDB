@@ -15,18 +15,20 @@ namespace tinydb {
 class PageReader;
 
 /*
-** Return the pinned leaf whose routing range contains key. Read descent keeps
-** no ancestor handles or path allocation, and the caller reuses the final
-** lease instead of looking the leaf up a second time.
+** Return the pinned leaf whose routing range contains key. Descent retains no
+** ancestor handles or path allocation; the final lease is returned so the
+** caller does not perform a second cache lookup and pin operation.
 */
 auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<PageHandle>;
 
-/* Return the leftmost leaf without inventing a sentinel key. */
 auto FindFirstLeaf(PageReader *pages, page_id_t root_page_id) -> Result<PageHandle>;
 
 /*
-** Return a bounded list of exact leaf successors. The planner reads internal
-** edges only. An empty result leaves the later leaf-chain traversal unchanged.
+** Return at most page_count leaves that follow current_leaf_page_id in key
+** order, using only authenticated internal-tree edges. The direct-I/O cursor
+** uses the result as optional read-ahead advice; buffered cursors do not call
+** this function. An empty result means that traversal must continue from the
+** leaf chain without advice.
 */
 auto PlanLeafPageSuccessorsForReadAhead(
     PageReader *pages, page_id_t root_page_id, page_id_t current_leaf_page_id, page_id_t logical_page_count,

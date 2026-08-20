@@ -9,17 +9,21 @@ namespace tinydb {
 /*
 ** ERROR MODEL
 **
-** Status and Result<T> carry every failure an embedding application might
-** reasonably encounter: invalid input, resource exhaustion, I/O failure,
-** unsupported formats, and detected persistent corruption. TinyDB does not
-** throw exceptions across its API and does not terminate the host merely
-** because bytes read from disk are malformed.
+** Status and Result<T> describe failures that an embedding application is
+** expected to handle, including invalid input, resource exhaustion, I/O
+** failure, unsupported formats, and persistent corruption. In particular,
+** malformed bytes read from disk remain inside this error model instead of
+** becoming failed implementation assertions.
 **
-** TINYDB_CHECK is deliberately outside this model. It is reserved for an
-** internal programming error, such as releasing one page lease twice or
-** performing an impossible state transition. Turning such a bug into a
-** Status would make the database appear recoverable when its implementation
-** invariant has already failed.
+** These types do not replace the usual C++ rules for constructing owning
+** values. An allocation made while producing a result may still throw
+** std::bad_alloc.
+**
+** TINYDB_CHECK is outside this model. It marks an internal programming error,
+** such as releasing one page lease twice or performing an impossible state
+** transition. Returning Status after such a failure would tell the caller
+** that recovery is possible even though an implementation invariant no
+** longer holds.
 **
 ** Commit failures need two distinct statuses. IndeterminateCommit reports
 ** that the durability boundary may have been crossed. NeedsRecovery reports
@@ -29,15 +33,15 @@ namespace tinydb {
 
 enum class StatusCode {
   Ok,
-  Busy,                 // an exclusive resource is currently owned elsewhere
-  IoError,              // the environment failed: read, write, sync, open
-  Corruption,           // on-disk state cannot be trusted
-  UnsupportedFormat,    // persistent bytes use a format this binary cannot read
-  InvalidArgument,      // the caller asked for something impossible
-  ResourceExhausted,    // a fixed resource ran out (e.g. evictable frames)
-  IndeterminateCommit,  // a commit may or may not have crossed durability
-  NeedsRecovery,        // reopen is required before the outcome can be known
-  Closed,               // the handle no longer accepts work
+  Busy,
+  IoError,
+  Corruption,
+  UnsupportedFormat,
+  InvalidArgument,
+  ResourceExhausted,
+  IndeterminateCommit,
+  NeedsRecovery,
+  Closed,
 };
 
 /*
@@ -48,13 +52,12 @@ enum class StatusCode {
 */
 class [[nodiscard]] Status {
  public:
-  Status() = default;  // Ok
+  Status() = default;
 
   auto Ok() const -> bool { return code_ == StatusCode::Ok; }
   auto Code() const -> StatusCode { return code_; }
   auto Message() const -> const std::string & { return message_; }
 
-  // "IO error: pwrite: No space left on device" — for logs and CLI output.
   auto ToString() const -> std::string {
     if (Ok()) {
       return "OK";
@@ -113,7 +116,6 @@ class [[nodiscard]] Status {
   std::string message_;
 };
 
-/* A value-producing operation returns either the value or its Status. */
 template <typename T>
 using Result = std::expected<T, Status>;
 

@@ -23,8 +23,8 @@
 ** DATABASE GUARANTEE TESTS
 **
 ** This is the public contract exercised through the one production API path.
-** Tests deliberately avoid fixtures and storage doubles: each case owns a
-** fresh path, and reopen observes the same recovery path an application uses.
+** These tests avoid fixtures and storage doubles: each case owns a fresh path,
+** and reopen observes the same recovery path an application uses.
 ** Codec and exact durability-order tests live in their focused suites.
 */
 
@@ -39,7 +39,6 @@ auto Fresh(std::string_view name, tinydb::Options options = {}) -> tinydb::Resul
 }
 
 }  // namespace
-
 TEST(Database, Transactions) {
   const auto path = tinydb::test::Path("transactions");
   auto database = Fresh("transactions").value();

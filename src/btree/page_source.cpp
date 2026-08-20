@@ -12,8 +12,6 @@ auto PageReadStream::Read(page_id_t page_id) -> Result<PageHandle> {
 }
 
 auto PageReader::BeginReadStream() -> PageReadStream {
-  // Readers without an advice backend use the same stream interface. The
-  // null state disables planning and forwards each semantic read unchanged.
   const auto read = [](void *owner, const std::shared_ptr<void> &, page_id_t page_id) -> Result<PageHandle> {
     return static_cast<PageReader *>(owner)->Read(page_id);
   };

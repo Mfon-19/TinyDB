@@ -704,7 +704,6 @@ void AddIoReadResults(const Scenario &scenario, Results &results, std::size_t tr
 }
 
 }  // namespace
-
 void BuildTinyDbFixture(const std::filesystem::path &path, const Scenario &scenario, const Config &config) {
   auto error = std::error_code{};
   if (std::filesystem::exists(path, error) || PersistentBytes(path) != 0) {

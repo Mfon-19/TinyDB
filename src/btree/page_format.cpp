@@ -13,19 +13,14 @@
 namespace tinydb {
 namespace {
 
-/*
-** Validation observes persistent bytes and never normalizes them in place.
-** Once this routine succeeds, page views rely on its proof and use internal
-** checks only to detect an impossible mutation of supposedly immutable bytes.
-*/
 auto PageSpan(const char *page) -> std::span<const std::byte, PAGE_SIZE> {
   return std::as_bytes(std::span<const char, PAGE_SIZE>{page, PAGE_SIZE});
 }
 
 /*
-** Validate the complete slot/cell region for one node. In addition to local
-** bounds, this proves canonical free_start, strict key order, legal child
-** references, and non-overlapping interpretation of the cell payloads.
+** Validate each slot and the cell it names. In addition to local bounds, this
+** checks the canonical free_start value, strict key order, and the encoded
+** fields that PageView later reads without further validation.
 */
 auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, std::uint16_t cell_count,
                    std::uint16_t free_start, std::uint16_t free_end) -> Status {
@@ -40,7 +35,6 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
   auto previous_key = std::string_view{};
   bool first = true;
   for (std::size_t i = 0; i < cell_count; ++i) {
-    // A slot may reference only the descending cell region.
     const auto slot = storage::GetLittleEndianUnchecked<slot_t>(page, header_bytes + i * SLOT_SIZE);
     if (slot < free_end || slot >= PAGE_SIZE) {
       return Status::Corruption("tree-page slot points outside the cell region");
@@ -50,7 +44,6 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
     std::size_t key_bytes = 0;
     std::size_t cell_bytes = 0;
     if (type == storage::DataPageType::Leaf) {
-      // Prove the kind-specific payload before constructing borrowed views.
       if (slot > PAGE_SIZE - LEAF_CELL_HEADER_SIZE) {
         return Status::Corruption("invalid leaf-cell header");
       }
@@ -78,7 +71,6 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
         }
       }
     } else {
-      // Every internal record owns a real right child.
       if (slot > PAGE_SIZE - INTERNAL_CELL_HEADER_SIZE) {
         return Status::Corruption("invalid internal-cell header");
       }
@@ -95,7 +87,6 @@ auto ValidateSlots(std::span<const std::byte> page, storage::DataPageType type, 
       return Status::Corruption("tree-page cell overruns the page");
     }
     const auto key = std::string_view{reinterpret_cast<const char *>(page.data() + key_offset), key_bytes};
-    // Strict byte ordering rejects duplicate keys and ambiguous separators.
     if (!first && !txn::BytewiseLess{}(previous_key, key)) {
       return Status::Corruption("tree-page keys are not strictly ordered");
     }
@@ -132,14 +123,11 @@ auto ValidateTreePayload(const char *page, const storage::DataPageHeader &common
 }
 
 }  // namespace
-
 auto RawNodeType(const char *page) -> std::uint16_t {
-  // Zero is reserved for fresh-root detection and is never a valid page type.
   return storage::GetLittleEndianUnchecked<std::uint16_t>(PageSpan(page), storage::data_page_offset::TYPE);
 }
 
 auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status {
-  // Common framing and checksum validation always precede tree-local offsets.
   const auto common = storage::DecodeDataPageHeader(PageSpan(page), expected_page_id);
   if (!common) {
     return common.error();

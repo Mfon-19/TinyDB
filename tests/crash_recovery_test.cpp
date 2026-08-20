@@ -180,7 +180,6 @@ auto RunChild(const std::filesystem::path &path, const std::vector<Operation> &o
 }
 
 }  // namespace
-
 TEST(Crash, Commit) {
   const auto path = tinydb::test::Path("crash_commit");
   const auto base = tinydb::test::Path("crash_commit_base");

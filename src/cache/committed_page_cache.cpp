@@ -23,25 +23,21 @@ namespace tinydb::cache {
 
 /*
 ** A frame owns exactly one immutable encoded page version. Its validated
-** common header orders physical versions and travels with immutable handles,
-** so consumers never checksum the same bytes twice. The header LSN and cache
-** checkpoint LSN determine eviction eligibility, not visibility.
+** common header travels with immutable handles, so consumers can reuse the
+** checksum result. The header's page LSN identifies the version, while the
+** cache checkpoint LSN determines whether that version may be evicted.
 */
 struct CommittedFrame final {
   CommittedFrame(storage::DataPageHeader initial_header, PageArena::Lease initial_bytes)
       : header(initial_header), bytes(std::move(initial_bytes)) {}
 
-  storage::DataPageHeader header;  // checksum-authenticated common fields
-  PageArena::Lease bytes;          // immutable after construction
+  storage::DataPageHeader header;
+  PageArena::Lease bytes;
 
-  /*
-  ** CHECKPOINTED LRU LINKS
-  **
-  ** Every current checkpointed frame belongs to this intrusive list, including
-  ** a temporarily pinned one. newer points toward the MRU end and older toward
-  ** the LRU end. Eviction skips pins; release therefore only drops shared
-  ** ownership and never reacquires the cache mutex.
-  */
+  // Every current checkpointed frame belongs to this intrusive list, including
+  // a temporarily pinned one. Field newer points toward the MRU end and older
+  // points toward the LRU end. Eviction skips pins; release therefore only
+  // drops shared ownership and never reacquires the cache mutex.
   CommittedFrame *newer{nullptr};
   CommittedFrame *older{nullptr};
   bool in_lru{false};
@@ -76,11 +72,11 @@ auto Lease(std::shared_ptr<CommittedFrame> frame) -> PageHandle {
 /*
 ** DIRECT READ STAGING
 **
-** A planned direct read stays outside the replacement cache. Demand can use a
-** staged page without cache admission. Each staged page owns an arena lease
-** and one shared budget reservation.
-** The budget limits all streams to 4 MiB or one quarter of the cache target,
-** whichever is smaller.
+** Planned direct reads remain outside the replacement cache, so speculation
+** cannot evict a demanded page or alter LRU order. A demand may consume a
+** staged page without admitting it to the cache. Each page owns an arena lease
+** and one reservation from a budget shared by all streams; the budget is the
+** smaller of 4 MiB and one quarter of the cache target.
 **
 ** Cancellation drains the native run before it releases page ownership and
 ** budget reservations. Thus, the kernel never uses a returned arena page.
@@ -111,11 +107,6 @@ class StagingBudget final {
   std::size_t used_pages_{0};
 };
 
-/*
-** A staged page owns one arena lease and one budget reservation. A consuming
-** demand decodes the page and stores its validated header here before the
-** object backs an immutable PageHandle.
-*/
 class StagedPage final {
  public:
   StagedPage() = default;
@@ -141,8 +132,8 @@ class StagedPage final {
     if (!reserved_) {
       return;
     }
-    // Reset releases the page before its budget slot. Another plan cannot use
-    // this capacity while the prior page still owns physical memory.
+    // Reset returns the arena lease before its budget slot. Another plan cannot
+    // reuse this capacity while the prior staged buffer is still owned.
     bytes_ = {};
     budget_->Release(1);
     reserved_ = false;
@@ -250,8 +241,8 @@ struct ReadStreamState final {
   std::mutex mutex;
   std::vector<page_id_t> plan;
   std::vector<std::shared_ptr<StagedRun>> runs;
-  // A generation change rejects an old plan after a new plan or
-  // CloseReadStream.
+  // A new plan or close increments generation before waiting on old I/O, so
+  // an older completion cannot install itself into the stream.
   std::uint64_t generation{0};
   bool open{true};
 };
@@ -263,19 +254,19 @@ void CancelRuns(const std::vector<std::shared_ptr<StagedRun>> &runs) noexcept {
 }
 
 }  // namespace
-
 struct CommittedPageCache::Impl final {
-  // The staging limit covers speculative pages outside the replacement cache.
-  // Each staged run fills at most one maximal transport read, and one plan
-  // holds at most two such runs.
+  // Speculative pages live outside the cache target. One plan is limited to
+  // two maximal transport reads and the shared byte budget below.
   static constexpr auto MAXIMUM_STAGING_BYTES = std::size_t{4} * 1024U * 1024U;
   static constexpr auto MAXIMUM_PHYSICAL_RUN_PAGES = io::MAX_DIRECT_READ_BATCH_PAGES;
   static constexpr auto MAXIMUM_PLANNED_PAGES = 2U * MAXIMUM_PHYSICAL_RUN_PAGES;
 
-  DiskManager &disk;  // backing checkpointed database file
+  DiskManager &disk;
   const std::size_t target_bytes;
   std::shared_ptr<PageArena> page_arena;
-  mutable std::mutex mutex;  // protects every field below
+  // This mutex protects the page table, load table, LRU links, counters, and
+  // checkpoint frontier below; physical I/O never occurs while it is held.
+  mutable std::mutex mutex;
   std::vector<std::shared_ptr<CommittedFrame>> pages;
   std::unordered_map<page_id_t, std::shared_ptr<LoadState>> loads;
   std::size_t resident_pages{0};
@@ -283,7 +274,7 @@ struct CommittedPageCache::Impl final {
   std::size_t dirty_pages{0};
   CommittedFrame *most_recent{nullptr};
   CommittedFrame *least_recent{nullptr};
-  std::uint64_t checkpoint_lsn;  // newest page LSN stored in the database file
+  std::uint64_t checkpoint_lsn;
   std::uint64_t hits{0};
   std::uint64_t misses{0};
   std::uint64_t evictions{0};
@@ -295,8 +286,6 @@ struct CommittedPageCache::Impl final {
   // stops before load state, frames, and arena leases begin destruction.
   std::unique_ptr<DirectIoEngine> direct_io;
 
-  // Buffered mode creates only a heap arena. Direct mode also creates the
-  // shared staging budget and one native engine.
   Impl(DiskManager &database_file, std::size_t byte_target, std::uint64_t initial_checkpoint_lsn)
       : disk(database_file),
         target_bytes(byte_target),
@@ -409,13 +398,11 @@ struct CommittedPageCache::Impl final {
 
   auto HasRoomForRead() const -> bool { return resident_pages + loading_pages < target_bytes / PAGE_SIZE; }
 
-  /*
-  ** Every blocking and page-sized operation in a physical miss happens here,
-  ** outside mutex. An unobserved eviction victim supplies its existing page
-  ** buffer and frame control block. Buffered mode has no arena free list, so
-  ** this reuse is what prevents two allocations per steady-state miss; the
-  ** miss-per-read benchmark loses about 6% without it.
-  */
+  // Every blocking and page-sized operation in a physical miss happens here,
+  // outside the mutex. Demand reads are synchronous for both transports;
+  // DiskManager uses an ordinary buffered transfer or the aligned direct page
+  // supplied by PageArena. An unobserved eviction victim contributes both its
+  // page and control block, avoiding two allocations on a steady-state miss.
   auto LoadFrame(page_id_t page_id,
                  std::shared_ptr<CommittedFrame> frame) const -> Result<std::shared_ptr<CommittedFrame>> {
     try {
@@ -565,9 +552,6 @@ struct CommittedPageCache::Impl final {
 
   void PrimeExactPages(const std::shared_ptr<ReadStreamState> &state,
                        std::span<const page_id_t> hinted_page_ids) noexcept {
-    // Staged pages intentionally remain outside the replacement cache. This
-    // keeps speculative advice from changing cache residency or displacing a
-    // demanded page. A later ordinary demand uses the replacement cache.
     try {
       const auto copied_count = std::min(hinted_page_ids.size(), MAXIMUM_PLANNED_PAGES);
       const auto copied_hints = std::vector<page_id_t>{
@@ -678,8 +662,9 @@ struct CommittedPageCache::Impl final {
     }
   }
 
-  // Staging is only an optimization. Any race, cancellation, I/O error,
-  // validation error, or allocation error uses the ordinary coalesced read.
+  // Return a staged direct page only after revalidating its persistent bytes.
+  // A race, cancellation, I/O error, validation error, or allocation error
+  // discards the staged candidate and uses the ordinary coalesced read.
   auto ReadStreamPage(const std::shared_ptr<ReadStreamState> &state, page_id_t page_id) -> Result<PageHandle> {
     auto staged_run = std::shared_ptr<StagedRun>{};
     auto staged_index = std::size_t{0};
@@ -785,7 +770,6 @@ auto CommittedPageCache::Read(page_id_t page_id) -> Result<PageHandle> { return 
 
 auto CommittedPageCache::BeginReadStream() -> PageReadStream {
   if (impl_->direct_io == nullptr || !impl_->direct_io->Available() || impl_->staging_budget->Empty()) {
-    // This synchronous stream preserves all read semantics without staging.
     return PageReader::BeginReadStream();
   }
   auto state = std::shared_ptr<ReadStreamState>{};
@@ -817,13 +801,10 @@ auto CommittedPageCache::PreparePublication(std::vector<CommittedPageImage> imag
   auto frames = std::vector<std::shared_ptr<CommittedFrame>>{};
   frames.reserve(images.size());
 
-  /*
-  ** PREPARE CACHE OWNERSHIP
-  **
-  ** Grow the dense table and allocate every shared control block here. The
-  ** writer has not appended WAL yet, so any validation or allocation failure
-  ** remains a definite abort.
-  */
+  // Publication transfers PageArena leases into immutable frames without
+  // copying their bytes. Grow the dense table and allocate every shared
+  // control block here. The writer has not appended WAL yet, so any validation
+  // or allocation failure remains a definite abort.
   auto lock = std::lock_guard(impl_->mutex);
   if (impl_->pages.size() < logical_page_count) {
     impl_->pages.resize(logical_page_count);
@@ -944,9 +925,6 @@ auto CommittedPageCache::CaptureDirtyPages() -> std::vector<PageHandle> {
 
 auto CommittedPageCache::WriteCheckpointPages(std::span<const PageHandle> pages,
                                               page_id_t captured_logical_page_count) -> Status {
-  // CaptureDirtyPages produces ordered non-null page handles. The native
-  // engine and DiskManager validate the batches they receive against their
-  // own transfer bounds, so this method adds no third copy of those checks.
   if (impl_->direct_io != nullptr) {
     auto direct_pages = std::vector<DirectIoCheckpointPage>{};
     try {
@@ -968,12 +946,11 @@ auto CommittedPageCache::WriteCheckpointPages(std::span<const PageHandle> pages,
     if (*native) {
       return {};
     }
-    // False means that no native write started. The synchronous path can write
-    // the complete page set without a repeated native transfer.
   }
 
-  // The synchronous path groups only consecutive page IDs. The fixed array
-  // bounds each request for buffered and direct transports.
+  // Buffered checkpoints always reach this path. Direct checkpoints reach it
+  // only if no native write started, so retrying the complete set is safe.
+  // Consecutive page IDs share one bounded request in either case.
   auto batch = std::array<const std::byte *, io::MAX_PAGE_WRITE_BATCH_PAGES>{};
   auto batch_first = page_id_t{0};
   auto batch_size = std::size_t{0};

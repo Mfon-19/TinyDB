@@ -123,7 +123,6 @@ class PlainPageReader final : public tinydb::PageReader {
 };
 
 void AddBoundedTree(RecordingPageReader &pages) {
-  // The path to page 19 is 2, 66, 19. Page 23 is its next leaf.
   pages.AddInternal(2, 66, {{"m", 80}, {"x", 90}});
   pages.AddInternal(66, 7, {{"g", 19}, {"j", 23}});
   pages.AddInternal(80, 5, {{"q", 30}});

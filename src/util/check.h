@@ -12,8 +12,11 @@ namespace tinydb {
 
 }  // namespace tinydb
 
-// Always-on invariant check; a violated invariant means the caller's state is
-// broken and continuing would corrupt data, so abort loudly
+/*
+** TINYDB_CHECK is for internal invariants, not errors caused by untrusted
+** input. Continuing after one of these checks fails could corrupt data, so the
+** process reports the source location and aborts.
+*/
 #define TINYDB_CHECK(condition, message)                \
   do {                                                  \
     if (!(condition)) {                                 \

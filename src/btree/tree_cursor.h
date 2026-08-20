@@ -22,6 +22,12 @@ namespace tinydb {
 ** borrow that page and expire on movement or destruction. Overflow payload
 ** pages are read only when an owning value copy is requested.
 **
+** Leaf links and their validation are authoritative for every transport.
+** Buffered I/O reads each successor on demand. With direct I/O, a scan may
+** stage an exact list of successors. A staged page is used only when it
+** matches the authenticated successor and passes normal page validation;
+** otherwise the ordinary read path determines the result.
+**
 ** Opening each successor validates both page-local structure and global chain
 ** order. Strict key boundaries detect every cycle containing a non-empty
 ** leaf; a temporary set is needed only while skipping empty leaves. Normal

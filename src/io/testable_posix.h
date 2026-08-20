@@ -14,9 +14,10 @@
 
 namespace tinydb::io {
 
-// Private POSIX boundary. Production calls go directly to POSIX. Tests can
-// observe calls and inject failures to verify crash safety and durability
-// ordering.
+/*
+** This private boundary calls POSIX directly in production. Tests may observe
+** operations and inject failures at exact crash and durability boundaries.
+*/
 enum class Syscall {
   Open,
   Fstat,
@@ -49,8 +50,10 @@ struct Fault {
   int error;
 };
 
-// Limit one real vectored write. Tests use this to exercise retry behavior
-// after a short write without replacing the underlying file.
+/*
+** Limit one real vectored write so tests can exercise retry behavior after a
+** short write without replacing the underlying file.
+*/
 struct WriteLimit {
   std::size_t bytes;
 };

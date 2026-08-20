@@ -24,23 +24,25 @@ struct CommittedFrame;
 /*
 ** IMMUTABLE COMMITTED PAGE CACHE
 **
-** The page table contains only the newest visible committed version of each
-** page. Installed frame bytes never change. Replacing a page swaps the table's
-** shared frame pointer, while an older PageHandle can continue reading the old
-** immutable frame until its snapshot drains.
+** Each populated page-table entry is the newest visible committed version of
+** that page, regardless of the page-file transport. Installed frame bytes
+** never change. Replacing a page swaps the table's shared frame pointer,
+** while an older PageHandle can continue reading the old immutable frame
+** until its snapshot drains.
 **
 ** Frames newer than checkpoint_lsn are dirty in the cache sense: WAL contains
 ** their durable image, but the database file does not yet. Such frames cannot
 ** be evicted. The byte target is soft. Publication can exceed it until
 ** checkpointing stores those page versions in the database file.
 **
-** PageHandle is the sole byte lease for reads and checkpoints. Its shared
-** keepalive both retains the immutable frame and supplies the exact cache pin.
+** PageHandle is the byte lease exposed to reads and checkpoints. Once a frame
+** is checkpointed, the page table's ownership alone leaves it evictable; any
+** additional shared owner, usually a PageHandle or an active load, pins it.
 */
 /*
-** Seal has authenticated the final bytes and attaches their decoded common
-** header plus the builder's tree-payload proof. Publication consumes those
-** proofs while transferring the same allocation directly into a frame.
+** TransactionPages::PrepareCommit authenticates each dirty image and attaches
+** its decoded common header plus any tree-payload proof. Publication consumes
+** those proofs while transferring the same page allocation into a frame.
 */
 struct CommittedPageImage {
   storage::DataPageHeader header;
@@ -88,10 +90,22 @@ struct CommittedCacheStats {
 ** Thread-safe cache for latest committed versions. Its mutex protects the
 ** dense page table, load-capacity reservations, and intrusive checkpointed-page
 ** LRU queue; physical reads and page validation run without that mutex. A
-** frame's shared ownership is also its exact pin count: the table owns one
-** reference and each PageHandle owns another. Pinned pages remain in the queue
-** and eviction skips them, so a hot handle release needs no callback or cache
-** lock.
+** checkpointed frame is evictable only while the table is its sole shared
+** owner. PageHandle, active-load, and checkpoint references pin it. Pinned
+** pages remain in the queue and eviction skips them, so a hot handle release
+** needs no callback or cache lock.
+**
+** Demand misses are synchronous. A buffered cache owns heap-backed page
+** leases; a direct cache owns aligned slab leases and may also use io_uring
+** for exact read-ahead and checkpoint batches. Transport choice does not
+** alter the page table, pin rules, validation, or replacement policy.
+**
+** One-page demand reads remain synchronous in direct mode because there is no
+** batch over which to amortize reactor queueing, eventfd wakeups, and thread
+** handoff. io_uring is reserved for exact multi-page advice and checkpoint
+** batches, where concurrency or vectored submission can repay that overhead.
+** The load table still coalesces concurrent misses for one page, preventing
+** duplicate physical reads and competing frame installation.
 */
 class CommittedPageCache final : public PageReader {
  public:
@@ -100,14 +114,9 @@ class CommittedPageCache final : public PageReader {
   auto operator=(const CommittedPageCache &) -> CommittedPageCache & = delete;
   ~CommittedPageCache() override;
 
-  // A miss validates the complete common page header before caching bytes.
   auto Read(page_id_t page_id) -> Result<PageHandle> override;
-  // When the native engine is available, a direct stream accepts exact-page
-  // plans. Buffered and unavailable engines use the ordinary read path.
   auto BeginReadStream() -> PageReadStream override;
 
-  // Write transactions use this same arena. Commit can therefore transfer an
-  // aligned direct page into the cache without a page-sized copy.
   auto SharedPageArena() const noexcept -> std::shared_ptr<PageArena>;
 
   auto PreparePublication(std::vector<CommittedPageImage> images, std::vector<page_id_t> retired,
@@ -115,15 +124,11 @@ class CommittedPageCache final : public PageReader {
   void Publish(PublicationPlan plan) noexcept;
 
   // Capture every current version that is newer than the database file. The
-  // caller serializes capture with publication so these pages and its captured
+  // caller serializes capture with publication so these pages and the captured
   // DatabaseState describe one visibility point.
   auto CaptureDirtyPages() -> std::vector<PageHandle>;
-  // Direct mode first uses the native checkpoint queue. If no native write
-  // starts, the method writes the complete page set synchronously.
   auto WriteCheckpointPages(std::span<const PageHandle> pages, page_id_t captured_logical_page_count) -> Status;
 
-  // Wait until the native direct-I/O queue has no queued or active work.
-  // Buffered caches have no engine, so this returns immediately.
   void DrainIoForTesting();
 
   // The caller invokes this only after the database file and superblock make

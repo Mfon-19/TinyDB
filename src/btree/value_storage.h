@@ -16,10 +16,17 @@ class PageSource;
 /*
 ** OVERFLOW VALUE OPERATIONS
 **
-** PrepareValue chooses inline storage when one record remains below the
-** byte-split safety bound. Otherwise it allocates and completely encodes a
-** private chain. A failure leaves partial pages private; the write transaction
-** must abort.
+** PrepareValue chooses inline storage while the resulting record stays below
+** the size limit that guarantees a legal leaf split. Otherwise it allocates
+** and completely encodes a private overflow chain. A failure leaves partial
+** pages private, so the write transaction must abort.
+**
+** The leaf descriptor stores only the total length and first page ID. Each
+** overflow page names its successor, allowing the allocator to use any
+** checkpoint-safe page IDs while keeping the leaf descriptor fixed at 16
+** bytes. The resulting reads form a dependent page chain: numeric adjacency
+** is not authoritative, and a reader may follow only the next link decoded
+** from the current authenticated page.
 **
 ** CopyValue and RetireOverflowValue validate the complete chain before
 ** returning bytes or changing reachability. Integrity validation additionally

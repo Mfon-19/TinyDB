@@ -43,6 +43,12 @@ namespace tinydb::wal_format {
 ** contain final physical pages. CommitState contains the resulting roots,
 ** logical page count, and number of PageImage records. Recovery accepts no
 ** page image until it validates the terminal CommitState record.
+**
+** Physical redo keeps recovery independent of B+ tree mutation and allocator
+** algorithms: replay writes the exact page images produced by the committing
+** transaction, then publishes their terminal state through a superblock. This
+** trades page-image WAL bandwidth for replay that is idempotent at the
+** page-write boundary and preserves the original encoding.
 */
 
 inline constexpr auto MAGIC = std::array{
@@ -81,7 +87,6 @@ inline constexpr std::size_t STARTING_LSN = 48;
 inline constexpr std::size_t CHECKSUM = 56;
 inline constexpr std::size_t ENCODED_BYTES = 60;
 }  // namespace header_offset
-
 /*
 ** Every record is self-framing:
 **
@@ -99,7 +104,6 @@ inline constexpr std::size_t CHECKSUM = 16;
 inline constexpr std::size_t RESERVED = 20;
 inline constexpr std::size_t PAYLOAD = RECORD_HEADER_BYTES;
 }  // namespace record_offset
-
 /*
 ** PAGE_IMAGE is exactly one final data page, never a superblock. The page's
 ** authenticated common header already contains its page ID and commit LSN.
@@ -121,8 +125,6 @@ inline constexpr std::size_t COMMIT_STATE_PAGE_IMAGE_COUNT_OFFSET = 24;
 inline constexpr std::size_t COMMIT_STATE_RESERVED_OFFSET = 28;
 inline constexpr std::size_t COMMIT_STATE_PAYLOAD_BYTES = 32;
 
-// Header contains the variable identity and compatibility fields of the fixed
-// WAL file header. The codec supplies its magic, version, size, and checksum.
 struct Header {
   DatabaseUuid database_uuid{};
   std::uint64_t starting_lsn{1};
@@ -132,37 +134,28 @@ struct Header {
   auto operator==(const Header &) const -> bool = default;
 };
 
-// Record is a validated, non-owning view of one encoded WAL record. Its payload
-// refers to the input bytes and cannot outlive them.
 struct Record {
   RecordType type;
   std::uint64_t lsn;
   std::span<const std::byte> payload;
 };
 
-// PageImageView is a non-owning encoder input for one final data-page image.
-// validated_header can supply an existing validation result for the same bytes.
 struct PageImageView {
   page_id_t page_id;
   std::span<const char, PAGE_SIZE> bytes;
   const storage::DataPageHeader *validated_header{nullptr};
 };
 
-// DecodedPageImage owns one validated data-page image from a WAL transaction.
 struct DecodedPageImage {
   page_id_t page_id;
   std::array<char, PAGE_SIZE> bytes;
 };
 
-// EncodedTransaction owns the complete record sequence for one prepared WAL
-// commit. The byte sequence does not include the WAL file header.
 struct EncodedTransaction {
   std::uint64_t commit_lsn;
   std::vector<char> bytes;
 };
 
-// DecodedTransaction owns one complete and validated WAL transaction. It
-// contains the resulting database state and the final page images.
 struct DecodedTransaction {
   std::uint64_t commit_lsn;
   txn::DatabaseState state;
@@ -174,12 +167,6 @@ auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header>;
 auto EncodeRecord(RecordType type, std::uint64_t lsn, std::span<const std::byte> payload) -> Result<std::vector<char>>;
 auto DecodeRecord(std::span<const std::byte> bytes) -> Result<Record>;
 
-/*
-** Encode or decode exactly one complete transaction. Encode assigns the
-** one commit LSN to every record. Decode rejects any missing, duplicated,
-** reordered, corrupt, or trailing record.
-*/
-// Page images must be in strictly increasing page-ID order.
 auto EncodeTransaction(std::uint64_t commit_lsn, std::span<const PageImageView> pages,
                        txn::DatabaseState state) -> Result<EncodedTransaction>;
 auto DecodeTransaction(std::span<const std::byte> bytes,

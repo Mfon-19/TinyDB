@@ -30,8 +30,6 @@ auto Manager::Record(Status status) -> Status {
 }
 
 auto Manager::Checkpoint() -> Status {
-  // The DatabaseCore writer permit excludes publication throughout capture,
-  // I/O, and cleanup. Reader activity cannot replace immutable current pages.
   const auto state = readers_.CurrentState();
   const auto durable_lsn = disk_.CheckpointLsn();
   TINYDB_CHECK(durable_lsn <= state->visible_lsn, "database file is newer than visible state");
@@ -39,20 +37,9 @@ auto Manager::Checkpoint() -> Status {
 
   const auto target_lsn = state->visible_lsn;
   if (target_lsn > durable_lsn) {
-    /*
-    ** CHECKPOINT DURABLE FRONTIER
-    **
-    ** File growth is harmless before the recovery root advances. A failure
-    ** can leave trailing pages, but the old logical page count excludes them.
-    **
-    ** The cache groups adjacent page IDs into bounded batches. When the native
-    ** queue is available, direct mode uses it. If no native write starts, the
-    ** cache uses synchronous direct I/O for the complete page set.
-    **
-    ** All page writes complete before the first Sync. CommitCheckpoint then
-    ** writes and synchronizes the inactive superblock. The WAL remains the
-    ** recovery basis until that superblock becomes durable.
-    */
+    // File growth and page writes precede the recovery root. Failure may leave
+    // trailing physical pages, but the old superblock excludes them and keeps
+    // the WAL authoritative until the new superblock has been synchronized.
     if (auto status = disk_.EnsurePageCount(state->logical_page_count); !status.Ok()) {
       return Record(std::move(status));
     }
@@ -69,17 +56,12 @@ auto Manager::Checkpoint() -> Status {
     }
   }
 
-  // These handles pin the exact checkpoint images during I/O. pages.clear
+  // These handles pin the exact checkpoint images during I/O. pages.clear()
   // releases them before MarkCheckpointed releases free arena memory.
   pages.clear();
 
-  /*
-  ** POST-DURABILITY PHASE
-  **
-  ** Publish the new checkpoint LSN without draining readers. Old snapshots can
-  ** retain the prior checkpoint LSN because their logical contents do not
-  ** change.
-  */
+  // Publish the new checkpoint LSN without draining readers; an old snapshot
+  // may retain the prior LSN because its logical contents do not change.
   readers_.AdvanceCheckpoint(target_lsn);
   cache_.MarkCheckpointed(target_lsn);
   if (auto status = wal_.Reset(target_lsn); !status.Ok()) {

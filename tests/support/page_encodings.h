@@ -1,7 +1,7 @@
 #pragma once
 
-#include "storage/page_codec.h"
 #include "storage/page.h"
+#include "storage/page_codec.h"
 
 #include <array>
 #include <expected>
@@ -17,12 +17,10 @@ namespace tinydb::test {
 ** tests that persist standalone page images.
 */
 inline auto EncodeFreeExtentPage(page_id_t page_id, std::uint64_t page_lsn, page_id_t next_page_id,
-                                 std::span<const storage::FreeExtent> extents)
-    -> Result<std::array<char, PAGE_SIZE>> {
+                                 std::span<const storage::FreeExtent> extents) -> Result<std::array<char, PAGE_SIZE>> {
   auto output = std::array<char, PAGE_SIZE>{};
   auto bytes = std::as_writable_bytes(std::span{output});
-  if (auto status = storage::InitializeFreeExtentPage(bytes, page_id, page_lsn, next_page_id, extents);
-      !status.Ok()) {
+  if (auto status = storage::InitializeFreeExtentPage(bytes, page_id, page_lsn, next_page_id, extents); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
   storage::FinalizeDataPage(bytes);

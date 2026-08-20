@@ -27,15 +27,16 @@ namespace tinydb::txn {
 **
 **   checkpoint_lsn <= visible_lsn
 **
-** A page retired after checkpoint_lsn is not yet reusable. Recovery can still
-** need an older physical image that only the WAL contains.
+** A page retired after checkpoint_lsn is not yet reusable. Until a checkpoint
+** covers that retirement, the selected superblock may still make the old
+** on-disk image reachable; reuse would overwrite the recovery base.
 */
 struct DatabaseState final {
-  page_id_t root_page_id{HEADER_PAGE_ID};            // visible B+ tree root
-  page_id_t allocator_root_page_id{HEADER_PAGE_ID};  // free-extent chain root
-  page_id_t logical_page_count{FIRST_DATA_PAGE_ID};  // number of logical page slots
-  std::uint64_t visible_lsn{0};                      // newest published WAL LSN
-  std::uint64_t checkpoint_lsn{0};                   // newest DB-file-resident LSN
+  page_id_t root_page_id{HEADER_PAGE_ID};
+  page_id_t allocator_root_page_id{HEADER_PAGE_ID};
+  page_id_t logical_page_count{FIRST_DATA_PAGE_ID};
+  std::uint64_t visible_lsn{0};
+  std::uint64_t checkpoint_lsn{0};
 
   auto operator==(const DatabaseState &) const -> bool = default;
 };

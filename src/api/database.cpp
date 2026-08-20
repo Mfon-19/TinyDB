@@ -54,6 +54,13 @@ namespace {
 **   CommittedPageCache     visible immutable page versions
 **   DiskManager            checkpointed file and durable metadata
 **
+** This separation gives each state transition one authority. The private
+** overlay makes abort a destruction operation, the WAL establishes commit
+** durability, cache ownership plus ReaderGate publication establishes
+** visibility, and DiskManager supplies the restart base. If visible and
+** checkpointed state were the same domain, every commit would have to rewrite
+** and synchronize the database file before it could become visible.
+**
 ** Commit order is fixed:
 **
 **   assign commit LSN -> finish allocator state and seal page bytes
@@ -61,8 +68,8 @@ namespace {
 **   -> append and fsync WAL -> drain old readers -> publish noexcept
 **
 ** Every validation and allocation happens before WAL append. Once fsync proves
-** the COMMIT_STATE record durable, publication only transfers existing ownership and
-** replaces the one visible DatabaseState pointer.
+** the COMMIT_STATE record durable, publication only transfers existing
+** ownership and replaces the one visible DatabaseState pointer.
 */
 using io::ErrnoStatus;
 using io::SyncParentDirectory;
@@ -92,7 +99,6 @@ auto ValidateOptions(const Options &options) -> Status {
 }
 
 auto AcquireDatabaseLock(const std::filesystem::path &path) -> Result<UniqueFd> {
-  // Ownership precedes recovery because replay and WAL reset are writes.
   auto fd = UniqueFd(io::Open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644));
   if (!fd.Valid()) {
     return std::unexpected(ErrnoStatus("open"));
@@ -145,7 +151,6 @@ auto LifecycleError(Lifecycle lifecycle, bool diagnostics = false) -> Status {
 }
 
 }  // namespace
-
 auto KeyRange::All() -> KeyRange { return {}; }
 
 auto KeyRange::From(BytesView lower) -> KeyRange { return {Bytes(lower), std::nullopt}; }
@@ -251,12 +256,11 @@ class DatabaseCore final {
     return checkpoints->Checkpoint();
   }
 
-  /*
-  ** Verify holds an ordinary read snapshot, so publication waits while the
-  ** audit follows cross-page references.  It neither takes the writer permit
-  ** nor invokes checkpointing.  Corruption is returned in the report; only an
-  ** environmental failure prevents a report from being produced.
-  */
+  // Verify holds an ordinary read snapshot, so publication waits while the
+  // audit follows cross-page references. It neither takes the writer permit
+  // nor invokes checkpointing. Persistent corruption is returned in the
+  // report; invalid options, lifecycle state, or an environmental failure can
+  // prevent a report from being produced.
   auto Verify(VerifyOptions verify_options) -> Result<VerifyReport> {
     auto snapshot = [&]() -> Result<txn::ReadSnapshot> {
       auto lock = std::lock_guard(lifecycle_mutex);
@@ -271,11 +275,9 @@ class DatabaseCore final {
     return verify::Snapshot(cache.get(), snapshot->State(), verify_options);
   }
 
-  /*
-  ** lifecycle_mutex excludes Close while subsystem snapshots are collected.
-  ** Each subsystem supplies its own coherent counters; the result is
-  ** diagnostic and does not claim one transactional instant across counters.
-  */
+  // lifecycle_mutex excludes Close while subsystem snapshots are collected.
+  // Each subsystem supplies its own coherent counters; the result is
+  // diagnostic and does not claim one transactional instant across counters.
   auto Statistics() const -> Result<DatabaseStats> {
     auto lock = std::lock_guard(lifecycle_mutex);
     if (auto status = LifecycleError(lifecycle, true); !status.Ok()) {
@@ -352,8 +354,9 @@ class DatabaseCore final {
   void ReleaseResources() noexcept {
     checkpoints.reset();
     readers.reset();
-    // The cache stops its direct-I/O reactor before DiskManager closes the
-    // descriptor that the reactor borrows.
+    // The cache must stop its direct-I/O reactor before DiskManager closes the
+    // page-file descriptor. The same destruction order is harmless for the
+    // buffered backend.
     cache.reset();
     disk.reset();
     wal.reset();
@@ -363,15 +366,11 @@ class DatabaseCore final {
   std::filesystem::path path;
   std::size_t write_transaction_bytes;
 
-  /*
-  ** CORE LOCK ORDER
-  **
-  ** Code needing both the writer permit and lifecycle state acquires
-  ** writer_mutex first. lifecycle_mutex protects admission counts and state;
-  ** writer_mutex protects write preparation, commit, and checkpoint I/O.
-  ** Close and explicit Checkpoint use a non-blocking acquisition, so an
-  ** application-owned writer produces Busy rather than a wait or deadlock.
-  */
+  // Code needing both the writer permit and lifecycle state acquires
+  // writer_mutex first. lifecycle_mutex protects admission counts and state;
+  // writer_mutex protects write preparation, commit, and checkpoint I/O.
+  // Close and explicit Checkpoint use a non-blocking acquisition, so an
+  // application-owned writer produces Busy rather than a wait or deadlock.
   mutable std::mutex lifecycle_mutex;
   Lifecycle lifecycle{Lifecycle::Open};
   std::mutex writer_mutex;
@@ -387,7 +386,6 @@ class DatabaseCore final {
 };
 
 }  // namespace detail
-
 struct Cursor::Impl final {
   Impl(std::shared_ptr<detail::DatabaseCore> database, txn::SnapshotToken admission, BTreeCursor tree_cursor,
        KeyRange key_range)
@@ -498,8 +496,8 @@ auto ReadTransaction::Scan(KeyRange range) -> Result<Cursor> {
 
   // The token copy ties the cursor to this transaction's reader admission, so
   // the cursor keeps its stable snapshot even if the transaction is destroyed.
-  return Cursor(std::make_unique<Cursor::Impl>(impl_->core, impl_->snapshot.Token(), std::move(*tree_cursor),
-                                               std::move(range)));
+  return Cursor(
+      std::make_unique<Cursor::Impl>(impl_->core, impl_->snapshot.Token(), std::move(*tree_cursor), std::move(range)));
 }
 
 Cursor::Cursor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -560,6 +558,12 @@ auto WriteTransaction::Get(BytesView key) -> Result<std::optional<Bytes>> {
   return impl_->Tree().Get(key);
 }
 
+/*
+** Put and Delete may discover I/O or corruption after changing private pages.
+** Such a failure destroys the transaction so a caller cannot commit a partial
+** copy-on-write overlay. InvalidArgument is retryable because public argument
+** validation completes before either operation mutates the overlay.
+*/
 auto WriteTransaction::Put(BytesView key, BytesView value) -> Status {
   if (impl_ == nullptr) {
     return Status::Closed("Put on an inactive write transaction");
@@ -631,14 +635,10 @@ Database::Database(std::shared_ptr<detail::DatabaseCore> core) : core_(std::move
 Database::Database(Database &&) noexcept = default;
 
 auto Database::Open(const std::filesystem::path &path, Options options) -> Result<Database> {
-  /*
-  ** OPEN ORDER
-  **
-  ** Options are rejected without touching the filesystem. Process ownership
-  ** then precedes recovery because replay and WAL reset mutate durable
-  ** files. Recovery completes before DiskManager selects superblocks and
-  ** before any cache can retain page bytes.
-  */
+  // Reject options before touching the filesystem, then acquire process
+  // ownership before recovery because replay and WAL reset mutate durable
+  // files. Recovery must finish before DiskManager selects a superblock or the
+  // cache retains any page bytes.
   if (auto status = ValidateOptions(options); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
@@ -647,8 +647,9 @@ auto Database::Open(const std::filesystem::path &path, Options options) -> Resul
     return std::unexpected(lock.error());
   }
   const auto wal_path = Wal::PathFor(path);
-  // Both modes use the buffered lock descriptor above. The selected page
-  // descriptor then stays open through recovery and normal operation.
+  // The lock descriptor and WAL remain buffered. Only PageFile changes: it
+  // opens an ordinary descriptor for buffered mode and a fail-closed O_DIRECT
+  // descriptor for direct mode.
   auto page_file = io::PageFile::Open(path, options.page_io_mode);
   if (!page_file) {
     return std::unexpected(page_file.error());
@@ -745,8 +746,9 @@ auto Database::BeginWrite() -> Result<WriteTransaction> {
     return std::unexpected(std::move(status));
   }
   const auto base = core->readers->CurrentState();
-  // Direct mode shares one aligned arena between private and committed pages.
-  // Publication can therefore transfer page ownership without a payload copy.
+  // Private and committed pages share one arena so publication can transfer
+  // ownership without copying a page. The buffered arena uses heap storage;
+  // the direct arena supplies the alignment required by O_DIRECT.
   auto transaction = txn::TransactionPages::Begin(core->cache.get(), *base, core->write_transaction_bytes,
                                                   core->cache->SharedPageArena());
   if (!transaction) {

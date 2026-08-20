@@ -107,12 +107,6 @@ auto WalkOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
 }
 
 }  // namespace
-
-/*
-** Return an owning leaf representation for value. All overflow pages are
-** allocated, encoded, and marked dirty before success. Any error means the
-** caller must abort its private page transaction; no committed state changed.
-*/
 auto PrepareValue(PageSource *pages, std::string_view key, std::string_view value) -> Result<LeafValueView> {
   const auto inline_footprint = SLOT_SIZE + LEAF_CELL_HEADER_SIZE + key.size() + value.size();
   if (inline_footprint <= MAX_LEAF_RECORD_BYTES) {
@@ -154,7 +148,6 @@ auto PrepareValue(PageSource *pages, std::string_view key, std::string_view valu
   });
 }
 
-/* Copy one validated overflow value. No borrowed page bytes escape. */
 auto CopyOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor) -> Result<std::string> {
   auto output = std::string{};
   output.reserve(static_cast<std::size_t>(descriptor.total_value_bytes));
@@ -169,11 +162,6 @@ auto CopyOverflowValue(PageReader *pages, const OverflowValueDescriptor &descrip
   return output;
 }
 
-/*
-** Prove the complete old chain first, then retire every page through the
-** transaction allocator. Failure is transaction-fatal but never mutates the
-** committed allocator.
-*/
 auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descriptor) -> Status {
   // Validate before the first Free so a malformed chain never produces a
   // partially retired transaction state. The caller still aborts on any later
@@ -195,7 +183,6 @@ auto RetireOverflowValue(PageSource *pages, const OverflowValueDescriptor &descr
   return {};
 }
 
-/* Join chain-local validation to the verifier's global page-ownership proof. */
 auto ValidateOverflowValue(PageReader *pages, const OverflowValueDescriptor &descriptor, page_id_t logical_page_count,
                            std::uint64_t maximum_page_lsn, const std::unordered_set<page_id_t> &free_pages,
                            const std::unordered_set<page_id_t> &allocator_pages,

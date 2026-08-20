@@ -23,10 +23,16 @@ struct CommitInfo final {
 ** the process-local writer permit and a private page overlay. Both keep the
 ** database core alive across Database moves.
 **
+** Readers need no tree-level lock after admission because their DatabaseState
+** and committed page versions are immutable. The single writer uses a
+** page-level copy-on-write overlay, so abort is discard rather than undo and
+** no write-write conflict resolution is needed. Its new root and page versions
+** become reachable only after WAL durability and quiescent-state publication.
+**
 ** Destroying an active writer aborts it. Commit consumes its handle: success
-** means the complete transaction is WAL-durable and visible;
-** IndeterminateCommit means the caller must reopen and inspect application
-** state before deciding whether it committed.
+** means the complete transaction is WAL-durable and visible. An
+** IndeterminateCommit or NeedsRecovery result requires reopening the database
+** before the application decides whether the transaction committed.
 */
 class ReadTransaction final {
  public:

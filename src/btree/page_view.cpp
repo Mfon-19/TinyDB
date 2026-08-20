@@ -12,8 +12,6 @@
 namespace tinydb {
 
 auto LeafPageView::Open(const char *page, page_id_t expected_page_id) -> Result<LeafPageView> {
-  // One full validation makes later accessors branch-free with respect to
-  // persistent corruption. They retain only programmer-invariant checks.
   if (auto status = ValidateTreePage(page, expected_page_id); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
@@ -38,7 +36,6 @@ auto LeafPageView::OpenValidated(const char *page, std::uint16_t raw_type) -> Re
 }
 
 auto LeafPageView::LowerBound(std::string_view key) const -> std::size_t {
-  // Search the encoded slot order without constructing keys.
   const auto less = txn::BytewiseLess{};
   auto first = std::size_t{0};
   auto last = static_cast<std::size_t>(cell_count_);
@@ -53,9 +50,11 @@ auto LeafPageView::LowerBound(std::string_view key) const -> std::size_t {
   return first;
 }
 
+/*
+** Search for equality directly. Calling LowerBound and comparing its result
+** would repeat the final key comparison on every successful point lookup.
+*/
 auto LeafPageView::Get(std::string_view key) const -> std::optional<LeafValueView> {
-  // Point reads can stop on equality instead of completing lower_bound and
-  // comparing the candidate a second time.
   auto first = std::size_t{0};
   auto last = static_cast<std::size_t>(cell_count_);
   while (first < last) {
@@ -96,9 +95,12 @@ auto InternalPageView::OpenValidated(const char *page, std::uint16_t raw_type) -
   return InternalPageView(page, separator_count, first_child);
 }
 
+/*
+** Return the upper_bound position of key. Separators are inclusive lower
+** bounds for their right child, so equality belongs to child middle+1 rather
+** than the child on its left.
+*/
 auto InternalPageView::FindChildIndex(std::string_view key) const -> std::size_t {
-  // upper_bound implements the inclusive lower bound of every right child:
-  // child i owns [separator i-1, separator i).
   auto first = std::size_t{0};
   auto last = static_cast<std::size_t>(separator_count_);
   while (first < last) {
@@ -109,8 +111,6 @@ auto InternalPageView::FindChildIndex(std::string_view key) const -> std::size_t
     } else if (order < 0) {
       last = middle;
     } else {
-      // Separators are unique. Equality therefore identifies upper_bound
-      // exactly, and the matching key belongs to the child on its right.
       return middle + 1;
     }
   }

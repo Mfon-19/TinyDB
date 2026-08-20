@@ -13,7 +13,6 @@
 
 namespace tinydb {
 
-// Owning mutation state for one leaf. Reads use LeafPageView directly.
 class LeafPageBuilder {
  public:
   struct UpsertResult {
@@ -33,7 +32,6 @@ class LeafPageBuilder {
 
   static auto From(const LeafPageView &page) -> LeafPageBuilder;
 
-  // Emits canonical transaction bytes. Commit assigns the final LSN and CRC.
   void Store(char *page, page_id_t page_id) const;
 
   auto Upsert(std::string_view key, LeafValueView value) -> UpsertResult;
@@ -71,7 +69,6 @@ class LeafPageBuilder {
 };
 
 struct LeafPageBuilder::SplitResult {
-  // separator is right's inclusive lower bound and remains in right.
   LeafPageBuilder right;
   std::string separator;
 };

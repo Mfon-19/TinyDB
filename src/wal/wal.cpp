@@ -26,8 +26,6 @@ using io::ErrnoStatus;
 using io::FullPread;
 using io::FullPwrite;
 
-// Encodes and writes a clean WAL header at offset zero. It synchronizes the
-// file but does not truncate it or synchronize the parent directory.
 auto WriteCleanHeader(int fd, const DatabaseUuid &database_uuid, std::uint64_t starting_lsn) -> Status {
   const auto encoded =
       wal_format::EncodeHeader(wal_format::Header{.database_uuid = database_uuid, .starting_lsn = starting_lsn});
@@ -44,7 +42,6 @@ auto WriteCleanHeader(int fd, const DatabaseUuid &database_uuid, std::uint64_t s
 }
 
 }  // namespace
-
 auto Wal::PathFor(const std::filesystem::path &db_path) -> std::filesystem::path {
   auto wal_path = db_path;
   wal_path += "-wal";
@@ -58,10 +55,12 @@ Wal::Wal(Wal &&other) noexcept
       next_lsn_(other.next_lsn_),
       needs_recovery_(other.needs_recovery_) {}
 
-// Opens or creates a header-only WAL for the specified database and starting
-// LSN. An empty file receives a new durable header. A nonempty file must
-// contain only a supported header with the specified database UUID and starting
-// LSN.
+/*
+** Open or create a header-only WAL for the specified database and starting
+** LSN. An empty file receives a new durable header; a nonempty file must
+** contain only a supported header with the same database UUID and starting
+** LSN.
+*/
 auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &database_uuid,
                std::uint64_t starting_lsn) -> Result<Wal> {
   if (starting_lsn == 0) {
@@ -118,8 +117,6 @@ auto Wal::Open(const std::filesystem::path &wal_path, const DatabaseUuid &databa
   return wal;
 }
 
-// Returns the LSN that Prepare and Commit expect next. It does not consume the
-// LSN. It reports resource exhaustion before the LSN space ends.
 auto Wal::NextCommitLsn() const -> Result<std::uint64_t> {
   auto lock = std::lock_guard(mutex_);
   if (next_lsn_ == std::numeric_limits<std::uint64_t>::max()) {
@@ -128,10 +125,12 @@ auto Wal::NextCommitLsn() const -> Result<std::uint64_t> {
   return next_lsn_;
 }
 
-// Encodes one transaction with the caller's commit LSN and performs no file
-// I/O. The caller sealed its page images with this same LSN; Commit later
-// rejects the prepared transaction if the durable tail no longer expects it.
-// The function rejects a WAL that needs recovery.
+/*
+** Encode one transaction with the caller's commit LSN without performing file
+** I/O. The caller has sealed its page images with this same LSN; Commit later
+** rejects the prepared transaction if the durable tail no longer expects it.
+** A WAL that needs recovery cannot prepare more work.
+*/
 auto Wal::Prepare(std::uint64_t commit_lsn, std::span<const wal_format::PageImageView> pages,
                   txn::DatabaseState state) const -> Result<wal_format::EncodedTransaction> {
   auto lock = std::lock_guard(mutex_);
@@ -142,10 +141,12 @@ auto Wal::Prepare(std::uint64_t commit_lsn, std::span<const wal_format::PageImag
   return wal_format::EncodeTransaction(commit_lsn, pages, state);
 }
 
-// Appends one prepared transaction at the known-good WAL tail and synchronizes
-// the file. Success advances the tracked file size and next LSN. An append error
-// triggers truncation to the old tail. A truncation or synchronization error
-// makes the handle require recovery.
+/*
+** Append one prepared transaction at the known-good WAL tail and synchronize
+** the file. Success advances the tracked file size and next LSN. An append
+** error triggers truncation to the old tail; a truncation or synchronization
+** error makes the handle require recovery.
+*/
 auto Wal::Commit(wal_format::EncodedTransaction transaction) -> Result<std::uint64_t> {
   auto lock = std::lock_guard(mutex_);
   TINYDB_CHECK(fd_.Valid(), "committing on a moved-from log");
@@ -173,17 +174,17 @@ auto Wal::Commit(wal_format::EncodedTransaction transaction) -> Result<std::uint
   return transaction.commit_lsn;
 }
 
-// Returns the tracked WAL byte count under the mutex. It does not read file
-// metadata from the filesystem.
 auto Wal::SizeBytes() const -> std::uint64_t {
   auto lock = std::lock_guard(mutex_);
   return size_bytes_;
 }
 
-// Replaces the fully checkpointed WAL with a clean header that starts at
-// next_lsn_. The checkpoint LSN must cover the complete durable tail. A
-// header-only WAL needs no change. An I/O error makes the handle require
-// recovery.
+/*
+** Replace the fully checkpointed WAL with a clean header that starts at
+** next_lsn_. The checkpoint LSN must cover the complete durable tail, while a
+** header-only WAL needs no change. An I/O error makes the handle require
+** recovery.
+*/
 auto Wal::Reset(std::uint64_t checkpoint_lsn) -> Status {
   auto lock = std::lock_guard(mutex_);
   TINYDB_CHECK(fd_.Valid(), "resetting a moved-from log");

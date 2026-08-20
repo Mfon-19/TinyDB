@@ -27,10 +27,11 @@ struct VerifyIssue final {
 };
 
 /*
-** Verification reports corruption as data instead of losing the partial audit
-** behind an error Status. Result<VerifyReport> is reserved for environmental
-** failures such as I/O or memory exhaustion. complete is false when malformed
-** bytes made further traversal unsafe.
+** Verification reports persistent damage as data instead of losing the
+** partial audit behind an error Status. Non-persistent failures returned by
+** the page reader, such as I/O errors, remain Status failures. complete is
+** false if malformed bytes stopped traversal or the issue limit prevented a
+** complete report.
 */
 struct VerifyReport final {
   std::uint64_t visible_lsn{0};

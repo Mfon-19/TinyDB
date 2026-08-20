@@ -36,7 +36,6 @@ namespace {
 constexpr std::size_t USABLE_BYTES = PAGE_SIZE - INTERNAL_HEADER_SIZE;
 
 }  // namespace
-
 auto InternalPageBuilder::Append(std::string_view bytes) -> Slice {
   if (bytes_.capacity() == 0) {
     bytes_.reserve(PAGE_SIZE + MAX_KEY_BYTES);
@@ -58,7 +57,6 @@ auto InternalPageBuilder::RecordFootprint(const Record &record) -> std::size_t {
   return SLOT_SIZE + INTERNAL_CELL_HEADER_SIZE + record.key.size;
 }
 
-// Construct the minimal internal page used when a split creates a new root.
 InternalPageBuilder::InternalPageBuilder(page_id_t first_child, std::string_view separator, page_id_t right_child)
     : first_child_(first_child) {
   auto record = MakeRecord(separator, right_child);
@@ -66,11 +64,14 @@ InternalPageBuilder::InternalPageBuilder(page_id_t first_child, std::string_view
   records_.push_back(record);
 }
 
-// Copy only through view accessors so builders cannot become a second decoder.
+/*
+** Copy logical records through InternalPageView. Builders must not become a
+** second decoder for persistent offsets, because that would create another
+** trust boundary beside the page validator.
+*/
 auto InternalPageBuilder::From(const InternalPageView &page) -> InternalPageBuilder {
   InternalPageBuilder builder;
   builder.first_child_ = page.ChildAt(0);
-  // Put adds at most one separator before this builder is stored or split.
   builder.records_.reserve(page.SeparatorCount() + 1);
   for (std::size_t index = 0; index < page.SeparatorCount(); ++index) {
     auto record = builder.MakeRecord(page.KeyAt(index), page.ChildAt(index + 1));
@@ -80,8 +81,6 @@ auto InternalPageBuilder::From(const InternalPageView &page) -> InternalPageBuil
   return builder;
 }
 
-// Reinitialize the complete page, append slots in separator order, and pack
-// cells from the end downward. The header link stores first_child_.
 void InternalPageBuilder::Store(char *page, page_id_t page_id) const {
   TINYDB_CHECK(Fits(), "records do not fit in a page");
   auto bytes = std::as_writable_bytes(std::span<char, PAGE_SIZE>{page, PAGE_SIZE});
@@ -121,15 +120,16 @@ void InternalPageBuilder::InsertSeparator(std::string_view key, page_id_t right_
 
 auto InternalPageBuilder::Fits() const -> bool { return encoded_bytes_ <= USABLE_BYTES; }
 
-// Choose the legal promoted separator with the smallest encoded-size
-// imbalance. The candidate itself belongs to neither child.
+/*
+** Return the legal promoted separator with the smallest encoded-size
+** imbalance. The first and last separators are not candidates because each
+** resulting internal page must retain at least one routing record. The
+** promoted separator itself belongs to neither child.
+*/
 auto InternalPageBuilder::ChooseSplitIndex() const -> std::size_t {
   const std::size_t count = records_.size();
   TINYDB_CHECK(count >= 3, "too few records to split");
 
-  // The first and last separators cannot be promoted because each resulting
-  // internal page must retain at least one routing record. Keep the left size
-  // incrementally instead of allocating a prefix array.
   std::size_t best_split = 0;
   std::size_t best_imbalance = 0;
   std::size_t left = RecordFootprint(records_.front());
@@ -153,8 +153,8 @@ auto InternalPageBuilder::ChooseSplitIndex() const -> std::size_t {
 }
 
 auto InternalPageBuilder::Split() -> SplitResult {
-  // Promotion removes the separator from both children. Its former right child
-  // becomes the right page's first child, preserving every subtree edge.
+  // The promoted separator leaves both pages; its former right child becomes
+  // the new page's first child, preserving the edge that crossed the split.
   const std::size_t split = ChooseSplitIndex();
   const auto split_it = records_.begin() + static_cast<std::ptrdiff_t>(split);
   const auto promoted_bytes = RecordFootprint(records_[split]);

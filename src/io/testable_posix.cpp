@@ -79,7 +79,6 @@ void Forget(int fd) {
 }
 
 }  // namespace
-
 void SetTestHook(TestHook hook) {
   auto replacement = hook ? std::make_shared<const TestHook>(std::move(hook)) : nullptr;
   auto &state = TestState();

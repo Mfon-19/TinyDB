@@ -14,9 +14,9 @@ namespace tinydb {
 ** Keys compare in unsigned lexicographic byte order, so ordering is identical
 ** on platforms where plain char has different signedness.
 **
-** The limits are application contracts rather than consequences of 4 KiB
-** tree pages. Large values use overflow pages; keys remain bounded because
-** internal B+ tree separators contain complete keys.
+** These limits are enforced before a public mutation begins. Large values use
+** overflow pages; keys remain bounded because internal B+ tree separators
+** contain complete keys.
 */
 using Bytes = std::string;
 using BytesView = std::string_view;

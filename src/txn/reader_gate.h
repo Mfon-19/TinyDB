@@ -53,6 +53,12 @@ struct ReaderGateAdmission final {
 ** steady stream of new readers cannot indefinitely postpone a writer that is
 ** already waiting to publish.
 **
+** This is quiescent-state publication rather than a general MVCC version
+** lookup. The publisher drains the old reader population before swapping the
+** dense cache table and DatabaseState, so reads never choose among per-page
+** versions by LSN. Copy-on-write frames are needed during preparation and for
+** outstanding leases, but the steady-state lookup names one current frame.
+**
 ** Copying SnapshotToken shares one admission. A transaction and all cursors
 ** created from it count as one active reader until the final token copy is
 ** destroyed, even if that destruction occurs on another thread.
@@ -74,9 +80,9 @@ class SnapshotToken final {
 
 /*
 ** Non-shareable admission for an owning point result. Database::Get keeps this
-** object at one stable stack address until the copied value is complete,
-** avoiding a shared-lease allocation when no cursor can escape. Measured on
-** the buffered random point-read benchmark, that allocation costs about 6%.
+** object at one stable stack address until the copied value is complete. No
+** shared admission allocation is needed because a cursor cannot escape the
+** call.
 */
 class ScopedSnapshotToken final {
  public:

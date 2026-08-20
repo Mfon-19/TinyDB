@@ -39,12 +39,8 @@ namespace {
 constexpr std::size_t USABLE_BYTES = PAGE_SIZE - LEAF_HEADER_SIZE;
 
 }  // namespace
-
 auto LeafPageBuilder::Append(std::string_view bytes) -> Slice {
   if (bytes_.capacity() == 0) {
-    // One insertion may temporarily overflow a full page before splitting.
-    // Offsets remain stable even if a nonstandard caller grows beyond this
-    // ordinary one-allocation budget.
     bytes_.reserve(PAGE_SIZE + MAX_LEAF_RECORD_BYTES);
   }
   const auto result = Slice{.offset = bytes_.size(), .size = bytes.size()};
@@ -84,13 +80,14 @@ auto LeafPageBuilder::RecordFootprint(const Record &record) -> std::size_t {
   return SLOT_SIZE + LEAF_CELL_HEADER_SIZE + record.key.size + value_bytes;
 }
 
-// Copy only through view accessors so builders cannot become a second decoder.
+/*
+** Copy logical records through LeafPageView. Builders must not become a
+** second decoder for persistent offsets, because that would create another
+** trust boundary beside the page validator.
+*/
 auto LeafPageBuilder::From(const LeafPageView &page) -> LeafPageBuilder {
   LeafPageBuilder builder;
   builder.next_leaf_ = page.NextLeaf();
-  // A builder is opened for exactly one mutation. Leave room for that insert
-  // so a full leaf needs one record allocation, not one while decoding and
-  // another immediately afterward.
   builder.records_.reserve(page.Count() + 1);
   for (std::size_t index = 0; index < page.Count(); ++index) {
     auto record = builder.MakeRecord(page.KeyAt(index), page.ValueAt(index));
@@ -100,8 +97,6 @@ auto LeafPageBuilder::From(const LeafPageView &page) -> LeafPageBuilder {
   return builder;
 }
 
-// Reinitialize the complete page, append slots in key order, and pack cells
-// from the end downward. Rebuilding removes fragmentation and stale bytes.
 void LeafPageBuilder::Store(char *page, page_id_t page_id) const {
   TINYDB_CHECK(Fits(), "records do not fit in a page");
   auto bytes = std::as_writable_bytes(std::span<char, PAGE_SIZE>{page, PAGE_SIZE});
@@ -197,14 +192,15 @@ auto LeafPageBuilder::Erase(std::string_view key) -> EraseResult {
 
 auto LeafPageBuilder::Fits() const -> bool { return encoded_bytes_ <= USABLE_BYTES; }
 
-// Choose the legal byte boundary with the smallest encoded-size imbalance.
+/*
+** Return the legal byte boundary with the smallest encoded-size imbalance.
+** Record count is not a useful balance measure because keys and inline values
+** vary in size. A running left size avoids a temporary prefix array.
+*/
 auto LeafPageBuilder::ChooseSplitIndex() const -> std::size_t {
   const std::size_t count = records_.size();
   TINYDB_CHECK(count >= 2, "too few records to split");
 
-  // Only boundaries where both encoded halves fit are candidates. Among
-  // those, prefer the smallest byte imbalance to stabilize occupancy. A
-  // running left size avoids allocating a prefix array for this one pass.
   std::size_t best_split = 0;
   std::size_t best_imbalance = 0;
   std::size_t left = 0;
@@ -246,7 +242,7 @@ auto LeafPageBuilder::Split(page_id_t right_page_id, bool tail_heavy) -> SplitRe
   encoded_bytes_ -= result.right.encoded_bytes_;
   result.right.next_leaf_ = next_leaf_;
   records_.erase(split_it, records_.end());
-  next_leaf_ = right_page_id;  // right is inserted between this leaf and old_next
+  next_leaf_ = right_page_id;
   return result;
 }
 

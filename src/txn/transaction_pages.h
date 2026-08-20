@@ -21,19 +21,28 @@ namespace tinydb::txn {
 **
 ** TransactionPages is the complete mutable page universe of one writer. A
 ** read first consults the private map and otherwise borrows committed bytes.
-** The first Edit copies a committed page once. Later edits reuse the same
-** stable heap-owned frame. Allocate reuses a checkpoint-safe page ID when one
-** is available. Otherwise, it extends the private logical page count. Free
-** removes a private image and records a retirement. It does not change the
-** committed allocator state.
+** The first Edit copies a committed page once; later edits reuse the stable
+** private frame. Allocate reuses a checkpoint-safe page ID when possible and
+** otherwise extends the private logical page count. Free removes a private
+** image and records a retirement without changing committed allocator state.
 **
 ** Nothing owned here is reachable through the committed cache. Therefore
 ** abort requires no undo: dropping the overlay restores the base state.
-** PrepareCommit finishes allocator work and seals every final page once.
+** PrepareCommit finishes allocator work and seals every dirty final page.
+** Edits retain their logical page IDs; after reader quiescence, publication
+** replaces the committed frame for that ID. This is page shadowing inside one
+** transaction, not an append-only physical version chain.
 **
-** Memory accounting covers private pages and retained value bytes. All page
-** handles must be released before PrepareCommit, Abort, ownership transfer, or
-** destruction. Those operations can invalidate frame ownership.
+** Memory accounting charges private pages and each value accepted by Put.
+** Value charges remain until the transaction ends, even if a later mutation
+** replaces or deletes that value. All page handles must be released before
+** PrepareCommit, Abort, ownership transfer, or destruction because those
+** operations can invalidate frame ownership.
+**
+** The committed cache supplies the PageArena: heap-backed for buffered I/O or
+** aligned and slab-backed for direct I/O. Copy-on-write and commit are
+** otherwise identical, and publication transfers leases without changing
+** their backing storage.
 */
 class TransactionPages final : public PageSource {
  public:
@@ -54,9 +63,8 @@ class TransactionPages final : public PageSource {
   void SetRootPageId(page_id_t root_page_id);
   auto ChargeValueBytes(std::size_t bytes) -> Status;
 
-  // Finish allocator metadata, assign one commit LSN, and seal every final
-  // private image. The WAL LSN no longer depends on page count, so structural
-  // preparation and byte sealing are one operation.
+  // Finish allocator metadata, assign the commit LSN, and seal each dirty
+  // private image before its lease is transferred to WAL and cache preparation.
   auto PrepareCommit(std::uint64_t commit_lsn) -> Status;
 
   auto ResultingState() const -> const DatabaseState &;
@@ -71,13 +79,13 @@ class TransactionPages final : public PageSource {
 
  private:
   struct PrivateFrame {
-    page_id_t page_id{HEADER_PAGE_ID};                       // immutable identity of this frame
-    cache::PageArena::Lease bytes;                           // stable address until transfer
-    std::size_t pin_count{0};                                // outstanding PageHandles
-    bool editing{false};                                     // mutable leases are exclusive
-    bool dirty{false};                                       // needs WAL/publication image
-    PagePayloadProof payload_proof{PagePayloadProof::None};  // trusted private payload kind
-    storage::DataPageHeader sealed_header{};                 // page_id zero means not sealed
+    page_id_t page_id{HEADER_PAGE_ID};
+    cache::PageArena::Lease bytes;
+    std::size_t pin_count{0};
+    bool editing{false};
+    bool dirty{false};
+    PagePayloadProof payload_proof{PagePayloadProof::None};
+    storage::DataPageHeader sealed_header{};
   };
 
   TransactionPages(PageReader *committed, DatabaseState base_state, std::size_t memory_limit_bytes,
@@ -101,14 +109,14 @@ class TransactionPages final : public PageSource {
   void RequireActive() const;
   void RequireUnpinned() const;
 
-  PageReader *committed_;           // immutable fallback for reads
-  DatabaseState base_state_;        // captured at Begin
-  DatabaseState resulting_state_;   // private roots and logical page count
-  std::size_t memory_limit_bytes_;  // pages plus retained values
+  PageReader *committed_;
+  DatabaseState base_state_;
+  DatabaseState resulting_state_;
+  std::size_t memory_limit_bytes_;
   std::shared_ptr<cache::PageArena> page_arena_;
   std::size_t memory_used_bytes_{0};
-  bool prepared_{false};         // final page set carries the exact commit LSN
-  bool allocator_dirty_{false};  // extent index needs rewriting
+  bool prepared_{false};
+  bool allocator_dirty_{false};
 
   // unordered_map preserves element addresses across rehash. Free removes a
   // frame only after proving that no PageHandle still refers to it.

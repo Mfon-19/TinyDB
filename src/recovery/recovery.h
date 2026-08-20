@@ -12,9 +12,11 @@ namespace tinydb::recovery {
 
 /*
 ** Restore the database file through the latest complete durable WAL
-** transaction.  The caller must already hold exclusive process ownership.
-** Success means the database file and its selected superblock cover every
-** accepted transaction and the remaining WAL contains only a clean header.
+** transaction. The caller must already hold exclusive process ownership.
+** Success means that the database file and selected superblock cover every
+** accepted transaction and that no WAL transaction remains pending for redo.
+** Wal::Open creates or checks the clean header afterward. Buffered and direct
+** page transports produce the same persistent bytes and durability order.
 **
 ** Corruption and unsupported input are reported before database pages are
 ** written.  Environmental failures during redo leave the previous

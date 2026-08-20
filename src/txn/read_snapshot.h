@@ -27,8 +27,8 @@ namespace tinydb::txn {
 **
 ** PageReader is owned by DatabaseCore. Public ReadTransaction holds this
 ** object for its full lifetime. Returned point values are owning copies.
-** Cursor keys borrow the current page; value copies cross a Result boundary
-** so overflow-chain I/O and corruption retain the same ownership semantics.
+** Cursor keys borrow the current page. CopyValue returns owned bytes and
+** reports any overflow-page I/O or corruption through Result.
 */
 class ReadSnapshot final {
  public:

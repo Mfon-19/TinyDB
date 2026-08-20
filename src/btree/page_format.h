@@ -27,11 +27,12 @@ namespace tinydb {
 ** leftmost child; each separator cell stores the child on its right. Internal
 ** separators are inclusive lower bounds, so equality routes right.
 **
-** ValidateTreePage proves every offset, length, identity, link, reserved field,
-** and key-order invariant before PageView exposes unchecked borrowed slices.
+** ValidateTreePage checks the common header and the page-local offsets,
+** lengths, reserved fields, link encodings, and key order used by PageView
+** before the view exposes unchecked borrowed slices. Logical ranges and
+** cross-page ownership are checked by tree traversal and verification.
 */
 
-/* Tree types are aliases of the common codec's persisted type values. */
 enum class NodeType : std::uint16_t {
   Leaf = static_cast<std::uint16_t>(storage::DataPageType::Leaf),
   Internal = static_cast<std::uint16_t>(storage::DataPageType::Internal),
@@ -45,7 +46,6 @@ inline constexpr std::size_t RESERVED = FREE_END + sizeof(std::uint16_t);
 inline constexpr std::size_t LINK = RESERVED + sizeof(std::uint16_t);
 inline constexpr std::size_t HEADER_BYTES = LINK + sizeof(page_id_t);
 }  // namespace node_page_offset
-
 namespace leaf_cell_offset {
 /*
 ** Leaf cell, relative to its slot offset:
@@ -63,20 +63,17 @@ inline constexpr std::size_t VALUE_BYTES = 2;
 inline constexpr std::size_t VALUE_KIND = 4;
 inline constexpr std::size_t HEADER_BYTES = 5;
 }  // namespace leaf_cell_offset
-
 namespace overflow_descriptor_offset {
-// 0 total u64 | 8 first/owner page u64
+/* Overflow descriptor: 0 total bytes u64 | 8 first page ID u64. */
 inline constexpr std::size_t TOTAL_VALUE_BYTES = 0;
 inline constexpr std::size_t FIRST_PAGE_ID = 8;
 }  // namespace overflow_descriptor_offset
-
 namespace internal_cell_offset {
-// Internal cell: [right child][key length][separator]. The first child is LINK.
+/* Internal cell: 0 right child u64 | 8 key bytes u16 | 10 separator. */
 inline constexpr std::size_t RIGHT_CHILD = 0;
 inline constexpr std::size_t KEY_BYTES = 8;
 inline constexpr std::size_t HEADER_BYTES = 10;
 }  // namespace internal_cell_offset
-
 using slot_t = std::uint16_t;
 inline constexpr std::size_t SLOT_SIZE = sizeof(slot_t);
 inline constexpr std::size_t LEAF_HEADER_SIZE = node_page_offset::HEADER_BYTES;
@@ -93,11 +90,13 @@ inline auto RawNodeType(const PageHandle &page) -> std::uint16_t {
   return RawNodeType(page.Data());
 }
 
-// Validates the common header plus all tree-local structural invariants.
+/*
+** Validate the common data-page header and the page-local fields used by tree
+** views. The payload-only form accepts a header that has already crossed the
+** checksum boundary, as occurs during immutable-cache admission.
+*/
 auto ValidateTreePage(const char *page, page_id_t expected_page_id) -> Status;
 
-// Validate tree-local bytes using an already authenticated common header.
-// Immutable caches use this once at admission and retain the resulting proof.
 auto ValidateTreePagePayload(const char *page, const storage::DataPageHeader &validated_header) -> Status;
 
 inline auto ValidateTreePage(const PageHandle &page) -> Status {
@@ -116,9 +115,11 @@ inline auto ValidateTreePage(const PageHandle &page) -> Status {
   return ValidateTreePagePayload(page.Data(), *common);
 }
 
-// One record at or below half the usable bytes guarantees that every
-// overflowing builder has a legal split boundary. Overflow descriptors keep a
-// maximum-sized key below this bound regardless of logical value size.
+/*
+** Capping one record at half the usable leaf bytes guarantees a legal split
+** boundary whenever a builder overflows. An overflow descriptor keeps a
+** maximum-sized key below this bound regardless of the logical value size.
+*/
 inline constexpr std::size_t MAX_LEAF_RECORD_BYTES = (PAGE_SIZE - LEAF_HEADER_SIZE) / 2;
 static_assert(SLOT_SIZE + LEAF_CELL_HEADER_SIZE + MAX_KEY_BYTES + OVERFLOW_VALUE_DESCRIPTOR_BYTES <=
               MAX_LEAF_RECORD_BYTES);

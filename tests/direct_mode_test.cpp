@@ -47,7 +47,6 @@ void ExpectValue(tinydb::Database &database, std::string_view key, const std::st
 }
 
 }  // namespace
-
 TEST(IoMode, DefaultUsesBufferedDatabaseTransport) {
   EXPECT_EQ(tinydb::Options{}.page_io_mode, tinydb::PageIoMode::Buffered);
   const auto legacy_positional =

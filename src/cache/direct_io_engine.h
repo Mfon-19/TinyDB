@@ -33,10 +33,11 @@ enum class DirectReadRunState {
 /*
 ** NONBLOCKING EXACT-PAGE READ
 **
-** The run owns its arena leases until the caller takes a ready page or the
-** run releases it. Cancellation is logical and does not submit a kernel
-** cancellation request. A loading run releases its leases only after all
-** submitted I/O completes. The run can safely outlive its engine.
+** The native reactor uses this object for planned direct-I/O read-ahead. The
+** run owns its arena leases until the caller takes a ready page or the run
+** releases it. Cancellation is logical and does not submit a kernel
+** cancellation request; a loading run releases its leases only after every
+** submitted operation completes. The run may safely outlive its engine.
 */
 class DirectReadRun final {
  public:
@@ -62,11 +63,21 @@ class DirectReadRun final {
 /*
 ** NATIVE DIRECT-I/O ENGINE
 **
-** One reactor owns one io_uring instance for exact reads and checkpoint
-** writes. Exact scheduling publishes all pages in one run as one unit.
-** Checkpoint writes wait for completion. A null run or false write result
-** means that the caller must use synchronous direct I/O. The engine does not
-** silently change the database transport.
+** A direct page cache constructs this engine and uses it only if io_uring
+** initializes successfully; a buffered cache never constructs it. When
+** available, one reactor owns the ring used for exact read-ahead and
+** checkpoint writes. Exact scheduling publishes every page in a run as one
+** unit, while checkpoint writes wait for completion. A null read result means
+** that no usable run was handed to the caller; any run scheduled before a
+** wrapper-allocation failure has already been drained. A false checkpoint
+** result guarantees that no native checkpoint transfer started, so the caller
+** may use synchronous direct I/O. Failure never changes the selected
+** page-file transport.
+**
+** The engine is a physical batching layer, not a cache or visibility layer.
+** The cache chooses exact page IDs, owns cache admission and LRU policy, and
+** validates bytes after completion. Keeping those decisions above the reactor
+** prevents CQE order from becoming semantic traversal or publication order.
 */
 class DirectIoEngine final {
  public:

@@ -17,10 +17,10 @@ using Clock = std::chrono::steady_clock;
 ** reader departs, the two events on which a waiter can make progress.
 */
 struct ReaderGateControl final {
-  mutable std::mutex mutex;         // protects every field below
-  std::condition_variable changed;  // admission or drain may progress
+  mutable std::mutex mutex;
+  std::condition_variable changed;
   std::shared_ptr<const DatabaseState> state;
-  bool publication_pending{false};  // admission is closed when true
+  bool publication_pending{false};
 
   // Admissions append in clock order. Intrusive links live either in the
   // shared cursor lease or in a point read's stack token, avoiding a separate
@@ -35,10 +35,8 @@ ReaderGateAdmission::~ReaderGateAdmission() {
     return;
   }
 
-  /*
-  ** The owner of this admission performs the one unlink. Count and oldest age
-  ** change under the same mutex, so diagnostics always describe one population.
-  */
+  // Unlink and decrement under the same mutex, so active count and oldest-age
+  // diagnostics always describe the same admitted population.
   auto lock = std::lock_guard(control->mutex);
   TINYDB_CHECK(control->active_readers != 0, "reader gate active count underflow");
   if (previous != nullptr) {
@@ -84,7 +82,6 @@ void Admit(std::shared_ptr<ReaderGateControl> control, ReaderGateAdmission *admi
 }
 
 }  // namespace
-
 auto SnapshotToken::State() const -> const DatabaseState & {
   TINYDB_CHECK(admission_ != nullptr, "reading an empty snapshot token");
   return *admission_->state;
@@ -119,13 +116,9 @@ auto ReaderGate::CurrentState() const -> std::shared_ptr<const DatabaseState> {
 }
 
 void ReaderGate::AdvanceCheckpoint(std::uint64_t checkpoint_lsn) {
-  /*
-  ** CHECKPOINT LSN PUBLICATION
-  **
-  ** The database file is already durable through checkpoint_lsn. The caller's
-  ** writer permit excludes transaction publication, while old readers may
-  ** safely retain the older immutable state.
-  */
+  // The file is already durable through checkpoint_lsn. The writer permit
+  // excludes transaction publication, while old readers may retain their
+  // prior immutable DatabaseState.
   auto lock = std::lock_guard(control_->mutex);
   const auto &current = control_->state;
   TINYDB_CHECK(checkpoint_lsn >= current->checkpoint_lsn, "visible checkpoint LSN moved backward");

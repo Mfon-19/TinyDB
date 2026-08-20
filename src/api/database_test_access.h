@@ -12,7 +12,6 @@ struct ReadAheadCounters final {
   std::uint64_t pages_consumed{0};
 };
 
-/* Benchmark-only endpoint for work initiated by a completed read operation. */
 class DatabaseTestAccess final {
  public:
   static void WaitForReadQuiescence(Database &database) noexcept;

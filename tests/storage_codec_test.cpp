@@ -30,7 +30,7 @@
 
 /*
 ** Persistent-format tests use byte-distinct golden values and mutate encoded
-** fields only after deliberately resealing their checksums. This separates
+** fields only after resealing their checksums. This separates
 ** framing/checksum failures from semantic validation and detects accidental
 ** dependence on host endianness, padding, or native struct layout.
 */
@@ -73,9 +73,11 @@ auto Golden(std::string_view name) -> std::vector<std::byte> {
   return result;
 }
 
-// Deliberately choose asymmetric, byte-distinct numbers. A native-endian or
-// misaligned field will then disagree visibly with the golden fixture instead
-// of accidentally passing because the value is zero or palindromic.
+/*
+** The asymmetric, byte-distinct values below make a native-endian or
+** misaligned field disagree visibly with the golden fixture instead of
+** passing because the value happens to be zero or palindromic.
+*/
 auto Fixture(std::uint64_t generation = 0x0102030405060708ULL) -> Superblock {
   auto uuid = DatabaseUuid{};
   for (std::size_t i = 0; i < uuid.size(); ++i) {
@@ -447,8 +449,8 @@ TEST(Format, PageVersion) {
 }
 
 TEST(Format, Tree) {
-  // Exercise the one builder/view encoding path, ensuring tree pages did not
-  // retain a parallel legacy decoder beside the common page codec.
+  // Exercise the builder and borrowed view through the common page codec, so
+  // a disagreement at either boundary appears in one round trip.
   auto leaf_page = std::array<char, tinydb::PAGE_SIZE>{};
   auto leaf = tinydb::LeafPageBuilder{};
   leaf.Upsert("alpha", tinydb::LeafValueView::Inline("one"));

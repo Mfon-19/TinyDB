@@ -10,12 +10,13 @@
 namespace tinydb::storage {
 
 /*
-** PERSISTENT ENCODING PRIMITIVES
+** These routines read and write fixed-width fields in persistent pages.  The
+** file format is little-endian and does not depend on C++ padding, alignment,
+** native byte order, enum representation, or compiler ABI.
 **
-** These are the only primitives persistent codecs use for fixed-width fields.
-** Encoding field-by-field avoids persisting C++ padding, alignment, native byte
-** order, enum representation, or compiler ABI details. Use an Unchecked form
-** only after a fixed span or an earlier size check proves that the field fits.
+** The checked forms return false or nullopt if the field does not fit; an
+** Unchecked form assumes that a fixed-size span or an earlier bounds check has
+** already proved that the complete field is present.
 */
 template <typename Integer>
   requires std::is_unsigned_v<Integer>

@@ -9,11 +9,6 @@
 
 namespace tinydb::cache {
 
-/*
-** PageBytes keeps normal byte alignment. Buffered mode therefore uses compact,
-** independent heap allocations. Direct arenas get runtime O_DIRECT alignment
-** from mmap, so this common page type needs no larger static alignment.
-*/
 using PageBytes = std::array<char, PAGE_SIZE>;
 static_assert(sizeof(PageBytes) == PAGE_SIZE);
 static_assert(alignof(PageBytes) == alignof(char));
@@ -21,15 +16,24 @@ static_assert(alignof(PageBytes) == alignof(char));
 /*
 ** PAGE OWNERSHIP ARENA
 **
-** A Lease owns one mutable 4 KiB page. A heap lease owns its allocation. A
-** direct lease keeps its PageArena alive and identifies one page in a slab.
+** A Lease owns one mutable 4 KiB page. A transaction lease moves unchanged
+** into an immutable committed frame. Buffered caches obtain pages from
+** ordinary heap allocations. Direct caches obtain pages from mmap-backed
+** slabs whose runtime addresses satisfy O_DIRECT, so PageBytes itself keeps
+** natural alignment and buffered allocations remain compact.
 **
-** When no free extent fits a request, a direct arena adds a slab. The cache,
-** transaction, and staging limits bound live pages. The slab size controls
-** only the growth increment.
+** Lease is the common ownership currency for copy-on-write, cache publication,
+** read-ahead staging, and checkpoint I/O. Direct mode can retain one aligned
+** allocation across transaction publication and checkpoint I/O, and request
+** ownership prevents reclamation while the kernel references that buffer.
+** Buffered mode avoids the allocator and RSS cost of making every PageBytes
+** type globally over-aligned.
 **
-** Commit moves a lease from a write transaction into a committed frame. This
-** ownership transfer does not copy the page.
+** A direct arena adds a slab only when no free extent can satisfy a request.
+** AcquireBatch reserves one contiguous extent for direct I/O, while the heap
+** arena returns independent allocations. In either case failure leaves the
+** caller's destination unchanged. Slab size controls only the mapping growth
+** increment, not the number of live leases.
 */
 class PageArena final : public std::enable_shared_from_this<PageArena> {
  public:
@@ -73,13 +77,10 @@ class PageArena final : public std::enable_shared_from_this<PageArena> {
 
   auto Acquire() noexcept -> Lease;
 
-  // Direct arenas return one contiguous run. Heap arenas return independent
-  // pages. A failure leaves the destination unchanged in both modes.
   auto AcquireBatch(std::span<Lease> destination) noexcept -> bool;
 
-  // Direct arenas keep their mappings and ask the kernel to release free
-  // physical pages. Active leases stay mapped and unchanged. Heap leases
-  // release their allocations immediately, so heap arenas do no work here.
+  // A direct arena retains virtual mappings but asks the kernel to discard
+  // physical storage for free extents. Heap arenas have nothing to release.
   void ReleaseFreeMemory() noexcept;
 
  private:

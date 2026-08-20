@@ -29,8 +29,8 @@ auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child
   auto page_id = root_page_id;
   auto depth = std::size_t{0};
   for (;;) {
-    // Sixty-four levels exceed the representable page population at minimum
-    // fanout, so this constant-space bound also detects parent cycles.
+    // This fixed bound prevents malformed child links from causing unbounded
+    // descent. It is far above the depth produced by the page builders.
     if (++depth > 64) {
       return std::unexpected(Status::Corruption("tree descent is too deep or cyclic"));
     }
@@ -40,8 +40,6 @@ auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child
     }
     const auto type = RawNodeType(*page);
     if (type == static_cast<std::uint16_t>(NodeType::Leaf)) {
-      // The consumer opens and validates this leaf while retaining the same
-      // lease. Returning it avoids a second cache lookup and pin cycle.
       return std::move(*page);
     }
     const auto internal = InternalPageView::Open(*page);
@@ -53,10 +51,7 @@ auto Descend(PageReader *pages, page_id_t root_page_id, ChooseChild choose_child
 }
 
 }  // namespace
-
 auto FindLeaf(PageReader *pages, page_id_t root_page_id, std::string_view key) -> Result<PageHandle> {
-  // Separator equality routes right, matching the inclusive-lower-bound
-  // invariant used by page builders and verification.
   return Descend(pages, root_page_id,
                  [key](const InternalPageView &page) { return page.ChildAt(page.FindChildIndex(key)); });
 }
@@ -74,8 +69,6 @@ auto PlanLeafPageSuccessorsForReadAhead(PageReader *pages, page_id_t root_page_i
     std::size_t child_index;
   };
 
-  // Leaf links reveal only one successor. The internal path reveals a bounded
-  // set that the direct-I/O engine can read together.
   if (pages == nullptr || page_count == 0 || root_page_id < FIRST_DATA_PAGE_ID ||
       current_leaf_page_id < FIRST_DATA_PAGE_ID || logical_page_count <= FIRST_DATA_PAGE_ID) {
     return {};
@@ -122,8 +115,6 @@ auto PlanLeafPageSuccessorsForReadAhead(PageReader *pages, page_id_t root_page_i
 
     auto result = std::vector<page_id_t>{};
     result.reserve(page_count);
-    // Visit each right-hand subtree in key order. The level count prevents a
-    // corrupt edge from changing an internal page into a leaf plan.
     const auto collect = [&](auto &&self, page_id_t subtree_root, std::size_t internal_levels) -> bool {
       if (result.size() == page_count) {
         return true;
@@ -164,8 +155,6 @@ auto PlanLeafPageSuccessorsForReadAhead(PageReader *pages, page_id_t root_page_i
       return true;
     };
 
-    // Climb from the current branch toward the root. At each level, collect
-    // the sibling subtrees that follow the current child.
     for (auto level = ancestors.size(); level-- > 0 && result.size() < page_count;) {
       auto page = pages->Read(ancestors[level].page_id);
       if (!page || RawNodeType(*page) != static_cast<std::uint16_t>(NodeType::Internal)) {

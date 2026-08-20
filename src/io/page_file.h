@@ -21,18 +21,15 @@ inline constexpr std::size_t MAX_PAGE_WRITE_BATCH_PAGES = MAX_DIRECT_WRITE_BATCH
 /*
 ** DATABASE PAGE-FILE TRANSPORT
 **
-** When the database opens, PageFile selects one physical transport. Buffered
-** mode uses ordinary pread and pwrite on one descriptor. Direct mode uses
-** fail-closed O_DIRECT transfers. Direct mode never changes to buffered mode
-** after an open error. The selected backend remains fixed for the PageFile
-** lifetime. Both modes expose the same fixed-page and durability operations
-** to recovery and DiskManager. The transport never selects a persistent
-** format or WAL protocol.
+** PageFile chooses one database-page transport at open and keeps it for the
+** lifetime of the object. The buffered backend uses ordinary pread and pwrite;
+** the direct backend uses fail-closed O_DIRECT and never falls back after an
+** open or transfer error. Both expose the same fixed-page and durability
+** operations, and neither selects a persistent format or WAL protocol.
 **
-** Prepared direct requests borrow the DirectFile descriptor and diagnostic
-** path, so every request token must complete before this object moves or is
-** destroyed. DiskManager moves its PageFile only during open, before any
-** request can exist.
+** Native request tokens borrow the DirectFile descriptor and path. The caller
+** completes them before this object moves or is destroyed; DiskManager moves
+** PageFile only during open, before a request can exist.
 */
 class PageFile final {
  public:
@@ -48,7 +45,6 @@ class PageFile final {
   auto WritePage(page_id_t page_id, std::span<const std::byte, PAGE_SIZE> page) const -> Status;
   auto WritePages(page_id_t first_page_id, std::span<const std::byte *const> pages) const -> Status;
   auto IsDirect() const noexcept -> bool;
-  // Asynchronous preparation requires DirectFile as the selected backend.
   auto BeginDirectReadPages(std::span<const page_id_t> page_ids,
                             std::span<std::byte> contiguous_pages) const -> Result<DirectReadRequest>;
   auto BeginDirectWritePages(page_id_t first_page_id,
@@ -58,7 +54,6 @@ class PageFile final {
   auto Sync() const -> Status;
 
  private:
-  // The buffered transport is one ordinary descriptor.
   using Transport = std::variant<UniqueFd, DirectFile>;
 
   explicit PageFile(Transport transport) : transport_(std::move(transport)) {}

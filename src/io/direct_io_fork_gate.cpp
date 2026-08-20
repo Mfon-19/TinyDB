@@ -28,8 +28,8 @@ struct Gate final {
   std::size_t active_operations{0};
 };
 
-// pthread_atfork keeps callbacks until process exit. The leaked gate keeps
-// callback state valid after C++ static destruction.
+/* pthread_atfork retains its callbacks for process lifetime, so the callback
+** state must outlive C++ static destruction. */
 auto ProcessGate() -> Gate & {
   static auto *const gate = new Gate{};
   return *gate;
@@ -50,8 +50,8 @@ void PrepareFork() noexcept {
   while (gate.active_operations != 0) {
     TINYDB_CHECK(pthread_cond_wait(&gate.condition, &gate.mutex) == 0, "could not drain direct I/O before fork");
   }
-  // Keep this mutex locked across fork. ParentAfterFork unlocks the parent
-  // copy. The child copy stays locked, so inherited handles cannot start I/O.
+  // Keep the mutex locked across fork. The parent unlocks its copy; the child
+  // copy remains locked, preventing I/O through inherited handles.
 }
 
 void ParentAfterFork() noexcept {
@@ -66,14 +66,13 @@ auto RegistrationError(int error) -> Status {
 }
 
 }  // namespace
-
 auto EnsureDirectIoForkGate() -> Status {
   auto &gate = ProcessGate();
   auto error = 0;
   Lock(&gate);
   if (gate.registration == RegistrationState::Unattempted) {
-    // A registration failure is permanent. Direct I/O fails closed because
-    // fork is unsafe without these handlers.
+    // Registration is process-wide and cannot be repaired after failure. A
+    // direct open must fail because private-memory I/O would be unsafe.
     error = gate.registrar(&PrepareFork, &ParentAfterFork, nullptr);
     gate.registration_error = error;
     gate.registration = error == 0 ? RegistrationState::Succeeded : RegistrationState::Failed;
@@ -128,7 +127,6 @@ void DirectIoOperation::Release() noexcept {
   TINYDB_CHECK(gate.active_operations != 0, "direct-I/O operation counter underflow");
   --gate.active_operations;
   if (gate.active_operations == 0) {
-    // The prepare handler waits for this transition before fork.
     TINYDB_CHECK(pthread_cond_broadcast(&gate.condition) == 0, "could not signal drained direct I/O");
   }
   Unlock(&gate);

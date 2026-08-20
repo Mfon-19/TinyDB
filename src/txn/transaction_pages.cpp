@@ -27,8 +27,6 @@ auto TransactionPages::Begin(PageReader *committed, DatabaseState base_state, st
     return std::unexpected(Status::Corruption("invalid transaction base state"));
   }
 
-  // Decode the captured allocator before returning a write context. Corrupt
-  // metadata can never yield a partially usable transaction.
   try {
     if (page_arena == nullptr) {
       page_arena = cache::PageArena::CreateHeap();
@@ -45,9 +43,6 @@ auto TransactionPages::Begin(PageReader *committed, DatabaseState base_state, st
 
 TransactionPages::~TransactionPages() {
   RequireUnpinned();
-  // A failed or aborted direct transaction may be the last owner to touch a
-  // large group of mmap-backed pages. Release them as one batch after their
-  // leases have returned to the arena.
   pages_.clear();
   if (page_arena_ != nullptr) {
     page_arena_->ReleaseFreeMemory();
@@ -127,8 +122,6 @@ auto TransactionPages::Read(page_id_t page_id) -> Result<PageHandle> {
   if (retired_page_ids_.contains(page_id)) {
     return std::unexpected(Status::Corruption("transaction read a page it already retired"));
   }
-  // Read-your-writes is a map lookup; committed state is consulted only when
-  // this transaction has never copied or allocated the page.
   if (const auto page = pages_.find(page_id); page != pages_.end()) {
     return PrivateHandle(&page->second, false);
   }
@@ -144,8 +137,6 @@ auto TransactionPages::Edit(page_id_t page_id) -> Result<PageHandle> {
     return PrivateHandle(&page->second, true);
   }
 
-  // First edit is copy-on-write. Later edits resolve the stable private frame
-  // through the map branch above.
   auto committed = committed_->Read(page_id);
   if (!committed) {
     return std::unexpected(std::move(committed).error());
@@ -196,8 +187,6 @@ auto TransactionPages::AllocateNewPage() -> Result<PrivateFrame *> {
 
 auto TransactionPages::Allocate() -> Result<PageHandle> {
   RequireActive();
-  // Reuse limits file growth. If no page is reusable, AllocateNewPage changes
-  // only resulting_state_. It does not extend the physical file.
   auto page_id = AllocateReusablePage();
   PrivateFrame *frame = nullptr;
   if (page_id.has_value()) {
@@ -288,8 +277,6 @@ auto TransactionPages::LoadFreeExtents() -> Status {
     allocator_page_ids_.push_back(page_id);
     page_id = decoded->next_page_id;
   }
-  // Retain metadata IDs separately from free extents. Integrity verification
-  // and allocation must treat allocator pages as allocated but non-tree pages.
   return {};
 }
 
@@ -306,9 +293,6 @@ void TransactionPages::AddRetiredExtents(std::uint64_t retire_lsn) {
   }
   std::ranges::sort(free_extents_, {}, &storage::FreeExtent::first_page_id);
 
-  // Adjacent extents inherit the newer retirement LSN. Delayed reuse is safe;
-  // early reuse would not be. Compact in place because the input is no longer
-  // needed after sorting.
   auto output = std::size_t{0};
   for (const auto extent : free_extents_) {
     if (output != 0 &&
@@ -344,9 +328,6 @@ auto TransactionPages::EnsureFreeExtentIndexFrames() -> Status {
 }
 
 auto TransactionPages::StoreFreeExtentIndex() -> Status {
-  // Rewrite the metadata chain from its canonical in-memory model. The
-  // one-LSN WAL format lets preparation allocate and seal each image directly;
-  // there is no provisional frame-reservation phase.
   const auto slice = [](const std::vector<storage::FreeExtent> &extents, std::size_t index) {
     const auto first = index * storage::FREE_EXTENTS_PER_PAGE;
     if (first >= extents.size()) {
@@ -413,7 +394,6 @@ auto TransactionPages::TakePages() -> std::vector<cache::CommittedPageImage> {
   RequireUnpinned();
   auto result = std::vector<cache::CommittedPageImage>{};
   result.reserve(pages_.size());
-  // Ownership moves directly toward publication; page bytes are not copied.
   for (auto &[page_id, page] : pages_) {
     (void)page_id;
     if (!page.dirty) {
@@ -425,11 +405,7 @@ auto TransactionPages::TakePages() -> std::vector<cache::CommittedPageImage> {
         .tree_payload_validated = page.payload_proof == PagePayloadProof::Tree,
     });
   }
-  // One order serves WAL adjacency validation and cache publication. The
-  // unordered private map needs no second borrowed page list for determinism.
   std::ranges::sort(result, {}, [](const cache::CommittedPageImage &image) { return image.header.page_id; });
-  // Any clean private copy served read-your-writes but has no committed image
-  // to transfer. Clearing the map releases those copies with the dirty ones.
   pages_.clear();
   page_arena_->ReleaseFreeMemory();
   memory_used_bytes_ = 0;

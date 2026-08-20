@@ -11,8 +11,6 @@
 
 namespace tinydb {
 
-// Owning mutation state for one routing page. Persistent bytes enter only
-// through InternalPageView.
 class InternalPageBuilder {
  public:
   struct SplitResult;
@@ -22,7 +20,6 @@ class InternalPageBuilder {
 
   static auto From(const InternalPageView &page) -> InternalPageBuilder;
 
-  // Emits canonical transaction bytes. Commit assigns the final LSN and CRC.
   void Store(char *page, page_id_t page_id) const;
 
   void InsertSeparator(std::string_view key, page_id_t right_child);
@@ -55,7 +52,6 @@ class InternalPageBuilder {
 };
 
 struct InternalPageBuilder::SplitResult {
-  // separator moves to the parent; its old right child begins right.
   InternalPageBuilder right;
   std::string separator;
 };

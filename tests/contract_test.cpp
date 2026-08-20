@@ -15,10 +15,9 @@
 /*
 ** CONTRACT TESTS
 **
-** These tests pin the application-visible state machines and byte-string
-** rules without reproducing storage behavior in a second model. End-to-end
-** transaction, recovery, and corruption guarantees live in the database and
-** crash suites.
+** These tests pin small public scalar contracts: status names, size limits,
+** and unsigned byte ordering. Transaction, recovery, and corruption behavior
+** remains in the database and crash suites instead of being reproduced here.
 */
 
 TEST(Contract, StatusNames) {

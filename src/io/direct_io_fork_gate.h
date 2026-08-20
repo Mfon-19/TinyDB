@@ -9,13 +9,12 @@ namespace tinydb::io {
 using AtForkRegistrar = int (*)(void (*)(), void (*)(), void (*)());
 
 /*
-** Linux makes fork unsafe while private-memory direct I/O is in flight.
-** Each synchronous transfer and each prepared asynchronous request holds one
-** admission. DirectIoOperation is the admission token. Its lifetime covers
-** each kernel access to private memory. The atfork prepare handler stops new
-** transfers and drains current transfers before fork. Admission reopens only
-** in the parent. The child must exec or exit without using inherited TinyDB
-** handles.
+** Linux makes fork unsafe while direct I/O targets private memory. Each
+** synchronous transfer and prepared asynchronous request therefore holds one
+** DirectIoOperation admission for the complete kernel access. The atfork
+** prepare handler closes admission and drains active operations before fork;
+** only the parent reopens it. The child must exec or exit without using an
+** inherited TinyDB handle. Buffered transfers never enter this gate.
 */
 class DirectIoOperation final {
  public:
@@ -44,7 +43,7 @@ struct DirectIoForkGateSnapshot final {
   std::size_t active_operations;
 };
 
-// Registration is process-wide and cannot be reset after the first attempt.
+/* Registration is process-wide and cannot be reset after the first attempt. */
 void SetAtForkRegistrarForTest(AtForkRegistrar registrar);
 auto DirectIoForkGateSnapshotForTest() -> DirectIoForkGateSnapshot;
 void SetDirectIoActiveOperationsForTest(std::size_t active_operations);

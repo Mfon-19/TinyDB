@@ -24,7 +24,6 @@ auto Error(const tinydb::Status &status) -> int {
 }
 
 }  // namespace
-
 auto main(int argc, char **argv) -> int {
   auto options = tinydb::Options{};
   auto database_argument = 1;

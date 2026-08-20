@@ -28,10 +28,11 @@
 /*
 ** CACHE REPLACEMENT TESTS
 **
-** These cases use valid checkpoint pages but no B+ tree. That keeps page
-** selection deterministic: each Read names the exact frame whose queue
-** position is under test. Publication and checkpoint tests use the same page
-** images as the production commit path.
+** Replacement cases use independent, valid checkpoint pages so each Read
+** names the exact frame whose queue position is under test. Read-ahead cases
+** use validated leaf pages because staged tree pages cross the same structural
+** boundary as production scans. Publication and checkpoint cases use the page
+** images produced by the commit path.
 */
 namespace {
 
@@ -100,7 +101,6 @@ auto Image(tinydb::page_id_t page_id, std::uint64_t page_lsn,
 }
 
 }  // namespace
-
 TEST(Cache, PublicationKeepsArenaPageAddressAndPayloadProofs) {
   const auto path = Path("cache_arena_publication");
   tinydb::test::Remove(path);

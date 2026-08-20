@@ -192,7 +192,8 @@ TEST(Page, Mutations) {
 
   // Recompute the checksum after each mutation so the test reaches the
   // structural decoder instead of being rejected at the outer checksum on
-  // every iteration. A successful Open must make every accessor safe.
+  // every iteration. A successful Open must make subsequent slice access
+  // safe.
   auto rng = std::mt19937{0xB17E5U};
   auto offset = std::uniform_int_distribution<std::size_t>{0, tinydb::PAGE_SIZE - 1};
   auto byte = std::uniform_int_distribution<unsigned>{0, 255};

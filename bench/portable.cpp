@@ -455,7 +455,6 @@ void AddPortableResults(const Scenario &scenario, Results &results, std::size_t 
 }
 
 }  // namespace
-
 void AddPortableScenarios(const Config &config, std::vector<Scenario> &scenarios) {
   const auto profile = SelectedProfile(config.profile);
   const auto add_db = [&](std::string name, std::string workload, std::size_t rows, std::size_t operations,

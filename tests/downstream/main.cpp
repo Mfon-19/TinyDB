@@ -17,8 +17,8 @@ auto main() -> int {
   auto options = tinydb::Options{};
   options.page_cache_bytes = 512U << 10U;
 
-  // Referencing the complete public surface forces this consumer to compile
-  // and link through installed headers and the exported target only.
+  // These representative symbols force the installed headers and exported
+  // target to compile and link without access to the source tree.
   const auto open = &tinydb::Database::Open;
   const auto all = tinydb::KeyRange::All();
   const auto bytes = tinydb::Bytes{"value"};

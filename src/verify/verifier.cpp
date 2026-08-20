@@ -67,7 +67,6 @@ auto PageHeader(PageReader *pages, page_id_t page_id, std::uint64_t visible_lsn,
 }
 
 }  // namespace
-
 /*
 ** SNAPSHOT OWNERSHIP AUDIT
 **
@@ -80,10 +79,15 @@ auto PageHeader(PageReader *pages, page_id_t page_id, std::uint64_t visible_lsn,
 **   allocator metadata page
 **
 ** TransactionPages decodes the allocator with the same persistent codec used
-** by writers. The recursive walk below is the sole cross-page verifier: it
-** proves routing ranges, leaf links, overflow chains, disjoint ownership, and
-** complete accounting for every data page ID less than logical_page_count.
-** The transaction overlay is never edited or committed.
+** by writers. This full audit walks routing ranges, leaf links, and overflow
+** chains, then compares their combined ownership with the allocator domains.
+** A complete report accounts for every data page ID below
+** logical_page_count. The transaction overlay is never edited or committed.
+**
+** Keeping this graph-wide proof out of page admission is an architectural
+** boundary: ordinary reads validate only the page and edge they consume,
+** whereas verification pays for visited and ownership sets to detect aliases,
+** leaks, and cycles across the complete snapshot.
 */
 auto Snapshot(PageReader *pages, const txn::DatabaseState &state, VerifyOptions options) -> Result<VerifyReport> {
   if (options.max_issues == 0) {

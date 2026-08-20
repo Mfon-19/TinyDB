@@ -14,9 +14,11 @@ namespace tinydb::io {
 **
 ** POSIX pread and pwrite may complete only part of a request and may be
 ** interrupted before transferring bytes.  Persistent protocols cannot treat
-** either condition as a complete page or record.  These helpers provide the
-** retrying byte-transfer primitive shared by WAL writing and recovery while
-** keeping every syscall visible to the fault-injection shim.
+** either condition as a complete page or record.
+**
+** Buffered database pages and every WAL operation use these helpers. Direct
+** database pages use DirectFile instead, because each retry must preserve
+** O_DIRECT memory, offset, and length alignment.
 **
 ** FullPread reports clean end-of-file by returning the short byte count.
 ** FullPwrite reports the first environmental failure and otherwise transfers

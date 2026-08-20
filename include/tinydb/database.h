@@ -23,6 +23,12 @@ class DatabaseCore;
 ** Database owns one process-exclusive open of a database file. Its private
 ** core owns every storage subsystem at stable addresses; public transaction
 ** and cursor handles retain that core while they borrow it.
+**
+** The shared core is the lifetime boundary because a cursor or transaction
+** may outlive the Database wrapper that created it. Keeping the reader gate,
+** cache, WAL, and page file alive as one unit prevents a borrowed page lease
+** from outliving its owner; Close refuses teardown while such handles remain.
+**
 ** Convenience reads and writes use the same snapshot and commit paths exposed
 ** through transaction objects, so there is only one visibility and durability
 ** protocol.
@@ -44,13 +50,14 @@ class Database final {
   auto Get(BytesView key) -> Result<std::optional<Bytes>>;
   auto Delete(BytesView key) -> Status;
 
-  // Commits are durable before this call. Checkpoint only makes the visible
-  // state self-contained in the database file and shortens future recovery.
+  // Commit durability does not depend on this call. Checkpoint makes visible
+  // state self-contained in the database file, permits old page versions to
+  // be reclaimed, and shortens future recovery.
   auto Checkpoint() -> Status;
 
   // Audits one stable read snapshot without repair or persistent writes.
-  // Detected damage is represented by VerifyReport::issues; Result errors are
-  // reserved for environmental failures that prevented the audit.
+  // Persistent damage is represented by VerifyReport::issues. Invalid options,
+  // lifecycle failures, and environmental failures are returned as Status.
   auto Verify(VerifyOptions options = {}) -> Result<VerifyReport>;
 
   // Returns race-free subsystem counters for diagnosis, not one transactional

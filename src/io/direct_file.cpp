@@ -87,7 +87,6 @@ struct TransferResult final {
 };
 
 }  // namespace
-
 auto DirectFile::OpenExisting(const std::filesystem::path &path, int access_flags) -> Result<DirectFile> {
   auto opened = OpenExistingIfPresent(path, access_flags);
   if (!opened) {
@@ -132,8 +131,6 @@ auto DirectFile::Open(const std::filesystem::path &path, int access_flags, bool 
     return std::unexpected(std::move(status));
   }
 
-  // Direct mode is fail-closed. The descriptor is usable only after the
-  // kernel reports alignment that supports one complete TinyDB page.
   const auto flags = access_flags | O_DIRECT | O_CLOEXEC | (create ? O_CREAT | O_EXCL : 0);
   const auto descriptor = io::Open(path, flags, create_mode);
   if (descriptor < 0) {
@@ -205,8 +202,8 @@ auto DirectReadRequest::Complete(std::span<const int> completion_results,
   path_ = nullptr;
   admission_ = DirectIoOperation{};
 
-  // The reactor can split one logical run across many SQEs. Each CQE must
-  // cover its complete aligned segment.
+  // The reactor may split one logical run across several SQEs; each CQE must
+  // still cover its complete aligned segment.
   auto described_bytes = std::size_t{0};
   auto first_error = 0;
   auto short_read = false;
@@ -270,8 +267,6 @@ auto DirectWriteRequest::Complete(int completion_result, std::size_t expected_by
   if (completion_result < 0) {
     return PathError("io_uring writev", *path, -completion_result);
   }
-  // io_uring does not resume a partial checkpoint write. A short completion
-  // leaves the checkpoint transfer incomplete.
   TINYDB_CHECK(completion_result < static_cast<int>(expected_bytes), "asynchronous direct write exceeded its request");
   return Status::IoError("short asynchronous checkpoint write: " + path->string());
 }
@@ -283,8 +278,8 @@ auto DirectFile::ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> pag
   if (aligned) {
     return Transfer(page_id, page.data(), nullptr);
   }
-  // Direct arena pages avoid this copy. An ordinary caller page uses one
-  // aligned staging page for the kernel transfer.
+  // Cache-arena pages are already aligned. Other callers cross the O_DIRECT
+  // boundary through one aligned staging page.
   auto staging = DirectPageBuffer{};
   if (auto status = Transfer(page_id, staging.bytes.data(), nullptr); !status.Ok()) {
     return status;
@@ -300,8 +295,6 @@ auto DirectFile::WritePage(page_id_t page_id, std::span<const std::byte, PAGE_SI
   if (aligned) {
     return Transfer(page_id, nullptr, page.data());
   }
-  // Copy before the transfer because the kernel cannot read an unaligned
-  // caller page through O_DIRECT.
   auto staging = DirectPageBuffer{};
   std::ranges::copy(page, staging.bytes.begin());
   return Transfer(page_id, nullptr, staging.bytes.data());
@@ -327,8 +320,8 @@ auto DirectFile::WritePages(page_id_t first_page_id, std::span<const std::byte *
     return Status::InvalidArgument("direct write batch contains a null page");
   }
 
-  // A mixed batch stages the full run. This gives every retry one uniform
-  // aligned vector layout.
+  // Stage the complete batch if any source is unaligned, giving every retry a
+  // uniform vector layout that still satisfies O_DIRECT.
   auto staging = std::unique_ptr<DirectPageBuffer[]>{};
   const auto sources_are_aligned = std::ranges::all_of(
       pages, [&](const auto *page) { return reinterpret_cast<std::uintptr_t>(page) % memory_alignment_ == 0; });
@@ -361,8 +354,8 @@ auto DirectFile::WritePages(page_id_t first_page_id, std::span<const std::byte *
   auto total = std::size_t{0};
   {
     auto operation = std::move(*admission);
-    // POSIX permits short writes. A retry is valid only while the next vector,
-    // file offset, and remaining length still satisfy O_DIRECT.
+    // A short-write retry is valid only while the next vector, file offset,
+    // and remaining length continue to satisfy O_DIRECT alignment.
     while (total < transfer_bytes) {
       const auto first_index = total / PAGE_SIZE;
       const auto within_page = total % PAGE_SIZE;
@@ -444,8 +437,6 @@ auto DirectFile::BeginReadPages(std::span<const page_id_t> page_ids,
   if (!admission) {
     return std::unexpected(std::move(admission).error());
   }
-  // The request token keeps this admission. Thus, the fork handler waits for
-  // queued and active io_uring work.
   return DirectReadRequest(fd_.Get(), page_ids.size(), &path_, std::move(*admission));
 }
 
@@ -544,10 +535,10 @@ auto DirectFile::Transfer(page_id_t page_id, std::byte *read_page, const std::by
   auto result = TransferResult{};
   auto total = std::size_t{0};
   {
-    // This token keeps the fork gate active for the complete retry loop.
+    // Hold fork admission through the complete retry loop, and continue after
+    // a short transfer only if the next address, offset, and length remain
+    // aligned for O_DIRECT.
     auto operation = std::move(*admitted);
-    // POSIX permits short transfers. Continue only while the next buffer,
-    // offset, and length still satisfy direct-I/O alignment.
     while (total < PAGE_SIZE) {
       const auto remaining = PAGE_SIZE - total;
       const auto transferred = writing ? Pwrite(fd_.Get(), write_page + total, remaining, *offset + total)

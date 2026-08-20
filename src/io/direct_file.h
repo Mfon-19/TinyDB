@@ -18,8 +18,11 @@
 
 namespace tinydb::io {
 
-// O_DIRECT requires aligned transfer memory. Keep that requirement local to
-// the transport instead of over-aligning every in-memory page representation.
+/*
+** O_DIRECT requires aligned transfer memory. DirectPageBuffer keeps that
+** constraint at the transport boundary instead of imposing page alignment on
+** every buffered cache and codec allocation.
+*/
 struct alignas(PAGE_SIZE) DirectPageBuffer final {
   std::array<std::byte, PAGE_SIZE> bytes;
 };
@@ -28,24 +31,19 @@ static_assert(sizeof(DirectPageBuffer) == PAGE_SIZE);
 static_assert(alignof(DirectPageBuffer) == PAGE_SIZE);
 
 inline constexpr std::size_t MAX_DIRECT_WRITE_BATCH_PAGES = 32;
-// One prepared asynchronous read names at most this many pages. The native
-// engine schedules whole runs against this same bound and the cache sizes its
-// staging runs to it, so every layer shares one limit. A fully scattered run
-// of this size needs one SQE per page and still fits the reactor's in-flight
-// budget.
+/* A fully scattered prepared read must still fit the reactor's SQE budget. */
 inline constexpr std::size_t MAX_DIRECT_READ_BATCH_PAGES = 64;
 inline constexpr std::size_t MAX_DIRECT_READ_PAGES_PER_SQE = 32;
 
 /*
 ** ASYNCHRONOUS DIRECT TRANSFER TOKENS
 **
-** The native I/O engine borrows the DirectFile descriptor and diagnostic
-** path through these tokens. It must complete every token before DirectFile
-** moves or is destroyed. Each token owns one fork-gate admission. Completion
-** releases this admission after the kernel stops using transfer memory. The
-** caller keeps DirectFile and all submitted buffers alive until completion.
-** Completion consumes a token exactly once. Short reads report corruption.
-** Short writes report an I/O error.
+** The native I/O engine borrows the DirectFile descriptor and diagnostic path
+** through these tokens. It must complete every token before DirectFile moves
+** or is destroyed. Each token also owns one fork-gate admission, released only
+** after the kernel stops using the transfer memory. The caller keeps the file
+** and all submitted buffers alive until completion, and consumes each token
+** exactly once. Short reads report corruption; short writes report I/O error.
 */
 class DirectReadRequest final {
  public:
@@ -95,10 +93,10 @@ class DirectWriteRequest final {
 };
 
 /*
-** DirectFile owns an O_DIRECT descriptor for the database page file. It never
-** falls back to buffered I/O. Open requires kernel alignment data that is
-** compatible with PAGE_SIZE. The WAL and directory descriptors do not use
-** this type.
+** DirectFile owns the O_DIRECT descriptor used for database pages and never
+** changes to buffered I/O. Open requires the kernel to report memory and
+** offset alignment compatible with PAGE_SIZE. Buffered database pages, the
+** WAL, and directory synchronization use other descriptor types.
 */
 class DirectFile final {
  public:
@@ -119,12 +117,11 @@ class DirectFile final {
 
   auto ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> page) const -> Status;
   auto WritePage(page_id_t page_id, std::span<const std::byte, PAGE_SIZE> page) const -> Status;
-  // Write one physically consecutive run. Each pointer names one PAGE_SIZE
-  // source page. Aligned sources go directly to pwritev. If one source is
-  // misaligned, one bounded staging array holds the complete batch.
+  // Write one physically consecutive run. Aligned page sources go directly to
+  // pwritev; a mixed or unaligned run uses one bounded staging array.
   auto WritePages(page_id_t first_page_id, std::span<const std::byte *const> pages) const -> Status;
-  // Preparation validates each buffer and acquires one fork-gate admission.
-  // The caller owns the submitted buffers until it consumes the request token.
+  // Preparation validates every buffer and acquires one fork admission. The
+  // caller retains the buffers until it consumes the returned token.
   auto BeginReadPages(std::span<const page_id_t> page_ids,
                       std::span<std::byte> contiguous_pages) const -> Result<DirectReadRequest>;
   auto BeginWritePages(page_id_t first_page_id,
@@ -132,6 +129,8 @@ class DirectFile final {
   auto EnsurePageCount(page_id_t page_count) const -> Status;
   auto Stat(struct stat *result) const -> Status;
   auto Sync() const -> Status;
+  // Drop page-cache residency left by an earlier buffered open; failure of
+  // this advisory operation does not change O_DIRECT correctness.
   void DiscardBufferedResidency() const noexcept;
 
  private:

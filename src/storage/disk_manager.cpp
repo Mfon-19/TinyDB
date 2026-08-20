@@ -23,24 +23,21 @@ namespace {
 using io::SyncParentDirectory;
 
 /*
-** DATABASE FILE DURABILITY
-**
-** Pages 0 and 1 are alternating superblocks. Opening selects the valid copy
-** with the greatest generation. A fresh file is created in this order:
+** Pages 0 and 1 are alternating superblocks.  A new database is created in
+** this order:
 **
 **   reserve pages -> write A -> fsync file -> fsync parent directory
 **                 -> write B -> fsync file
 **
-** Thus any completed creation has at least one durable, checksummed root of
-** state, and a crash before completion leaves either a retryable zero file or
-** a valid first copy. Data-page writes occur during checkpoint. The WAL stays
-** authoritative until those writes and the next inactive superblock are
-** synchronized.
+** Once the directory entry is durable, superblock A is already a complete
+** root of database state and superblock B adds redundancy; a failure before A
+** is written leaves a zero file that a later open can initialize again.
+**
+** During checkpoint, data pages are written but the WAL remains authoritative
+** until those pages and a new inactive superblock have both been synchronized,
+** regardless of whether the page-file transport is buffered or direct.
 */
 auto RandomUuid() -> DatabaseUuid {
-  // std::random_device is used only for collision-resistant identity, not for
-  // cryptographic authorization. A UUID collision could pair unrelated WAL
-  // and database files, so still reject the one reserved all-zero result.
   auto uuid = DatabaseUuid{};
   auto random = std::random_device{};
   for (std::size_t offset = 0; offset < uuid.size(); offset += sizeof(std::uint32_t)) {
@@ -56,8 +53,6 @@ auto RandomUuid() -> DatabaseUuid {
 }
 
 auto ReadWholePage(const io::PageFile &file, page_id_t page_id) -> Result<storage::SuperblockPage> {
-  // Persistent pages are atomic units at the storage abstraction even though
-  // POSIX may return a short read. A short page cannot be safely decoded.
   auto page = storage::SuperblockPage{};
   if (auto status = file.ReadPage(page_id, page); !status.Ok()) {
     return std::unexpected(std::move(status));
@@ -66,18 +61,16 @@ auto ReadWholePage(const io::PageFile &file, page_id_t page_id) -> Result<storag
 }
 
 auto WriteWholePage(const io::PageFile &file, page_id_t page_id, const storage::SuperblockPage &page) -> Status {
-  // Checkpoint and superblock pages are logical 4 KiB writes even when POSIX
-  // completes them through several short writes or an interrupted syscall.
   return file.WritePage(page_id, page);
 }
 
 }  // namespace
-
 /*
-** Open may create and initialize an absent database. O_CREAT can leave an
-** empty directory entry before initialization begins, so the zero-file and
-** two-zero-superblock states are explicitly retryable. Existing nonempty
-** files pass superblock and file-size validation before any mutation.
+** Open the database at path, creating and initializing it if it is empty.
+** O_CREAT can leave an empty directory entry before initialization starts,
+** while file growth can leave exactly two zero-filled superblock pages before
+** the first superblock write; neither state contains an acknowledged database,
+** so both are safe to initialize again.
 */
 auto DiskManager::Open(const std::filesystem::path &path, PageIoMode mode) -> Result<DiskManager> {
   auto file = io::PageFile::Open(path, mode);
@@ -95,13 +88,6 @@ auto DiskManager::Open(const std::filesystem::path &path, io::PageFile file) -> 
   DiskManager disk(std::move(file));
 
   const auto initialize_fresh = [&]() -> Status {
-    // Creation ordering:
-    //   1. reserve both metadata pages;
-    //   2. write and fsync A, establishing one recoverable copy;
-    //   3. fsync the directory entry;
-    //   4. write and fsync B, establishing redundancy.
-    // At every boundary either no valid database exists yet or at least one
-    // complete superblock does.
     disk.selected_.value.database_uuid = RandomUuid();
     if (auto status = disk.file_.EnsurePageCount(FIRST_DATA_PAGE_ID); !status.Ok()) {
       return status;
@@ -127,7 +113,6 @@ auto DiskManager::Open(const std::filesystem::path &path, io::PageFile file) -> 
   };
 
   if (file_stat.st_size == 0) {
-    // Includes a zero-byte entry left by a failed/terminated earlier creation.
     if (auto status = initialize_fresh(); !status.Ok()) {
       return std::unexpected(std::move(status));
     }
@@ -136,8 +121,8 @@ auto DiskManager::Open(const std::filesystem::path &path, io::PageFile file) -> 
 
   if (file_stat.st_size < static_cast<off_t>(FIRST_DATA_PAGE_ID * PAGE_SIZE) ||
       file_stat.st_size % static_cast<off_t>(PAGE_SIZE) != 0) {
-    // Reject before mutation. In particular, the former one-header format is
-    // not silently upgraded or truncated into the new dual-superblock format.
+    // Reject before mutation. In particular, do not silently truncate or
+    // upgrade the former one-header format.
     return std::unexpected(Status::UnsupportedFormat("file does not contain TinyDB dual superblocks"));
   }
 
@@ -156,9 +141,8 @@ auto DiskManager::Open(const std::filesystem::path &path, io::PageFile file) -> 
     };
     if (file_stat.st_size == static_cast<off_t>(FIRST_DATA_PAGE_ID * PAGE_SIZE) && page_is_zero(*page_a) &&
         page_is_zero(*page_b)) {
-      // ftruncate may have reserved two zero-filled pages before the first
-      // superblock write failed. This exact state contains no acknowledged
-      // database, so creation can safely start again with a new UUID.
+      // ftruncate() can reserve both pages before the first superblock write
+      // fails. No UUID or database state was published, so creation can retry.
       if (auto status = initialize_fresh(); !status.Ok()) {
         return std::unexpected(std::move(status));
       }
@@ -167,13 +151,11 @@ auto DiskManager::Open(const std::filesystem::path &path, io::PageFile file) -> 
     return std::unexpected(selected.error());
   }
 
-  // Adopt the selected state only after both pages have been independently
-  // decoded. No persistent mutation occurs on the existing-file open path.
   disk.selected_ = *selected;
   disk.durable_logical_page_count_.store(selected->value.logical_page_count, std::memory_order_relaxed);
 
-  // The superblock may not claim pages beyond the physical file. It may claim
-  // fewer pages because a failed checkpoint can leave harmless trailing data.
+  // A failed checkpoint can leave unreferenced pages beyond the logical end,
+  // but a superblock can never claim pages beyond the physical file.
   const auto file_pages = static_cast<std::uint64_t>(file_stat.st_size) / PAGE_SIZE;
   if (disk.LogicalPageCount() > file_pages) {
     return std::unexpected(Status::Corruption("superblock logical page count exceeds the database file"));
@@ -204,15 +186,11 @@ auto DiskManager::EnsurePageCount(page_id_t logical_page_count) -> Status {
   if (logical_page_count < FIRST_DATA_PAGE_ID) {
     return Status::InvalidArgument("logical page count must include both superblocks");
   }
-  // File growth is physical preparation for checkpoint, not page allocation.
-  // The logical page count was already committed before this call.
   return file_.EnsurePageCount(logical_page_count);
 }
 
 auto DiskManager::WriteCheckpointPages(page_id_t first_page_id, std::span<const std::byte *const> pages,
                                        page_id_t captured_logical_page_count) const -> Status {
-  // The captured count can exceed the durable frontier after file growth.
-  // Bounds from this snapshot prevent writes into a later transaction range.
   if (captured_logical_page_count < FIRST_DATA_PAGE_ID || first_page_id < FIRST_DATA_PAGE_ID || pages.empty() ||
       first_page_id >= captured_logical_page_count || pages.size() > captured_logical_page_count - first_page_id) {
     return Status::InvalidArgument("checkpoint write lies outside its captured logical page range");
@@ -229,14 +207,6 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
     return Status::ResourceExhausted("superblock generation space exhausted");
   }
 
-  /*
-  ** SUPERBLOCK PUBLICATION
-  **
-  ** Data pages were synchronized by CheckpointManager before this call. Write
-  ** the inactive slot, then synchronize that one new recovery root. The old
-  ** slot is left untouched.
-  ** In-memory metadata changes only after fsync succeeds.
-  */
   auto next = selected_.value;
   ++next.generation;
   next.checkpoint_lsn = checkpoint_lsn;
@@ -261,8 +231,8 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
       .value = next,
       .slot = next_slot,
   };
-  // The release publishes the new durable frontier after superblock fsync.
-  // Native reads acquire this value before they validate a request.
+  // Direct read preparation can overlap checkpoint publication. Advance the
+  // visible frontier only after its superblock is durable.
   durable_logical_page_count_.store(logical_page_count, std::memory_order_release);
   return {};
 }
@@ -270,7 +240,8 @@ auto DiskManager::CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_r
 auto DiskManager::Sync() const -> Status { return file_.Sync(); }
 
 auto DiskManager::ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> data) const -> Status {
-  // This frontier excludes trailing pages from an incomplete checkpoint.
+  // Ignore trailing writes from failed checkpoints. Only pages below the
+  // selected superblock's frontier are readable.
   if (page_id < FIRST_DATA_PAGE_ID || page_id >= LogicalPageCount()) {
     return Status::InvalidArgument("reading a page that was never allocated");
   }
@@ -281,8 +252,8 @@ auto DiskManager::UsesDirectIo() const noexcept -> bool { return file_.IsDirect(
 
 auto DiskManager::BeginDirectReadPages(std::span<const page_id_t> page_ids,
                                        std::span<std::byte> contiguous_pages) const -> Result<io::DirectReadRequest> {
-  // One acquired snapshot bounds the complete native request. A later
-  // checkpoint can expand the frontier. This request does not change.
+  // One frontier snapshot bounds the complete request. A concurrent checkpoint
+  // can publish more pages, but it cannot change this validated range.
   const auto logical_page_count = LogicalPageCount();
   if (page_ids.empty() || std::ranges::any_of(page_ids, [logical_page_count](const auto page_id) {
         return page_id < FIRST_DATA_PAGE_ID || page_id >= logical_page_count;
@@ -295,8 +266,8 @@ auto DiskManager::BeginDirectReadPages(std::span<const page_id_t> page_ids,
 auto DiskManager::BeginDirectCheckpointWrite(page_id_t first_page_id, std::span<const struct iovec> vectors,
                                              page_id_t captured_logical_page_count) const
     -> Result<io::DirectWriteRequest> {
-  // Checkpoint data writes precede superblock publication. When the file grows,
-  // their captured frontier is newer than LogicalPageCount.
+  // Data pages precede superblock publication, so this request uses the
+  // captured checkpoint frontier rather than LogicalPageCount().
   if (captured_logical_page_count < FIRST_DATA_PAGE_ID || first_page_id < FIRST_DATA_PAGE_ID || vectors.empty() ||
       first_page_id >= captured_logical_page_count || vectors.size() > captured_logical_page_count - first_page_id) {
     return std::unexpected(Status::InvalidArgument("checkpoint write lies outside its captured logical page range"));

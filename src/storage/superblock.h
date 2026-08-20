@@ -12,40 +12,31 @@
 namespace tinydb::storage {
 
 /*
-** SUPERBLOCK PAGE AND STORAGE PROTOCOL
+** Pages 0 and 1 of the database are superblock slots A and B, each containing
+** a complete description of one durable checkpoint; the slot with the largest
+** generation is the selected slot.
 **
-** SuperblockPage holds the exact PAGE_SIZE bytes stored in one superblock
-** slot. It separates the on-disk byte format from the decoded Superblock
-** values used by the program. Its fixed size makes each superblock read and
-** write cover exactly one database page.
+** A checkpoint is published in the following order:
 **
-** Database pages 0 and 1 are slots A and B. Each slot contains a complete copy
-** of the metadata for one durable checkpoint. Two slots keep the previous copy
-** safe while TinyDB writes the next copy.
+**   1. Synchronize all changed data pages.
+**   2. Copy the selected metadata and increase its generation.
+**   3. Write the new metadata to the slot that is not selected.
+**   4. Synchronize the database file.
+**   5. Select the new slot in memory.
 **
-** The checkpoint protocol is:
+** The old slot is not modified during this sequence, so if a crash leaves the
+** new slot incomplete, the old slot and the WAL still describe a recoverable
+** state; in-memory metadata changes only after the new slot is durable.
 **
-**   1. The checkpoint manager synchronizes all changed data pages.
-**   2. TinyDB copies the current metadata, increases its generation, and
-**      records the new checkpoint state.
-**   3. TinyDB encodes the metadata in a SuperblockPage.
-**   4. TinyDB writes the page to the slot that is not currently selected.
-**   5. TinyDB synchronizes the database file.
-**   6. TinyDB selects the new slot in memory.
+** Opening decodes the slots independently and can proceed with one valid slot.
+** If both are valid, the larger generation wins; equal generations must
+** contain identical metadata because neither slot can be identified as newer.
 **
-** A crash during the write can leave the new slot incomplete. The previous
-** slot remains valid because this protocol does not modify it.
-**
-** Opening decodes both slots independently. It selects the valid slot with the
-** larger generation. One valid slot is sufficient. If both valid slots have
-** the same generation, their decoded metadata must match. Otherwise, TinyDB
-** reports corruption because it cannot identify one state as newer.
-**
-** The encoder writes each field at an explicit little-endian offset. It fills
-** reserved bytes with zero and includes them in the checksum. It never copies
-** the compiler-dependent memory layout of Superblock into the database file.
-** TinyDB rejects unknown required features. It preserves and ignores unknown
-** optional features.
+** SuperblockPage is the exact PAGE_SIZE byte image stored in one slot, with
+** fields written at explicit little-endian offsets instead of copied from the
+** C++ Superblock object.  Reserved bytes are zero and covered by the checksum;
+** unknown required features are rejected, while unknown optional features are
+** preserved but otherwise ignored.
 */
 using SuperblockPage = std::array<std::byte, PAGE_SIZE>;
 
@@ -59,7 +50,7 @@ inline constexpr std::uint64_t SUPPORTED_REQUIRED_FEATURES = 0;
 inline constexpr page_id_t FIRST_FORMAT_DATA_PAGE_ID = FIRST_DATA_PAGE_ID;
 
 /*
-** Stable byte offsets in the on-disk superblock:
+** The on-disk layout of a superblock is as follows:
 **
 **   0   magic[8]                 48  generation u64
 **   8   format major/minor       56  checkpoint LSN u64
@@ -86,27 +77,23 @@ inline constexpr std::size_t LOGICAL_PAGE_COUNT = 88;
 inline constexpr std::size_t CHECKSUM = 96;
 inline constexpr std::size_t ENCODED_BYTES = 100;
 }  // namespace superblock_offset
-
 struct Superblock {
-  // UUID prevents a WAL copied from another database from being replayed.
   DatabaseUuid database_uuid{};
 
-  // Generation chooses the newest valid slot. Zero is never valid.
+  // Zero is not a valid generation.
   std::uint64_t generation{1};
 
-  // Recovery can ignore WAL records at or before this LSN.
+  // WAL records at or before this LSN are already present in the database.
   std::uint64_t checkpoint_lsn{0};
 
-  // Zero means the corresponding persistent tree/index is currently absent.
+  // Zero means that the corresponding persistent root is absent.
   page_id_t root_page_id{0};
   page_id_t allocator_root_page_id{0};
 
-  // Number of logical page slots, including both superblocks and reusable
-  // data-page slots. Valid data-page references are less than this count.
+  // This count includes the two superblocks and all allocated or reusable
+  // data-page slots; a valid data-page reference is less than this value.
   page_id_t logical_page_count{FIRST_FORMAT_DATA_PAGE_ID};
 
-  // Unknown required bits make the format unsafe to interpret. TinyDB
-  // preserves and ignores unknown optional bits.
   std::uint64_t required_features{0};
   std::uint64_t optional_features{0};
 
@@ -123,19 +110,27 @@ struct SelectedSuperblock {
   SuperblockSlot slot;
 };
 
-// Encode always zero-fills the complete page before writing fields. Reserved
-// bytes therefore participate in the checksum and remain available for future
-// compatible extensions without exposing stale memory to disk.
+/*
+** Encode superblock into a new page, first filling the page with zero so that
+** reserved bytes participate in the checksum and cannot expose stale memory.
+** Return UnsupportedFormat for unknown required features or InvalidArgument
+** for invalid metadata.
+*/
 auto EncodeSuperblock(const Superblock &superblock) -> Result<SuperblockPage>;
 
-// Decode distinguishes an unknown format (UnsupportedFormat) from damage to a
-// recognized format (Corruption). Callers use that distinction to reject old
-// files without accidentally treating them as repairable TinyDB databases.
+/*
+** Decode one complete superblock page, returning UnsupportedFormat if the
+** magic, version, page size, or required features are not supported, or
+** Corruption if a recognized page has an invalid checksum, reserved field, or
+** metadata relationship.
+*/
 auto DecodeSuperblock(std::span<const std::byte> page) -> Result<Superblock>;
 
-// Selects the highest valid generation. A single valid copy is sufficient;
-// equal generations must be byte-for-byte equivalent in logical state because
-// there is otherwise no principled way to decide which one won.
+/*
+** Decode both superblock slots and return the valid slot with the largest
+** generation.  A single valid slot is sufficient, but if two valid slots have
+** the same generation, their metadata must be identical.
+*/
 auto SelectSuperblock(std::span<const std::byte> page_a,
                       std::span<const std::byte> page_b) -> Result<SelectedSuperblock>;
 

@@ -37,8 +37,6 @@ auto ValidState(const txn::DatabaseState &state) -> bool {
          state.checkpoint_lsn <= state.visible_lsn;
 }
 
-// Validates the final database state and encodes the terminal CommitState
-// payload. The payload also records the number of page images.
 auto EncodeCommitState(const txn::DatabaseState &state,
                        std::size_t page_image_count) -> Result<std::array<std::byte, COMMIT_STATE_PAYLOAD_BYTES>> {
   if (!ValidState(state) || page_image_count == 0 || page_image_count > std::numeric_limits<std::uint32_t>::max()) {
@@ -53,8 +51,6 @@ auto EncodeCommitState(const txn::DatabaseState &state,
   return payload;
 }
 
-// Decodes and validates a terminal CommitState payload. The result contains the
-// final database state and the expected number of page images.
 auto DecodeCommitState(std::span<const std::byte> payload,
                        std::uint64_t commit_lsn) -> Result<std::pair<txn::DatabaseState, std::uint32_t>> {
   if (payload.size() != COMMIT_STATE_PAYLOAD_BYTES) {
@@ -83,8 +79,6 @@ auto DecodeCommitState(std::span<const std::byte> payload,
   return std::pair{state, page_image_count};
 }
 
-// Reuses a validated page checksum to avoid a second scan of the page bytes.
-// Without validated_header, record encoding computes the complete record CRC.
 auto SealedPageCrc(const PageImageView &page) -> std::optional<std::uint32_t> {
   if (page.validated_header == nullptr) {
     return std::nullopt;
@@ -105,8 +99,6 @@ auto ValidateRecordMetadata(RecordType type, std::uint64_t lsn, std::size_t payl
   return {};
 }
 
-// Encodes one self-framing record into its exact destination span. An optional
-// payload CRC avoids a second payload scan.
 void EncodeRecordInto(std::span<std::byte> destination, RecordType type, std::uint64_t lsn,
                       std::span<const std::byte> payload, std::optional<std::uint32_t> payload_crc) {
   const auto total_bytes = RECORD_HEADER_BYTES + payload.size();
@@ -124,9 +116,6 @@ void EncodeRecordInto(std::span<std::byte> destination, RecordType type, std::ui
 }
 
 }  // namespace
-
-// Validates the logical header and encodes the fixed 64-byte WAL file header.
-// The function writes the CRC after it writes all other fields.
 auto EncodeHeader(const Header &header) -> Result<std::vector<char>> {
   if (!NonzeroUuid(header.database_uuid) || header.starting_lsn == 0) {
     return std::unexpected(Status::InvalidArgument("invalid WAL header identity or LSN"));
@@ -150,9 +139,6 @@ auto EncodeHeader(const Header &header) -> Result<std::vector<char>> {
   return output;
 }
 
-// Validates and decodes one complete 64-byte WAL file header. The function
-// rejects incompatible formats, checksum errors, invalid identities, and
-// nonzero reserved bytes.
 auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header> {
   if (bytes.size() != HEADER_BYTES) {
     return std::unexpected(Status::Corruption("WAL header has the wrong length"));
@@ -190,7 +176,6 @@ auto DecodeHeader(std::span<const std::byte> bytes) -> Result<Header> {
   return result;
 }
 
-// Encodes one checksummed WAL record into an owned byte vector.
 auto EncodeRecord(RecordType type, std::uint64_t lsn, std::span<const std::byte> payload) -> Result<std::vector<char>> {
   if (auto status = ValidateRecordMetadata(type, lsn, payload.size()); !status.Ok()) {
     return std::unexpected(std::move(status));
@@ -200,8 +185,6 @@ auto EncodeRecord(RecordType type, std::uint64_t lsn, std::span<const std::byte>
   return output;
 }
 
-// Validates one complete WAL record and returns a borrowed payload view. The
-// input bytes must outlive the returned Record.
 auto DecodeRecord(std::span<const std::byte> bytes) -> Result<Record> {
   if (bytes.size() < RECORD_HEADER_BYTES) {
     return std::unexpected(Status::Corruption("truncated WAL record header"));
@@ -225,9 +208,6 @@ auto DecodeRecord(std::span<const std::byte> bytes) -> Result<Record> {
   return Record{.type = type, .lsn = lsn, .payload = bytes.subspan(record_offset::PAYLOAD)};
 }
 
-// Validates and encodes one complete WAL transaction. Ordered page images come
-// first, and one terminal CommitState record comes last. Every record receives
-// commit_lsn.
 auto EncodeTransaction(std::uint64_t commit_lsn, std::span<const PageImageView> pages,
                        txn::DatabaseState state) -> Result<EncodedTransaction> {
   if (commit_lsn == std::numeric_limits<std::uint64_t>::max()) {
@@ -279,9 +259,6 @@ auto EncodeTransaction(std::uint64_t commit_lsn, std::span<const PageImageView> 
   };
 }
 
-// Decodes one complete WAL transaction and validates its record order, common
-// LSN, page images, terminal state, and page count. The result owns the decoded
-// page images and database state.
 auto DecodeTransaction(std::span<const std::byte> bytes,
                        std::uint64_t expected_commit_lsn) -> Result<DecodedTransaction> {
   if (bytes.empty() || expected_commit_lsn == 0) {

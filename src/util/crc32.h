@@ -10,10 +10,19 @@
 
 namespace tinydb {
 
-// IEEE CRC-32 (reflected polynomial 0xEDB88320), used as a corruption and
-// torn-write detector for persistent pages and WAL frames. It is not a
-// cryptographic authenticity check: an attacker who can rewrite the file can
-// also recompute it.
+/*
+** PORTABLE IEEE CRC-32
+**
+** Persistent pages and WAL records use the reflected IEEE polynomial
+** 0xEDB88320 as a corruption and torn-write detector. The accumulator consumes
+** sixteen bytes per iteration through independent slicing tables, with
+** explicit little-endian loads so alignment and host byte order cannot change
+** the result.
+**
+** The matrix table represents the effect of appending zero bytes in GF(2).
+** Crc32Combine and Crc32Replace use that operation to reuse checksums already
+** computed for page images instead of reading the same 4 KiB again.
+*/
 constexpr auto MakeCrc32Table() -> std::array<std::uint32_t, 256> {
   auto table = std::array<std::uint32_t, 256>{};
   for (std::uint32_t byte = 0; byte < table.size(); ++byte) {
@@ -95,12 +104,9 @@ inline auto Shift(std::uint32_t crc, std::size_t zero_bytes) noexcept -> std::ui
 }
 
 }  // namespace crc32_detail
-
 class Crc32Accumulator final {
  public:
   void Update(std::span<const std::byte> data) noexcept {
-    // Slicing by 16 keeps every lookup independent and halves loop/control
-    // overhead while retaining a portable IEEE CRC-32 implementation.
     while (data.size() >= 16) {
       const auto first = LoadLittleEndian(data) ^ remainder_;
       const auto second = LoadLittleEndian(data.subspan(4));
@@ -133,16 +139,16 @@ class Crc32Accumulator final {
   std::uint32_t remainder_{0xFFFFFFFFU};
 };
 
-// Explicit little-endian loads keep the slicing path identical across host
-// endian and alignment rules. Codecs store the returned value little-endian.
 inline auto Crc32(std::span<const std::byte> data) noexcept -> std::uint32_t {
   auto accumulator = Crc32Accumulator{};
   accumulator.Update(data);
   return accumulator.Finish();
 }
 
-// Calculate a CRC after treating one four-byte field as zero. The input bytes
-// remain unchanged.
+/*
+** Calculate a CRC while logically replacing one four-byte field with zero.
+** The offset must identify a complete field within data.
+*/
 inline auto Crc32WithZeroedU32(std::span<const std::byte> data, std::size_t offset) noexcept -> std::uint32_t {
   constexpr auto zero_field = std::array<std::byte, sizeof(std::uint32_t)>{};
   auto accumulator = Crc32Accumulator{};
@@ -152,14 +158,16 @@ inline auto Crc32WithZeroedU32(std::span<const std::byte> data, std::size_t offs
   return accumulator.Finish();
 }
 
-// Combine already-computed checksums without rereading either byte range.
+/* Combine two checksums without reading either byte range again. */
 inline auto Crc32Combine(std::uint32_t prefix_crc, std::uint32_t suffix_crc,
                          std::size_t suffix_bytes) noexcept -> std::uint32_t {
   return crc32_detail::Shift(prefix_crc, suffix_bytes) ^ suffix_crc;
 }
 
-// Update a complete checksum after replacing one equal-length byte range. The
-// caller supplies the number of bytes following the replaced range.
+/*
+** Update a complete checksum after replacing one equal-length byte range. The
+** caller supplies the number of bytes following that range.
+*/
 inline auto Crc32Replace(std::uint32_t original_crc, std::span<const std::byte> original,
                          std::span<const std::byte> replacement, std::size_t trailing_bytes) noexcept -> std::uint32_t {
   TINYDB_CHECK(original.size() == replacement.size(), "CRC replacement changed byte length");

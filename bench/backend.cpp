@@ -137,7 +137,7 @@ class SelectedBackend final : public Backend {
 
 class SelectedBackend final : public Backend {
  public:
-  SelectedBackend(const std::filesystem::path &root, const Config &config, const Scenario & /*scenario*/) {
+  SelectedBackend(const std::filesystem::path &root, const Config &config, const Scenario &) {
     std::filesystem::create_directories(root);
     const auto path = root / "database.sqlite";
     Check(sqlite3_open_v2(path.c_str(), &database_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr), "open");
@@ -327,7 +327,7 @@ void StabilizeLsm(lsm::DB &database) {
 
 class SelectedBackend final : public Backend {
  public:
-  SelectedBackend(const std::filesystem::path &root, const Config &config, const Scenario & /*scenario*/)
+  SelectedBackend(const std::filesystem::path &root, const Config &config, const Scenario &)
       : durable_(config.semantics == "durable") {
     std::filesystem::create_directories(root);
     auto options = lsm::Options{};
@@ -390,7 +390,6 @@ class SelectedBackend final : public Backend {
 #endif
 
 }  // namespace
-
 auto Identity() -> BackendIdentity {
 #if defined(KVBENCH_TINYDB)
   return {"tinydb", KVBENCH_TINYDB_FORMAT_FAMILY, true, true};

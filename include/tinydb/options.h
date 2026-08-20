@@ -6,8 +6,12 @@
 
 namespace tinydb {
 
-// This setting selects only the database page-file transport. Both modes use
-// the same persistent format, and the WAL remains buffered.
+/*
+** PageIoMode selects the transport for database pages; it does not change the
+** persistent format, locking protocol, or buffered WAL. Direct mode requires
+** aligned O_DIRECT transfers and fails when the host cannot provide them.
+** Buffered mode uses the kernel page cache and remains the default.
+*/
 enum class PageIoMode {
   Buffered,
   Direct,
@@ -30,9 +34,12 @@ struct CheckpointOptions final {
   std::chrono::milliseconds maximum_age{std::chrono::seconds(30)};
 };
 
-/* Verification stops recording ownership leaks after this many issues. A
-** malformed page or unsafe structural edge always stops traversal at the
-** first point where continuing would require trusting corrupted bytes. */
+/*
+** Verification records at most max_issues findings. Reaching this limit makes
+** the report incomplete because later findings may be omitted. Traversal also
+** stops at the first point where continuing would require trusting malformed
+** bytes or an unsafe structural edge.
+*/
 struct VerifyOptions final {
   std::size_t max_issues{64};
 };

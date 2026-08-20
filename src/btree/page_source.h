@@ -16,9 +16,11 @@ namespace storage {
 struct DataPageHeader;
 }
 
-// Transaction-private pages can defer their checksum until commit when an
-// internal builder or codec has proved the complete type-specific payload.
-// Any later mutable access clears this proof.
+/*
+** A private page may defer its checksum until commit after its builder has
+** proved the page-local type-specific payload. MutableData clears that proof,
+** so code cannot continue relying on a proof established for older bytes.
+*/
 enum class PagePayloadProof : std::uint8_t {
   None,
   Tree,
@@ -28,11 +30,15 @@ enum class PagePayloadProof : std::uint8_t {
 /*
 ** PAGE ACCESS BOUNDARY
 **
-** B+ tree algorithms know only four operations: Read, Edit, Allocate and
-** Free. They do not know whether bytes came from the committed cache, a write
-** transaction overlay, or an in-memory test model.
+** Tree mutation uses Read, Edit, Allocate, and Free without knowing whether
+** bytes came from the committed cache, a write-transaction overlay, or an
+** in-memory test model. Traversal can additionally request optional read
+** advice through PageReadStream.
+** This boundary keeps replacement policy, physical I/O, and copy-on-write
+** ownership out of the B+ tree algorithms; all implementations must expose
+** the same page identity and lease rules instead.
 **
-** Every successful operation returns a move-only PageHandle. While the handle
+** Read, Edit, and Allocate return a move-only PageHandle. While the handle
 ** lives, its byte address and page identity are stable. A source may not reuse
 ** or destroy the underlying page until the handle releases its lease. Read
 ** handles are immutable. Edit and Allocate handles accumulate a sticky dirty
@@ -59,8 +65,9 @@ class PageHandle {
         editable_(editable),
         payload_proof_(payload_proof) {}
 
-  // Immutable caches retain a frame through keepalive. Its shared ownership is
-  // also the exact eviction pin, so release needs no owner callback.
+  // The keepalive retains whatever immutable storage backs data. For a cache
+  // frame this shared owner is also an eviction pin; a staged direct-I/O page
+  // uses it to retain its arena lease and staging reservation.
   PageHandle(page_id_t page_id, const char *data, std::shared_ptr<const void> keepalive,
              const storage::DataPageHeader *validated_header = nullptr,
              PagePayloadProof payload_proof = PagePayloadProof::None)
@@ -100,7 +107,6 @@ class PageHandle {
   auto TreePayloadValidated() const noexcept -> bool { return payload_proof_ == PagePayloadProof::Tree; }
   auto OverflowPayloadValidated() const noexcept -> bool { return payload_proof_ == PagePayloadProof::Overflow; }
 
-  // Only Edit and Allocate may produce an editable handle.
   auto MutableData() -> char * {
     TINYDB_CHECK(editable_, "mutable access through a read-only page handle");
     // Any write invalidates the previous structural proof. The responsible
@@ -152,9 +158,12 @@ class PageHandle {
 /*
 ** TRAVERSAL READ STREAM
 **
-** A traversal uses one stream for semantic reads and exact read advice. The
-** reader can ignore the advice and preserve the same read results. An active
-** backend copies each advised page set before PrimeExactPages returns.
+** Read names the semantic page. A buffered reader uses a pass-through stream
+** and accepts no page advice. A direct reader may attach an available native
+** engine and stage exact pages, but staged bytes can satisfy only the same
+** page ID after validation. Advice failures are not returned; Read falls back
+** to its ordinary callback. An active backend copies the page-ID list before
+** PrimeExactPages returns.
 */
 class PageReadStream final {
  public:
@@ -181,8 +190,6 @@ class PageReadStream final {
 
   auto Read(page_id_t page_id) -> Result<PageHandle>;
 
-  // A false result means that PrimeExactPages has no effect. Semantic reads
-  // still use the ordinary PageReader path.
   auto AcceptsExactPagePlan() const noexcept -> bool { return state_ != nullptr && prime_ != nullptr; }
 
   void PrimeExactPages(std::span<const page_id_t> page_ids) noexcept {
@@ -191,8 +198,8 @@ class PageReadStream final {
     }
   }
 
-  // Stop advice and release its private state. Semantic reads remain valid and
-  // use the reader's ordinary demand path.
+  // Cancellation discards optional advice state. Read remains usable and
+  // invokes read_ without an active plan.
   void CancelAdvice() noexcept {
     if (state_ != nullptr && close_ != nullptr) {
       close_(owner_, state_);
@@ -224,7 +231,6 @@ class PageReadStream final {
   CloseFunction close_{nullptr};
 };
 
-/* Read algorithms depend only on stable immutable leases. */
 class PageReader {
  public:
   virtual ~PageReader() = default;

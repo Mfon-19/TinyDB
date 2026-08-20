@@ -41,7 +41,13 @@ struct Stats {
 };
 
 /*
-** IMMUTABLE CHECKPOINT MANAGER
+** CHECKPOINT EXECUTION
+**
+** Checkpoint decouples transaction commit latency from database-file
+** writeback. Commit synchronizes an append-only WAL transaction and can
+** publish the new state without waiting for page-file writeback; checkpoint
+** later folds many WAL-durable page versions into the random-access page file
+** and advances the recovery root once.
 **
 ** The database's writer permit serializes checkpoints with transactions.
 ** Readers continue during checkpoint I/O because committed frames and their
@@ -55,8 +61,9 @@ struct Stats {
 **   -> reset covered WAL -> fsync clean WAL header
 **
 ** Failure before the superblock fsync leaves the old superblock and WAL
-** authoritative. Failure afterward requires reopen, but the new checkpoint is
-** already a complete recovery basis.
+** authoritative. Once that fsync succeeds, the database file is a complete
+** recovery basis. If the later WAL reset fails, Wal marks the handle as
+** requiring recovery before further use.
 */
 class Manager final {
  public:
@@ -80,7 +87,7 @@ class Manager final {
   Wal &wal_;
   CheckpointOptions options_;
 
-  mutable std::mutex state_mutex_;  // protects failure/time diagnostics
+  mutable std::mutex state_mutex_;
   std::size_t consecutive_failures_{0};
   std::chrono::steady_clock::time_point last_success_{std::chrono::steady_clock::now()};
   std::optional<Status> last_failure_;

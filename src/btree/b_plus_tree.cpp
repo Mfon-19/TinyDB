@@ -22,20 +22,31 @@
 **
 ** Page views validate and search one encoded page. Page builders own one
 ** mutable logical page. This file establishes relationships between pages:
-** descent paths, split propagation, root replacement, and leaf chaining.
-** Cross-page verification belongs to verify/verifier.cpp so normal tree
-** mutation and hostile persistent-byte inspection cannot diverge.
+** descent paths, split propagation, root replacement, and leaf chaining. The
+** complete cross-page ownership audit remains in verify/verifier.cpp rather
+** than being duplicated in mutation code.
 **
 ** Internal separators are inclusive lower bounds for their right child, so an
 ** equal key always routes right. Leaves contain all values and form a strictly
 ** increasing forward chain. Root identity is ordinary logical state: growth
 ** allocates a new root above the old one.
 **
+** PageSource::Edit supplies page-level copy-on-write. An edit keeps the logical
+** page ID but rebuilds a transaction-private image; committed readers retain
+** the old immutable frame for that ID until publication. Only a split creates
+** another logical page, and only a root split changes the root ID. This keeps
+** tree algorithms independent of cache version ownership.
+**
 ** Put writes the destination leaf, then carries at most one pending separator
 ** upward. Each ancestor absorbs that separator or splits and replaces it with
-** another. Remove repacks only the destination leaf. Sparse pages remain
-** correct because parent separators are inclusive lower bounds, not exact
-** copies of the current child minimum.
+** another. Remove does not merge or rebalance tree pages; it repacks the
+** destination leaf and retires any overflow storage removed with the value.
+** Sparse pages remain correct because parent separators are inclusive lower
+** bounds, not exact copies of the current child minimum.
+** Omitting merge and root contraction limits tree-structure copy-on-write to
+** the destination leaf; allocator metadata may still record retired overflow
+** pages. The tradeoff is retained sparse pages and a height that does not
+** decrease.
 **
 ** Pages are retired only after every handle to them leaves scope. PageSource,
 ** not the tree, decides when the retired physical ID may be reused.
@@ -53,11 +64,13 @@ struct DescentPath final {
   std::size_t size{0};
 };
 
+/*
+** Fill path with page IDs from root through the destination leaf. Handles are
+** released at each level; retaining only IDs avoids pinning the tree while a
+** write is prepared. The fixed capacity prevents malformed child links from
+** causing unbounded traversal and exceeds the depth produced by the builders.
+*/
 auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view key, DescentPath &path) -> Status {
-  // Retain page ids, not page handles: each level is released before the next
-  // read. Sixty-four levels exceed the representable page population at
-  // minimum fanout, so the fixed path also turns a corrupt child cycle into a
-  // finite error without allocating on every Put.
   path.pages[0] = root_page_id;
   path.size = 1;
   for (;;) {
@@ -81,8 +94,6 @@ auto DescendToLeaf(PageSource *pages, page_id_t root_page_id, std::string_view k
   }
 }
 
-// Builders never decode raw bytes themselves. Opening the view first keeps
-// validation and interpretation in one implementation.
 auto LeafBuilder(PageHandle &page) -> Result<LeafPageBuilder> {
   const auto view = LeafPageView::Open(page);
   if (!view) {
@@ -106,15 +117,12 @@ void StoreTreePage(const Builder &builder, PageHandle &page) {
   page.MarkDirty();
 }
 
-// A split leaves its left half at the original page and carries this edge to
-// the parent. Parent overflow replaces it with another pending edge.
+/* A page split carries one separator and its right child toward the root. */
 struct PendingSeparator {
   std::string key;
   page_id_t right_child;
 };
 
-// Allocate the right leaf before changing the left. Split updates both leaf
-// contents and the forward link; the returned separator is the right minimum.
 auto SplitAndWrite(PageSource *pages, PageHandle &page, LeafPageBuilder &node,
                    bool tail_heavy) -> Result<PendingSeparator> {
   auto right_page = pages->Allocate();
@@ -128,8 +136,6 @@ auto SplitAndWrite(PageSource *pages, PageHandle &page, LeafPageBuilder &node,
   return PendingSeparator{std::move(split.separator), right_page->Id()};
 }
 
-// Internal splits promote one separator out of both halves. Its right child
-// becomes the new page's first child, preserving N separators/N+1 children.
 auto SplitAndWrite(PageSource *pages, PageHandle &page, InternalPageBuilder &node) -> Result<PendingSeparator> {
   auto right_page = pages->Allocate();
   if (!right_page) {
@@ -143,9 +149,6 @@ auto SplitAndWrite(PageSource *pages, PageHandle &page, InternalPageBuilder &nod
 }
 
 }  // namespace
-
-// Attach to a validated tree root or create the first empty leaf when the
-// database state has no root.
 auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusTree> {
   if (root_page_id == HEADER_PAGE_ID) {
     auto root_page = pages->Allocate();
@@ -157,13 +160,10 @@ auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusT
     return BPlusTree(pages, root_page_id);
   }
 
-  // Existing roots are normally read-only for the whole transaction. Do not
-  // copy one into the private write overlay merely to validate it.
   auto root_page = pages->Read(root_page_id);
   if (!root_page) {
     return std::unexpected(std::move(root_page).error());
   }
-  // Existing roots cross the full page-validation boundary before use.
   if (auto status = ValidateTreePage(*root_page); !status.Ok()) {
     return std::unexpected(std::move(status));
   }
@@ -171,8 +171,6 @@ auto BPlusTree::Open(PageSource *pages, page_id_t root_page_id) -> Result<BPlusT
 }
 
 auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
-  // Upsert the destination leaf, then carry at most one separator upward. Each
-  // ancestor either absorbs that edge or splits and replaces it with another.
   DescentPath path;
   if (auto status = DescendToLeaf(pages_, root_page_id_, key, path); !status.Ok()) {
     return status;
@@ -212,8 +210,9 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     }
   }
 
-  // The leaf descriptor changed before the old chain becomes allocator state.
-  // A later parent-split failure still aborts the complete private transaction.
+  // The leaf descriptor changes before the old chain becomes allocator state.
+  // If later propagation fails, the caller must abort rather than commit the
+  // partially updated private tree.
   if (retired_value.has_value()) {
     if (auto status = RetireOverflowValue(pages_, *retired_value); !status.Ok()) {
       return status;
@@ -223,7 +222,6 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     return {};
   }
 
-  // level names the child that just split; decrementing selects its parent.
   std::size_t level = path.size - 1;
   while (level > 0) {
     --level;
@@ -249,7 +247,6 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
     pending = std::move(*split);
   }
 
-  // No parent absorbed the final edge. The old root is already its left half.
   auto new_root = pages_->Allocate();
   if (!new_root) {
     return std::move(new_root).error();
@@ -260,8 +257,6 @@ auto BPlusTree::Put(std::string_view key, std::string_view value) -> Status {
   return {};
 }
 
-// Point lookup retains no ancestor path and allocates only when copying a
-// present value into the API result.
 auto BPlusTree::Read(PageReader *pages, page_id_t root_page_id,
                      std::string_view key) -> Result<std::optional<std::string>> {
   auto leaf_page = FindLeaf(pages, root_page_id, key);

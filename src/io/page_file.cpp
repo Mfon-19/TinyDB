@@ -24,15 +24,11 @@ auto OpenBuffered(const std::filesystem::path &path) -> Result<UniqueFd> {
 }
 
 auto OpenDirect(const std::filesystem::path &path) -> Result<DirectFile> {
-  // A direct request never opens a buffered descriptor. Every open and create
-  // attempt uses O_DIRECT and validates the alignment.
   auto opened = DirectFile::OpenExistingIfPresent(path, O_RDWR);
   if (!opened) {
     return std::unexpected(opened.error());
   }
   if (opened->has_value()) {
-    // Existing files can retain pages from prior buffered use. Ask the kernel
-    // to discard that residency before direct traffic starts.
     opened->value().DiscardBufferedResidency();  // NOLINT(bugprone-unchecked-optional-access)
     return std::move(opened->value());           // NOLINT(bugprone-unchecked-optional-access)
   }
@@ -45,8 +41,8 @@ auto OpenDirect(const std::filesystem::path &path) -> Result<DirectFile> {
     return std::move(created->value());  // NOLINT(bugprone-unchecked-optional-access)
   }
 
-  // One racing create is harmless. This code reopens the winner once and does
-  // not spin through repeated namespace changes.
+  // If another opener wins creation, reopen that file once rather than
+  // spinning through repeated namespace changes.
   auto retry = DirectFile::OpenExisting(path, O_RDWR);
   if (!retry) {
     return std::unexpected(retry.error());
@@ -56,10 +52,7 @@ auto OpenDirect(const std::filesystem::path &path) -> Result<DirectFile> {
 }
 
 }  // namespace
-
 auto PageFile::Open(const std::filesystem::path &path, PageIoMode mode) -> Result<PageFile> {
-  // Construction selects one variant alternative. Later operations cannot
-  // change the transport.
   switch (mode) {
     case PageIoMode::Buffered: {
       auto buffered = OpenBuffered(path);
@@ -89,8 +82,8 @@ auto PageFile::ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> page)
             return read.error();
           }
           if (*read != PAGE_SIZE) {
-            // Both transports require one complete persistent page. An EOF
-            // inside that page is corruption, not a successful short read.
+            // A database-page read must return exactly PAGE_SIZE bytes. EOF
+            // within the page is malformed persistent state, not success.
             return Status::Corruption("short read on a persistent page");
           }
           return {};
@@ -129,19 +122,14 @@ auto PageFile::WritePages(page_id_t first_page_id, std::span<const std::byte *co
           if (first_page_id > maximum_page_id || pages.size() - 1U > maximum_page_id - first_page_id) {
             return Status::InvalidArgument("database page write batch exceeds off_t");
           }
-          // Buffered mode preserves the physical page order. Direct mode can
-          // submit the same logical batch as one vectored run.
           for (auto index = std::size_t{0}; index < pages.size(); ++index) {
-            if (auto status =
-                    FullPwrite(transport.Get(), pages[index], PAGE_SIZE, (first_page_id + index) * PAGE_SIZE);
+            if (auto status = FullPwrite(transport.Get(), pages[index], PAGE_SIZE, (first_page_id + index) * PAGE_SIZE);
                 !status.Ok()) {
               return status;
             }
           }
           return {};
         } else {
-          // The strict direct transport validates its own batch shape, range,
-          // and alignment; a second copy of those checks here would drift.
           return transport.WritePages(first_page_id, pages);
         }
       },

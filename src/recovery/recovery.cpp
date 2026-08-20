@@ -72,9 +72,9 @@ auto ClearPartialWal(const std::filesystem::path &wal_path) -> Status {
 
 auto HasValidRecordAfter(std::span<const std::byte> bytes, std::size_t damaged_offset) -> bool {
   // Both record sizes and the file header are eight-byte aligned. Search only
-  // this exceptional damage path: finding a later checksummed record proves
-  // that malformed framing is in the durable middle rather than an incomplete
-  // append tail.
+  // this exceptional damage path. A valid record cannot have been appended
+  // beyond an incomplete tail, so finding one later makes the malformed
+  // framing durable middle damage rather than an ignorable final record.
   for (auto offset = damaged_offset + 8U; offset + wal_format::RECORD_HEADER_BYTES <= bytes.size(); offset += 8U) {
     const auto remaining = bytes.subspan(offset);
     const auto total = storage::GetLittleEndian<std::uint32_t>(remaining, wal_format::record_offset::TOTAL_BYTES);
@@ -308,11 +308,13 @@ auto BuildPlan(LoadedLog log, const storage::SelectedSuperblock &base) -> Result
 ** RECOVERY PAGE I/O
 **
 ** Recovery runs before construction of the cache and native I/O engine.
-** PageFile therefore uses buffered I/O or synchronous direct I/O for redo.
+** PageFile therefore performs synchronous buffered or direct redo according
+** to the selected transport; recovered bytes and durability order are the
+** same.
 **
 ** The decoded transactions own all source pages until Redo returns. Each batch
-** contains pointers into this stable ownership. If direct I/O needs alignment
-** staging, PageFile supplies a bounded buffer.
+** contains pointers into this stable ownership. DirectFile uses bounded
+** staging when those decoded WAL buffers are not aligned for O_DIRECT.
 */
 auto Redo(io::PageFile &database, const RecoveryPlan &plan) -> Status {
   if (plan.transactions.empty()) {
@@ -323,9 +325,8 @@ auto Redo(io::PageFile &database, const RecoveryPlan &plan) -> Status {
     return status;
   }
 
-  // Batches keep authenticated WAL order. Only adjacent physical IDs share a write.
-  // A gap, repeated page, or full bounded run flushes before the next image.
-  // Thus, batching does not reorder repeated updates across transactions.
+  // Only adjacent IDs share a batch. A gap, repeated page, or full batch
+  // flushes it, preserving authenticated WAL order across repeated updates.
   auto batch = std::array<const std::byte *, io::MAX_PAGE_WRITE_BATCH_PAGES>{};
   auto batch_first = page_id_t{0};
   auto batch_size = std::size_t{0};
@@ -355,8 +356,8 @@ auto Redo(io::PageFile &database, const RecoveryPlan &plan) -> Status {
   if (auto status = flush_batch(); !status.Ok()) {
     return status;
   }
-  // The first sync makes every recovered page image durable. The second sync
-  // publishes the recovered superblock and its new durable LSN frontier.
+  // The first sync makes every recovered page durable; the second publishes
+  // the recovered superblock and its durable LSN.
   if (auto status = database.Sync(); !status.Ok()) {
     return status;
   }
@@ -396,7 +397,6 @@ auto ResetWal(const std::filesystem::path &wal_path, const RecoveryPlan &plan) -
 }
 
 }  // namespace
-
 auto Recover(io::PageFile &database, const std::filesystem::path &wal_path) -> Status {
   auto loaded_result = LoadLog(wal_path);
   if (!loaded_result) {

@@ -92,7 +92,6 @@ auto RunCommand(tinydb::Database &engine, std::string_view program, const std::v
 }
 
 }  // namespace
-
 auto main(int argc, char **argv) -> int {
   try {
     const auto program = std::string_view{argc > 0 ? argv[0] : "TinyDB"};

@@ -253,7 +253,6 @@ auto Compiler() -> std::string {
 }
 
 }  // namespace
-
 [[noreturn]] void Fail(std::string_view message) {
   std::fprintf(stderr, "benchmark failed: %.*s\n", static_cast<int>(message.size()), message.data());
   std::exit(1);
@@ -510,7 +509,6 @@ void RunTrial(const std::filesystem::path &path, const Scenario &scenario, const
 }
 
 }  // namespace tinydb::bench
-
 auto main(int argc, char **argv) -> int {
   using namespace tinydb::bench;
 

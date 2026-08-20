@@ -138,7 +138,6 @@ auto ObserveSingleFileResidency(const std::filesystem::path &path) -> FileReside
 }
 
 }  // namespace
-
 auto FileResidency::Ratio() const -> double {
   return pages == 0 ? 0.0 : static_cast<double>(resident_pages) / static_cast<double>(pages);
 }

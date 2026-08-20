@@ -15,24 +15,28 @@
 namespace tinydb {
 
 /*
-** DISK MANAGER BOUNDARY
-**
-** DiskManager owns the database file descriptor and the metadata represented
-** by the newest durable superblock. It performs physical page I/O and durable
-** superblock selection. It does not track the newer state visible only through
-** the committed cache and WAL. Logical allocation, retirement, and reuse
-** belong to TransactionPages.
+** DiskManager owns the database PageFile and the metadata decoded from the
+** selected superblock, which together form the durable view of the database.
+** Newer state that exists only in the WAL or committed cache is not represented
+** here; logical page allocation, retirement, and reuse belong to
+** TransactionPages.
 **
 ** Checkpoint data pages are written against a captured logical page count.
-** CommitCheckpoint then writes only the inactive superblock and
-** synchronizes it before adopting the captured metadata in memory. Until that
-** synchronization succeeds, the previously selected superblock and WAL remain
-** the recovery basis. Superblocks are checkpoint artifacts. They are never
-** transaction page images.
+** CommitCheckpoint() writes the inactive superblock and synchronizes it before
+** adopting the captured metadata in memory.  Until that synchronization
+** succeeds, the old superblock and WAL remain the recovery basis, which makes
+** a superblock a checkpoint artifact rather than a transaction page.
 **
-** PageFile keeps the selected buffered or direct transport. Synchronous page
-** operations work in both modes. Native requests are optional direct-mode
-** acceleration.
+** PageFile selects buffered or direct I/O when the database is opened, and
+** both transports implement the synchronous page and durability operations
+** below; direct I/O additionally exposes prepared requests used by read-ahead
+** and native checkpoint batches.
+**
+** selected_ remains writer-owned because most metadata is read only during
+** open, commit, or checkpoint. The logical page frontier is copied into a
+** release/acquire atomic because direct read preparation can overlap
+** checkpoint publication. This avoids a mutex on every physical miss without
+** exposing newly grown pages before their superblock is durable.
 */
 
 class DiskManager {
@@ -52,20 +56,22 @@ class DiskManager {
   auto CheckpointLsn() const -> std::uint64_t;
   auto Uuid() const -> const DatabaseUuid &;
 
-  // Checkpoint data-page writes can extend the file to the committed logical
-  // page count. Allocation itself never performs this physical growth.
+  // This grows the physical file for checkpoint; logical allocation has
+  // already occurred.
   auto EnsurePageCount(page_id_t logical_page_count) -> Status;
 
   auto WriteCheckpointPages(page_id_t first_page_id, std::span<const std::byte *const> pages,
                             page_id_t captured_logical_page_count) const -> Status;
+
   auto CommitCheckpoint(page_id_t root_page_id, page_id_t allocator_root_page_id, page_id_t logical_page_count,
                         std::uint64_t checkpoint_lsn) -> Status;
   auto Sync() const -> Status;
 
   auto ReadPage(page_id_t page_id, std::span<std::byte, PAGE_SIZE> data) const -> Status;
   auto UsesDirectIo() const noexcept -> bool;
-  // Direct reads use the current durable page frontier. Direct checkpoint
-  // writes use the captured frontier that the checkpoint will publish.
+
+  // These entry points are used only by the direct-I/O engine. Reads use the
+  // durable page count; checkpoint writes use the count being published.
   auto BeginDirectReadPages(std::span<const page_id_t> page_ids,
                             std::span<std::byte> contiguous_pages) const -> Result<io::DirectReadRequest>;
   auto BeginDirectCheckpointWrite(page_id_t first_page_id, std::span<const struct iovec> vectors,
@@ -78,8 +84,9 @@ class DiskManager {
 
   io::PageFile file_;
   storage::SelectedSuperblock selected_{};
-  // Native reactor threads read this frontier without access to selected_. A
-  // successful superblock synchronization publishes the new value.
+
+  // Direct-I/O reads can overlap checkpoint publication, so the reactor reads
+  // this atomic copy instead of selected_. It advances only after fsync.
   std::atomic<page_id_t> durable_logical_page_count_{FIRST_DATA_PAGE_ID};
 };
 

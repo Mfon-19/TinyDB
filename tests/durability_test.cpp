@@ -48,7 +48,6 @@ auto FindDataWrite(const std::vector<tinydb::io::Call> &calls, const std::filesy
 }
 
 }  // namespace
-
 TEST(Durability, CreationOrder) {
   const auto path = tinydb::test::Path("creation_order");
   tinydb::test::Remove(path);
@@ -319,8 +318,9 @@ TEST(Durability, WalResetFailure) {
       },
       [&] { EXPECT_EQ(database.Checkpoint().Code(), tinydb::StatusCode::NeedsRecovery); });
 
-  // The database superblock was durable before reset began, so even an empty
-  // replacement WAL is a complete base, not data loss.
+  // The database superblock was durable before reset began, so the database
+  // file remains a complete recovery base even if the replacement WAL is
+  // empty.
   tinydb::test::Copy(path, copy);
   auto recovered = tinydb::Database::Open(copy).value();
   EXPECT_EQ(recovered.Get("key").value(), "value");

@@ -40,15 +40,9 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
     return std::unexpected(std::move(status));
   }
 
-  /*
-  ** PREPARE DURABLE AND VISIBLE OWNERSHIP
-  **
-  ** TransactionPages transfers one ordered image vector. WAL borrows and
-  ** copies those bytes before the same allocations move into committed frames.
-  ** The shared DatabaseState, dense page-table capacity, frame control blocks,
-  ** retirement list, and encoded WAL transaction are all created while failure
-  ** is still a definite abort.
-  */
+  // Prepare every allocation and ownership transfer before WAL I/O. WAL first
+  // copies the ordered page bytes; the same page leases then move into cache
+  // frames while failure still means a definite abort.
   const auto state = transaction.ResultingState();
   auto retired = std::vector<page_id_t>(transaction.RetiredPageIds().begin(), transaction.RetiredPageIds().end());
   std::ranges::sort(retired);
@@ -73,7 +67,6 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
     record_prepare();
     return std::unexpected(publication_plan.error());
   }
-  // This object remains private through WAL synchronization.
   auto published_state = std::make_shared<DatabaseState>(state);
   record_prepare();
 
@@ -83,13 +76,9 @@ auto CommitTransaction(Wal &wal, cache::CommittedPageCache &cache, ReaderGate &r
   if (!durable) {
     return std::unexpected(durable.error());
   }
-  /*
-  ** INFALLIBLE PUBLICATION
-  **
-  ** BeginPublication may wait for old readers, but publication itself only
-  ** consumes prepared ownership. No allocation, validation, maintenance, or
-  ** I/O remains after WAL durability.
-  */
+  // WAL durability has crossed the commit boundary. BeginPublication may wait
+  // for old readers, but the remaining steps only consume prepared ownership;
+  // no allocation, validation, maintenance, or I/O is permitted here.
   {
     const auto publication_started = Clock::now();
     auto publication = readers.BeginPublication();

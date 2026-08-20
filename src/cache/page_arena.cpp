@@ -20,7 +20,6 @@ namespace {
 auto PageBytesFor(std::size_t pages) noexcept -> std::size_t { return pages * PAGE_SIZE; }
 
 }  // namespace
-
 struct PageArena::Impl final {
   static constexpr auto MINIMUM_SLAB_PAGES = std::size_t{256};
   static constexpr auto MAXIMUM_SLAB_PAGES = std::size_t{1024};
@@ -35,13 +34,13 @@ struct PageArena::Impl final {
       if (count == 0 || count > std::numeric_limits<std::size_t>::max() / PAGE_SIZE) {
         throw std::length_error("direct page-arena slab is too large");
       }
-      // One entry per page is more than the maximum possible fragmentation.
-      // Thus, Release never allocates extent metadata.
+      // Reserve the worst-case number of free extents now, because Lease
+      // destruction must return a page without allocating.
       free_extents.reserve(count);
       free_extents.push_back(FreeExtent{.offset = 0, .count = count});
       const auto byte_count = PageBytesFor(count);
-      // MAP_SHARED supports MADV_REMOVE for free pages. Physical memory appears
-      // only after a caller writes to a mapped page.
+      // MAP_SHARED permits MADV_REMOVE during reclamation; the anonymous pages
+      // consume physical memory only after a caller writes them.
       auto *const mapping = ::mmap(nullptr, byte_count, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
       if (mapping == MAP_FAILED) {
         throw std::bad_alloc{};
@@ -51,8 +50,7 @@ struct PageArena::Impl final {
         throw std::bad_alloc{};
       }
       pages = static_cast<PageBytes *>(mapping);
-      // Default construction begins the PageBytes array lifetime without
-      // touching the lazily mapped character storage.
+      // Begin the PageBytes array lifetime without touching the lazy mapping.
       std::uninitialized_default_construct_n(pages, count);
     }
 
@@ -78,8 +76,7 @@ struct PageArena::Impl final {
 
   Impl(bool direct_backend, std::size_t target_pages)
       : direct(direct_backend),
-        // The cache, transaction, and staging limits control live leases. This
-        // value controls only the size of each normal mapping growth step.
+        // This value controls mapping growth, not the number of live leases.
         slab_pages(direct ? std::clamp(target_pages, MINIMUM_SLAB_PAGES, MAXIMUM_SLAB_PAGES) : 0) {}
 
   auto Reserve(std::size_t page_count) -> Allocation {
@@ -162,8 +159,8 @@ auto PageArena::AcquireBatch(std::span<Lease> destination) noexcept -> bool {
 
   if (!impl_->direct) {
     try {
-      // This temporary vector keeps new ownership. The destination changes
-      // only after every heap allocation succeeds.
+      // Hold every allocation here until the batch is complete, so failure
+      // cannot replace only a prefix of destination.
       auto pages = std::vector<std::unique_ptr<PageBytes>>{};
       pages.reserve(destination.size());
       for (auto index = std::size_t{0}; index < destination.size(); ++index) {
@@ -181,8 +178,8 @@ auto PageArena::AcquireBatch(std::span<Lease> destination) noexcept -> bool {
   }
 
   try {
-    // This temporary vector keeps new ownership. The destination changes
-    // only after the arena reserves the complete contiguous extent.
+    // Build the leases separately so destination changes only after the arena
+    // has reserved the complete contiguous extent.
     auto leases = std::vector<Lease>{};
     leases.reserve(destination.size());
     auto owner = shared_from_this();
@@ -298,7 +295,6 @@ auto PageArena::Lease::Bytes() const noexcept -> const PageBytes & {
 
 void PageArena::Lease::Reset() noexcept {
   if (owner_ != nullptr && page_ != nullptr) {
-    // The shared arena owner stays alive until Release restores the free list.
     owner_->Release(slab_index_, page_);
   }
   page_ = nullptr;

@@ -17,7 +17,6 @@ namespace {
 constexpr auto RANGE_READ_AHEAD_PAGES = std::size_t{128};
 
 }  // namespace
-
 auto BTreeCursor::First(PageReader *pages, page_id_t root_page_id,
                         page_id_t logical_page_count) -> Result<BTreeCursor> {
   return Position(pages, root_page_id, logical_page_count, std::nullopt);
@@ -39,8 +38,8 @@ auto BTreeCursor::Next(std::optional<std::string_view> upper) -> Status {
   if (range_advances_ != std::numeric_limits<std::size_t>::max()) {
     ++range_advances_;
   }
-  // Two moves prove that the caller performs a scan. This delay prevents
-  // read-ahead work for a cursor that reads one row.
+  // Wait for two moves before planning successors; this avoids speculative
+  // direct reads for cursors used as single-row lookups.
   if (range_advances_ >= 2U && !successor_primed_) {
     PrimeSuccessor(CurrentLeaf().NextLeaf(), upper);
   }
@@ -128,8 +127,9 @@ auto BTreeCursor::AdvanceToNonEmptyLeaf(page_id_t page_id, std::optional<std::st
     }
     auto followed_plan = false;
     if (planned_successor_index_ < planned_successors_.size()) {
-      // The authenticated leaf link remains authoritative. Use staged bytes
-      // only when the plan predicts that exact link.
+      // Advice may supply bytes only for the page named by the authenticated
+      // leaf link. A disagreement cancels advice rather than changing
+      // traversal.
       if (planned_successors_[planned_successor_index_] == page_id) {
         followed_plan = true;
       } else {
@@ -177,15 +177,12 @@ auto BTreeCursor::AdvanceToNonEmptyLeaf(page_id_t page_id, std::optional<std::st
 
   CancelRangeAdvice();
   page_ = PageHandle{};
-  // End-of-chain is represented by an absent view, not a fabricated position.
   leaf_.reset();
   index_ = 0;
   return {};
 }
 
 void BTreeCursor::CancelRangeAdvice() noexcept {
-  // A mismatch makes the remaining plan unprovable. Keep semantic reads
-  // active, but disable more advice for this cursor position.
   planned_successors_.clear();
   planned_successor_index_ = 0;
   successor_primed_ = false;
@@ -208,9 +205,8 @@ void BTreeCursor::PrimeSuccessor(page_id_t page_id, std::optional<std::string_vi
   if (range_planning_disabled_ || !Valid() || CurrentLeaf().NextLeaf() != page_id || !stream_.AcceptsExactPagePlan()) {
     return;
   }
-  // Internal edges provide the batch. The first planned leaf must also match
-  // the authenticated link from the current leaf, which stays authoritative;
-  // a mismatch proves no plan and the cursor follows the chain without advice.
+  // The first planned page must agree with the current leaf's authenticated
+  // successor. Otherwise the cursor disables advice and follows the chain.
   auto pages = PlanLeafPageSuccessorsForReadAhead(pages_, root_page_id_, page_.Id(), logical_page_count_, Key(),
                                                   RANGE_READ_AHEAD_PAGES, upper);
   if (!pages.empty() && pages.front() == page_id) {
