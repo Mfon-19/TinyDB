@@ -1,9 +1,0 @@
----
-Language: Cpp
-BasedOnStyle: Google
-ColumnLimit: 120
-DerivePointerAlignment: false
-PointerAlignment: Right
-IncludeBlocks: Preserve
-FixNamespaceComments: false
-InsertNewlineAtEOF: true

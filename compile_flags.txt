@@ -1,4 +1,0 @@
--std=c++23
--stdlib=libc++
--Iinclude
--Isrc
