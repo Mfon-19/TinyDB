@@ -16,11 +16,10 @@ Result<Database> Database::Open(std::string_view name) {
 
 Status Database::WritePage(storage::PageId page_id,
                            const storage::PageBytes &page) {
-  return disk_manager_.WritePage(page_id, page);
+  return buffer_pool_.WritePage(page_id, page);
 }
 
-Status Database::ReadPage(storage::PageId page_id,
-                          storage::PageBytes &page) const {
-  return disk_manager_.ReadPage(page_id, page);
+Status Database::ReadPage(storage::PageId page_id, storage::PageBytes &page) {
+  return buffer_pool_.ReadPage(page_id, page);
 }
 } // namespace tinydb
