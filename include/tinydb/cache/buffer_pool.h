@@ -6,7 +6,7 @@
  */
 
 #include "tinydb/storage/disk_manager.h"
-#include <vector>
+#include <unordered_map>
 
 namespace tinydb::cache {
 
@@ -19,14 +19,11 @@ public:
 
 private:
   struct Frame {
-    storage::PageId page_id;
     storage::PageBytes page;
   };
 
-  auto FindFrame(storage::PageId page_id) -> Frame *;
-
   storage::DiskManager disk_manager_;
-  std::vector<Frame> frames_;
+  std::unordered_map<storage::PageId, Frame> frames_;
 };
 
 } // namespace tinydb::cache
