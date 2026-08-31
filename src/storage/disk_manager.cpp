@@ -3,7 +3,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <format>
-#include <limits>
 #include <string>
 #include <sys/types.h>
 #include <unistd.h>
@@ -12,16 +11,8 @@ namespace tinydb::storage {
 
 namespace {
 
-auto PageOffset(PageId page_id) -> Result<off_t> {
-  constexpr auto max_offset =
-      static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
-  constexpr auto last_byte = static_cast<std::uint64_t>(PAGE_SIZE - 1);
-
-  if (page_id > (max_offset - last_byte) / PAGE_SIZE) {
-    return Err(Status::IoError("page offset is too large"));
-  }
-
-  return static_cast<off_t>(page_id * PAGE_SIZE);
+auto PageOffset(PageId page_id) noexcept -> off_t {
+  return static_cast<off_t>(page_id) * static_cast<off_t>(PAGE_SIZE);
 }
 
 auto SystemError(std::string_view operation, int error) -> Status {
@@ -65,14 +56,11 @@ Result<DiskManager> DiskManager::Open(const std::string_view name) {
 }
 
 Status DiskManager::WritePage(PageId page_id, const PageBytes &page) {
-  auto offset = PageOffset(page_id);
-  if (!offset) {
-    return std::move(offset.error());
-  }
+  const off_t offset = PageOffset(page_id);
 
   std::size_t written = 0;
   while (written < page.size()) {
-    const auto current_offset = *offset + static_cast<off_t>(written);
+    const auto current_offset = offset + static_cast<off_t>(written);
     const ssize_t count = pwrite(fd_, page.data() + written,
                                  page.size() - written, current_offset);
 
@@ -96,14 +84,11 @@ Status DiskManager::WritePage(PageId page_id, const PageBytes &page) {
 }
 
 Status DiskManager::ReadPage(PageId page_id, PageBytes &page) const {
-  auto offset = PageOffset(page_id);
-  if (!offset) {
-    return std::move(offset.error());
-  }
+  const off_t offset = PageOffset(page_id);
 
   std::size_t read_bytes = 0;
   while (read_bytes < page.size()) {
-    const auto current_offset = *offset + static_cast<off_t>(read_bytes);
+    const auto current_offset = offset + static_cast<off_t>(read_bytes);
     const ssize_t count = pread(fd_, page.data() + read_bytes,
                                 page.size() - read_bytes, current_offset);
 
