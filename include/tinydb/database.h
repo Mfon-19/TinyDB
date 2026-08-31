@@ -1,10 +1,12 @@
+#pragma once
+
 /*
- * This is the API to the database that callers use
+ * This is the API to the database that callers use.
  */
 
 #include "tinydb/storage/disk_manager.h"
-#include <algorithm>
 #include <string_view>
+#include <utility>
 
 namespace tinydb {
 
@@ -18,8 +20,8 @@ public:
   Database(Database &&) noexcept = default;
   Database &operator=(Database &&) noexcept = default;
 
-  Status Write(const std::string_view buffer);
-  Status Read(std::string &buffer);
+  Status WritePage(storage::PageId page_id, const storage::PageBytes &page);
+  Status ReadPage(storage::PageId page_id, storage::PageBytes &page) const;
 
 private:
   explicit Database(storage::DiskManager disk_manager)

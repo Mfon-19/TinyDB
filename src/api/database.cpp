@@ -1,24 +1,26 @@
 #include "tinydb/database.h"
-#include <string>
 #include <string_view>
+#include <utility>
 
 namespace tinydb {
 
 Result<Database> Database::Open(std::string_view name) {
   auto disk_manager = storage::DiskManager::Open(name);
 
-  if (!disk_manager.has_value()) {
-    return Err(Status::IoError("disk manager failed"));
+  if (!disk_manager) {
+    return Err(std::move(disk_manager.error()));
   }
 
   return Database{std::move(*disk_manager)};
 }
 
-Status Database::Write(const std::string_view buffer) {
-  return disk_manager_.Write(buffer);
+Status Database::WritePage(storage::PageId page_id,
+                           const storage::PageBytes &page) {
+  return disk_manager_.WritePage(page_id, page);
 }
 
-Status Database::Read(std::string &buffer) {
-  return disk_manager_.Read(buffer);
+Status Database::ReadPage(storage::PageId page_id,
+                          storage::PageBytes &page) const {
+  return disk_manager_.ReadPage(page_id, page);
 }
 } // namespace tinydb
