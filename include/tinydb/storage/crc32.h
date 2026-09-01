@@ -5,6 +5,7 @@
  * TinyDB page and WAL record.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 
@@ -20,5 +21,7 @@ private:
 };
 
 auto Crc32(std::span<const char> bytes) noexcept -> std::uint32_t;
+auto Crc32WithZeroedU32(std::span<const char> bytes,
+                        std::size_t offset) noexcept -> std::uint32_t;
 
 } // namespace tinydb::storage

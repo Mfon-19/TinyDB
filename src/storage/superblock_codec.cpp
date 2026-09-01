@@ -20,18 +20,6 @@ inline constexpr std::size_t VERSION_OFFSET = 8;
 inline constexpr std::size_t PAGE_SIZE_OFFSET = 10;
 inline constexpr std::size_t ROOT_PAGE_ID_OFFSET = 12;
 inline constexpr std::size_t CHECKSUM_OFFSET = 16;
-inline constexpr std::size_t CHECKSUM_SIZE = sizeof(std::uint32_t);
-
-auto SuperblockChecksum(const PageBytes &page) noexcept -> std::uint32_t {
-  const std::span<const char> bytes{page};
-  constexpr std::array<char, CHECKSUM_SIZE> zeros{};
-
-  Crc32Accumulator crc;
-  crc.Update(bytes.first(CHECKSUM_OFFSET));
-  crc.Update(zeros);
-  crc.Update(bytes.subspan(CHECKSUM_OFFSET + CHECKSUM_SIZE));
-  return crc.Finish();
-}
 
 } // namespace
 
@@ -47,7 +35,9 @@ auto EncodeSuperblock(const Superblock &superblock) -> Result<PageBytes> {
   little_endian::PutU16(page, PAGE_SIZE_OFFSET,
                         static_cast<std::uint16_t>(PAGE_SIZE));
   little_endian::PutU32(page, ROOT_PAGE_ID_OFFSET, superblock.root_page_id);
-  little_endian::PutU32(page, CHECKSUM_OFFSET, SuperblockChecksum(page));
+  little_endian::PutU32(
+      page, CHECKSUM_OFFSET,
+      Crc32WithZeroedU32(std::span<const char>{page}, CHECKSUM_OFFSET));
   return page;
 }
 
@@ -68,7 +58,7 @@ auto DecodeSuperblock(const PageBytes &page) -> Result<Superblock> {
   }
 
   const auto stored_checksum = little_endian::GetU32(bytes, CHECKSUM_OFFSET);
-  if (stored_checksum != SuperblockChecksum(page)) {
+  if (stored_checksum != Crc32WithZeroedU32(bytes, CHECKSUM_OFFSET)) {
     return Err(Status::Corruption("superblock checksum mismatch"));
   }
 
