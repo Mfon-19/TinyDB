@@ -4,11 +4,13 @@
 
 #include "tinydb/database.h"
 #include <algorithm>
+#include <cstddef>
 #include <iostream>
 #include <string_view>
 
 int main() {
-  auto db = tinydb::Database::Open("my_db.db");
+  constexpr std::size_t BUFFER_POOL_CAPACITY = 16;
+  auto db = tinydb::Database::Open("my_db.db", BUFFER_POOL_CAPACITY);
   if (!db) {
     std::cerr << db.error().Message() << '\n';
     return 1;
@@ -23,13 +25,13 @@ int main() {
     return 1;
   }
 
-  tinydb::storage::PageBytes read_page{};
-  if (auto status = db->ReadPage(0, read_page); !status.Ok()) {
-    std::cerr << status.Message() << '\n';
+  auto read_page = db->ReadPage(0);
+  if (!read_page) {
+    std::cerr << read_page.error().Message() << '\n';
     return 1;
   }
 
-  std::cout.write(read_page.data(),
+  std::cout.write(read_page->Bytes().data(),
                   static_cast<std::streamsize>(message.size()));
   std::cout << '\n';
 }

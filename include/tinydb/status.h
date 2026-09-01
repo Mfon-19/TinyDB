@@ -20,7 +20,9 @@ class Status {
 public:
   Status() = default; // Ok
 
-  [[nodiscard]] auto Ok() const noexcept -> bool { return code_ == Code::Ok; } // for callers
+  [[nodiscard]] auto Ok() const noexcept -> bool {
+    return code_ == Code::Ok;
+  } 
   [[nodiscard]] auto Message() const noexcept -> std::string_view {
     return message_;
   }
@@ -29,8 +31,12 @@ public:
     return {Code::IoError, std::move(message)};
   }
 
+  static auto ResourceExhausted(std::string message) -> Status {
+    return {Code::ResourceExhausted, std::move(message)};
+  }
+
 private:
-  enum class Code { Ok, IoError };
+  enum class Code { Ok, IoError, ResourceExhausted };
 
   Status(Code code, std::string message)
       : code_(code), message_(std::move(message)) {}
