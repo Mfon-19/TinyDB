@@ -18,6 +18,7 @@ class BufferPool {
 public:
   BufferPool(storage::DiskManager disk_manager, std::size_t capacity);
 
+  Result<storage::PageId> AllocatePage();
   Status WritePage(storage::PageId page_id, const storage::PageBytes &page);
   Result<PageHandle> ReadPage(storage::PageId page_id);
 

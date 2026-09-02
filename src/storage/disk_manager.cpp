@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <format>
 #include <string>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -29,7 +30,8 @@ DiskManager::~DiskManager() {
   }
 }
 
-DiskManager::DiskManager(DiskManager &&other) noexcept : fd_(other.fd_) {
+DiskManager::DiskManager(DiskManager &&other) noexcept
+    : fd_(other.fd_), next_page_id_(other.next_page_id_) {
   other.fd_ = -1;
 }
 
@@ -39,6 +41,7 @@ DiskManager &DiskManager::operator=(DiskManager &&other) noexcept {
       close(fd_);
     }
     fd_ = other.fd_;
+    next_page_id_ = other.next_page_id_;
     other.fd_ = -1;
   }
   return *this;
@@ -52,7 +55,31 @@ Result<DiskManager> DiskManager::Open(const std::string_view name) {
     return Err(SystemError("failed to open database", errno));
   }
 
-  return DiskManager{fd};
+  struct stat file_status {};
+  if (fstat(fd, &file_status) == -1) {
+    const int error = errno;
+    close(fd);
+    return Err(SystemError("failed to inspect database", error));
+  }
+
+  const auto file_size = static_cast<std::uint64_t>(file_status.st_size);
+  const auto page_count =
+      (file_size + PAGE_SIZE - 1) / static_cast<std::uint64_t>(PAGE_SIZE);
+  if (page_count >= INVALID_PAGE_ID) {
+    close(fd);
+    return Err(Status::ResourceExhausted("database has too many pages"));
+  }
+
+  const auto next_page_id =
+      static_cast<PageId>(page_count == 0 ? 1 : page_count);
+  return DiskManager{fd, next_page_id};
+}
+
+Result<PageId> DiskManager::AllocatePage() {
+  if (next_page_id_ == INVALID_PAGE_ID) {
+    return Err(Status::ResourceExhausted("database has too many pages"));
+  }
+  return next_page_id_++;
 }
 
 Status DiskManager::WritePage(PageId page_id, const PageBytes &page) {
@@ -78,6 +105,10 @@ Status DiskManager::WritePage(PageId page_id, const PageBytes &page) {
     }
 
     return SystemError("failed to write page", errno);
+  }
+
+  if (page_id >= next_page_id_ && page_id != INVALID_PAGE_ID) {
+    next_page_id_ = page_id + 1;
   }
 
   return {};

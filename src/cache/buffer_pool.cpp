@@ -6,6 +6,10 @@ namespace tinydb::cache {
 BufferPool::BufferPool(storage::DiskManager disk_manager, std::size_t capacity)
     : disk_manager_(std::move(disk_manager)), capacity_(capacity) {}
 
+Result<storage::PageId> BufferPool::AllocatePage() {
+  return disk_manager_.AllocatePage();
+}
+
 auto BufferPool::FindVictim() -> FrameIterator {
   auto frame = frames_.end();
   while (frame != frames_.begin()) {

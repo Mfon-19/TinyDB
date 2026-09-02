@@ -24,11 +24,14 @@ public:
   DiskManager(DiskManager &&other) noexcept;
   DiskManager &operator=(DiskManager &&other) noexcept;
 
+  Result<PageId> AllocatePage();
   Status WritePage(PageId page_id, const PageBytes &page);
   Status ReadPage(PageId page_id, PageBytes &page) const;
 
 private:
-  explicit DiskManager(int fd) noexcept : fd_(fd) {}
+  DiskManager(int fd, PageId next_page_id) noexcept
+      : fd_(fd), next_page_id_(next_page_id) {}
   int fd_; // the file descriptor we get from Linux
+  PageId next_page_id_;
 };
 } // namespace tinydb::storage
