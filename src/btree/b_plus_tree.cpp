@@ -10,8 +10,8 @@ namespace tinydb::btree {
 
 namespace {
 
-auto LowerBound(const storage::LeafPageView &leaf,
-                std::string_view key) noexcept -> std::size_t {
+auto LeafLowerBound(const storage::LeafPageView &leaf,
+                    std::string_view key) noexcept -> std::size_t {
   std::size_t first = 0;
   std::size_t count = leaf.EntryCount();
 
@@ -29,6 +29,28 @@ auto LowerBound(const storage::LeafPageView &leaf,
   return first;
 }
 
+auto FindChild(const storage::InternalPageView &page,
+               std::string_view key) noexcept -> storage::PageId {
+  std::size_t first = 0;
+  std::size_t count = page.EntryCount();
+
+  while (count != 0) {
+    const std::size_t step = count / 2;
+    const std::size_t middle = first + step;
+    if (key < page.Entry(middle).key) {
+      count = step;
+    } else {
+      first = middle + 1;
+      count -= step + 1;
+    }
+  }
+
+  if (first == 0) {
+    return page.LeftmostChild();
+  }
+  return page.Entry(first - 1).right_child;
+}
+
 } // namespace
 
 Status BPlusTree::Initialize() {
@@ -43,26 +65,44 @@ Status BPlusTree::Initialize() {
 
 auto BPlusTree::Get(std::string_view key)
     -> Result<std::optional<std::string>> {
-  auto page = buffer_pool_.ReadPage(root_page_id_);
-  if (!page) {
-    return Err(std::move(page.error()));
-  }
+  storage::PageId page_id = root_page_id_;
 
-  auto leaf = storage::DecodeLeafPage(root_page_id_, page->Bytes());
-  if (!leaf) {
-    return Err(std::move(leaf.error()));
-  }
+  while (true) {
+    auto page = buffer_pool_.ReadPage(page_id);
+    if (!page) {
+      return Err(std::move(page.error()));
+    }
 
-  const std::size_t index = LowerBound(*leaf, key);
-  if (index == leaf->EntryCount()) {
-    return std::optional<std::string>{};
-  }
+    switch (storage::PeekPageType(page->Bytes())) {
+    case storage::PageType::Leaf: {
+      auto leaf = storage::DecodeLeafPage(page_id, page->Bytes());
+      if (!leaf) {
+        return Err(std::move(leaf.error()));
+      }
 
-  const auto entry = leaf->Entry(index);
-  if (entry.key != key) {
-    return std::optional<std::string>{};
+      const std::size_t index = LeafLowerBound(*leaf, key);
+      if (index == leaf->EntryCount()) {
+        return std::optional<std::string>{};
+      }
+
+      const auto entry = leaf->Entry(index);
+      if (entry.key != key) {
+        return std::optional<std::string>{};
+      }
+      return std::optional<std::string>{std::string{entry.value}};
+    }
+    case storage::PageType::Internal: {
+      auto internal = storage::DecodeInternalPage(page_id, page->Bytes());
+      if (!internal) {
+        return Err(std::move(internal.error()));
+      }
+      page_id = FindChild(*internal, key);
+      break;
+    }
+    default:
+      return Err(Status::Corruption("unknown B+ tree page type"));
+    }
   }
-  return std::optional<std::string>{std::string{entry.value}};
 }
 
 Status BPlusTree::Put(std::string_view key, std::string_view value) {
@@ -84,7 +124,7 @@ Status BPlusTree::Put(std::string_view key, std::string_view value) {
       entries.push_back(leaf->Entry(index));
     }
 
-    const std::size_t index = LowerBound(*leaf, key);
+    const std::size_t index = LeafLowerBound(*leaf, key);
     if (index < entries.size() && entries[index].key == key) {
       entries[index].value = value;
     } else {
