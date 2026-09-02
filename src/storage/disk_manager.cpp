@@ -70,9 +70,7 @@ Result<DiskManager> DiskManager::Open(const std::string_view name) {
     return Err(Status::ResourceExhausted("database has too many pages"));
   }
 
-  const auto next_page_id =
-      static_cast<PageId>(page_count == 0 ? 1 : page_count);
-  return DiskManager{fd, next_page_id};
+  return DiskManager{fd, static_cast<PageId>(page_count)};
 }
 
 Result<PageId> DiskManager::AllocatePage() {

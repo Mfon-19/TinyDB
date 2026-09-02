@@ -23,6 +23,7 @@ public:
   Status Initialize();
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
   Status Put(std::string_view key, std::string_view value);
+  auto Delete(std::string_view key) -> Result<bool>;
 
 private:
   struct Split {
@@ -31,6 +32,7 @@ private:
     storage::PageId right;
   };
 
+  auto FindLeaf(std::string_view key) -> Result<storage::PageId>;
   auto Insert(storage::PageId page_id, std::string_view key,
               std::string_view value) -> Result<std::optional<Split>>;
   auto SplitLeaf(storage::PageId page_id, storage::PageId next_leaf,

@@ -24,6 +24,11 @@ public:
   DiskManager(DiskManager &&other) noexcept;
   DiskManager &operator=(DiskManager &&other) noexcept;
 
+  // Pages in the file, counting any allocated but not yet written.
+  [[nodiscard]] auto PageCount() const noexcept -> PageId {
+    return next_page_id_;
+  }
+
   Result<PageId> AllocatePage();
   Status WritePage(PageId page_id, const PageBytes &page);
   Status ReadPage(PageId page_id, PageBytes &page) const;

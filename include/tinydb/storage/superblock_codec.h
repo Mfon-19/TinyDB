@@ -1,7 +1,7 @@
 #pragma once
 
 /*
- * The superblock identifies the database format and 
+ * The superblock identifies the database format and
  * records the root page of the B+ tree.
  */
 
@@ -9,6 +9,8 @@
 #include "tinydb/storage/page.h"
 
 namespace tinydb::storage {
+
+inline constexpr PageId SUPERBLOCK_PAGE_ID = 0;
 
 struct Superblock {
   PageId root_page_id;

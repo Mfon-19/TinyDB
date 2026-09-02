@@ -85,8 +85,7 @@ Status BPlusTree::Initialize() {
   return buffer_pool_.WritePage(root_page_id_, *page);
 }
 
-auto BPlusTree::Get(std::string_view key)
-    -> Result<std::optional<std::string>> {
+auto BPlusTree::FindLeaf(std::string_view key) -> Result<PageId> {
   PageId page_id = root_page_id_;
 
   while (true) {
@@ -94,29 +93,41 @@ auto BPlusTree::Get(std::string_view key)
     if (!page) {
       return Err(std::move(page.error()));
     }
-
-    if (storage::PeekPageType(page->Bytes()) == storage::PageType::Internal) {
-      auto internal = storage::DecodeInternalPage(page_id, page->Bytes());
-      if (!internal) {
-        return Err(std::move(internal.error()));
-      }
-      const auto entries = Entries(*internal);
-      page_id = ChildAt(*internal, entries, ChildIndex(entries, key));
-      continue;
+    if (storage::PeekPageType(page->Bytes()) != storage::PageType::Internal) {
+      return page_id;
     }
 
-    auto leaf = storage::DecodeLeafPage(page_id, page->Bytes());
-    if (!leaf) {
-      return Err(std::move(leaf.error()));
+    auto internal = storage::DecodeInternalPage(page_id, page->Bytes());
+    if (!internal) {
+      return Err(std::move(internal.error()));
     }
-    const auto entries = Entries(*leaf);
-    const auto found =
-        std::ranges::lower_bound(entries, key, {}, &LeafEntry::key);
-    if (found == entries.end() || found->key != key) {
-      return std::nullopt;
-    }
-    return std::string{found->value};
+    const auto entries = Entries(*internal);
+    page_id = ChildAt(*internal, entries, ChildIndex(entries, key));
   }
+}
+
+auto BPlusTree::Get(std::string_view key)
+    -> Result<std::optional<std::string>> {
+  auto page_id = FindLeaf(key);
+  if (!page_id) {
+    return Err(std::move(page_id.error()));
+  }
+  auto page = buffer_pool_.ReadPage(*page_id);
+  if (!page) {
+    return Err(std::move(page.error()));
+  }
+  auto leaf = storage::DecodeLeafPage(*page_id, page->Bytes());
+  if (!leaf) {
+    return Err(std::move(leaf.error()));
+  }
+
+  const auto entries = Entries(*leaf);
+  const auto found =
+      std::ranges::lower_bound(entries, key, {}, &LeafEntry::key);
+  if (found == entries.end() || found->key != key) {
+    return std::nullopt;
+  }
+  return std::string{found->value};
 }
 
 Status BPlusTree::Put(std::string_view key, std::string_view value) {
@@ -140,6 +151,38 @@ Status BPlusTree::Put(std::string_view key, std::string_view value) {
     return std::move(root.error());
   }
   return buffer_pool_.WritePage(root_page_id_, *root);
+}
+
+auto BPlusTree::Delete(std::string_view key) -> Result<bool> {
+  auto page_id = FindLeaf(key);
+  if (!page_id) {
+    return Err(std::move(page_id.error()));
+  }
+  auto page = buffer_pool_.ReadPage(*page_id);
+  if (!page) {
+    return Err(std::move(page.error()));
+  }
+  auto leaf = storage::DecodeLeafPage(*page_id, page->Bytes());
+  if (!leaf) {
+    return Err(std::move(leaf.error()));
+  }
+
+  auto entries = Entries(*leaf);
+  const auto found =
+      std::ranges::lower_bound(entries, key, {}, &LeafEntry::key);
+  if (found == entries.end() || found->key != key) {
+    return false;
+  }
+  entries.erase(found);
+
+  auto encoded = storage::EncodeLeafPage(*page_id, leaf->NextLeaf(), entries);
+  if (!encoded) {
+    return Err(std::move(encoded.error()));
+  }
+  if (auto status = buffer_pool_.WritePage(*page_id, *encoded); !status.Ok()) {
+    return Err(std::move(status));
+  }
+  return true;
 }
 
 auto BPlusTree::Insert(PageId page_id, std::string_view key,
