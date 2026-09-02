@@ -6,7 +6,9 @@
 
 #include "tinydb/cache/buffer_pool.h"
 #include "tinydb/storage/page.h"
+#include "tinydb/storage/page_codec.h"
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -23,6 +25,24 @@ public:
   Status Put(std::string_view key, std::string_view value);
 
 private:
+  struct Split {
+    storage::PageId left;
+    std::string separator;
+    storage::PageId right;
+  };
+
+  auto Insert(storage::PageId page_id, std::string_view key,
+              std::string_view value) -> Result<std::optional<Split>>;
+  auto SplitLeaf(storage::PageId page_id, storage::PageId next_leaf,
+                 std::span<const storage::LeafEntry> entries) -> Result<Split>;
+  auto SplitInternal(storage::PageId page_id, storage::PageId leftmost_child,
+                     std::span<const storage::InternalEntry> entries)
+      -> Result<Split>;
+  auto AllocateSplit(storage::PageId page_id,
+                     std::string_view separator) -> Result<Split>;
+  auto WriteSplit(Split split, Result<storage::PageBytes> left,
+                  Result<storage::PageBytes> right) -> Result<Split>;
+
   cache::BufferPool &buffer_pool_;
   storage::PageId root_page_id_;
 };
