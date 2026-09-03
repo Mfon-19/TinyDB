@@ -74,6 +74,15 @@ auto ChildAt(const storage::InternalPageView &page,
   return index == 0 ? page.LeftmostChild() : entries[index - 1].right_child;
 }
 
+auto ReadPageCopy(cache::BufferPool &buffer_pool,
+                  PageId page_id) -> Result<storage::PageBytes> {
+  auto page = buffer_pool.ReadPage(page_id);
+  if (!page) {
+    return Err(std::move(page.error()));
+  }
+  return page->Bytes();
+}
+
 } // namespace
 
 Status BPlusTree::Initialize() {
@@ -154,15 +163,129 @@ Status BPlusTree::Put(std::string_view key, std::string_view value) {
 }
 
 auto BPlusTree::Delete(std::string_view key) -> Result<bool> {
-  auto page_id = FindLeaf(key);
-  if (!page_id) {
-    return Err(std::move(page_id.error()));
+  std::vector<PageId> freed_pages;
+  auto removal = Remove(root_page_id_, key, freed_pages);
+  if (!removal) {
+    return Err(std::move(removal.error()));
   }
-  auto page = buffer_pool_.ReadPage(*page_id);
+  for (const PageId page_id : freed_pages) {
+    buffer_pool_.FreePage(page_id);
+  }
+  return *removal;
+}
+
+Status BPlusTree::RebuildFreeList() {
+  const PageId page_count = buffer_pool_.PageCount();
+  std::vector<bool> reachable(page_count, false);
+  std::vector<PageId> pending{root_page_id_};
+
+  while (!pending.empty()) {
+    const PageId page_id = pending.back();
+    pending.pop_back();
+    if (page_id == 0 || page_id >= page_count || reachable[page_id]) {
+      return Status::Corruption("invalid or repeated B+ tree page ID");
+    }
+    reachable[page_id] = true;
+
+    auto page = ReadPageCopy(buffer_pool_, page_id);
+    if (!page) {
+      return std::move(page.error());
+    }
+    if (storage::PeekPageType(*page) != storage::PageType::Internal) {
+      auto leaf = storage::DecodeLeafPage(page_id, *page);
+      if (!leaf) {
+        return std::move(leaf.error());
+      }
+      continue;
+    }
+
+    auto internal = storage::DecodeInternalPage(page_id, *page);
+    if (!internal) {
+      return std::move(internal.error());
+    }
+
+    pending.push_back(internal->LeftmostChild());
+    for (std::size_t index = 0; index < internal->EntryCount(); ++index) {
+      pending.push_back(internal->Entry(index).right_child);
+    }
+  }
+
+  std::vector<PageId> free_pages;
+  for (PageId page_id = 1; page_id < page_count; ++page_id) {
+    if (!reachable[page_id]) {
+      free_pages.push_back(page_id);
+    }
+  }
+  buffer_pool_.SetFreePages(std::move(free_pages));
+  return {};
+}
+
+auto BPlusTree::Remove(PageId page_id, std::string_view key,
+                       std::vector<PageId> &freed_pages) -> Result<bool> {
+  auto page = ReadPageCopy(buffer_pool_, page_id);
   if (!page) {
     return Err(std::move(page.error()));
   }
-  auto leaf = storage::DecodeLeafPage(*page_id, page->Bytes());
+
+  if (storage::PeekPageType(*page) == storage::PageType::Internal) {
+    auto internal = storage::DecodeInternalPage(page_id, *page);
+    if (!internal) {
+      return Err(std::move(internal.error()));
+    }
+
+    PageId leftmost_child = internal->LeftmostChild();
+    auto entries = Entries(*internal);
+    const std::size_t child_index = ChildIndex(entries, key);
+    const PageId child_page_id =
+        child_index == 0 ? leftmost_child
+                         : entries[child_index - 1].right_child;
+    auto child = Remove(child_page_id, key, freed_pages);
+    if (!child) {
+      return Err(std::move(child.error()));
+    }
+    if (!*child) {
+      return false;
+    }
+
+    if (page_id == root_page_id_ || entries.size() > 1) {
+      const std::size_t separator_index =
+          std::min(child_index, entries.size() - 1);
+      const PageId left = separator_index == 0
+                              ? leftmost_child
+                              : entries[separator_index - 1].right_child;
+      const PageId right = entries[separator_index].right_child;
+      auto merged = MergeChildren(left, right, entries[separator_index].key);
+      if (!merged) {
+        return Err(std::move(merged.error()));
+      }
+      if (*merged) {
+        freed_pages.push_back(right);
+        entries.erase(entries.begin() +
+                      static_cast<std::ptrdiff_t>(separator_index));
+      }
+    }
+
+    if (entries.empty()) {
+      if (auto status = CollapseRoot(leftmost_child); !status.Ok()) {
+        return Err(std::move(status));
+      }
+      freed_pages.push_back(leftmost_child);
+      return true;
+    }
+
+    auto encoded =
+        storage::EncodeInternalPage(page_id, leftmost_child, entries);
+    if (!encoded) {
+      return Err(std::move(encoded.error()));
+    }
+    if (auto status = buffer_pool_.WritePage(page_id, *encoded);
+        !status.Ok()) {
+      return Err(std::move(status));
+    }
+    return true;
+  }
+
+  auto leaf = storage::DecodeLeafPage(page_id, *page);
   if (!leaf) {
     return Err(std::move(leaf.error()));
   }
@@ -175,14 +298,95 @@ auto BPlusTree::Delete(std::string_view key) -> Result<bool> {
   }
   entries.erase(found);
 
-  auto encoded = storage::EncodeLeafPage(*page_id, leaf->NextLeaf(), entries);
+  auto encoded = storage::EncodeLeafPage(page_id, leaf->NextLeaf(), entries);
   if (!encoded) {
     return Err(std::move(encoded.error()));
   }
-  if (auto status = buffer_pool_.WritePage(*page_id, *encoded); !status.Ok()) {
+  if (auto status = buffer_pool_.WritePage(page_id, *encoded); !status.Ok()) {
     return Err(std::move(status));
   }
   return true;
+}
+
+auto BPlusTree::MergeChildren(PageId left_id, PageId right_id,
+                              std::string_view separator) -> Result<bool> {
+  auto left = ReadPageCopy(buffer_pool_, left_id);
+  if (!left) {
+    return Err(std::move(left.error()));
+  }
+  auto right = ReadPageCopy(buffer_pool_, right_id);
+  if (!right) {
+    return Err(std::move(right.error()));
+  }
+
+  Result<storage::PageBytes> merged;
+  if (storage::PeekPageType(*left) == storage::PageType::Internal) {
+    auto left_page = storage::DecodeInternalPage(left_id, *left);
+    if (!left_page) {
+      return Err(std::move(left_page.error()));
+    }
+    auto right_page = storage::DecodeInternalPage(right_id, *right);
+    if (!right_page) {
+      return Err(std::move(right_page.error()));
+    }
+
+    auto entries = Entries(*left_page);
+    entries.push_back({separator, right_page->LeftmostChild()});
+    const auto right_entries = Entries(*right_page);
+    entries.insert(entries.end(), right_entries.begin(), right_entries.end());
+    merged = storage::EncodeInternalPage(left_id, left_page->LeftmostChild(),
+                                         entries);
+  } else {
+    auto left_page = storage::DecodeLeafPage(left_id, *left);
+    if (!left_page) {
+      return Err(std::move(left_page.error()));
+    }
+    auto right_page = storage::DecodeLeafPage(right_id, *right);
+    if (!right_page) {
+      return Err(std::move(right_page.error()));
+    }
+
+    auto entries = Entries(*left_page);
+    const auto right_entries = Entries(*right_page);
+    entries.insert(entries.end(), right_entries.begin(), right_entries.end());
+    merged = storage::EncodeLeafPage(left_id, right_page->NextLeaf(), entries);
+  }
+
+  if (!merged) {
+    return false;
+  }
+  if (auto status = buffer_pool_.WritePage(left_id, *merged); !status.Ok()) {
+    return Err(std::move(status));
+  }
+  return true;
+}
+
+Status BPlusTree::CollapseRoot(PageId child) {
+  auto page = ReadPageCopy(buffer_pool_, child);
+  if (!page) {
+    return std::move(page.error());
+  }
+
+  Result<storage::PageBytes> root;
+  if (storage::PeekPageType(*page) == storage::PageType::Internal) {
+    auto internal = storage::DecodeInternalPage(child, *page);
+    if (!internal) {
+      return std::move(internal.error());
+    }
+    root = storage::EncodeInternalPage(root_page_id_, internal->LeftmostChild(),
+                                       Entries(*internal));
+  } else {
+    auto leaf = storage::DecodeLeafPage(child, *page);
+    if (!leaf) {
+      return std::move(leaf.error());
+    }
+    root = storage::EncodeLeafPage(root_page_id_, leaf->NextLeaf(),
+                                   Entries(*leaf));
+  }
+  if (!root) {
+    return std::move(root.error());
+  }
+  return buffer_pool_.WritePage(root_page_id_, *root);
 }
 
 auto BPlusTree::Insert(PageId page_id, std::string_view key,

@@ -2,6 +2,8 @@
 #include "tinydb/cache/buffer_pool.h"
 #include "tinydb/storage/disk_manager.h"
 #include "tinydb/storage/page.h"
+#include "tinydb/storage/page_codec.h"
+#include <algorithm>
 #include <cstddef>
 #include <format>
 #include <gtest/gtest.h>
@@ -12,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unistd.h>
+#include <vector>
 
 namespace tinydb::btree {
 
@@ -67,6 +70,60 @@ auto Remove(BPlusTree &tree, std::string_view key) -> bool {
     ADD_FAILURE() << "Delete(" << key << "): " << result.error().Message();
   }
   return result.value_or(false);
+}
+
+auto LeftmostPath(cache::BufferPool &pool,
+                  storage::PageId page_id) -> std::vector<storage::PageId> {
+  std::vector<storage::PageId> path{page_id};
+  while (true) {
+    const auto page = pool.ReadPage(page_id).value();
+    if (storage::PeekPageType(page.Bytes()) != storage::PageType::Internal) {
+      return path;
+    }
+    page_id = storage::DecodeInternalPage(page_id, page.Bytes())
+                  .value()
+                  .LeftmostChild();
+    path.push_back(page_id);
+  }
+}
+
+auto LeafKeys(cache::BufferPool &pool,
+              storage::PageId root) -> std::vector<std::string> {
+  std::vector<std::string> keys;
+  storage::PageId page_id = LeftmostPath(pool, root).back();
+  while (page_id != storage::INVALID_PAGE_ID) {
+    const auto page = pool.ReadPage(page_id).value();
+    const auto leaf = storage::DecodeLeafPage(page_id, page.Bytes()).value();
+    for (std::size_t index = 0; index < leaf.EntryCount(); ++index) {
+      keys.emplace_back(leaf.Entry(index).key);
+    }
+    page_id = leaf.NextLeaf();
+  }
+  return keys;
+}
+
+void CollectLeafDepths(cache::BufferPool &pool, storage::PageId page_id,
+                       std::size_t depth, std::vector<std::size_t> &depths) {
+  const auto page = pool.ReadPage(page_id).value();
+  if (storage::PeekPageType(page.Bytes()) != storage::PageType::Internal) {
+    depths.push_back(depth);
+    return;
+  }
+
+  const auto internal =
+      storage::DecodeInternalPage(page_id, page.Bytes()).value();
+  CollectLeafDepths(pool, internal.LeftmostChild(), depth + 1, depths);
+  for (std::size_t index = 0; index < internal.EntryCount(); ++index) {
+    CollectLeafDepths(pool, internal.Entry(index).right_child, depth + 1,
+                      depths);
+  }
+}
+
+auto LeafDepths(cache::BufferPool &pool,
+                storage::PageId root) -> std::vector<std::size_t> {
+  std::vector<std::size_t> depths;
+  CollectLeafDepths(pool, root, 0, depths);
+  return depths;
 }
 
 auto Key(std::size_t index) -> std::string {
@@ -162,10 +219,12 @@ TEST(BPlusTree, MatchesAMapUnderRandomOperations) {
     ASSERT_TRUE(IsOk(t.tree.Put(key, model[key])));
   }
 
+  std::vector<std::string> removed;
   std::size_t index = 0;
   for (auto it = model.begin(); it != model.end(); ++index) {
     if (index % 3 == 0) {
       EXPECT_TRUE(Remove(t.tree, it->first));
+      removed.push_back(it->first);
       it = model.erase(it);
       continue;
     }
@@ -178,17 +237,39 @@ TEST(BPlusTree, MatchesAMapUnderRandomOperations) {
   for (const auto &[key, value] : model) {
     EXPECT_EQ(Lookup(t.tree, key), value);
   }
+  for (const auto &key : removed) {
+    EXPECT_EQ(Lookup(t.tree, key), std::nullopt);
+  }
+
+  std::vector<std::string> expected;
+  for (const auto &[key, value] : model) {
+    expected.push_back(key);
+  }
+  EXPECT_EQ(LeafKeys(t.pool, t.root), expected);
+  EXPECT_TRUE(IsOk(t.tree.RebuildFreeList()));
+  const auto depths = LeafDepths(t.pool, t.root);
+  EXPECT_TRUE(std::ranges::all_of(depths,
+                                  [&](std::size_t depth) {
+                                    return depth == depths.front();
+                                  }));
 }
 
 TEST(BPlusTree, DeleteEverythingThenReinsert) {
   TestTree t;
-  Fill(t.tree, 1000, 200);
+  Fill(t.tree, 1000, 1000);
+  ASSERT_GE(LeftmostPath(t.pool, t.root).size(), 3U);
+  const storage::PageId page_count = t.pool.PageCount();
   for (std::size_t i = 0; i < 1000; ++i) {
     EXPECT_TRUE(Remove(t.tree, Key(i))) << Key(i);
     EXPECT_EQ(Lookup(t.tree, Key(i)), std::nullopt) << Key(i);
   }
+  EXPECT_EQ(LeftmostPath(t.pool, t.root).size(), 1U);
+  EXPECT_TRUE(LeafKeys(t.pool, t.root).empty());
+
+  ASSERT_TRUE(IsOk(t.tree.RebuildFreeList()));
   Fill(t.tree, 1000, 250);
   ExpectFilled(t.tree, 1000, 250);
+  EXPECT_EQ(t.pool.PageCount(), page_count);
 }
 
 TEST(BPlusTree, PersistsAcrossReopen) {

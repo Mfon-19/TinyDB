@@ -1,4 +1,5 @@
 #include "tinydb/cache/buffer_pool.h"
+#include <cassert>
 #include <utility>
 
 namespace tinydb::cache {
@@ -6,8 +7,31 @@ namespace tinydb::cache {
 BufferPool::BufferPool(storage::DiskManager disk_manager, std::size_t capacity)
     : disk_manager_(std::move(disk_manager)), capacity_(capacity) {}
 
+auto BufferPool::PageCount() const noexcept -> storage::PageId {
+  return disk_manager_.PageCount();
+}
+
 Result<storage::PageId> BufferPool::AllocatePage() {
+  if (!free_pages_.empty()) {
+    const storage::PageId page_id = free_pages_.back();
+    free_pages_.pop_back();
+    return page_id;
+  }
   return disk_manager_.AllocatePage();
+}
+
+void BufferPool::FreePage(storage::PageId page_id) {
+  assert(page_id != 0);
+  assert(page_id != storage::INVALID_PAGE_ID);
+  if (auto found = page_table_.find(page_id); found != page_table_.end()) {
+    assert(found->second->pin_count == 0);
+    Evict(found->second);
+  }
+  free_pages_.push_back(page_id);
+}
+
+void BufferPool::SetFreePages(std::vector<storage::PageId> page_ids) {
+  free_pages_ = std::move(page_ids);
 }
 
 auto BufferPool::FindVictim() -> FrameIterator {

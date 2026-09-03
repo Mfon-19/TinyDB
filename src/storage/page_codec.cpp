@@ -15,14 +15,8 @@
  *
  *   header          magic, version, type, page ID, checksum, entry
  *                   count, link
- *   slot directory  a u16 cell offset per entry, in key order
- *   cells           packed back to back at the end of the page, in
- *                   entry order, so a cell ends where the next begins
- *
- * A cell is a u16 key size, the key, then the value, which fills the
- * rest of the cell. Internal pages store the right child page ID of
- * an entry as its value. The link is the next leaf of a leaf page and
- * the leftmost child of an internal page.
+ *   slot directory  a u16 cell offset per entry ordered by key
+ *   cells           packed back to back at the end of the page
  */
 
 namespace tinydb::storage {
@@ -86,7 +80,6 @@ auto CellBounds(const PageBytes &page, std::size_t entry_count,
   return {SlotOffset(page, index), end};
 }
 
-// The key and value in a cell that DecodePage has checked.
 auto CellAt(const PageBytes &page, std::size_t entry_count,
             std::size_t index) noexcept -> LeafEntry {
   const auto [begin, end] = CellBounds(page, entry_count, index);
@@ -139,7 +132,6 @@ auto EncodePage(PageType type, PageId page_id, PageId link,
   return page;
 }
 
-// Checks everything about a page that does not depend on its type.
 auto DecodePage(PageId expected_page_id, PageType expected_type,
                 const PageBytes &page) -> Result<PageHeader> {
   assert(ValidDataPageId(expected_page_id));

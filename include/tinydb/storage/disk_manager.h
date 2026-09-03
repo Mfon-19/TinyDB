@@ -24,7 +24,6 @@ public:
   DiskManager(DiskManager &&other) noexcept;
   DiskManager &operator=(DiskManager &&other) noexcept;
 
-  // Pages in the file, counting any allocated but not yet written.
   [[nodiscard]] auto PageCount() const noexcept -> PageId {
     return next_page_id_;
   }
@@ -36,7 +35,7 @@ public:
 private:
   DiskManager(int fd, PageId next_page_id) noexcept
       : fd_(fd), next_page_id_(next_page_id) {}
-  int fd_; // the file descriptor we get from Linux
+  int fd_;
   PageId next_page_id_;
 };
 } // namespace tinydb::storage

@@ -67,8 +67,12 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
   if (!root_page_id) {
     return Err(std::move(root_page_id.error()));
   }
-  return std::unique_ptr<Database>(
+  auto database = std::unique_ptr<Database>(
       new Database(std::move(buffer_pool), *root_page_id));
+  if (auto status = database->tree_.RebuildFreeList(); !status.Ok()) {
+    return Err(std::move(status));
+  }
+  return database;
 }
 
 auto Database::Get(std::string_view key) -> Result<std::optional<std::string>> {
