@@ -11,7 +11,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace tinydb::btree {
 
@@ -37,11 +36,10 @@ private:
   auto FindLeaf(std::string_view key) -> Result<storage::PageId>;
   auto Insert(storage::PageId page_id, std::string_view key,
               std::string_view value) -> Result<std::optional<Split>>;
-  auto Remove(storage::PageId page_id, std::string_view key,
-              std::vector<storage::PageId> &freed_pages) -> Result<bool>;
-  auto MergeChildren(storage::PageId left, storage::PageId right,
+  auto Remove(storage::PageId page_id, std::string_view key) -> Result<bool>;
+  auto MergeChildren(storage::PageId target, storage::PageId left,
+                     storage::PageId right,
                      std::string_view separator) -> Result<bool>;
-  Status CollapseRoot(storage::PageId child);
   auto SplitLeaf(storage::PageId page_id, storage::PageId next_leaf,
                  std::span<const storage::LeafEntry> entries) -> Result<Split>;
   auto SplitInternal(storage::PageId page_id, storage::PageId leftmost_child,

@@ -163,15 +163,7 @@ Status BPlusTree::Put(std::string_view key, std::string_view value) {
 }
 
 auto BPlusTree::Delete(std::string_view key) -> Result<bool> {
-  std::vector<PageId> freed_pages;
-  auto removal = Remove(root_page_id_, key, freed_pages);
-  if (!removal) {
-    return Err(std::move(removal.error()));
-  }
-  for (const PageId page_id : freed_pages) {
-    buffer_pool_.FreePage(page_id);
-  }
-  return *removal;
+  return Remove(root_page_id_, key);
 }
 
 Status BPlusTree::RebuildFreeList() {
@@ -220,8 +212,7 @@ Status BPlusTree::RebuildFreeList() {
   return {};
 }
 
-auto BPlusTree::Remove(PageId page_id, std::string_view key,
-                       std::vector<PageId> &freed_pages) -> Result<bool> {
+auto BPlusTree::Remove(PageId page_id, std::string_view key) -> Result<bool> {
   auto page = ReadPageCopy(buffer_pool_, page_id);
   if (!page) {
     return Err(std::move(page.error()));
@@ -233,13 +224,9 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key,
       return Err(std::move(internal.error()));
     }
 
-    PageId leftmost_child = internal->LeftmostChild();
     auto entries = Entries(*internal);
     const std::size_t child_index = ChildIndex(entries, key);
-    const PageId child_page_id =
-        child_index == 0 ? leftmost_child
-                         : entries[child_index - 1].right_child;
-    auto child = Remove(child_page_id, key, freed_pages);
+    auto child = Remove(ChildAt(*internal, entries, child_index), key);
     if (!child) {
       return Err(std::move(child.error()));
     }
@@ -247,34 +234,32 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key,
       return false;
     }
 
-    if (page_id == root_page_id_ || entries.size() > 1) {
-      const std::size_t separator_index =
-          std::min(child_index, entries.size() - 1);
-      const PageId left = separator_index == 0
-                              ? leftmost_child
-                              : entries[separator_index - 1].right_child;
-      const PageId right = entries[separator_index].right_child;
-      auto merged = MergeChildren(left, right, entries[separator_index].key);
-      if (!merged) {
-        return Err(std::move(merged.error()));
-      }
-      if (*merged) {
-        freed_pages.push_back(right);
-        entries.erase(entries.begin() +
-                      static_cast<std::ptrdiff_t>(separator_index));
-      }
-    }
-
-    if (entries.empty()) {
-      if (auto status = CollapseRoot(leftmost_child); !status.Ok()) {
-        return Err(std::move(status));
-      }
-      freed_pages.push_back(leftmost_child);
+    if (entries.size() == 1 && page_id != root_page_id_) {
       return true;
     }
 
-    auto encoded =
-        storage::EncodeInternalPage(page_id, leftmost_child, entries);
+    // Merge with the right sibling, or the left one for the last child.
+    const std::size_t left_index = std::min(child_index, entries.size() - 1);
+    const PageId left = ChildAt(*internal, entries, left_index);
+    const PageId right = ChildAt(*internal, entries, left_index + 1);
+    const PageId target = entries.size() == 1 ? page_id : left;
+    auto merged = MergeChildren(target, left, right, entries[left_index].key);
+    if (!merged) {
+      return Err(std::move(merged.error()));
+    }
+    if (!*merged) {
+      return true;
+    }
+
+    buffer_pool_.FreePage(right);
+    if (target == page_id) {
+      buffer_pool_.FreePage(left);
+      return true;
+    }
+    entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(left_index));
+
+    auto encoded = storage::EncodeInternalPage(
+        page_id, internal->LeftmostChild(), entries);
     if (!encoded) {
       return Err(std::move(encoded.error()));
     }
@@ -308,7 +293,7 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key,
   return true;
 }
 
-auto BPlusTree::MergeChildren(PageId left_id, PageId right_id,
+auto BPlusTree::MergeChildren(PageId target, PageId left_id, PageId right_id,
                               std::string_view separator) -> Result<bool> {
   auto left = ReadPageCopy(buffer_pool_, left_id);
   if (!left) {
@@ -334,7 +319,7 @@ auto BPlusTree::MergeChildren(PageId left_id, PageId right_id,
     entries.push_back({separator, right_page->LeftmostChild()});
     const auto right_entries = Entries(*right_page);
     entries.insert(entries.end(), right_entries.begin(), right_entries.end());
-    merged = storage::EncodeInternalPage(left_id, left_page->LeftmostChild(),
+    merged = storage::EncodeInternalPage(target, left_page->LeftmostChild(),
                                          entries);
   } else {
     auto left_page = storage::DecodeLeafPage(left_id, *left);
@@ -349,44 +334,16 @@ auto BPlusTree::MergeChildren(PageId left_id, PageId right_id,
     auto entries = Entries(*left_page);
     const auto right_entries = Entries(*right_page);
     entries.insert(entries.end(), right_entries.begin(), right_entries.end());
-    merged = storage::EncodeLeafPage(left_id, right_page->NextLeaf(), entries);
+    merged = storage::EncodeLeafPage(target, right_page->NextLeaf(), entries);
   }
 
   if (!merged) {
     return false;
   }
-  if (auto status = buffer_pool_.WritePage(left_id, *merged); !status.Ok()) {
+  if (auto status = buffer_pool_.WritePage(target, *merged); !status.Ok()) {
     return Err(std::move(status));
   }
   return true;
-}
-
-Status BPlusTree::CollapseRoot(PageId child) {
-  auto page = ReadPageCopy(buffer_pool_, child);
-  if (!page) {
-    return std::move(page.error());
-  }
-
-  Result<storage::PageBytes> root;
-  if (storage::PeekPageType(*page) == storage::PageType::Internal) {
-    auto internal = storage::DecodeInternalPage(child, *page);
-    if (!internal) {
-      return std::move(internal.error());
-    }
-    root = storage::EncodeInternalPage(root_page_id_, internal->LeftmostChild(),
-                                       Entries(*internal));
-  } else {
-    auto leaf = storage::DecodeLeafPage(child, *page);
-    if (!leaf) {
-      return std::move(leaf.error());
-    }
-    root = storage::EncodeLeafPage(root_page_id_, leaf->NextLeaf(),
-                                   Entries(*leaf));
-  }
-  if (!root) {
-    return std::move(root.error());
-  }
-  return buffer_pool_.WritePage(root_page_id_, *root);
 }
 
 auto BPlusTree::Insert(PageId page_id, std::string_view key,
