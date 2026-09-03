@@ -87,4 +87,8 @@ auto Database::Delete(std::string_view key) -> Result<bool> {
   return tree_.Delete(key);
 }
 
+auto Database::Seek(std::string_view key) -> Result<btree::Cursor> {
+  return tree_.Seek(key);
+}
+
 } // namespace tinydb

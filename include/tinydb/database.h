@@ -27,6 +27,7 @@ public:
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
   Status Put(std::string_view key, std::string_view value);
   auto Delete(std::string_view key) -> Result<bool>;
+  auto Seek(std::string_view key) -> Result<btree::Cursor>;
 
 private:
   Database(cache::BufferPool buffer_pool, storage::PageId root_page_id);

@@ -1,6 +1,7 @@
 #include "tinydb/btree/b_plus_tree.h"
 #include "tinydb/storage/page_codec.h"
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -164,6 +165,14 @@ Status BPlusTree::Put(std::string_view key, std::string_view value) {
 
 auto BPlusTree::Delete(std::string_view key) -> Result<bool> {
   return Remove(root_page_id_, key);
+}
+
+auto BPlusTree::Seek(std::string_view key) -> Result<Cursor> {
+  Cursor cursor(*this);
+  if (auto status = cursor.Position(key, true); !status.Ok()) {
+    return Err(std::move(status));
+  }
+  return cursor;
 }
 
 Status BPlusTree::RebuildFreeList() {
@@ -471,6 +480,60 @@ auto BPlusTree::WriteSplit(Split split, Result<storage::PageBytes> left,
     return Err(std::move(status));
   }
   return split;
+}
+
+auto Cursor::Key() const noexcept -> std::string_view {
+  assert(Valid());
+  return leaf_->Entry(index_).key;
+}
+
+auto Cursor::Value() const noexcept -> std::string_view {
+  assert(Valid());
+  return leaf_->Entry(index_).value;
+}
+
+Status Cursor::Next() {
+  assert(Valid());
+  if (index_ + 1 < leaf_->EntryCount()) {
+    ++index_;
+    return {};
+  }
+
+  const std::string last_key{Key()};
+  return Position(last_key, false);
+}
+
+Status Cursor::Position(std::string_view key, bool inclusive) {
+  leaf_.reset();
+  auto page_id = tree_->FindLeaf(key);
+  if (!page_id) {
+    return std::move(page_id.error());
+  }
+
+  for (PageId leaf_id = *page_id; leaf_id != storage::INVALID_PAGE_ID;) {
+    auto page = tree_->buffer_pool_.ReadPage(leaf_id);
+    if (!page) {
+      return std::move(page.error());
+    }
+    *page_ = page->Bytes();
+    auto leaf = storage::DecodeLeafPage(leaf_id, *page_);
+    if (!leaf) {
+      return std::move(leaf.error());
+    }
+
+    const auto entries = Entries(*leaf);
+    auto found = std::ranges::lower_bound(entries, key, {}, &LeafEntry::key);
+    if (!inclusive && found != entries.end() && found->key == key) {
+      ++found;
+    }
+    if (found != entries.end()) {
+      leaf_ = *leaf;
+      index_ = static_cast<std::size_t>(found - entries.begin());
+      return {};
+    }
+    leaf_id = leaf->NextLeaf();
+  }
+  return {};
 }
 
 } // namespace tinydb::btree
