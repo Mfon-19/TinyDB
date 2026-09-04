@@ -11,3 +11,8 @@ target_compile_options(b_plus_tree_test PRIVATE -Wall -Wextra -Wpedantic)
 
 include(GoogleTest)
 gtest_discover_tests(b_plus_tree_test)
+
+add_executable(database_test database_test.cpp)
+target_link_libraries(database_test PRIVATE tinydb GTest::gtest_main)
+target_compile_options(database_test PRIVATE -Wall -Wextra -Wpedantic)
+gtest_discover_tests(database_test)

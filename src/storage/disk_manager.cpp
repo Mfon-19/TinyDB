@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <format>
 #include <string>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -19,6 +20,15 @@ auto PageOffset(PageId page_id) noexcept -> off_t {
 auto SystemError(std::string_view operation, int error) -> Status {
   return Status::IoError(
       std::format("{}: {}", operation, std::strerror(error)));
+}
+
+Status SyncFile(int fd, std::string_view operation) {
+  while (fsync(fd) == -1) {
+    if (errno != EINTR) {
+      return SystemError(operation, errno);
+    }
+  }
+  return {};
 }
 
 } // namespace
@@ -55,6 +65,15 @@ Result<DiskManager> DiskManager::Open(const std::string_view name) {
     return Err(SystemError("failed to open database", errno));
   }
 
+  if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
+    const int error = errno;
+    close(fd);
+    if (error == EWOULDBLOCK) {
+      return Err(Status::ResourceExhausted("database is already open"));
+    }
+    return Err(SystemError("failed to lock database", error));
+  }
+
   struct stat file_status {};
   if (fstat(fd, &file_status) == -1) {
     const int error = errno;
@@ -78,6 +97,24 @@ Result<PageId> DiskManager::AllocatePage() {
     return Err(Status::ResourceExhausted("database has too many pages"));
   }
   return next_page_id_++;
+}
+
+Status DiskManager::Sync() const {
+  return SyncFile(fd_, "failed to synchronize database");
+}
+
+Status SyncParentDirectory(std::string_view path) {
+  const auto slash = path.find_last_of('/');
+  const std::string parent = slash == std::string_view::npos
+                                 ? "."
+                                 : std::string{path.substr(0, slash == 0 ? 1 : slash)};
+  const int fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd == -1) {
+    return SystemError("failed to open database directory", errno);
+  }
+  auto status = SyncFile(fd, "failed to synchronize database directory");
+  close(fd);
+  return status;
 }
 
 Status DiskManager::WritePage(PageId page_id, const PageBytes &page) {

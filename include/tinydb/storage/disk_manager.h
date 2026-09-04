@@ -3,7 +3,8 @@
 /*
  * This is the interface with Linux that handles the initial
  * creation of the database file and subsequent reading and
- * writing to the file.
+ * writing to the file. The open descriptor holds an exclusive 
+ * process lock.
  */
 
 #include "tinydb/status.h"
@@ -31,6 +32,7 @@ public:
   Result<PageId> AllocatePage();
   Status WritePage(PageId page_id, const PageBytes &page);
   Status ReadPage(PageId page_id, PageBytes &page) const;
+  Status Sync() const;
 
 private:
   DiskManager(int fd, PageId next_page_id) noexcept
@@ -38,4 +40,6 @@ private:
   int fd_;
   PageId next_page_id_;
 };
+
+Status SyncParentDirectory(std::string_view path);
 } // namespace tinydb::storage

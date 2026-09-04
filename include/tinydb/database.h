@@ -1,7 +1,8 @@
 #pragma once
 
 /*
- * This is the API to the database that callers use.
+ * This is the API to the database that callers use. Only one open Database
+ * may own a file at a time, including within the same process.
  */
 
 #include "tinydb/btree/b_plus_tree.h"

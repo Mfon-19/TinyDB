@@ -273,17 +273,25 @@ TEST(BPlusTree, DeleteEverythingThenReinsert) {
 }
 
 TEST(BPlusTree, PersistsAcrossReopen) {
-  TestTree t;
-  Fill(t.tree, 800, 400);
-  EXPECT_TRUE(Remove(t.tree, Key(7)));
+  const std::string path = TempFile();
+  storage::PageId root;
+  {
+    cache::BufferPool pool{storage::DiskManager::Open(path).value(), 8};
+    root = AllocateRoot(pool);
+    BPlusTree tree{pool, root};
+    ASSERT_TRUE(IsOk(tree.Initialize()));
+    Fill(tree, 800, 400);
+    EXPECT_TRUE(Remove(tree, Key(7)));
+  }
 
-  cache::BufferPool pool{storage::DiskManager::Open(t.path).value(), 8};
-  BPlusTree tree{pool, t.root};
+  cache::BufferPool pool{storage::DiskManager::Open(path).value(), 8};
+  BPlusTree tree{pool, root};
   ExpectFilled(tree, 7, 400);
   EXPECT_EQ(Lookup(tree, Key(7)), std::nullopt);
   for (std::size_t i = 8; i < 800; ++i) {
     EXPECT_EQ(Lookup(tree, Key(i)), Value(Key(i), 400)) << Key(i);
   }
+  unlink(path.c_str());
 }
 
 } // namespace

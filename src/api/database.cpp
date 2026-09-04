@@ -9,18 +9,23 @@ namespace tinydb {
 
 namespace {
 
-auto Create(cache::BufferPool &buffer_pool) -> Result<storage::PageId> {
-  auto superblock_page_id = buffer_pool.AllocatePage();
+auto Create(storage::DiskManager &disk_manager,
+            std::string_view name) -> Result<storage::PageId> {
+  auto superblock_page_id = disk_manager.AllocatePage();
   if (!superblock_page_id) {
     return Err(std::move(superblock_page_id.error()));
   }
   assert(*superblock_page_id == storage::SUPERBLOCK_PAGE_ID);
 
-  auto root_page_id = buffer_pool.AllocatePage();
+  auto root_page_id = disk_manager.AllocatePage();
   if (!root_page_id) {
     return Err(std::move(root_page_id.error()));
   }
-  if (auto status = btree::BPlusTree{buffer_pool, *root_page_id}.Initialize();
+  auto root = storage::EncodeLeafPage(*root_page_id, storage::INVALID_PAGE_ID, {});
+  if (!root) {
+    return Err(std::move(root.error()));
+  }
+  if (auto status = disk_manager.WritePage(*root_page_id, *root);
       !status.Ok()) {
     return Err(std::move(status));
   }
@@ -30,19 +35,26 @@ auto Create(cache::BufferPool &buffer_pool) -> Result<storage::PageId> {
     return Err(std::move(superblock.error()));
   }
   if (auto status =
-          buffer_pool.WritePage(storage::SUPERBLOCK_PAGE_ID, *superblock);
+          disk_manager.WritePage(storage::SUPERBLOCK_PAGE_ID, *superblock);
       !status.Ok()) {
+    return Err(std::move(status));
+  }
+  if (auto status = disk_manager.Sync(); !status.Ok()) {
+    return Err(std::move(status));
+  }
+  if (auto status = storage::SyncParentDirectory(name); !status.Ok()) {
     return Err(std::move(status));
   }
   return *root_page_id;
 }
 
-auto Load(cache::BufferPool &buffer_pool) -> Result<storage::PageId> {
-  auto page = buffer_pool.ReadPage(storage::SUPERBLOCK_PAGE_ID);
-  if (!page) {
-    return Err(std::move(page.error()));
+auto Load(storage::DiskManager &disk_manager) -> Result<storage::PageId> {
+  storage::PageBytes page{};
+  if (auto status = disk_manager.ReadPage(storage::SUPERBLOCK_PAGE_ID, page);
+      !status.Ok()) {
+    return Err(std::move(status));
   }
-  auto superblock = storage::DecodeSuperblock(page->Bytes());
+  auto superblock = storage::DecodeSuperblock(page);
   if (!superblock) {
     return Err(std::move(superblock.error()));
   }
@@ -62,11 +74,11 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
   }
 
   const bool is_new = disk_manager->PageCount() == 0;
-  cache::BufferPool buffer_pool(std::move(*disk_manager), buffer_pool_capacity);
-  auto root_page_id = is_new ? Create(buffer_pool) : Load(buffer_pool);
+  auto root_page_id = is_new ? Create(*disk_manager, name) : Load(*disk_manager);
   if (!root_page_id) {
     return Err(std::move(root_page_id.error()));
   }
+  cache::BufferPool buffer_pool(std::move(*disk_manager), buffer_pool_capacity);
   auto database = std::unique_ptr<Database>(
       new Database(std::move(buffer_pool), *root_page_id));
   if (auto status = database->tree_.RebuildFreeList(); !status.Ok()) {
