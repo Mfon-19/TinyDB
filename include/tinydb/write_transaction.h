@@ -1,9 +1,5 @@
 #pragma once
 
-/*
- * A write transaction over a private context
- */
-
 #include "tinydb/btree/b_plus_tree.h"
 #include "tinydb/detail/page_context.h"
 #include <mutex>

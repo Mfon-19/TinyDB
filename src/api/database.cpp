@@ -53,11 +53,11 @@ auto Load(storage::DiskManager &disk_manager) -> Result<storage::PageId> {
 
 } // namespace
 
-Database::Database(cache::BufferPool buffer_pool, storage::PageId root_page_id,
-                   storage::PageId page_count)
-    : buffer_pool_(std::move(buffer_pool)), root_page_id_(root_page_id),
-      page_count_(page_count), read_context_(buffer_pool_, poisoned_),
-      tree_(read_context_, root_page_id) {}
+Database::Database(storage::DiskManager disk_manager,
+                   std::size_t buffer_pool_capacity,
+                   storage::PageId root_page_id, storage::PageId page_count)
+    : buffer_pool_(std::move(disk_manager), buffer_pool_capacity),
+      root_page_id_(root_page_id), page_count_(page_count) {}
 
 Result<std::unique_ptr<Database>>
 Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
@@ -72,10 +72,11 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
     return Err(std::move(root_page_id.error()));
   }
   const auto page_count = disk_manager->PageCount();
-  cache::BufferPool buffer_pool(std::move(*disk_manager), buffer_pool_capacity);
   auto database = std::unique_ptr<Database>(
-      new Database(std::move(buffer_pool), *root_page_id, page_count));
-  auto free_pages = database->tree_.FindFreePages(page_count);
+      new Database(std::move(*disk_manager), buffer_pool_capacity,
+                   *root_page_id, page_count));
+  ReadTransaction transaction(*database);
+  auto free_pages = transaction.tree_.FindFreePages(page_count);
   if (!free_pages) {
     return Err(std::move(free_pages.error()));
   }
@@ -84,7 +85,20 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
 }
 
 auto Database::Get(std::string_view key) -> Result<std::optional<std::string>> {
-  return tree_.Get(key);
+  auto transaction = BeginRead();
+  if (!transaction) {
+    return Err(std::move(transaction.error()));
+  }
+  return (*transaction)->Get(key);
+}
+
+auto Database::BeginRead() -> Result<std::unique_ptr<ReadTransaction>> {
+  auto transaction =
+      std::unique_ptr<ReadTransaction>(new ReadTransaction(*this));
+  if (auto status = transaction->context_.CheckActive(); !status.Ok()) {
+    return Err(std::move(status));
+  }
+  return transaction;
 }
 
 auto Database::BeginWrite() -> Result<std::unique_ptr<WriteTransaction>> {
@@ -120,10 +134,6 @@ auto Database::Delete(std::string_view key) -> Result<bool> {
     return Err(std::move(status));
   }
   return *removed;
-}
-
-auto Database::Seek(std::string_view key) -> Result<btree::Cursor> {
-  return tree_.Seek(key);
 }
 
 } // namespace tinydb

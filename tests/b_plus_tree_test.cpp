@@ -4,6 +4,7 @@
 #include "tinydb/storage/page.h"
 #include "tinydb/storage/page_codec.h"
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <format>
 #include <gtest/gtest.h>
@@ -31,7 +32,7 @@ auto TempFile() -> std::string {
 struct TestTree {
   std::string path = TempFile();
   cache::BufferPool pool{storage::DiskManager::Open(path).value(), 8};
-  bool poisoned = false;
+  std::atomic<bool> poisoned{false};
   detail::WriteState state{2, {}};
   detail::PageContext context{pool, poisoned, &state};
   storage::PageId root = 1;
@@ -273,7 +274,7 @@ TEST(BPlusTree, DeleteEverythingThenReinsert) {
 TEST(BPlusTree, PersistsAcrossReopen) {
   const std::string path = TempFile();
   constexpr storage::PageId root = 1;
-  const bool poisoned = false;
+  const std::atomic<bool> poisoned{false};
   {
     cache::BufferPool pool{storage::DiskManager::Open(path).value(), 8};
     detail::WriteState state{2, {}};

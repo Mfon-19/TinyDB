@@ -11,6 +11,7 @@ find_package(Threads REQUIRED)
 add_library(tinydb
   src/api/database.cpp
   src/api/page_context.cpp
+  src/api/read_transaction.cpp
   src/api/write_transaction.cpp
   src/btree/b_plus_tree.cpp
   src/cache/buffer_pool.cpp

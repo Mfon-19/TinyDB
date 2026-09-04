@@ -1,12 +1,17 @@
 #include "tinydb/database.h"
+#include <barrier>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <future>
 #include <gtest/gtest.h>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 namespace tinydb {
 namespace {
@@ -174,7 +179,8 @@ TEST_F(DatabaseTest, RollbackPreservesTreeAndAllocator) {
   EXPECT_EQ(std::filesystem::file_size(path_), original.size());
   database.reset();
   database = Database::Open(path_, 2).value();
-  auto cursor = database->Seek("").value();
+  auto reader = database->BeginRead().value();
+  auto cursor = reader->Seek("").value();
   for (int index = 0; index < 80; ++index) {
     ASSERT_TRUE(cursor.Valid());
     EXPECT_EQ(cursor.Key(), key(index));
@@ -184,5 +190,113 @@ TEST_F(DatabaseTest, RollbackPreservesTreeAndAllocator) {
   EXPECT_FALSE(cursor.Valid());
 }
 
+TEST_F(DatabaseTest, ReaderBlocksCommit) {
+  using namespace std::chrono_literals;
+  auto database = Database::Open(path_, 4).value();
+  const auto key = [](int index) { return std::format("k{:02}", index); };
+  const std::string value(900, 'v');
+  {
+    auto writer = database->BeginWrite().value();
+    for (int index = 0; index < 32; ++index) {
+      ASSERT_TRUE(writer->Put(key(index), value).Ok());
+    }
+    ASSERT_TRUE(writer->Commit().Ok());
+  }
+
+  std::promise<void> prepared;
+  auto ready = prepared.get_future();
+  std::future<Status> committed;
+  std::jthread worker;
+  {
+    auto reader = database->BeginRead().value();
+    auto cursor = reader->Seek("").value();
+    std::packaged_task<Status()> commit([&] {
+      auto writer = database->BeginWrite().value();
+      for (int index = 0; index < 32; ++index) {
+        if (!writer->Delete(key(index)).value()) {
+          return Status::Corruption("missing committed key");
+        }
+      }
+      if (auto status = writer->Put("new", "published"); !status.Ok()) {
+        return status;
+      }
+      prepared.set_value();
+      return writer->Commit();
+    });
+    committed = commit.get_future();
+    worker = std::jthread(std::move(commit));
+    ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(committed.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(reader->Get("new").value(), std::nullopt);
+    for (int index = 0; index < 32; ++index) {
+      ASSERT_TRUE(cursor.Valid());
+      EXPECT_EQ(cursor.Key(), key(index));
+      EXPECT_EQ(cursor.Value(), value);
+      ASSERT_TRUE(cursor.Next().Ok());
+    }
+    EXPECT_FALSE(cursor.Valid());
+    EXPECT_EQ(reader->Get(key(31)).value(), value);
+  }
+  ASSERT_EQ(committed.wait_for(5s), std::future_status::ready);
+  const auto status = committed.get();
+  ASSERT_TRUE(status.Ok()) << status.Message();
+  EXPECT_EQ(database->Get("new").value(), "published");
+  EXPECT_EQ(database->Get(key(0)).value(), std::nullopt);
+}
+
+TEST_F(DatabaseTest, ConcurrentTransactions) {
+  auto database = Database::Open(path_, 8).value();
+  const auto key = [](int index) {
+    return std::format("{:03}", index) + std::string(400, 'k');
+  };
+  {
+    auto writer = database->BeginWrite().value();
+    for (int index = 0; index < 48; ++index) {
+      ASSERT_TRUE(writer->Put(key(index), std::string(600, 'a')).Ok());
+    }
+    ASSERT_TRUE(writer->Commit().Ok());
+  }
+
+  std::barrier start(6);
+  std::vector<std::jthread> workers;
+  for (int thread = 0; thread < 4; ++thread) {
+    workers.emplace_back([&] {
+      start.arrive_and_wait();
+      for (int iteration = 0; iteration < 8; ++iteration) {
+        auto reader = database->BeginRead();
+        ASSERT_TRUE(reader);
+        auto first = (*reader)->Get(key(0));
+        ASSERT_TRUE(first && first->has_value());
+        auto cursor = (*reader)->Seek("");
+        ASSERT_TRUE(cursor);
+        for (int index = 0; index < 48; ++index) {
+          ASSERT_TRUE(cursor->Valid());
+          EXPECT_EQ(cursor->Key(), key(index));
+          EXPECT_EQ(cursor->Value(), **first);
+          ASSERT_TRUE(cursor->Next().Ok());
+        }
+        EXPECT_FALSE(cursor->Valid());
+      }
+    });
+  }
+  for (int thread = 0; thread < 2; ++thread) {
+    workers.emplace_back([&] {
+      start.arrive_and_wait();
+      for (int iteration = 0; iteration < 6; ++iteration) {
+        auto writer = database->BeginWrite();
+        ASSERT_TRUE(writer);
+        auto first = (*writer)->Get(key(0));
+        ASSERT_TRUE(first && first->has_value());
+        const std::string value(600, static_cast<char>((**first).front() + 1));
+        for (int index = 0; index < 48; ++index) {
+          ASSERT_TRUE((*writer)->Put(key(index), value).Ok());
+        }
+        ASSERT_TRUE((*writer)->Commit().Ok());
+      }
+    });
+  }
+  workers.clear();
+  EXPECT_EQ(database->Get(key(0)).value(), std::string(600, 'm'));
+}
 }
 }

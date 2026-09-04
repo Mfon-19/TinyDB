@@ -70,16 +70,25 @@ Status WriteTransaction::Commit() {
     return status;
   }
 
+  if (state_.pages.empty()) {
+    Finish();
+    return {};
+  }
+
+  std::unique_lock visibility(database_.visibility_mutex_);
+
   for (const auto &[page_id, page] : state_.pages) {
     if (auto status = database_.buffer_pool_.WritePage(page_id, page);
         !status.Ok()) {
       database_.poisoned_ = true;
+      visibility.unlock();
       Finish();
       return status;
     }
   }
   database_.page_count_ = state_.page_count;
   database_.free_pages_ = std::move(state_.free_pages);
+  visibility.unlock();
   Finish();
   return {};
 }

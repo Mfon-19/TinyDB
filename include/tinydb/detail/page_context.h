@@ -2,6 +2,7 @@
 
 #include "tinydb/status.h"
 #include "tinydb/storage/page.h"
+#include <atomic>
 #include <map>
 #include <vector>
 
@@ -20,11 +21,9 @@ struct WriteState {
   Phase phase = Phase::Active;
 };
 
-// The tree owns its read copies. Replacing a private image cannot invalidate
-// page views held by a recursive tree operation, and pool pins stay temporary.
 class PageContext {
 public:
-  PageContext(cache::BufferPool &pool, const bool &poisoned,
+  PageContext(cache::BufferPool &pool, const std::atomic<bool> &poisoned,
               WriteState *write = nullptr) noexcept
       : pool_(pool), poisoned_(poisoned), write_(write) {}
 
@@ -37,7 +36,7 @@ public:
 
 private:
   cache::BufferPool &pool_;
-  const bool &poisoned_;
+  const std::atomic<bool> &poisoned_;
   WriteState *write_;
 };
 

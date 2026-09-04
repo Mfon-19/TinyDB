@@ -10,7 +10,7 @@ auto BufferPool::FindVictim() -> FrameIterator {
   auto frame = frames_.end();
   while (frame != frames_.begin()) {
     --frame;
-    if (frame->pin_count == 0) {
+    if (frame->pin_count.load(std::memory_order_acquire) == 0) {
       return frame;
     }
   }
@@ -20,7 +20,7 @@ auto BufferPool::FindVictim() -> FrameIterator {
 
 auto BufferPool::InsertFrame(storage::PageId page_id,
                              storage::PageBytes page) -> FrameIterator {
-  frames_.push_front(Frame{page_id, std::move(page)});
+  frames_.emplace_front(page_id, std::move(page));
   page_table_.emplace(page_id, frames_.begin());
   return frames_.begin();
 }
@@ -36,7 +36,12 @@ void BufferPool::Evict(FrameIterator frame) {
 
 Status BufferPool::WritePage(storage::PageId page_id,
                              const storage::PageBytes &page) {
+  std::lock_guard lock(mutex_);
   auto found = page_table_.find(page_id);
+  if (found != page_table_.end() &&
+      found->second->pin_count.load(std::memory_order_acquire) != 0) {
+    return Status::ResourceExhausted("cannot write a pinned page");
+  }
   auto victim = frames_.end();
   if (found == page_table_.end() && frames_.size() >= capacity_) {
     victim = FindVictim();
@@ -64,6 +69,7 @@ Status BufferPool::WritePage(storage::PageId page_id,
 }
 
 Result<PageHandle> BufferPool::ReadPage(storage::PageId page_id) {
+  std::lock_guard lock(mutex_);
   if (auto found = page_table_.find(page_id); found != page_table_.end()) {
     Touch(found->second);
     return PageHandle{&found->second->page, &found->second->pin_count};
