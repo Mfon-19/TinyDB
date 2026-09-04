@@ -5,7 +5,6 @@
  * may own a file at a time, including within the same process.
  */
 
-#include "tinydb/btree/b_plus_tree.h"
 #include "tinydb/cache/buffer_pool.h"
 #include "tinydb/read_transaction.h"
 #include "tinydb/write_transaction.h"

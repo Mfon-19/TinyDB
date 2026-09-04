@@ -75,8 +75,9 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
   auto database = std::unique_ptr<Database>(
       new Database(std::move(*disk_manager), buffer_pool_capacity,
                    *root_page_id, page_count));
-  ReadTransaction transaction(*database);
-  auto free_pages = transaction.tree_.FindFreePages(page_count);
+  detail::PageContext context(database->buffer_pool_, database->poisoned_);
+  btree::BPlusTree tree(context, *root_page_id);
+  auto free_pages = tree.FindFreePages(page_count);
   if (!free_pages) {
     return Err(std::move(free_pages.error()));
   }

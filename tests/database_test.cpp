@@ -1,6 +1,5 @@
 #include "tinydb/database.h"
 #include <barrier>
-#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
