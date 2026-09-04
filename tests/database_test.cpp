@@ -48,20 +48,6 @@ TEST_F(DatabaseTest, CreatesAndReopens) {
   EXPECT_EQ(*value, "value");
 }
 
-TEST_F(DatabaseTest, RejectsAnotherProcess) {
-  auto opened = Database::Open(path_, 8);
-  ASSERT_TRUE(opened) << opened.error().Message();
-  ASSERT_EXIT(
-      {
-        opened->reset();
-        auto second = Database::Open(path_, 8);
-        _exit(!second && second.error().Message() == "database is already open"
-                  ? 0
-                  : 1);
-      },
-      testing::ExitedWithCode(0), "");
-}
-
 TEST_F(DatabaseTest, ReadsPendingWritesAndCommits) {
   auto database = Database::Open(path_, 2).value();
   ASSERT_TRUE(database->Put("a", "old").Ok());

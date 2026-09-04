@@ -16,3 +16,8 @@ add_executable(database_test database_test.cpp)
 target_link_libraries(database_test PRIVATE tinydb GTest::gtest_main)
 target_compile_options(database_test PRIVATE -Wall -Wextra -Wpedantic)
 gtest_discover_tests(database_test PROPERTIES TIMEOUT 30)
+
+add_executable(wal_test wal_test.cpp)
+target_link_libraries(wal_test PRIVATE tinydb GTest::gtest_main)
+target_compile_options(wal_test PRIVATE -Wall -Wextra -Wpedantic)
+gtest_discover_tests(wal_test)

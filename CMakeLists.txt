@@ -18,7 +18,9 @@ add_library(tinydb
   src/storage/crc32.cpp
   src/storage/disk_manager.cpp
   src/storage/page_codec.cpp
-  src/storage/superblock_codec.cpp)
+  src/storage/superblock_codec.cpp
+  src/storage/wal.cpp
+  src/storage/wal_codec.cpp)
 target_include_directories(tinydb PUBLIC include)
 target_link_libraries(tinydb PUBLIC Threads::Threads)
 target_compile_options(tinydb PRIVATE -Wall -Wextra -Wpedantic)
