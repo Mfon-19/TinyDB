@@ -1,6 +1,5 @@
 #include "tinydb/database.h"
 #include "tinydb/storage/superblock_codec.h"
-#include <cassert>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -11,26 +10,17 @@ namespace {
 
 auto Create(storage::DiskManager &disk_manager,
             std::string_view name) -> Result<storage::PageId> {
-  auto superblock_page_id = disk_manager.AllocatePage();
-  if (!superblock_page_id) {
-    return Err(std::move(superblock_page_id.error()));
-  }
-  assert(*superblock_page_id == storage::SUPERBLOCK_PAGE_ID);
-
-  auto root_page_id = disk_manager.AllocatePage();
-  if (!root_page_id) {
-    return Err(std::move(root_page_id.error()));
-  }
-  auto root = storage::EncodeLeafPage(*root_page_id, storage::INVALID_PAGE_ID, {});
+  constexpr storage::PageId root_page_id = 1;
+  auto root =
+      storage::EncodeLeafPage(root_page_id, storage::INVALID_PAGE_ID, {});
   if (!root) {
     return Err(std::move(root.error()));
   }
-  if (auto status = disk_manager.WritePage(*root_page_id, *root);
-      !status.Ok()) {
+  if (auto status = disk_manager.WritePage(root_page_id, *root); !status.Ok()) {
     return Err(std::move(status));
   }
 
-  auto superblock = storage::EncodeSuperblock({*root_page_id});
+  auto superblock = storage::EncodeSuperblock({root_page_id});
   if (!superblock) {
     return Err(std::move(superblock.error()));
   }
@@ -45,7 +35,7 @@ auto Create(storage::DiskManager &disk_manager,
   if (auto status = storage::SyncParentDirectory(name); !status.Ok()) {
     return Err(std::move(status));
   }
-  return *root_page_id;
+  return root_page_id;
 }
 
 auto Load(storage::DiskManager &disk_manager) -> Result<storage::PageId> {
@@ -63,8 +53,11 @@ auto Load(storage::DiskManager &disk_manager) -> Result<storage::PageId> {
 
 } // namespace
 
-Database::Database(cache::BufferPool buffer_pool, storage::PageId root_page_id)
-    : buffer_pool_(std::move(buffer_pool)), tree_(buffer_pool_, root_page_id) {}
+Database::Database(cache::BufferPool buffer_pool, storage::PageId root_page_id,
+                   storage::PageId page_count)
+    : buffer_pool_(std::move(buffer_pool)), root_page_id_(root_page_id),
+      page_count_(page_count), read_context_(buffer_pool_, poisoned_),
+      tree_(read_context_, root_page_id) {}
 
 Result<std::unique_ptr<Database>>
 Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
@@ -78,12 +71,15 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
   if (!root_page_id) {
     return Err(std::move(root_page_id.error()));
   }
+  const auto page_count = disk_manager->PageCount();
   cache::BufferPool buffer_pool(std::move(*disk_manager), buffer_pool_capacity);
   auto database = std::unique_ptr<Database>(
-      new Database(std::move(buffer_pool), *root_page_id));
-  if (auto status = database->tree_.RebuildFreeList(); !status.Ok()) {
-    return Err(std::move(status));
+      new Database(std::move(buffer_pool), *root_page_id, page_count));
+  auto free_pages = database->tree_.FindFreePages(page_count);
+  if (!free_pages) {
+    return Err(std::move(free_pages.error()));
   }
+  database->free_pages_ = std::move(*free_pages);
   return database;
 }
 
@@ -91,12 +87,39 @@ auto Database::Get(std::string_view key) -> Result<std::optional<std::string>> {
   return tree_.Get(key);
 }
 
+auto Database::BeginWrite() -> Result<std::unique_ptr<WriteTransaction>> {
+  auto transaction =
+      std::unique_ptr<WriteTransaction>(new WriteTransaction(*this));
+  if (auto status = transaction->context_.CheckActive(); !status.Ok()) {
+    return Err(std::move(status));
+  }
+  return transaction;
+}
+
 Status Database::Put(std::string_view key, std::string_view value) {
-  return tree_.Put(key, value);
+  auto transaction = BeginWrite();
+  if (!transaction) {
+    return std::move(transaction.error());
+  }
+  if (auto status = (*transaction)->Put(key, value); !status.Ok()) {
+    return status;
+  }
+  return (*transaction)->Commit();
 }
 
 auto Database::Delete(std::string_view key) -> Result<bool> {
-  return tree_.Delete(key);
+  auto transaction = BeginWrite();
+  if (!transaction) {
+    return Err(std::move(transaction.error()));
+  }
+  auto removed = (*transaction)->Delete(key);
+  if (!removed) {
+    return Err(std::move(removed.error()));
+  }
+  if (auto status = (*transaction)->Commit(); !status.Ok()) {
+    return Err(std::move(status));
+  }
+  return *removed;
 }
 
 auto Database::Seek(std::string_view key) -> Result<btree::Cursor> {

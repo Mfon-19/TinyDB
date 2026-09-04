@@ -28,16 +28,14 @@ auto TempFile() -> std::string {
   return path;
 }
 
-auto AllocateRoot(cache::BufferPool &pool) -> storage::PageId {
-  pool.AllocatePage().value();
-  return pool.AllocatePage().value();
-}
-
 struct TestTree {
   std::string path = TempFile();
   cache::BufferPool pool{storage::DiskManager::Open(path).value(), 8};
-  storage::PageId root = AllocateRoot(pool);
-  BPlusTree tree{pool, root};
+  bool poisoned = false;
+  detail::WriteState state{2, {}};
+  detail::PageContext context{pool, poisoned, &state};
+  storage::PageId root = 1;
+  BPlusTree tree{context, root};
 
   TestTree() {
     const Status status = tree.Initialize();
@@ -72,28 +70,27 @@ auto Remove(BPlusTree &tree, std::string_view key) -> bool {
   return result.value_or(false);
 }
 
-auto LeftmostPath(cache::BufferPool &pool,
+auto LeftmostPath(detail::PageContext &context,
                   storage::PageId page_id) -> std::vector<storage::PageId> {
   std::vector<storage::PageId> path{page_id};
   while (true) {
-    const auto page = pool.ReadPage(page_id).value();
-    if (storage::PeekPageType(page.Bytes()) != storage::PageType::Internal) {
+    const auto page = context.ReadPage(page_id).value();
+    if (storage::PeekPageType(page) != storage::PageType::Internal) {
       return path;
     }
-    page_id = storage::DecodeInternalPage(page_id, page.Bytes())
-                  .value()
-                  .LeftmostChild();
+    page_id =
+        storage::DecodeInternalPage(page_id, page).value().LeftmostChild();
     path.push_back(page_id);
   }
 }
 
-auto LeafKeys(cache::BufferPool &pool,
+auto LeafKeys(detail::PageContext &context,
               storage::PageId root) -> std::vector<std::string> {
   std::vector<std::string> keys;
-  storage::PageId page_id = LeftmostPath(pool, root).back();
+  storage::PageId page_id = LeftmostPath(context, root).back();
   while (page_id != storage::INVALID_PAGE_ID) {
-    const auto page = pool.ReadPage(page_id).value();
-    const auto leaf = storage::DecodeLeafPage(page_id, page.Bytes()).value();
+    const auto page = context.ReadPage(page_id).value();
+    const auto leaf = storage::DecodeLeafPage(page_id, page).value();
     for (std::size_t index = 0; index < leaf.EntryCount(); ++index) {
       keys.emplace_back(leaf.Entry(index).key);
     }
@@ -102,27 +99,26 @@ auto LeafKeys(cache::BufferPool &pool,
   return keys;
 }
 
-void CollectLeafDepths(cache::BufferPool &pool, storage::PageId page_id,
+void CollectLeafDepths(detail::PageContext &context, storage::PageId page_id,
                        std::size_t depth, std::vector<std::size_t> &depths) {
-  const auto page = pool.ReadPage(page_id).value();
-  if (storage::PeekPageType(page.Bytes()) != storage::PageType::Internal) {
+  const auto page = context.ReadPage(page_id).value();
+  if (storage::PeekPageType(page) != storage::PageType::Internal) {
     depths.push_back(depth);
     return;
   }
 
-  const auto internal =
-      storage::DecodeInternalPage(page_id, page.Bytes()).value();
-  CollectLeafDepths(pool, internal.LeftmostChild(), depth + 1, depths);
+  const auto internal = storage::DecodeInternalPage(page_id, page).value();
+  CollectLeafDepths(context, internal.LeftmostChild(), depth + 1, depths);
   for (std::size_t index = 0; index < internal.EntryCount(); ++index) {
-    CollectLeafDepths(pool, internal.Entry(index).right_child, depth + 1,
+    CollectLeafDepths(context, internal.Entry(index).right_child, depth + 1,
                       depths);
   }
 }
 
-auto LeafDepths(cache::BufferPool &pool,
+auto LeafDepths(detail::PageContext &context,
                 storage::PageId root) -> std::vector<std::size_t> {
   std::vector<std::size_t> depths;
-  CollectLeafDepths(pool, root, 0, depths);
+  CollectLeafDepths(context, root, 0, depths);
   return depths;
 }
 
@@ -245,9 +241,9 @@ TEST(BPlusTree, MatchesAMapUnderRandomOperations) {
   for (const auto &[key, value] : model) {
     expected.push_back(key);
   }
-  EXPECT_EQ(LeafKeys(t.pool, t.root), expected);
-  EXPECT_TRUE(IsOk(t.tree.RebuildFreeList()));
-  const auto depths = LeafDepths(t.pool, t.root);
+  EXPECT_EQ(LeafKeys(t.context, t.root), expected);
+  EXPECT_TRUE(t.tree.FindFreePages(t.state.page_count));
+  const auto depths = LeafDepths(t.context, t.root);
   EXPECT_TRUE(std::ranges::all_of(depths,
                                   [&](std::size_t depth) {
                                     return depth == depths.front();
@@ -257,35 +253,43 @@ TEST(BPlusTree, MatchesAMapUnderRandomOperations) {
 TEST(BPlusTree, DeleteEverythingThenReinsert) {
   TestTree t;
   Fill(t.tree, 1000, 1000);
-  ASSERT_GE(LeftmostPath(t.pool, t.root).size(), 3U);
-  const storage::PageId page_count = t.pool.PageCount();
+  ASSERT_GE(LeftmostPath(t.context, t.root).size(), 3U);
+  const storage::PageId page_count = t.state.page_count;
   for (std::size_t i = 0; i < 1000; ++i) {
     EXPECT_TRUE(Remove(t.tree, Key(i))) << Key(i);
     EXPECT_EQ(Lookup(t.tree, Key(i)), std::nullopt) << Key(i);
   }
-  EXPECT_EQ(LeftmostPath(t.pool, t.root).size(), 1U);
-  EXPECT_TRUE(LeafKeys(t.pool, t.root).empty());
+  EXPECT_EQ(LeftmostPath(t.context, t.root).size(), 1U);
+  EXPECT_TRUE(LeafKeys(t.context, t.root).empty());
 
-  ASSERT_TRUE(IsOk(t.tree.RebuildFreeList()));
+  auto free_pages = t.tree.FindFreePages(t.state.page_count);
+  ASSERT_TRUE(free_pages);
+  t.state.free_pages = std::move(*free_pages);
   Fill(t.tree, 1000, 250);
   ExpectFilled(t.tree, 1000, 250);
-  EXPECT_EQ(t.pool.PageCount(), page_count);
+  EXPECT_EQ(t.state.page_count, page_count);
 }
 
 TEST(BPlusTree, PersistsAcrossReopen) {
   const std::string path = TempFile();
-  storage::PageId root;
+  constexpr storage::PageId root = 1;
+  const bool poisoned = false;
   {
     cache::BufferPool pool{storage::DiskManager::Open(path).value(), 8};
-    root = AllocateRoot(pool);
-    BPlusTree tree{pool, root};
+    detail::WriteState state{2, {}};
+    detail::PageContext context{pool, poisoned, &state};
+    BPlusTree tree{context, root};
     ASSERT_TRUE(IsOk(tree.Initialize()));
     Fill(tree, 800, 400);
     EXPECT_TRUE(Remove(tree, Key(7)));
+    for (const auto &[page_id, page] : state.pages) {
+      ASSERT_TRUE(IsOk(pool.WritePage(page_id, page)));
+    }
   }
 
   cache::BufferPool pool{storage::DiskManager::Open(path).value(), 8};
-  BPlusTree tree{pool, root};
+  detail::PageContext context{pool, poisoned};
+  BPlusTree tree{context, root};
   ExpectFilled(tree, 7, 400);
   EXPECT_EQ(Lookup(tree, Key(7)), std::nullopt);
   for (std::size_t i = 8; i < 800; ++i) {

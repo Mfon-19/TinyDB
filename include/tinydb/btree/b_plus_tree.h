@@ -1,10 +1,10 @@
 #pragma once
 
 /*
- * A B+ tree over frames in our buffer pool
+ * A B+ tree over a transaction page context
  */
 
-#include "tinydb/cache/buffer_pool.h"
+#include "tinydb/detail/page_context.h"
 #include "tinydb/storage/page.h"
 #include "tinydb/storage/page_codec.h"
 #include <cstddef>
@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace tinydb::btree {
 
@@ -23,9 +24,7 @@ class BPlusTree;
  */
 class Cursor {
 public:
-  [[nodiscard]] auto Valid() const noexcept -> bool {
-    return leaf_.has_value();
-  }
+  [[nodiscard]] auto Valid() const noexcept -> bool;
   [[nodiscard]] auto Key() const noexcept -> std::string_view;
   [[nodiscard]] auto Value() const noexcept -> std::string_view;
   Status Next();
@@ -46,16 +45,16 @@ private:
 
 class BPlusTree {
 public:
-  BPlusTree(cache::BufferPool &buffer_pool,
-            storage::PageId root_page_id) noexcept
-      : buffer_pool_(buffer_pool), root_page_id_(root_page_id) {}
+  BPlusTree(detail::PageContext &context, storage::PageId root_page_id) noexcept
+      : context_(context), root_page_id_(root_page_id) {}
 
   Status Initialize();
   auto Get(std::string_view key) -> Result<std::optional<std::string>>;
   Status Put(std::string_view key, std::string_view value);
   auto Delete(std::string_view key) -> Result<bool>;
   auto Seek(std::string_view key) -> Result<Cursor>;
-  Status RebuildFreeList();
+  auto FindFreePages(storage::PageId page_count)
+      -> Result<std::vector<storage::PageId>>;
 
 private:
   friend class Cursor;
@@ -83,7 +82,7 @@ private:
   auto WriteSplit(Split split, Result<storage::PageBytes> left,
                   Result<storage::PageBytes> right) -> Result<Split>;
 
-  cache::BufferPool &buffer_pool_;
+  detail::PageContext &context_;
   storage::PageId root_page_id_;
 };
 

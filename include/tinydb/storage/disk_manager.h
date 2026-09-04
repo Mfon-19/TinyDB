@@ -3,7 +3,7 @@
 /*
  * This is the interface with Linux that handles the initial
  * creation of the database file and subsequent reading and
- * writing to the file. The open descriptor holds an exclusive 
+ * writing to the file. The open descriptor holds an exclusive
  * process lock.
  */
 
@@ -26,19 +26,18 @@ public:
   DiskManager &operator=(DiskManager &&other) noexcept;
 
   [[nodiscard]] auto PageCount() const noexcept -> PageId {
-    return next_page_id_;
+    return page_count_;
   }
 
-  Result<PageId> AllocatePage();
   Status WritePage(PageId page_id, const PageBytes &page);
   Status ReadPage(PageId page_id, PageBytes &page) const;
   Status Sync() const;
 
 private:
-  DiskManager(int fd, PageId next_page_id) noexcept
-      : fd_(fd), next_page_id_(next_page_id) {}
+  DiskManager(int fd, PageId page_count) noexcept
+      : fd_(fd), page_count_(page_count) {}
   int fd_;
-  PageId next_page_id_;
+  PageId page_count_;
 };
 
 Status SyncParentDirectory(std::string_view path);

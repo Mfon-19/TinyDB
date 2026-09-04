@@ -16,29 +16,11 @@ int main() {
   }
   tinydb::Database &db = **opened;
 
-  if (auto status = db.Put("greeting", "konichiwaa"); !status.Ok()) {
-    std::cerr << status.Message() << '\n';
+  if (auto status = db.BeginWrite(); !status) {
+    std::cerr << status.error().Message() << '\n';
     return 1;
   }
 
-  auto value = db.Get("greeting");
-  if (!value) {
-    std::cerr << value.error().Message() << '\n';
-    return 1;
-  }
-  std::cout << value->value_or("<missing>") << '\n';
-
-  auto deleted = db.Delete("greeting");
-  if (!deleted) {
-    std::cerr << deleted.error().Message() << '\n';
-    return 1;
-  }
-  std::cout << (*deleted ? "deleted" : "not found") << '\n';
-
-  value = db.Get("greeting");
-  if (!value) {
-    std::cerr << value.error().Message() << '\n';
-    return 1;
-  }
-  std::cout << value->value_or("<missing>") << '\n';
+  db.Put("greeting1", "konichiwa");
+  db.Put("greeting2", "morning");
 }

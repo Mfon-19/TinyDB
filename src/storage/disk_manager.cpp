@@ -41,7 +41,7 @@ DiskManager::~DiskManager() {
 }
 
 DiskManager::DiskManager(DiskManager &&other) noexcept
-    : fd_(other.fd_), next_page_id_(other.next_page_id_) {
+    : fd_(other.fd_), page_count_(other.page_count_) {
   other.fd_ = -1;
 }
 
@@ -51,7 +51,7 @@ DiskManager &DiskManager::operator=(DiskManager &&other) noexcept {
       close(fd_);
     }
     fd_ = other.fd_;
-    next_page_id_ = other.next_page_id_;
+    page_count_ = other.page_count_;
     other.fd_ = -1;
   }
   return *this;
@@ -90,13 +90,6 @@ Result<DiskManager> DiskManager::Open(const std::string_view name) {
   }
 
   return DiskManager{fd, static_cast<PageId>(page_count)};
-}
-
-Result<PageId> DiskManager::AllocatePage() {
-  if (next_page_id_ == INVALID_PAGE_ID) {
-    return Err(Status::ResourceExhausted("database has too many pages"));
-  }
-  return next_page_id_++;
 }
 
 Status DiskManager::Sync() const {
@@ -142,8 +135,8 @@ Status DiskManager::WritePage(PageId page_id, const PageBytes &page) {
     return SystemError("failed to write page", errno);
   }
 
-  if (page_id >= next_page_id_ && page_id != INVALID_PAGE_ID) {
-    next_page_id_ = page_id + 1;
+  if (page_id >= page_count_ && page_id != INVALID_PAGE_ID) {
+    page_count_ = page_id + 1;
   }
 
   return {};
