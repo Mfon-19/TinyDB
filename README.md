@@ -105,12 +105,12 @@ a warm Linux file cache.
 
 | Workload | Operations/s, median (min–max) | p99 transaction (ms) |
 | --- | ---: | ---: |
-| Sequential inserts | 8,565 (8,311–8,566) | 15.666 |
-| Random inserts | 6,767 (6,468–6,809) | 18.977 |
-| Existing-key reads | 12,634 (12,572–12,679) | 0.089 |
-| Missing-key reads | 12,687 (12,257–12,718) | 0.090 |
-| 100-entry scans | 147,046 (142,027–147,608) | 0.762 |
-| Full scans | 164,126 (155,452–165,174) | — |
-| Overwrites | 6,054 (6,009–6,142) | 19.484 |
-| Deletes | 3,612 (3,558–3,633) | 30.771 |
-| Reinserts | 5,909 (5,533–5,918) | 23.232 |
+| Sequential inserts | 33,024 (29,687–39,958) | 6.441 |
+| Random inserts | 19,817 (17,570–20,791) | 9.017 |
+| Existing-key reads | 127,677 (125,359–128,825) | 0.010 |
+| Missing-key reads | 120,599 (118,664–127,853) | 0.011 |
+| 100-entry scans | 4,056,313 (4,010,319–4,096,829) | 0.030 |
+| Full scans | 5,353,290 (5,074,970–5,386,396) | — |
+| Overwrites | 17,898 (17,691–18,099) | 9.532 |
+| Deletes | 16,790 (14,879–17,048) | 8.173 |
+| Reinserts | 20,739 (17,692–21,331) | 8.052 |
