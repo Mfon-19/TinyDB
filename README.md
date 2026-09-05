@@ -98,19 +98,21 @@ cmake --build build-release --target tinydb_bench -j
 ./build-release/tinydb_bench ./build-release/bench-data all --keys 10000 --runs 3
 ```
 
-The baseline uses 10,000 16-byte keys, 100-byte values, a 256-page pool (1 MiB),
+The benchmark uses 10,000 16-byte keys, 100-byte values, a 256-page pool (1 MiB),
 100 writes per transaction, and seed 42. Throughput and per-run p99 latencies
 are medians of three runs; parentheses show the throughput range. Reads use
-a warm Linux file cache.
+a warm Linux file cache. The concurrent workload uses four readers and one writer.
 
 | Workload | Operations/s, median (min–max) | p99 transaction (ms) |
 | --- | ---: | ---: |
-| Sequential inserts | 33,024 (29,687–39,958) | 6.441 |
-| Random inserts | 19,817 (17,570–20,791) | 9.017 |
-| Existing-key reads | 127,677 (125,359–128,825) | 0.010 |
-| Missing-key reads | 120,599 (118,664–127,853) | 0.011 |
-| 100-entry scans | 4,056,313 (4,010,319–4,096,829) | 0.030 |
-| Full scans | 5,353,290 (5,074,970–5,386,396) | — |
-| Overwrites | 17,898 (17,691–18,099) | 9.532 |
-| Deletes | 16,790 (14,879–17,048) | 8.173 |
-| Reinserts | 20,739 (17,692–21,331) | 8.052 |
+| Sequential inserts | 40,915 (40,789–47,333) | 6.044 |
+| Random inserts | 24,057 (23,346–27,528) | 8.078 |
+| Existing-key reads | 507,258 (476,963–514,364) | 0.00405 |
+| Missing-key reads | 539,307 (539,192–545,057) | 0.00290 |
+| 100-entry scans | 6,940,362 (2,181,802–7,774,291) | 0.02455 |
+| Full scans | 6,506,613 (5,721,102–6,744,544) | — |
+| Overwrites | 20,224 (20,001–21,520) | 8.237 |
+| Deletes | 20,307 (19,731–20,375) | 7.383 |
+| Reinserts | 18,594 (18,093–18,963) | 8.908 |
+| Concurrent reads | 65,411 (64,002–71,658) | 0.106 |
+| Concurrent writes | 16,353 (16,000–17,915) | 18.516 |
