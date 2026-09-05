@@ -6,7 +6,6 @@
  */
 
 #include "tinydb/cache/buffer_pool.h"
-#include "tinydb/limits.h"
 #include "tinydb/read_transaction.h"
 #include "tinydb/storage/wal.h"
 #include "tinydb/write_transaction.h"

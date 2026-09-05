@@ -84,19 +84,19 @@ auto Keys(const auto &page) {
              [&page](std::size_t index) { return page.Key(index); });
 }
 
-// Owns validated bytes. Views borrow them until the page is replaced.
 class Page {
 public:
-  [[nodiscard]] auto Bytes() const noexcept -> const PageBytes & {
-    return bytes_;
-  }
+  void UpdateChecksum() noexcept;
+  [[nodiscard]] auto Bytes() const noexcept -> PageBytes;
   [[nodiscard]] auto Id() const noexcept -> PageId;
   [[nodiscard]] auto Type() const noexcept -> PageType;
   [[nodiscard]] auto FreeSpace() const noexcept -> std::size_t;
   [[nodiscard]] auto PayloadSize() const noexcept -> std::size_t;
   [[nodiscard]] auto Leaf() const noexcept -> LeafPageView;
   [[nodiscard]] auto Internal() const noexcept -> InternalPageView;
-  auto operator==(const Page &) const noexcept -> bool = default;
+  auto operator==(const Page &other) const noexcept -> bool {
+    return bytes_ == other.bytes_;
+  }
 
 private:
   friend auto DecodePage(PageId expected_page_id,
@@ -110,6 +110,7 @@ private:
   explicit Page(const PageBytes &bytes) noexcept : bytes_(bytes) {}
 
   PageBytes bytes_;
+  std::uint32_t checksum_ = 0;
 };
 
 using PageMap = std::map<PageId, Page>;

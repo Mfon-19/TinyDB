@@ -190,6 +190,9 @@ auto Database::Commit(detail::WriteState &pending) -> Status {
   if (pending.pages.empty()) {
     return {};
   }
+  for (auto &[page_id, page] : pending.pages) {
+    page.UpdateChecksum();
+  }
   auto record = storage::EncodeWalRecord(pending.pages);
   if (!record) {
     return std::move(record.error());

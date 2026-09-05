@@ -85,7 +85,6 @@ void EncodeHeader(PageBytes &page, PageType type, PageId page_id,
   little_endian::PutU32(page, PAGE_ID_OFFSET, page_id);
   little_endian::PutU16(page, ENTRY_COUNT_OFFSET, entry_count);
   little_endian::PutU32(page, LINK_OFFSET, link);
-  little_endian::PutU32(page, CHECKSUM_OFFSET, Crc32(page));
 }
 
 template <typename Entry>
@@ -164,6 +163,15 @@ auto InternalPageView::Entry(std::size_t index) const noexcept
   return {cell.key, little_endian::GetU32(cell.value, 0)};
 }
 
+void Page::UpdateChecksum() noexcept { checksum_ = Crc32(bytes_); }
+
+auto Page::Bytes() const noexcept -> PageBytes {
+  auto bytes = bytes_;
+  little_endian::PutU32(bytes, CHECKSUM_OFFSET,
+                       checksum_ == 0 ? Crc32(bytes) : checksum_);
+  return bytes;
+}
+
 auto Page::Id() const noexcept -> PageId {
   return little_endian::GetU32(bytes_, PAGE_ID_OFFSET);
 }
@@ -216,8 +224,10 @@ auto DecodePage(PageId expected_page_id,
   if (little_endian::GetU32(bytes, PAGE_ID_OFFSET) != expected_page_id) {
     return Err(Status::Corruption("page ID mismatch"));
   }
-  if (little_endian::GetU32(bytes, CHECKSUM_OFFSET) !=
-      Crc32WithZeroedU32(bytes, CHECKSUM_OFFSET)) {
+  Page decoded{page};
+  little_endian::PutU32(decoded.bytes_, CHECKSUM_OFFSET, 0);
+  decoded.UpdateChecksum();
+  if (little_endian::GetU32(bytes, CHECKSUM_OFFSET) != decoded.checksum_) {
     return Err(Status::Corruption("page checksum mismatch"));
   }
 
@@ -263,7 +273,7 @@ auto DecodePage(PageId expected_page_id,
       return Err(Status::Corruption("internal page has no entries"));
     }
   }
-  return Page{page};
+  return decoded;
 }
 
 auto EncodeLeafPage(PageId page_id, PageId next_leaf,
