@@ -16,7 +16,7 @@ auto Cursor::Valid() const noexcept -> bool {
 
 auto Cursor::Key() const noexcept -> std::string_view {
   assert(Valid());
-  return page_->Leaf().Entry(index_).key;
+  return page_->Leaf().Key(index_);
 }
 
 auto Cursor::Value() const noexcept -> std::string_view {

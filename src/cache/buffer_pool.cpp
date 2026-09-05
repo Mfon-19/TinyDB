@@ -79,19 +79,18 @@ auto BufferPool::ReadPage(storage::PageId page_id) -> Result<storage::Page> {
     return Err(Status::ResourceExhausted("all buffer pool frames are dirty"));
   }
 
-  storage::PageBytes page{};
+  storage::PageBytes page;
   auto status = disk_manager_.ReadPage(page_id, page);
   if (!status.Ok()) {
     return Err(std::move(status));
   }
 
   auto decoded = storage::DecodePage(page_id, page);
-  if (!decoded) {
-    return Err(std::move(decoded.error()));
+  if (decoded) {
+    SetPage(frame, *decoded);
+    Touch(frame);
   }
-  SetPage(frame, *decoded);
-  Touch(frame);
-  return *frame->page;
+  return decoded;
 }
 
 auto BufferPool::Checkpoint(const storage::PageMap &incoming) -> Status {

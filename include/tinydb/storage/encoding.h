@@ -4,22 +4,27 @@
  * Explicit little-endian encoding
  */
 
+#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 
 namespace tinydb::storage::little_endian {
+
+static_assert(std::endian::native == std::endian::little ||
+              std::endian::native == std::endian::big);
 
 inline auto GetU16(std::span<const char> bytes,
                    std::size_t offset) noexcept -> std::uint16_t {
   assert(bytes.size() >= sizeof(std::uint16_t));
   assert(offset <= bytes.size() - sizeof(std::uint16_t));
 
-  const auto byte0 = static_cast<unsigned char>(bytes[offset]);
-  const auto byte1 = static_cast<unsigned char>(bytes[offset + 1]);
-  return static_cast<std::uint16_t>(byte0) |
-         static_cast<std::uint16_t>(byte1 << 8U);
+  std::uint16_t value;
+  std::memcpy(&value, bytes.data() + offset, sizeof(value));
+  return std::endian::native == std::endian::little ? value
+                                                    : std::byteswap(value);
 }
 
 inline auto GetU32(std::span<const char> bytes,
@@ -27,14 +32,10 @@ inline auto GetU32(std::span<const char> bytes,
   assert(bytes.size() >= sizeof(std::uint32_t));
   assert(offset <= bytes.size() - sizeof(std::uint32_t));
 
-  const auto byte0 = static_cast<unsigned char>(bytes[offset]);
-  const auto byte1 = static_cast<unsigned char>(bytes[offset + 1]);
-  const auto byte2 = static_cast<unsigned char>(bytes[offset + 2]);
-  const auto byte3 = static_cast<unsigned char>(bytes[offset + 3]);
-  return static_cast<std::uint32_t>(byte0) |
-         (static_cast<std::uint32_t>(byte1) << 8U) |
-         (static_cast<std::uint32_t>(byte2) << 16U) |
-         (static_cast<std::uint32_t>(byte3) << 24U);
+  std::uint32_t value;
+  std::memcpy(&value, bytes.data() + offset, sizeof(value));
+  return std::endian::native == std::endian::little ? value
+                                                    : std::byteswap(value);
 }
 
 inline void PutU16(std::span<char> bytes, std::size_t offset,

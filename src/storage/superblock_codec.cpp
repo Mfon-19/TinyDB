@@ -34,9 +34,7 @@ auto EncodeSuperblock(const Superblock &superblock) -> Result<PageBytes> {
   little_endian::PutU16(page, PAGE_SIZE_OFFSET,
                         static_cast<std::uint16_t>(PAGE_SIZE));
   little_endian::PutU32(page, ROOT_PAGE_ID_OFFSET, superblock.root_page_id);
-  little_endian::PutU32(
-      page, CHECKSUM_OFFSET,
-      Crc32WithZeroedU32(std::span<const char>{page}, CHECKSUM_OFFSET));
+  little_endian::PutU32(page, CHECKSUM_OFFSET, Crc32(page));
   return page;
 }
 

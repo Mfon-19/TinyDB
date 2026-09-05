@@ -70,10 +70,7 @@ auto BPlusTree::FindLeaf(std::string_view key) -> Result<storage::Page> {
 
   while (true) {
     auto page = context_.ReadPage(page_id);
-    if (!page) {
-      return Err(std::move(page.error()));
-    }
-    if (page->Type() == storage::PageType::Leaf) {
+    if (!page || page->Type() == storage::PageType::Leaf) {
       return page;
     }
 
@@ -320,9 +317,10 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
 
     const Split &split = **child;
     auto entries = Entries(internal);
-    entries.insert(entries.begin() + static_cast<std::ptrdiff_t>(child_index),
-                   InternalEntry{split.separator, split.right});
-    if (storage::EntriesFit(std::span<const InternalEntry>{entries})) {
+    const auto position = entries.insert(
+        entries.begin() + static_cast<std::ptrdiff_t>(child_index),
+        InternalEntry{split.separator, split.right});
+    if (EntrySize(*position) <= page->FreeSpace()) {
       auto encoded = storage::EncodeInternalPage(
           page_id, internal.LeftmostChild(), entries);
       if (!encoded) {
@@ -345,13 +343,15 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
     return std::nullopt;
   }
   auto entries = Entries(leaf);
+  auto available = page->FreeSpace();
   auto position = entries.begin() + static_cast<std::ptrdiff_t>(index);
   if (exists) {
+    available += EntrySize(*position);
     position->value = value;
   } else {
     entries.insert(position, LeafEntry{key, value});
   }
-  if (storage::EntriesFit(std::span<const LeafEntry>{entries})) {
+  if (EntrySize(LeafEntry{key, value}) <= available) {
     auto encoded = storage::EncodeLeafPage(page_id, leaf.NextLeaf(), entries);
     if (!encoded) {
       return Err(std::move(encoded.error()));

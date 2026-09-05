@@ -32,55 +32,48 @@ struct InternalEntry {
 [[nodiscard]] auto EntrySize(const LeafEntry &entry) noexcept -> std::size_t;
 [[nodiscard]] auto EntrySize(const InternalEntry &entry) noexcept
     -> std::size_t;
-[[nodiscard]] auto EntriesFit(std::span<const LeafEntry> entries) noexcept
-    -> bool;
-[[nodiscard]] auto EntriesFit(std::span<const InternalEntry> entries) noexcept
-    -> bool;
 
 class LeafPageView {
 public:
-  [[nodiscard]] auto Id() const noexcept -> PageId { return page_id_; }
   [[nodiscard]] auto NextLeaf() const noexcept -> PageId { return next_leaf_; }
   [[nodiscard]] auto EntryCount() const noexcept -> std::size_t {
     return entry_count_;
   }
+  [[nodiscard]] auto Key(std::size_t index) const noexcept -> std::string_view;
   [[nodiscard]] auto Entry(std::size_t index) const noexcept -> LeafEntry;
 
 private:
   friend class Page;
 
-  LeafPageView(const PageBytes *page, PageId page_id, PageId next_leaf,
+  LeafPageView(const PageBytes *page, PageId next_leaf,
                std::uint16_t entry_count) noexcept
-      : page_(page), page_id_(page_id), next_leaf_(next_leaf),
-        entry_count_(entry_count) {}
+      : page_(page), next_leaf_(next_leaf), entry_count_(entry_count) {}
 
   const PageBytes *page_;
-  PageId page_id_;
   PageId next_leaf_;
   std::uint16_t entry_count_;
 };
 
 class InternalPageView {
 public:
-  [[nodiscard]] auto Id() const noexcept -> PageId { return page_id_; }
   [[nodiscard]] auto LeftmostChild() const noexcept -> PageId {
     return leftmost_child_;
   }
   [[nodiscard]] auto EntryCount() const noexcept -> std::size_t {
     return entry_count_;
   }
+  [[nodiscard]] auto Key(std::size_t index) const noexcept -> std::string_view;
   [[nodiscard]] auto Entry(std::size_t index) const noexcept -> InternalEntry;
 
 private:
   friend class Page;
 
-  InternalPageView(const PageBytes *page, PageId page_id, PageId leftmost_child,
+  InternalPageView(const PageBytes *page, PageId leftmost_child,
                    std::uint16_t entry_count) noexcept
-      : page_(page), page_id_(page_id), leftmost_child_(leftmost_child),
+      : page_(page), leftmost_child_(leftmost_child),
         entry_count_(entry_count) {}
 
   const PageBytes *page_;
-  PageId page_id_;
   PageId leftmost_child_;
   std::uint16_t entry_count_;
 };
@@ -88,7 +81,7 @@ private:
 auto Keys(const auto &page) {
   return std::views::iota(std::size_t{0}, page.EntryCount()) |
          std::views::transform(
-             [&page](std::size_t index) { return page.Entry(index).key; });
+             [&page](std::size_t index) { return page.Key(index); });
 }
 
 // Owns validated bytes. Views borrow them until the page is replaced.

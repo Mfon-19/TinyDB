@@ -42,14 +42,6 @@ auto ValidLink(PageId page_id, PageId link) noexcept -> bool {
   return ValidDataPageId(link) && link != page_id;
 }
 
-auto ValueSize(const LeafEntry &entry) noexcept -> std::size_t {
-  return entry.value.size();
-}
-
-auto ValueSize(const InternalEntry & /*entry*/) noexcept -> std::size_t {
-  return sizeof(PageId);
-}
-
 void PutValue(PageBytes &page, std::size_t offset, const LeafEntry &entry) {
   std::ranges::copy(entry.value, page.begin() + offset);
 }
@@ -71,14 +63,18 @@ auto CellBounds(const PageBytes &page, std::size_t entry_count,
   return {SlotOffset(page, index), end};
 }
 
+auto CellKey(const PageBytes &page,
+             std::size_t offset) noexcept -> std::string_view {
+  return {page.data() + offset + KEY_SIZE_SIZE,
+          little_endian::GetU16(page, offset)};
+}
+
 auto CellAt(const PageBytes &page, std::size_t entry_count,
             std::size_t index) noexcept -> LeafEntry {
   const auto [begin, end] = CellBounds(page, entry_count, index);
-  const std::size_t key_begin = begin + KEY_SIZE_SIZE;
-  const std::size_t value_begin =
-      key_begin + little_endian::GetU16(page, begin);
-  return {{page.data() + key_begin, value_begin - key_begin},
-          {page.data() + value_begin, end - value_begin}};
+  const auto key = CellKey(page, begin);
+  return {key,
+          {key.data() + key.size(), end - begin - KEY_SIZE_SIZE - key.size()}};
 }
 
 void EncodeHeader(PageBytes &page, PageType type, PageId page_id,
@@ -89,22 +85,7 @@ void EncodeHeader(PageBytes &page, PageType type, PageId page_id,
   little_endian::PutU32(page, PAGE_ID_OFFSET, page_id);
   little_endian::PutU16(page, ENTRY_COUNT_OFFSET, entry_count);
   little_endian::PutU32(page, LINK_OFFSET, link);
-  little_endian::PutU32(
-      page, CHECKSUM_OFFSET,
-      Crc32WithZeroedU32(std::span<const char>{page}, CHECKSUM_OFFSET));
-}
-
-template <typename Entry>
-auto Fits(std::span<const Entry> entries) noexcept -> bool {
-  std::size_t remaining = PAGE_SIZE - HEADER_SIZE;
-  for (const auto &entry : entries) {
-    const auto size = EntrySize(entry);
-    if (size > remaining) {
-      return false;
-    }
-    remaining -= size;
-  }
-  return true;
+  little_endian::PutU32(page, CHECKSUM_OFFSET, Crc32(page));
 }
 
 template <typename Entry>
@@ -116,25 +97,27 @@ auto EncodePage(PageType type, PageId page_id, PageId link,
            : entries.empty() || !ValidLink(page_id, link))) {
     return Err(Status::InvalidArgument("invalid page ID or link"));
   }
-  if (!Fits(entries)) {
+  if (entries.size() > (PAGE_SIZE - HEADER_SIZE) / SLOT_SIZE) {
     return Err(Status::InvalidArgument("entries do not fit in a page"));
   }
-  for (std::size_t index = 0; index < entries.size(); ++index) {
-    if (index != 0 && entries[index - 1].key >= entries[index].key) {
-      return Err(Status::InvalidArgument("keys are not strictly ordered"));
-    }
-    if constexpr (std::is_same_v<Entry, InternalEntry>) {
-      if (!ValidLink(page_id, entries[index].right_child)) {
-        return Err(Status::InvalidArgument("invalid internal child page ID"));
-      }
-    }
-  }
-
+  const auto slots_end = HEADER_SIZE + entries.size() * SLOT_SIZE;
   PageBytes page{};
   std::size_t cell = PAGE_SIZE;
   for (std::size_t index = entries.size(); index != 0; --index) {
     const auto &entry = entries[index - 1];
-    cell -= KEY_SIZE_SIZE + entry.key.size() + ValueSize(entry);
+    const auto size = EntrySize(entry) - SLOT_SIZE;
+    if (size > cell - slots_end) {
+      return Err(Status::InvalidArgument("entries do not fit in a page"));
+    }
+    if (index > 1 && entries[index - 2].key >= entry.key) {
+      return Err(Status::InvalidArgument("keys are not strictly ordered"));
+    }
+    if constexpr (std::is_same_v<Entry, InternalEntry>) {
+      if (!ValidLink(page_id, entry.right_child)) {
+        return Err(Status::InvalidArgument("invalid internal child page ID"));
+      }
+    }
+    cell -= size;
     little_endian::PutU16(page, HEADER_SIZE + (index - 1) * SLOT_SIZE,
                           static_cast<std::uint16_t>(cell));
     little_endian::PutU16(page, cell,
@@ -158,17 +141,20 @@ auto EntrySize(const InternalEntry &entry) noexcept -> std::size_t {
   return SLOT_SIZE + KEY_SIZE_SIZE + sizeof(PageId) + entry.key.size();
 }
 
-auto EntriesFit(std::span<const LeafEntry> entries) noexcept -> bool {
-  return Fits(entries);
-}
-
-auto EntriesFit(std::span<const InternalEntry> entries) noexcept -> bool {
-  return Fits(entries);
+auto LeafPageView::Key(std::size_t index) const noexcept -> std::string_view {
+  assert(index < entry_count_);
+  return CellKey(*page_, SlotOffset(*page_, index));
 }
 
 auto LeafPageView::Entry(std::size_t index) const noexcept -> LeafEntry {
   assert(index < entry_count_);
   return CellAt(*page_, entry_count_, index);
+}
+
+auto InternalPageView::Key(std::size_t index) const noexcept
+    -> std::string_view {
+  assert(index < entry_count_);
+  return CellKey(*page_, SlotOffset(*page_, index));
 }
 
 auto InternalPageView::Entry(std::size_t index) const noexcept
@@ -198,14 +184,13 @@ auto Page::PayloadSize() const noexcept -> std::size_t {
 
 auto Page::Leaf() const noexcept -> LeafPageView {
   assert(Type() == PageType::Leaf);
-  return LeafPageView{&bytes_, Id(), little_endian::GetU32(bytes_, LINK_OFFSET),
+  return LeafPageView{&bytes_, little_endian::GetU32(bytes_, LINK_OFFSET),
                       little_endian::GetU16(bytes_, ENTRY_COUNT_OFFSET)};
 }
 
 auto Page::Internal() const noexcept -> InternalPageView {
   assert(Type() == PageType::Internal);
-  return InternalPageView{&bytes_, Id(),
-                          little_endian::GetU32(bytes_, LINK_OFFSET),
+  return InternalPageView{&bytes_, little_endian::GetU32(bytes_, LINK_OFFSET),
                           little_endian::GetU16(bytes_, ENTRY_COUNT_OFFSET)};
 }
 
