@@ -25,8 +25,9 @@ target_include_directories(tinydb PUBLIC include)
 target_link_libraries(tinydb PUBLIC Threads::Threads)
 target_compile_options(tinydb PRIVATE -Wall -Wextra -Wpedantic)
 
-add_executable(tinydb_main main.cpp)
-target_link_libraries(tinydb_main PRIVATE tinydb)
+add_executable(tinydb_cli main.cpp)
+target_link_libraries(tinydb_cli PRIVATE tinydb)
+target_compile_options(tinydb_cli PRIVATE -Wall -Wextra -Wpedantic)
 
 option(TINYDB_BUILD_TESTS "Build the tests" ON)
 if(TINYDB_BUILD_TESTS)
