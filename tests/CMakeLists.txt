@@ -25,5 +25,6 @@ gtest_discover_tests(wal_test)
 add_executable(durability_test durability_test.cpp)
 target_link_libraries(durability_test PRIVATE tinydb GTest::gtest_main)
 target_compile_options(durability_test PRIVATE -Wall -Wextra -Wpedantic)
-target_link_options(durability_test PRIVATE -Wl,--wrap=pwrite)
+target_link_options(durability_test PRIVATE
+  -Wl,--wrap=pwrite -Wl,--wrap=fsync -Wl,--wrap=_Znwm)
 gtest_discover_tests(durability_test PROPERTIES TIMEOUT 30)

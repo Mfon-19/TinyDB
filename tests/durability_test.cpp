@@ -25,6 +25,8 @@ struct Fault {
 
 thread_local Fault fault;
 thread_local int mutations = 0;
+thread_local bool fail_after_sync = false;
+thread_local bool fail_allocation = false;
 
 bool Fail(int fd, Operation operation) {
   ++mutations;
@@ -82,6 +84,7 @@ class DurabilityTest : public testing::Test {
 protected:
   void SetUp() override {
     fault = {};
+    fail_after_sync = fail_allocation = false;
     directory_ = testing::TempDir() + "tinydb_durable_XXXXXX";
     ASSERT_NE(mkdtemp(directory_.data()), nullptr);
     path_ = directory_ + "/database";
@@ -89,6 +92,7 @@ protected:
 
   void TearDown() override {
     fault = {};
+    fail_after_sync = fail_allocation = false;
     std::filesystem::remove_all(directory_);
   }
 

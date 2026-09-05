@@ -9,6 +9,7 @@
  * type with Result<T> and then the caller can check for Status.
  */
 
+#include <cstring>
 #include <expected>
 #include <string>
 #include <string_view>
@@ -22,7 +23,12 @@ public:
 
   [[nodiscard]] auto Ok() const noexcept -> bool { return code_ == Code::Ok; }
   [[nodiscard]] auto Message() const noexcept -> std::string_view {
-    return message_;
+    return error_ == 0 ? std::string_view{message_} : std::strerror(error_);
+  }
+
+  // Preserve errno without allocating an error message.
+  static auto IoError(int error) noexcept -> Status {
+    return Status(error);
   }
 
   static auto IoError(std::string message) -> Status {
@@ -53,7 +59,11 @@ private:
   Status(Code code, std::string message)
       : code_(code), message_(std::move(message)) {}
 
+  explicit Status(int error) noexcept
+      : code_(Code::IoError), error_(error) {}
+
   Code code_ = Code::Ok;
+  int error_ = 0;
   std::string message_;
 };
 

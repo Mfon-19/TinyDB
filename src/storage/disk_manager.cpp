@@ -22,10 +22,10 @@ auto SystemError(std::string_view operation, int error) -> Status {
       std::format("{}: {}", operation, std::strerror(error)));
 }
 
-Status SyncFile(int fd, std::string_view operation) {
+Status SyncFile(int fd) {
   while (fsync(fd) == -1) {
     if (errno != EINTR) {
-      return SystemError(operation, errno);
+      return Status::IoError(errno);
     }
   }
   return {};
@@ -80,6 +80,11 @@ Result<DiskManager> DiskManager::Open(const std::string_view name) {
     close(fd);
     return Err(SystemError("failed to inspect database", error));
   }
+  if (file_status.st_nlink != 1) {
+    close(fd);
+    return Err(
+        Status::InvalidArgument("database must have exactly one hard link"));
+  }
 
   const auto file_size = static_cast<std::uint64_t>(file_status.st_size);
   const auto page_count =
@@ -93,7 +98,7 @@ Result<DiskManager> DiskManager::Open(const std::string_view name) {
 }
 
 Status DiskManager::Sync() const {
-  return SyncFile(fd_, "failed to synchronize database");
+  return SyncFile(fd_);
 }
 
 Status SyncParentDirectory(std::string_view path) {
@@ -105,7 +110,7 @@ Status SyncParentDirectory(std::string_view path) {
   if (fd == -1) {
     return SystemError("failed to open database directory", errno);
   }
-  auto status = SyncFile(fd, "failed to synchronize database directory");
+  auto status = SyncFile(fd);
   close(fd);
   return status;
 }
@@ -129,10 +134,10 @@ Status DiskManager::WritePage(PageId page_id, const PageBytes &page) {
     }
 
     if (count == 0) {
-      return Status::IoError("page write made no progress");
+      return Status::IoError(EIO);
     }
 
-    return SystemError("failed to write page", errno);
+    return Status::IoError(errno);
   }
 
   if (page_id >= page_count_ && page_id != INVALID_PAGE_ID) {

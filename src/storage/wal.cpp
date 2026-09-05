@@ -91,9 +91,9 @@ Status Wal::Append(std::span<const char> record) {
     } else if (count == -1 && errno == EINTR) {
       continue;
     } else if (count == 0) {
-      return Status::IoError("WAL append made no progress");
+      return Status::IoError(EIO);
     } else {
-      return SystemError("failed to append WAL", errno);
+      return Status::IoError(errno);
     }
   }
   end_ += static_cast<off_t>(record.size());
@@ -103,7 +103,7 @@ Status Wal::Append(std::span<const char> record) {
 Status Wal::Sync() const {
   while (fsync(fd_) == -1) {
     if (errno != EINTR) {
-      return SystemError("failed to synchronize WAL", errno);
+      return Status::IoError(errno);
     }
   }
   return {};
@@ -112,7 +112,7 @@ Status Wal::Sync() const {
 Status Wal::Reset() {
   while (ftruncate(fd_, 0) == -1) {
     if (errno != EINTR) {
-      return SystemError("failed to truncate WAL", errno);
+      return Status::IoError(errno);
     }
   }
   if (auto status = Sync(); !status.Ok()) {

@@ -1,6 +1,7 @@
 #include "tinydb/database.h"
 #include "tinydb/storage/superblock_codec.h"
 #include <cassert>
+#include <filesystem>
 #include <format>
 #include <memory>
 #include <string_view>
@@ -81,7 +82,13 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
     return Err(std::move(disk_manager.error()));
   }
 
-  auto wal = storage::Wal::Open(name);
+  std::error_code error;
+  const auto path = std::filesystem::canonical(name, error).string();
+  if (error) {
+    return Err(Status::IoError(
+        std::format("failed to resolve database path: {}", error.message())));
+  }
+  auto wal = storage::Wal::Open(path);
   if (!wal) {
     return Err(std::move(wal.error()));
   }
@@ -98,7 +105,7 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
   } else if (auto status = Recover(*disk_manager, *wal); !status.Ok()) {
     return Err(std::move(status));
   }
-  if (auto status = storage::SyncParentDirectory(name); !status.Ok()) {
+  if (auto status = storage::SyncParentDirectory(path); !status.Ok()) {
     return Err(std::move(status));
   }
   auto root_page_id = Load(*disk_manager);

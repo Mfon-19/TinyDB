@@ -4,6 +4,7 @@
  * A BufferPool keeps pages read from disk into in-memory
  * fixed-sized frames. When full, it replaces the least recently
  * used frame that is neither dirty nor pinned by a PageHandle.
+ * All frames are allocated at construction and reused.
  */
 
 #include "tinydb/cache/page_handle.h"
@@ -13,7 +14,6 @@
 #include <list>
 #include <map>
 #include <mutex>
-#include <unordered_map>
 
 namespace tinydb::cache {
 
@@ -33,8 +33,8 @@ public:
 
 private:
   struct Frame {
-    storage::PageId page_id;
-    storage::PageBytes page;
+    storage::PageId page_id = storage::INVALID_PAGE_ID;
+    storage::PageBytes page{};
     std::atomic<std::size_t> pin_count{0};
     bool dirty = false;
   };
@@ -42,16 +42,12 @@ private:
   using FrameIterator = std::list<Frame>::iterator;
 
   auto FindVictim() -> FrameIterator;
-  auto InsertFrame(storage::PageId page_id,
-                   storage::PageBytes page) -> FrameIterator;
   void Touch(FrameIterator frame);
-  void Evict(FrameIterator frame);
 
   storage::DiskManager disk_manager_;
   std::size_t capacity_;
   std::mutex mutex_;
   std::list<Frame> frames_;
-  std::unordered_map<storage::PageId, FrameIterator> page_table_;
 };
 
 } // namespace tinydb::cache
