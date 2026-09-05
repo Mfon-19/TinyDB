@@ -65,7 +65,8 @@ private:
     storage::PageId right;
   };
 
-  auto FindLeaf(std::string_view key) -> Result<storage::PageId>;
+  auto FindLeaf(std::string_view key, storage::PageBytes &leaf_page)
+      -> Result<storage::LeafPageView>;
   auto Insert(storage::PageId page_id, std::string_view key,
               std::string_view value) -> Result<std::optional<Split>>;
   auto Remove(storage::PageId page_id, std::string_view key) -> Result<bool>;
