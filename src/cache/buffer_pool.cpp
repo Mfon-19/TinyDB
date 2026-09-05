@@ -11,24 +11,24 @@ BufferPool::BufferPool(storage::DiskManager disk_manager, std::size_t capacity)
 
 auto BufferPool::FindPage(storage::PageId page_id) -> FrameIterator {
   auto frame = buckets_[page_id % buckets_.size()];
-  while (frame != frames_.end() && frame->page_id != page_id) {
+  while (frame != frames_.end() && frame->page->Id() != page_id) {
     frame = frame->hash_next;
   }
   return frame;
 }
 
-void BufferPool::SetPageId(FrameIterator frame, storage::PageId page_id) {
-  if (frame->page_id != storage::INVALID_PAGE_ID) {
-    auto *link = &buckets_[frame->page_id % buckets_.size()];
+void BufferPool::SetPage(FrameIterator frame, const storage::Page &page) {
+  if (frame->page) {
+    auto *link = &buckets_[frame->page->Id() % buckets_.size()];
     while (*link != frame) {
       link = &(*link)->hash_next;
     }
     *link = frame->hash_next;
   }
-  auto &head = buckets_[page_id % buckets_.size()];
+  auto &head = buckets_[page.Id() % buckets_.size()];
   frame->hash_next = head;
   head = frame;
-  frame->page_id = page_id;
+  frame->page = page;
 }
 
 auto BufferPool::FindVictim() -> FrameIterator {
@@ -50,7 +50,7 @@ void BufferPool::Touch(FrameIterator frame) {
 
 Status BufferPool::InstallPage(storage::PageId page_id,
                                const storage::PageBytes &page) {
-  if (page_id == storage::INVALID_PAGE_ID) {
+  if (page_id == 0 || page_id == storage::INVALID_PAGE_ID) {
     return Status::InvalidArgument("invalid page ID");
   }
   std::lock_guard lock(mutex_);
@@ -67,21 +67,24 @@ Status BufferPool::InstallPage(storage::PageId page_id,
     }
   }
 
-  SetPageId(frame, page_id);
-  frame->page = page;
+  auto decoded = storage::DecodePage(page_id, page);
+  if (!decoded) {
+    return std::move(decoded.error());
+  }
+  SetPage(frame, *decoded);
   frame->dirty = true;
   Touch(frame);
   return {};
 }
 
 Result<PageHandle> BufferPool::ReadPage(storage::PageId page_id) {
-  if (page_id == storage::INVALID_PAGE_ID) {
+  if (page_id == 0 || page_id == storage::INVALID_PAGE_ID) {
     return Err(Status::InvalidArgument("invalid page ID"));
   }
   std::lock_guard lock(mutex_);
   if (auto frame = FindPage(page_id); frame != frames_.end()) {
     Touch(frame);
-    return PageHandle{&frame->page, &frame->pin_count};
+    return PageHandle{&*frame->page, &frame->pin_count};
   }
 
   auto frame = FindVictim();
@@ -96,10 +99,13 @@ Result<PageHandle> BufferPool::ReadPage(storage::PageId page_id) {
     return Err(std::move(status));
   }
 
-  SetPageId(frame, page_id);
-  frame->page = page;
+  auto decoded = storage::DecodePage(page_id, page);
+  if (!decoded) {
+    return Err(std::move(decoded.error()));
+  }
+  SetPage(frame, *decoded);
   Touch(frame);
-  return PageHandle{&frame->page, &frame->pin_count};
+  return PageHandle{&*frame->page, &frame->pin_count};
 }
 
 Status BufferPool::Flush(
@@ -111,8 +117,9 @@ Status BufferPool::Flush(
     }
   }
   for (const auto &frame : frames_) {
-    if (frame.dirty && !incoming.contains(frame.page_id)) {
-      if (auto status = disk_manager_.WritePage(frame.page_id, frame.page);
+    if (frame.dirty && !incoming.contains(frame.page->Id())) {
+      if (auto status =
+              disk_manager_.WritePage(frame.page->Id(), frame.page->Bytes());
           !status.Ok()) {
         return status;
       }
@@ -127,8 +134,15 @@ Status BufferPool::Flush(
     return status;
   }
   for (auto &frame : frames_) {
-    if (auto found = incoming.find(frame.page_id); found != incoming.end()) {
-      frame.page = found->second;
+    if (!frame.page) {
+      continue;
+    }
+    if (auto found = incoming.find(frame.page->Id()); found != incoming.end()) {
+      auto decoded = storage::DecodePage(found->first, found->second);
+      if (!decoded) {
+        return std::move(decoded.error());
+      }
+      frame.page = std::move(*decoded);
     }
     frame.dirty = false;
   }

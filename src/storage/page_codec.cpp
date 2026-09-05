@@ -37,11 +37,6 @@ inline constexpr std::size_t HEADER_SIZE = 22;
 inline constexpr std::size_t SLOT_SIZE = sizeof(std::uint16_t);
 inline constexpr std::size_t KEY_SIZE_SIZE = sizeof(std::uint16_t);
 
-struct PageHeader {
-  std::uint16_t entry_count;
-  PageId link;
-};
-
 auto ValidDataPageId(PageId page_id) noexcept -> bool {
   return page_id != 0 && page_id != INVALID_PAGE_ID;
 }
@@ -132,9 +127,45 @@ auto EncodePage(PageType type, PageId page_id, PageId link,
   return page;
 }
 
-auto DecodePage(PageId expected_page_id, PageType expected_type,
-                const PageBytes &page) -> Result<PageHeader> {
-  assert(ValidDataPageId(expected_page_id));
+} // namespace
+
+auto LeafPageView::Entry(std::size_t index) const noexcept -> LeafEntry {
+  assert(index < entry_count_);
+  return CellAt(*page_, entry_count_, index);
+}
+
+auto InternalPageView::Entry(std::size_t index) const noexcept
+    -> InternalEntry {
+  assert(index < entry_count_);
+  const auto cell = CellAt(*page_, entry_count_, index);
+  return {cell.key, little_endian::GetU32(cell.value, 0)};
+}
+
+auto Page::Id() const noexcept -> PageId {
+  return little_endian::GetU32(bytes_, PAGE_ID_OFFSET);
+}
+
+auto Page::Type() const noexcept -> PageType {
+  return static_cast<PageType>(little_endian::GetU16(bytes_, TYPE_OFFSET));
+}
+
+auto Page::Leaf() const noexcept -> LeafPageView {
+  assert(Type() == PageType::Leaf);
+  return LeafPageView{&bytes_, Id(), little_endian::GetU32(bytes_, LINK_OFFSET),
+                      little_endian::GetU16(bytes_, ENTRY_COUNT_OFFSET)};
+}
+
+auto Page::Internal() const noexcept -> InternalPageView {
+  assert(Type() == PageType::Internal);
+  return InternalPageView{&bytes_, Id(),
+                          little_endian::GetU32(bytes_, LINK_OFFSET),
+                          little_endian::GetU16(bytes_, ENTRY_COUNT_OFFSET)};
+}
+
+auto DecodePage(PageId expected_page_id, const PageBytes &page) -> Result<Page> {
+  if (!ValidDataPageId(expected_page_id)) {
+    return Err(Status::InvalidArgument("invalid data page ID"));
+  }
 
   const std::span<const char> bytes{page};
   if (!std::ranges::equal(PAGE_MAGIC,
@@ -144,8 +175,9 @@ auto DecodePage(PageId expected_page_id, PageType expected_type,
   if (little_endian::GetU16(bytes, VERSION_OFFSET) != FORMAT_VERSION) {
     return Err(Status::Corruption("unsupported page version"));
   }
-  if (little_endian::GetU16(bytes, TYPE_OFFSET) !=
-      static_cast<std::uint16_t>(expected_type)) {
+  const auto type =
+      static_cast<PageType>(little_endian::GetU16(bytes, TYPE_OFFSET));
+  if (type != PageType::Leaf && type != PageType::Internal) {
     return Err(Status::Corruption("unexpected page type"));
   }
   if (little_endian::GetU32(bytes, PAGE_ID_OFFSET) != expected_page_id) {
@@ -172,32 +204,33 @@ auto DecodePage(PageId expected_page_id, PageType expected_type,
       return Err(Status::Corruption("invalid key size"));
     }
 
-    const std::string_view key = CellAt(page, entry_count, index).key;
+    const auto cell = CellAt(page, entry_count, index);
+    const std::string_view key = cell.key;
     if (index != 0 && previous_key >= key) {
       return Err(Status::Corruption("keys are not strictly ordered"));
     }
     previous_key = key;
+    if (type == PageType::Internal &&
+        (cell.value.size() != sizeof(PageId) ||
+         !ValidLink(expected_page_id, little_endian::GetU32(cell.value, 0)))) {
+      return Err(Status::Corruption("invalid internal child page ID"));
+    }
   }
 
-  return PageHeader{entry_count, little_endian::GetU32(bytes, LINK_OFFSET)};
-}
-
-} // namespace
-
-auto LeafPageView::Entry(std::size_t index) const noexcept -> LeafEntry {
-  assert(index < entry_count_);
-  return CellAt(*page_, entry_count_, index);
-}
-
-auto InternalPageView::Entry(std::size_t index) const noexcept
-    -> InternalEntry {
-  assert(index < entry_count_);
-  const auto cell = CellAt(*page_, entry_count_, index);
-  return {cell.key, little_endian::GetU32(cell.value, 0)};
-}
-
-auto PeekPageType(const PageBytes &page) noexcept -> PageType {
-  return static_cast<PageType>(little_endian::GetU16(page, TYPE_OFFSET));
+  const auto link = little_endian::GetU32(bytes, LINK_OFFSET);
+  if (type == PageType::Leaf) {
+    if (link != INVALID_PAGE_ID && !ValidLink(expected_page_id, link)) {
+      return Err(Status::Corruption("invalid next leaf page ID"));
+    }
+  } else {
+    if (!ValidLink(expected_page_id, link)) {
+      return Err(Status::Corruption("invalid leftmost child page ID"));
+    }
+    if (entry_count == 0) {
+      return Err(Status::Corruption("internal page has no entries"));
+    }
+  }
+  return Page{page};
 }
 
 auto EncodeLeafPage(PageId page_id, PageId next_leaf,
@@ -207,20 +240,6 @@ auto EncodeLeafPage(PageId page_id, PageId next_leaf,
   return EncodePage(PageType::Leaf, page_id, next_leaf, entries);
 }
 
-auto DecodeLeafPage(PageId expected_page_id,
-                    const PageBytes &page) -> Result<LeafPageView> {
-  auto header = DecodePage(expected_page_id, PageType::Leaf, page);
-  if (!header) {
-    return Err(std::move(header.error()));
-  }
-  if (header->link != INVALID_PAGE_ID &&
-      !ValidLink(expected_page_id, header->link)) {
-    return Err(Status::Corruption("invalid next leaf page ID"));
-  }
-  return LeafPageView{&page, expected_page_id, header->link,
-                      header->entry_count};
-}
-
 auto EncodeInternalPage(PageId page_id, PageId leftmost_child,
                         std::span<const InternalEntry> entries)
     -> Result<PageBytes> {
@@ -228,29 +247,6 @@ auto EncodeInternalPage(PageId page_id, PageId leftmost_child,
   assert(ValidLink(page_id, leftmost_child));
   assert(!entries.empty());
   return EncodePage(PageType::Internal, page_id, leftmost_child, entries);
-}
-
-auto DecodeInternalPage(PageId expected_page_id,
-                        const PageBytes &page) -> Result<InternalPageView> {
-  auto header = DecodePage(expected_page_id, PageType::Internal, page);
-  if (!header) {
-    return Err(std::move(header.error()));
-  }
-  if (!ValidLink(expected_page_id, header->link)) {
-    return Err(Status::Corruption("invalid leftmost child page ID"));
-  }
-  if (header->entry_count == 0) {
-    return Err(Status::Corruption("internal page has no entries"));
-  }
-  for (std::size_t index = 0; index < header->entry_count; ++index) {
-    const auto cell = CellAt(page, header->entry_count, index);
-    if (cell.value.size() != sizeof(PageId) ||
-        !ValidLink(expected_page_id, little_endian::GetU32(cell.value, 0))) {
-      return Err(Status::Corruption("invalid internal child page ID"));
-    }
-  }
-  return InternalPageView{&page, expected_page_id, header->link,
-                          header->entry_count};
 }
 
 } // namespace tinydb::storage

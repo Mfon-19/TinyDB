@@ -127,11 +127,8 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
 }
 
 auto Database::Get(std::string_view key) -> Result<std::optional<std::string>> {
-  auto transaction = BeginRead();
-  if (!transaction) {
-    return Err(std::move(transaction.error()));
-  }
-  return (*transaction)->Get(key);
+  ReadTransaction transaction(*this);
+  return transaction.Get(key);
 }
 
 auto Database::BeginRead() -> Result<std::unique_ptr<ReadTransaction>> {
@@ -153,26 +150,20 @@ auto Database::BeginWrite() -> Result<std::unique_ptr<WriteTransaction>> {
 }
 
 Status Database::Put(std::string_view key, std::string_view value) {
-  auto transaction = BeginWrite();
-  if (!transaction) {
-    return std::move(transaction.error());
-  }
-  if (auto status = (*transaction)->Put(key, value); !status.Ok()) {
+  WriteTransaction transaction(*this);
+  if (auto status = transaction.Put(key, value); !status.Ok()) {
     return status;
   }
-  return (*transaction)->Commit();
+  return transaction.Commit();
 }
 
 auto Database::Delete(std::string_view key) -> Result<bool> {
-  auto transaction = BeginWrite();
-  if (!transaction) {
-    return Err(std::move(transaction.error()));
-  }
-  auto removed = (*transaction)->Delete(key);
+  WriteTransaction transaction(*this);
+  auto removed = transaction.Delete(key);
   if (!removed) {
     return Err(std::move(removed.error()));
   }
-  if (auto status = (*transaction)->Commit(); !status.Ok()) {
+  if (auto status = transaction.Commit(); !status.Ok()) {
     return Err(std::move(status));
   }
   return *removed;

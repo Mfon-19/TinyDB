@@ -32,14 +32,14 @@ public:
 private:
   friend class BPlusTree;
 
-  explicit Cursor(BPlusTree &tree)
-      : tree_(&tree), page_(std::make_unique<storage::PageBytes>()) {}
+  Cursor(BPlusTree &tree, const storage::Page &page)
+      : tree_(&tree), page_(std::make_unique<storage::Page>(page)) {}
 
   Status Position(std::string_view key, bool inclusive);
   Status LoadLeaf(storage::PageId page_id);
 
   BPlusTree *tree_;
-  std::unique_ptr<storage::PageBytes> page_;
+  std::unique_ptr<storage::Page> page_;
   std::optional<storage::LeafPageView> leaf_;
   std::size_t index_ = 0;
 };
@@ -66,8 +66,7 @@ private:
     storage::PageId right;
   };
 
-  auto FindLeaf(std::string_view key, storage::PageBytes &leaf_page)
-      -> Result<storage::LeafPageView>;
+  auto FindLeaf(std::string_view key) -> Result<storage::Page>;
   auto Insert(storage::PageId page_id, std::string_view key,
               std::string_view value) -> Result<std::optional<Split>>;
   auto Remove(storage::PageId page_id, std::string_view key) -> Result<bool>;

@@ -5,7 +5,7 @@
  * as the handle exists.
  */
 
-#include "tinydb/storage/page.h"
+#include "tinydb/storage/page_codec.h"
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -36,13 +36,17 @@ public:
   ~PageHandle() { Release(); }
 
   [[nodiscard]] auto Bytes() const noexcept -> const storage::PageBytes & {
+    return page_->Bytes();
+  }
+
+  [[nodiscard]] auto Get() const noexcept -> const storage::Page & {
     return *page_;
   }
 
 private:
   friend class BufferPool;
 
-  PageHandle(const storage::PageBytes *page,
+  PageHandle(const storage::Page *page,
              std::atomic<std::size_t> *pin_count) noexcept
       : page_(page), pin_count_(pin_count) {
     pin_count_->fetch_add(1, std::memory_order_relaxed);
@@ -57,7 +61,7 @@ private:
     }
   }
 
-  const storage::PageBytes *page_;
+  const storage::Page *page_;
   std::atomic<std::size_t> *pin_count_;
 };
 

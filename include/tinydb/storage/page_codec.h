@@ -37,8 +37,7 @@ public:
   [[nodiscard]] auto Entry(std::size_t index) const noexcept -> LeafEntry;
 
 private:
-  friend auto DecodeLeafPage(PageId expected_page_id,
-                             const PageBytes &page) -> Result<LeafPageView>;
+  friend class Page;
 
   LeafPageView(const PageBytes *page, PageId page_id, PageId next_leaf,
                std::uint16_t entry_count) noexcept
@@ -63,8 +62,7 @@ public:
   [[nodiscard]] auto Entry(std::size_t index) const noexcept -> InternalEntry;
 
 private:
-  friend auto DecodeInternalPage(PageId expected_page_id, const PageBytes &page)
-      -> Result<InternalPageView>;
+  friend class Page;
 
   InternalPageView(const PageBytes *page, PageId page_id, PageId leftmost_child,
                    std::uint16_t entry_count) noexcept
@@ -77,17 +75,32 @@ private:
   std::uint16_t entry_count_;
 };
 
-auto PeekPageType(const PageBytes &page) noexcept -> PageType;
+// Owns validated bytes. Views borrow them until the page is replaced.
+class Page {
+public:
+  [[nodiscard]] auto Bytes() const noexcept -> const PageBytes & {
+    return bytes_;
+  }
+  [[nodiscard]] auto Id() const noexcept -> PageId;
+  [[nodiscard]] auto Type() const noexcept -> PageType;
+  [[nodiscard]] auto Leaf() const noexcept -> LeafPageView;
+  [[nodiscard]] auto Internal() const noexcept -> InternalPageView;
+
+private:
+  friend auto DecodePage(PageId expected_page_id, const PageBytes &bytes)
+      -> Result<Page>;
+  explicit Page(const PageBytes &bytes) noexcept : bytes_(bytes) {}
+
+  PageBytes bytes_;
+};
+
+auto DecodePage(PageId expected_page_id, const PageBytes &bytes) -> Result<Page>;
 
 auto EncodeLeafPage(PageId page_id, PageId next_leaf,
                     std::span<const LeafEntry> entries) -> Result<PageBytes>;
-auto DecodeLeafPage(PageId expected_page_id,
-                    const PageBytes &page) -> Result<LeafPageView>;
 
 auto EncodeInternalPage(PageId page_id, PageId leftmost_child,
                         std::span<const InternalEntry> entries)
     -> Result<PageBytes>;
-auto DecodeInternalPage(PageId expected_page_id,
-                        const PageBytes &page) -> Result<InternalPageView>;
 
 } // namespace tinydb::storage

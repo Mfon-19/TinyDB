@@ -92,8 +92,7 @@ Status BPlusTree::Initialize() {
   return context_.WritePage(root_page_id_, *page);
 }
 
-auto BPlusTree::FindLeaf(std::string_view key, storage::PageBytes &leaf_page)
-    -> Result<storage::LeafPageView> {
+auto BPlusTree::FindLeaf(std::string_view key) -> Result<storage::Page> {
   PageId page_id = root_page_id_;
 
   while (true) {
@@ -101,33 +100,29 @@ auto BPlusTree::FindLeaf(std::string_view key, storage::PageBytes &leaf_page)
     if (!page) {
       return Err(std::move(page.error()));
     }
-    if (storage::PeekPageType(*page) != storage::PageType::Internal) {
-      leaf_page = *page;
-      return storage::DecodeLeafPage(page_id, leaf_page);
+    if (page->Type() == storage::PageType::Leaf) {
+      return page;
     }
 
-    auto internal = storage::DecodeInternalPage(page_id, *page);
-    if (!internal) {
-      return Err(std::move(internal.error()));
-    }
-    page_id = ChildAt(*internal, ChildIndex(*internal, key));
+    const auto internal = page->Internal();
+    page_id = ChildAt(internal, ChildIndex(internal, key));
   }
 }
 
 auto BPlusTree::Get(std::string_view key)
     -> Result<std::optional<std::string>> {
-  storage::PageBytes page;
-  auto leaf = FindLeaf(key, page);
-  if (!leaf) {
-    return Err(std::move(leaf.error()));
+  auto page = FindLeaf(key);
+  if (!page) {
+    return Err(std::move(page.error()));
   }
 
-  const auto keys = EntryKeys(*leaf);
+  const auto leaf = page->Leaf();
+  const auto keys = EntryKeys(leaf);
   const auto found = std::ranges::lower_bound(keys, key);
   if (found == keys.end() || *found != key) {
     return std::nullopt;
   }
-  return std::string{leaf->Entry(found - keys.begin()).value};
+  return std::string{leaf.Entry(found - keys.begin()).value};
 }
 
 Status BPlusTree::Put(std::string_view key, std::string_view value) {
@@ -158,7 +153,11 @@ auto BPlusTree::Delete(std::string_view key) -> Result<bool> {
 }
 
 auto BPlusTree::Seek(std::string_view key) -> Result<Cursor> {
-  Cursor cursor(*this);
+  auto page = FindLeaf(key);
+  if (!page) {
+    return Err(std::move(page.error()));
+  }
+  Cursor cursor(*this, *page);
   if (auto status = cursor.Position(key, true); !status.Ok()) {
     return Err(std::move(status));
   }
@@ -182,22 +181,14 @@ auto BPlusTree::FindFreePages(PageId page_count)
     if (!page) {
       return Err(std::move(page.error()));
     }
-    if (storage::PeekPageType(*page) != storage::PageType::Internal) {
-      auto leaf = storage::DecodeLeafPage(page_id, *page);
-      if (!leaf) {
-        return Err(std::move(leaf.error()));
-      }
+    if (page->Type() == storage::PageType::Leaf) {
       continue;
     }
 
-    auto internal = storage::DecodeInternalPage(page_id, *page);
-    if (!internal) {
-      return Err(std::move(internal.error()));
-    }
-
-    pending.push_back(internal->LeftmostChild());
-    for (std::size_t index = 0; index < internal->EntryCount(); ++index) {
-      pending.push_back(internal->Entry(index).right_child);
+    const auto internal = page->Internal();
+    pending.push_back(internal.LeftmostChild());
+    for (std::size_t index = 0; index < internal.EntryCount(); ++index) {
+      pending.push_back(internal.Entry(index).right_child);
     }
   }
 
@@ -216,14 +207,10 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key) -> Result<bool> {
     return Err(std::move(page.error()));
   }
 
-  if (storage::PeekPageType(*page) == storage::PageType::Internal) {
-    auto internal = storage::DecodeInternalPage(page_id, *page);
-    if (!internal) {
-      return Err(std::move(internal.error()));
-    }
-
-    const std::size_t child_index = ChildIndex(*internal, key);
-    auto child = Remove(ChildAt(*internal, child_index), key);
+  if (page->Type() == storage::PageType::Internal) {
+    const auto internal = page->Internal();
+    const std::size_t child_index = ChildIndex(internal, key);
+    auto child = Remove(ChildAt(internal, child_index), key);
     if (!child) {
       return Err(std::move(child.error()));
     }
@@ -231,18 +218,18 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key) -> Result<bool> {
       return false;
     }
 
-    if (internal->EntryCount() == 1 && page_id != root_page_id_) {
+    if (internal.EntryCount() == 1 && page_id != root_page_id_) {
       return true;
     }
 
     // Merge with the right sibling, or the left one for the last child.
     const std::size_t left_index =
-        std::min(child_index, internal->EntryCount() - 1);
-    const PageId left = ChildAt(*internal, left_index);
-    const PageId right = ChildAt(*internal, left_index + 1);
-    const PageId target = internal->EntryCount() == 1 ? page_id : left;
+        std::min(child_index, internal.EntryCount() - 1);
+    const PageId left = ChildAt(internal, left_index);
+    const PageId right = ChildAt(internal, left_index + 1);
+    const PageId target = internal.EntryCount() == 1 ? page_id : left;
     auto merged =
-        MergeChildren(target, left, right, internal->Entry(left_index).key);
+        MergeChildren(target, left, right, internal.Entry(left_index).key);
     if (!merged) {
       return Err(std::move(merged.error()));
     }
@@ -255,11 +242,11 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key) -> Result<bool> {
       context_.FreePage(left);
       return true;
     }
-    auto entries = Entries(*internal);
+    auto entries = Entries(internal);
     entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(left_index));
 
     auto encoded = storage::EncodeInternalPage(
-        page_id, internal->LeftmostChild(), entries);
+        page_id, internal.LeftmostChild(), entries);
     if (!encoded) {
       return Err(std::move(encoded.error()));
     }
@@ -269,12 +256,8 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key) -> Result<bool> {
     return true;
   }
 
-  auto leaf = storage::DecodeLeafPage(page_id, *page);
-  if (!leaf) {
-    return Err(std::move(leaf.error()));
-  }
-
-  auto entries = Entries(*leaf);
+  const auto leaf = page->Leaf();
+  auto entries = Entries(leaf);
   const auto found =
       std::ranges::lower_bound(entries, key, {}, &LeafEntry::key);
   if (found == entries.end() || found->key != key) {
@@ -282,7 +265,7 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key) -> Result<bool> {
   }
   entries.erase(found);
 
-  auto encoded = storage::EncodeLeafPage(page_id, leaf->NextLeaf(), entries);
+  auto encoded = storage::EncodeLeafPage(page_id, leaf.NextLeaf(), entries);
   if (!encoded) {
     return Err(std::move(encoded.error()));
   }
@@ -302,38 +285,29 @@ auto BPlusTree::MergeChildren(PageId target, PageId left_id, PageId right_id,
   if (!right) {
     return Err(std::move(right.error()));
   }
+  if (left->Type() != right->Type()) {
+    return Err(Status::Corruption("cannot merge pages of different types"));
+  }
 
   Result<storage::PageBytes> merged;
-  if (storage::PeekPageType(*left) == storage::PageType::Internal) {
-    auto left_page = storage::DecodeInternalPage(left_id, *left);
-    if (!left_page) {
-      return Err(std::move(left_page.error()));
-    }
-    auto right_page = storage::DecodeInternalPage(right_id, *right);
-    if (!right_page) {
-      return Err(std::move(right_page.error()));
-    }
+  if (left->Type() == storage::PageType::Internal) {
+    const auto left_page = left->Internal();
+    const auto right_page = right->Internal();
 
-    auto entries = Entries(*left_page);
-    entries.push_back({separator, right_page->LeftmostChild()});
-    const auto right_entries = Entries(*right_page);
+    auto entries = Entries(left_page);
+    entries.push_back({separator, right_page.LeftmostChild()});
+    const auto right_entries = Entries(right_page);
     entries.insert(entries.end(), right_entries.begin(), right_entries.end());
-    merged = storage::EncodeInternalPage(target, left_page->LeftmostChild(),
+    merged = storage::EncodeInternalPage(target, left_page.LeftmostChild(),
                                          entries);
   } else {
-    auto left_page = storage::DecodeLeafPage(left_id, *left);
-    if (!left_page) {
-      return Err(std::move(left_page.error()));
-    }
-    auto right_page = storage::DecodeLeafPage(right_id, *right);
-    if (!right_page) {
-      return Err(std::move(right_page.error()));
-    }
+    const auto left_page = left->Leaf();
+    const auto right_page = right->Leaf();
 
-    auto entries = Entries(*left_page);
-    const auto right_entries = Entries(*right_page);
+    auto entries = Entries(left_page);
+    const auto right_entries = Entries(right_page);
     entries.insert(entries.end(), right_entries.begin(), right_entries.end());
-    merged = storage::EncodeLeafPage(target, right_page->NextLeaf(), entries);
+    merged = storage::EncodeLeafPage(target, right_page.NextLeaf(), entries);
   }
 
   if (!merged) {
@@ -352,14 +326,10 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
     return Err(std::move(page.error()));
   }
 
-  if (storage::PeekPageType(*page) == storage::PageType::Internal) {
-    auto internal = storage::DecodeInternalPage(page_id, *page);
-    if (!internal) {
-      return Err(std::move(internal.error()));
-    }
-
-    const std::size_t child_index = ChildIndex(*internal, key);
-    auto child = Insert(ChildAt(*internal, child_index), key, value);
+  if (page->Type() == storage::PageType::Internal) {
+    const auto internal = page->Internal();
+    const std::size_t child_index = ChildIndex(internal, key);
+    auto child = Insert(ChildAt(internal, child_index), key, value);
     if (!child) {
       return Err(std::move(child.error()));
     }
@@ -368,39 +338,42 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
     }
 
     const Split &split = **child;
-    auto entries = Entries(*internal);
+    auto entries = Entries(internal);
     entries.insert(entries.begin() + static_cast<std::ptrdiff_t>(child_index),
                    InternalEntry{split.separator, split.right});
     if (auto encoded = storage::EncodeInternalPage(
-            page_id, internal->LeftmostChild(), entries)) {
+            page_id, internal.LeftmostChild(), entries)) {
       if (auto status = context_.WritePage(page_id, *encoded); !status.Ok()) {
         return Err(std::move(status));
       }
       return std::nullopt;
     }
-    return SplitInternal(page_id, internal->LeftmostChild(), entries);
+    return SplitInternal(page_id, internal.LeftmostChild(), entries);
   }
 
-  auto leaf = storage::DecodeLeafPage(page_id, *page);
-  if (!leaf) {
-    return Err(std::move(leaf.error()));
+  const auto leaf = page->Leaf();
+  const auto keys = EntryKeys(leaf);
+  const auto found = std::ranges::lower_bound(keys, key);
+  const auto index = found - keys.begin();
+  const bool exists = found != keys.end() && *found == key;
+  if (exists && leaf.Entry(index).value == value) {
+    return std::nullopt;
   }
-
-  auto entries = Entries(*leaf);
-  auto position = std::ranges::lower_bound(entries, key, {}, &LeafEntry::key);
-  if (position != entries.end() && position->key == key) {
+  auto entries = Entries(leaf);
+  auto position = entries.begin() + index;
+  if (exists) {
     position->value = value;
   } else {
     entries.insert(position, LeafEntry{key, value});
   }
   if (auto encoded =
-          storage::EncodeLeafPage(page_id, leaf->NextLeaf(), entries)) {
+          storage::EncodeLeafPage(page_id, leaf.NextLeaf(), entries)) {
     if (auto status = context_.WritePage(page_id, *encoded); !status.Ok()) {
       return Err(std::move(status));
     }
     return std::nullopt;
   }
-  return SplitLeaf(page_id, leaf->NextLeaf(), entries);
+  return SplitLeaf(page_id, leaf.NextLeaf(), entries);
 }
 
 auto BPlusTree::SplitLeaf(PageId page_id, PageId next_leaf,
@@ -499,16 +472,17 @@ Status Cursor::Next() {
     return LoadLeaf(leaf_->NextLeaf());
   }
   const std::string last_key{Key()};
+  leaf_.reset();
+  auto page = tree_->FindLeaf(last_key);
+  if (!page) {
+    return std::move(page.error());
+  }
+  *page_ = std::move(*page);
   return Position(last_key, false);
 }
 
 Status Cursor::Position(std::string_view key, bool inclusive) {
-  leaf_.reset();
-  auto leaf = tree_->FindLeaf(key, *page_);
-  if (!leaf) {
-    return std::move(leaf.error());
-  }
-  leaf_ = *leaf;
+  leaf_ = page_->Leaf();
 
   while (leaf_) {
     const auto keys = EntryKeys(*leaf_);
@@ -534,17 +508,17 @@ Status Cursor::LoadLeaf(PageId page_id) {
     if (!page) {
       return std::move(page.error());
     }
-    *page_ = *page;
-    auto leaf = storage::DecodeLeafPage(page_id, *page_);
-    if (!leaf) {
-      return std::move(leaf.error());
+    if (page->Type() != storage::PageType::Leaf) {
+      return Status::Corruption("leaf link points to an internal page");
     }
-    if (leaf->EntryCount() != 0) {
-      leaf_ = *leaf;
+    *page_ = std::move(*page);
+    const auto leaf = page_->Leaf();
+    if (leaf.EntryCount() != 0) {
+      leaf_ = leaf;
       index_ = 0;
       return {};
     }
-    page_id = leaf->NextLeaf();
+    page_id = leaf.NextLeaf();
   }
   return {};
 }

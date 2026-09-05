@@ -76,11 +76,10 @@ auto LeftmostPath(detail::PageContext &context,
   std::vector<storage::PageId> path{page_id};
   while (true) {
     const auto page = context.ReadPage(page_id).value();
-    if (storage::PeekPageType(page) != storage::PageType::Internal) {
+    if (page.Type() != storage::PageType::Internal) {
       return path;
     }
-    page_id =
-        storage::DecodeInternalPage(page_id, page).value().LeftmostChild();
+    page_id = page.Internal().LeftmostChild();
     path.push_back(page_id);
   }
 }
@@ -91,7 +90,7 @@ auto LeafKeys(detail::PageContext &context,
   storage::PageId page_id = LeftmostPath(context, root).back();
   while (page_id != storage::INVALID_PAGE_ID) {
     const auto page = context.ReadPage(page_id).value();
-    const auto leaf = storage::DecodeLeafPage(page_id, page).value();
+    const auto leaf = page.Leaf();
     for (std::size_t index = 0; index < leaf.EntryCount(); ++index) {
       keys.emplace_back(leaf.Entry(index).key);
     }
@@ -103,12 +102,12 @@ auto LeafKeys(detail::PageContext &context,
 void CollectLeafDepths(detail::PageContext &context, storage::PageId page_id,
                        std::size_t depth, std::vector<std::size_t> &depths) {
   const auto page = context.ReadPage(page_id).value();
-  if (storage::PeekPageType(page) != storage::PageType::Internal) {
+  if (page.Type() != storage::PageType::Internal) {
     depths.push_back(depth);
     return;
   }
 
-  const auto internal = storage::DecodeInternalPage(page_id, page).value();
+  const auto internal = page.Internal();
   CollectLeafDepths(context, internal.LeftmostChild(), depth + 1, depths);
   for (std::size_t index = 0; index < internal.EntryCount(); ++index) {
     CollectLeafDepths(context, internal.Entry(index).right_child, depth + 1,

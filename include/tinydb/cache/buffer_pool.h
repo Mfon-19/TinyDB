@@ -14,6 +14,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace tinydb::cache {
@@ -37,15 +38,14 @@ private:
   using FrameIterator = std::list<Frame>::iterator;
 
   struct Frame {
-    storage::PageId page_id = storage::INVALID_PAGE_ID;
-    storage::PageBytes page{};
+    std::optional<storage::Page> page;
     std::atomic<std::size_t> pin_count{0};
     bool dirty = false;
     FrameIterator hash_next;
   };
 
   auto FindPage(storage::PageId page_id) -> FrameIterator;
-  void SetPageId(FrameIterator frame, storage::PageId page_id);
+  void SetPage(FrameIterator frame, const storage::Page &page);
   auto FindVictim() -> FrameIterator;
   void Touch(FrameIterator frame);
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "tinydb/status.h"
-#include "tinydb/storage/page.h"
+#include "tinydb/storage/page_codec.h"
 #include <atomic>
 #include <map>
 #include <vector>
@@ -33,7 +33,7 @@ public:
   [[nodiscard]] bool Active() const noexcept;
   [[nodiscard]] bool ReadOnly() const noexcept { return write_ == nullptr; }
   Status CheckActive() const;
-  Result<storage::PageBytes> ReadPage(storage::PageId page_id);
+  Result<storage::Page> ReadPage(storage::PageId page_id);
   Status WritePage(storage::PageId page_id, const storage::PageBytes &page);
   Result<storage::PageId> AllocatePage();
   void FreePage(storage::PageId page_id);

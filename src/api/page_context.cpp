@@ -19,21 +19,21 @@ Status PageContext::CheckActive() const {
   return {};
 }
 
-Result<storage::PageBytes> PageContext::ReadPage(storage::PageId page_id) {
+Result<storage::Page> PageContext::ReadPage(storage::PageId page_id) {
   if (auto status = CheckActive(); !status.Ok()) {
     return Err(std::move(status));
   }
   if (write_) {
     if (auto found = write_->pages.find(page_id);
         found != write_->pages.end()) {
-      return found->second;
+      return storage::DecodePage(page_id, found->second);
     }
   }
   auto page = pool_.ReadPage(page_id);
   if (!page) {
     return Err(std::move(page.error()));
   }
-  return page->Bytes();
+  return page->Get();
 }
 
 Status PageContext::WritePage(storage::PageId page_id,
