@@ -36,6 +36,7 @@ private:
       : tree_(&tree), page_(std::make_unique<storage::PageBytes>()) {}
 
   Status Position(std::string_view key, bool inclusive);
+  Status LoadLeaf(storage::PageId page_id);
 
   BPlusTree *tree_;
   std::unique_ptr<storage::PageBytes> page_;

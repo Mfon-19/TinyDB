@@ -495,6 +495,9 @@ Status Cursor::Next() {
     return {};
   }
 
+  if (tree_->context_.ReadOnly()) {
+    return LoadLeaf(leaf_->NextLeaf());
+  }
   const std::string last_key{Key()};
   return Position(last_key, false);
 }
@@ -502,32 +505,48 @@ Status Cursor::Next() {
 Status Cursor::Position(std::string_view key, bool inclusive) {
   leaf_.reset();
   auto leaf = tree_->FindLeaf(key, *page_);
-  while (true) {
-    if (!leaf) {
-      return std::move(leaf.error());
-    }
+  if (!leaf) {
+    return std::move(leaf.error());
+  }
+  leaf_ = *leaf;
 
-    const auto keys = EntryKeys(*leaf);
+  while (leaf_) {
+    const auto keys = EntryKeys(*leaf_);
     auto found = std::ranges::lower_bound(keys, key);
     if (!inclusive && found != keys.end() && *found == key) {
       ++found;
     }
     if (found != keys.end()) {
-      leaf_ = *leaf;
       index_ = static_cast<std::size_t>(found - keys.begin());
       return {};
     }
-    const PageId next = leaf->NextLeaf();
-    if (next == storage::INVALID_PAGE_ID) {
-      return {};
+    if (auto status = LoadLeaf(leaf_->NextLeaf()); !status.Ok()) {
+      return status;
     }
-    auto page = tree_->context_.ReadPage(next);
+  }
+  return {};
+}
+
+Status Cursor::LoadLeaf(PageId page_id) {
+  leaf_.reset();
+  while (page_id != storage::INVALID_PAGE_ID) {
+    auto page = tree_->context_.ReadPage(page_id);
     if (!page) {
       return std::move(page.error());
     }
     *page_ = *page;
-    leaf = storage::DecodeLeafPage(next, *page_);
+    auto leaf = storage::DecodeLeafPage(page_id, *page_);
+    if (!leaf) {
+      return std::move(leaf.error());
+    }
+    if (leaf->EntryCount() != 0) {
+      leaf_ = *leaf;
+      index_ = 0;
+      return {};
+    }
+    page_id = leaf->NextLeaf();
   }
+  return {};
 }
 
 } // namespace tinydb::btree

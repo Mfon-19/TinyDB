@@ -14,6 +14,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <vector>
 
 namespace tinydb::cache {
 
@@ -32,15 +33,19 @@ public:
   Status Flush(const std::map<storage::PageId, storage::PageBytes> &incoming);
 
 private:
+  struct Frame;
+  using FrameIterator = std::list<Frame>::iterator;
+
   struct Frame {
     storage::PageId page_id = storage::INVALID_PAGE_ID;
     storage::PageBytes page{};
     std::atomic<std::size_t> pin_count{0};
     bool dirty = false;
+    FrameIterator hash_next;
   };
 
-  using FrameIterator = std::list<Frame>::iterator;
-
+  auto FindPage(storage::PageId page_id) -> FrameIterator;
+  void SetPageId(FrameIterator frame, storage::PageId page_id);
   auto FindVictim() -> FrameIterator;
   void Touch(FrameIterator frame);
 
@@ -48,6 +53,7 @@ private:
   std::size_t capacity_;
   std::mutex mutex_;
   std::list<Frame> frames_;
+  std::vector<FrameIterator> buckets_;
 };
 
 } // namespace tinydb::cache

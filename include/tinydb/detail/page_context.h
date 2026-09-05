@@ -31,6 +31,7 @@ public:
       : pool_(pool), poisoned_(poisoned), write_(write) {}
 
   [[nodiscard]] bool Active() const noexcept;
+  [[nodiscard]] bool ReadOnly() const noexcept { return write_ == nullptr; }
   Status CheckActive() const;
   Result<storage::PageBytes> ReadPage(storage::PageId page_id);
   Status WritePage(storage::PageId page_id, const storage::PageBytes &page);

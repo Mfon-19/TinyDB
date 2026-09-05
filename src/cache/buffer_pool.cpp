@@ -6,7 +6,30 @@ namespace tinydb::cache {
 
 BufferPool::BufferPool(storage::DiskManager disk_manager, std::size_t capacity)
     : disk_manager_(std::move(disk_manager)), capacity_(capacity),
-      frames_(capacity) {}
+      frames_(capacity),
+      buckets_(std::max(capacity, std::size_t{1}), frames_.end()) {}
+
+auto BufferPool::FindPage(storage::PageId page_id) -> FrameIterator {
+  auto frame = buckets_[page_id % buckets_.size()];
+  while (frame != frames_.end() && frame->page_id != page_id) {
+    frame = frame->hash_next;
+  }
+  return frame;
+}
+
+void BufferPool::SetPageId(FrameIterator frame, storage::PageId page_id) {
+  if (frame->page_id != storage::INVALID_PAGE_ID) {
+    auto *link = &buckets_[frame->page_id % buckets_.size()];
+    while (*link != frame) {
+      link = &(*link)->hash_next;
+    }
+    *link = frame->hash_next;
+  }
+  auto &head = buckets_[page_id % buckets_.size()];
+  frame->hash_next = head;
+  head = frame;
+  frame->page_id = page_id;
+}
 
 auto BufferPool::FindVictim() -> FrameIterator {
   auto frame = frames_.end();
@@ -31,7 +54,7 @@ Status BufferPool::InstallPage(storage::PageId page_id,
     return Status::InvalidArgument("invalid page ID");
   }
   std::lock_guard lock(mutex_);
-  auto frame = std::ranges::find(frames_, page_id, &Frame::page_id);
+  auto frame = FindPage(page_id);
   if (frame != frames_.end() &&
       frame->pin_count.load(std::memory_order_acquire) != 0) {
     return Status::ResourceExhausted("cannot write a pinned page");
@@ -44,7 +67,7 @@ Status BufferPool::InstallPage(storage::PageId page_id,
     }
   }
 
-  frame->page_id = page_id;
+  SetPageId(frame, page_id);
   frame->page = page;
   frame->dirty = true;
   Touch(frame);
@@ -56,8 +79,7 @@ Result<PageHandle> BufferPool::ReadPage(storage::PageId page_id) {
     return Err(Status::InvalidArgument("invalid page ID"));
   }
   std::lock_guard lock(mutex_);
-  if (auto frame = std::ranges::find(frames_, page_id, &Frame::page_id);
-      frame != frames_.end()) {
+  if (auto frame = FindPage(page_id); frame != frames_.end()) {
     Touch(frame);
     return PageHandle{&frame->page, &frame->pin_count};
   }
@@ -74,7 +96,7 @@ Result<PageHandle> BufferPool::ReadPage(storage::PageId page_id) {
     return Err(std::move(status));
   }
 
-  frame->page_id = page_id;
+  SetPageId(frame, page_id);
   frame->page = page;
   Touch(frame);
   return PageHandle{&frame->page, &frame->pin_count};
