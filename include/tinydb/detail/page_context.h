@@ -36,7 +36,8 @@ public:
   auto CheckActive() const -> Status;
 
   auto Fail(Status error) -> Status;
-  [[nodiscard]] auto ReadPage(storage::PageId page_id) -> Result<storage::Page>;
+  [[nodiscard]] auto ReadPage(storage::PageId page_id)
+      -> Result<storage::PageRef>;
 
   auto WritePage(const storage::Page &page) -> Status;
   [[nodiscard]] auto AllocatePage() -> Result<storage::PageId>;

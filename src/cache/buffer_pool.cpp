@@ -7,8 +7,7 @@ namespace tinydb::cache {
 
 BufferPool::BufferPool(storage::DiskManager disk_manager, std::size_t capacity)
     : disk_manager_(std::move(disk_manager)), capacity_(capacity),
-      frames_(capacity),
-      buckets_(std::bit_ceil(capacity), frames_.end()) {}
+      frames_(capacity), buckets_(std::bit_ceil(capacity), frames_.end()) {}
 
 auto BufferPool::FindPage(storage::PageId page_id) -> FrameIterator {
   auto frame = buckets_[page_id & (buckets_.size() - 1)];
@@ -18,7 +17,7 @@ auto BufferPool::FindPage(storage::PageId page_id) -> FrameIterator {
   return frame;
 }
 
-void BufferPool::SetPage(FrameIterator frame, const storage::Page &page) {
+void BufferPool::SetPage(FrameIterator frame, storage::PageRef page) {
   if (frame->page) {
     auto *link = &buckets_[frame->page->Id() & (buckets_.size() - 1)];
     while (*link != frame) {
@@ -26,10 +25,10 @@ void BufferPool::SetPage(FrameIterator frame, const storage::Page &page) {
     }
     *link = frame->hash_next;
   }
-  auto &head = buckets_[page.Id() & (buckets_.size() - 1)];
+  auto &head = buckets_[page->Id() & (buckets_.size() - 1)];
   frame->hash_next = head;
   head = frame;
-  frame->page = page;
+  frame->page = std::move(page);
 }
 
 auto BufferPool::FindVictim() -> FrameIterator {
@@ -58,20 +57,20 @@ auto BufferPool::InstallPage(const storage::Page &page) -> Status {
     }
   }
 
-  SetPage(frame, page);
+  SetPage(frame, std::make_shared<const storage::Page>(page));
   frame->dirty = true;
   Touch(frame);
   return {};
 }
 
-auto BufferPool::ReadPage(storage::PageId page_id) -> Result<storage::Page> {
+auto BufferPool::ReadPage(storage::PageId page_id) -> Result<storage::PageRef> {
   if (!storage::ValidDataPageId(page_id)) {
     return Err(Status::InvalidArgument("invalid page ID"));
   }
   std::lock_guard lock(mutex_);
   if (auto frame = FindPage(page_id); frame != frames_.end()) {
     Touch(frame);
-    return *frame->page;
+    return frame->page;
   }
 
   auto frame = FindVictim();
@@ -86,11 +85,12 @@ auto BufferPool::ReadPage(storage::PageId page_id) -> Result<storage::Page> {
   }
 
   auto decoded = storage::DecodePage(page_id, page);
-  if (decoded) {
-    SetPage(frame, *decoded);
-    Touch(frame);
+  if (!decoded) {
+    return Err(std::move(decoded.error()));
   }
-  return decoded;
+  SetPage(frame, std::make_shared<const storage::Page>(std::move(*decoded)));
+  Touch(frame);
+  return frame->page;
 }
 
 auto BufferPool::Checkpoint(const storage::PageMap &incoming) -> Status {
@@ -119,7 +119,7 @@ auto BufferPool::Checkpoint(const storage::PageMap &incoming) -> Status {
       continue;
     }
     if (auto found = incoming.find(frame.page->Id()); found != incoming.end()) {
-      frame.page = found->second;
+      frame.page = std::make_shared<const storage::Page>(found->second);
     }
     frame.dirty = false;
   }

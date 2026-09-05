@@ -31,13 +31,13 @@ public:
 
 private:
   friend class btree::BPlusTree;
-  Cursor(detail::PageContext &context, const storage::Page &page);
+  Cursor(detail::PageContext &context, storage::PageRef page);
 
   auto Position(std::string_view key) -> Status;
   auto LoadLeaf(storage::PageId page_id) -> Status;
 
   detail::PageContext *context_;
-  std::unique_ptr<storage::Page> page_;
+  storage::PageRef page_;
   storage::LeafPageView leaf_;
   std::uint64_t version_;
   std::size_t index_ = 0;

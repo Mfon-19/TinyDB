@@ -6,9 +6,9 @@
 
 namespace tinydb {
 
-Cursor::Cursor(detail::PageContext &context, const storage::Page &page)
-    : context_(&context), page_(std::make_unique<storage::Page>(page)),
-      leaf_(page_->Leaf()), version_(context.Version()) {}
+Cursor::Cursor(detail::PageContext &context, storage::PageRef page)
+    : context_(&context), page_(std::move(page)), leaf_(page_->Leaf()),
+      version_(context.Version()) {}
 
 auto Cursor::Valid() const noexcept -> bool {
   return page_ && context_->Active() && context_->Version() == version_;
@@ -59,12 +59,12 @@ auto Cursor::LoadLeaf(storage::PageId page_id) -> Status {
       page_.reset();
       return context_->Fail(std::move(page.error()));
     }
-    if (page->Type() != storage::PageType::Leaf) {
+    if ((*page)->Type() != storage::PageType::Leaf) {
       page_.reset();
       return context_->Fail(
           Status::Corruption("leaf link points to an internal page"));
     }
-    *page_ = std::move(*page);
+    page_ = std::move(*page);
     leaf_ = page_->Leaf();
     if (leaf_.EntryCount() != 0) {
       index_ = 0;

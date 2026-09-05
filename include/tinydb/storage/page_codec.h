@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <ranges>
 #include <span>
 #include <string_view>
@@ -114,6 +115,7 @@ private:
 };
 
 using PageMap = std::map<PageId, Page>;
+using PageRef = std::shared_ptr<const Page>;
 
 [[nodiscard]] auto DecodePage(PageId expected_page_id,
                               const PageBytes &bytes) -> Result<Page>;

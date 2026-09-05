@@ -105,10 +105,10 @@ TEST_F(DurabilityTest, DirtyPagesStayResident) {
   ASSERT_TRUE(pool.InstallPage(MakePage(1, "dirty")).Ok());
   EXPECT_TRUE(pool.ReadPage(2));
   EXPECT_TRUE(pool.ReadPage(3));
-  EXPECT_EQ(pool.ReadPage(1).value(), MakePage(1, "dirty"));
+  EXPECT_EQ(*pool.ReadPage(1).value(), MakePage(1, "dirty"));
   const storage::PageMap incoming{{1, MakePage(1, "checkpointed")}};
   ASSERT_TRUE(pool.Checkpoint(incoming).Ok());
-  EXPECT_EQ(pool.ReadPage(1).value(), incoming.at(1));
+  EXPECT_EQ(*pool.ReadPage(1).value(), incoming.at(1));
   EXPECT_TRUE(pool.ReadPage(2));
   EXPECT_TRUE(pool.ReadPage(3));
 }

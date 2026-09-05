@@ -65,16 +65,16 @@ auto BPlusTree::Initialize() -> Status {
   return context_.WritePage(*page);
 }
 
-auto BPlusTree::FindLeaf(std::string_view key) -> Result<storage::Page> {
+auto BPlusTree::FindLeaf(std::string_view key) -> Result<storage::PageRef> {
   PageId page_id = root_page_id_;
 
   while (true) {
     auto page = context_.ReadPage(page_id);
-    if (!page || page->Type() == storage::PageType::Leaf) {
+    if (!page || (*page)->Type() == storage::PageType::Leaf) {
       return page;
     }
 
-    const auto internal = page->Internal();
+    const auto internal = (*page)->Internal();
     page_id = ChildAt(internal, ChildIndex(internal, key));
   }
 }
@@ -86,7 +86,7 @@ auto BPlusTree::Get(std::string_view key)
     return Err(std::move(page.error()));
   }
 
-  const auto leaf = page->Leaf();
+  const auto leaf = (*page)->Leaf();
   const auto keys = Keys(leaf);
   const auto found = std::ranges::lower_bound(keys, key);
   if (found == keys.end() || *found != key) {
@@ -128,7 +128,7 @@ auto BPlusTree::Seek(std::string_view key) -> Result<Cursor> {
   if (!page) {
     return Err(std::move(page.error()));
   }
-  Cursor cursor(context_, *page);
+  Cursor cursor(context_, std::move(*page));
   if (auto status = cursor.Position(key); !status.Ok()) {
     return Err(std::move(status));
   }
@@ -152,11 +152,11 @@ auto BPlusTree::FindFreePages(PageId page_count)
     if (!page) {
       return Err(std::move(page.error()));
     }
-    if (page->Type() == storage::PageType::Leaf) {
+    if ((*page)->Type() == storage::PageType::Leaf) {
       continue;
     }
 
-    const auto internal = page->Internal();
+    const auto internal = (*page)->Internal();
     pending.push_back(internal.LeftmostChild());
     for (std::size_t index = 0; index < internal.EntryCount(); ++index) {
       pending.push_back(internal.Entry(index).right_child);
@@ -178,8 +178,8 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key) -> Result<bool> {
     return Err(std::move(page.error()));
   }
 
-  if (page->Type() == storage::PageType::Internal) {
-    const auto internal = page->Internal();
+  if ((*page)->Type() == storage::PageType::Internal) {
+    const auto internal = (*page)->Internal();
     const std::size_t child_index = ChildIndex(internal, key);
     auto child = Remove(ChildAt(internal, child_index), key);
     if (!child) {
@@ -227,7 +227,7 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key) -> Result<bool> {
     return true;
   }
 
-  const auto leaf = page->Leaf();
+  const auto leaf = (*page)->Leaf();
   const auto keys = Keys(leaf);
   const auto found = std::ranges::lower_bound(keys, key);
   if (found == keys.end() || *found != key) {
@@ -257,21 +257,21 @@ auto BPlusTree::MergeChildren(PageId target, PageId left_id, PageId right_id,
   if (!right) {
     return Err(std::move(right.error()));
   }
-  if (left->Type() != right->Type()) {
+  if ((*left)->Type() != (*right)->Type()) {
     return Err(Status::Corruption("cannot merge pages of different types"));
   }
-  auto added_size = right->PayloadSize();
-  if (left->Type() == storage::PageType::Internal) {
+  auto added_size = (*right)->PayloadSize();
+  if ((*left)->Type() == storage::PageType::Internal) {
     added_size += EntrySize(InternalEntry{separator, right_id});
   }
-  if (added_size > left->FreeSpace()) {
+  if (added_size > (*left)->FreeSpace()) {
     return false;
   }
 
   auto merged = [&]() -> Result<storage::Page> {
-    if (left->Type() == storage::PageType::Internal) {
-      const auto left_page = left->Internal();
-      const auto right_page = right->Internal();
+    if ((*left)->Type() == storage::PageType::Internal) {
+      const auto left_page = (*left)->Internal();
+      const auto right_page = (*right)->Internal();
       auto entries = Entries(left_page);
       entries.push_back({separator, right_page.LeftmostChild()});
       for (std::size_t index = 0; index < right_page.EntryCount(); ++index) {
@@ -280,8 +280,8 @@ auto BPlusTree::MergeChildren(PageId target, PageId left_id, PageId right_id,
       return storage::EncodeInternalPage(target, left_page.LeftmostChild(),
                                          entries);
     }
-    const auto left_page = left->Leaf();
-    const auto right_page = right->Leaf();
+    const auto left_page = (*left)->Leaf();
+    const auto right_page = (*right)->Leaf();
     auto entries = Entries(left_page);
     for (std::size_t index = 0; index < right_page.EntryCount(); ++index) {
       entries.push_back(right_page.Entry(index));
@@ -304,8 +304,8 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
     return Err(std::move(page.error()));
   }
 
-  if (page->Type() == storage::PageType::Internal) {
-    const auto internal = page->Internal();
+  if ((*page)->Type() == storage::PageType::Internal) {
+    const auto internal = (*page)->Internal();
     const std::size_t child_index = ChildIndex(internal, key);
     auto child = Insert(ChildAt(internal, child_index), key, value);
     if (!child) {
@@ -320,7 +320,7 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
     const auto position = entries.insert(
         entries.begin() + static_cast<std::ptrdiff_t>(child_index),
         InternalEntry{split.separator, split.right});
-    if (EntrySize(*position) <= page->FreeSpace()) {
+    if (EntrySize(*position) <= (*page)->FreeSpace()) {
       auto encoded = storage::EncodeInternalPage(
           page_id, internal.LeftmostChild(), entries);
       if (!encoded) {
@@ -334,7 +334,7 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
     return SplitInternal(page_id, internal.LeftmostChild(), entries);
   }
 
-  const auto leaf = page->Leaf();
+  const auto leaf = (*page)->Leaf();
   const auto keys = Keys(leaf);
   const auto found = std::ranges::lower_bound(keys, key);
   const auto index = static_cast<std::size_t>(found - keys.begin());
@@ -343,7 +343,7 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
     return std::nullopt;
   }
   auto entries = Entries(leaf);
-  auto available = page->FreeSpace();
+  auto available = (*page)->FreeSpace();
   auto position = entries.begin() + static_cast<std::ptrdiff_t>(index);
   if (exists) {
     available += EntrySize(*position);

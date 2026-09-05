@@ -12,7 +12,6 @@
 #include <cstddef>
 #include <list>
 #include <mutex>
-#include <optional>
 #include <vector>
 
 namespace tinydb::cache {
@@ -30,7 +29,8 @@ public:
     return capacity_;
   }
   auto InstallPage(const storage::Page &page) -> Status;
-  [[nodiscard]] auto ReadPage(storage::PageId page_id) -> Result<storage::Page>;
+  [[nodiscard]] auto ReadPage(storage::PageId page_id)
+      -> Result<storage::PageRef>;
 
   auto Checkpoint(const storage::PageMap &incoming) -> Status;
 
@@ -39,13 +39,13 @@ private:
   using FrameIterator = std::list<Frame>::iterator;
 
   struct Frame {
-    std::optional<storage::Page> page;
+    storage::PageRef page;
     bool dirty = false;
     FrameIterator hash_next;
   };
 
   auto FindPage(storage::PageId page_id) -> FrameIterator;
-  void SetPage(FrameIterator frame, const storage::Page &page);
+  void SetPage(FrameIterator frame, storage::PageRef page);
   auto FindVictim() -> FrameIterator;
   void Touch(FrameIterator frame);
 

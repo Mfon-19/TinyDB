@@ -1,6 +1,7 @@
 #include "tinydb/detail/page_context.h"
 #include "tinydb/cache/buffer_pool.h"
 #include <cassert>
+#include <memory>
 #include <utility>
 
 namespace tinydb::detail {
@@ -31,14 +32,15 @@ auto PageContext::Fail(Status error) -> Status {
   return error;
 }
 
-auto PageContext::ReadPage(storage::PageId page_id) -> Result<storage::Page> {
+auto PageContext::ReadPage(storage::PageId page_id)
+    -> Result<storage::PageRef> {
   if (auto status = CheckActive(); !status.Ok()) {
     return Err(std::move(status));
   }
   if (write_) {
     if (auto found = write_->pages.find(page_id);
         found != write_->pages.end()) {
-      return found->second;
+      return std::make_shared<const storage::Page>(found->second);
     }
   }
   return pool_.ReadPage(page_id);
