@@ -86,13 +86,31 @@ For a read transaction, readers acquire a shared visibility lock and proceed
 to read. Writers wait for these readers to finish before publishing committed
 changes.
 
-## Usage notes
+## Benchmarks
 
-- Only one open `Database` may own a file at a time, including within the same
-  process.
-- Destroying a write transaction without committing discards its changes.
-  `Commit()` ends the transaction.
-- Keep the database alive until its transactions are destroyed, and keep a
-  transaction alive while using its cursors.
-- Keep the database file and its `-wal` file together. Opening the database
-  recovers committed changes from the WAL.
+Benchmarked on my machine: Intel Core i5-1135G7 with four online CPUs,
+7.5 GiB RAM, and an Intel SSDPEKNW512G8 NVMe drive running ext4 over LVM.
+The build used GCC 13.3.0, `-O3 -DNDEBUG`, and Linux 6.17.0-29-generic.
+
+```sh
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DTINYDB_BUILD_TESTS=OFF
+cmake --build build-release --target tinydb_bench -j
+./build-release/tinydb_bench ./build-release/bench-data all --keys 10000 --runs 3
+```
+
+The baseline uses 10,000 16-byte keys, 100-byte values, a 256-page pool (1 MiB),
+100 writes per transaction, and seed 42. Throughput and per-run p99 latencies
+are medians of three runs; parentheses show the throughput range. Reads use
+a warm Linux file cache.
+
+| Workload | Operations/s, median (min–max) | p99 transaction (ms) |
+| --- | ---: | ---: |
+| Sequential inserts | 8,565 (8,311–8,566) | 15.666 |
+| Random inserts | 6,767 (6,468–6,809) | 18.977 |
+| Existing-key reads | 12,634 (12,572–12,679) | 0.089 |
+| Missing-key reads | 12,687 (12,257–12,718) | 0.090 |
+| 100-entry scans | 147,046 (142,027–147,608) | 0.762 |
+| Full scans | 164,126 (155,452–165,174) | — |
+| Overwrites | 6,054 (6,009–6,142) | 19.484 |
+| Deletes | 3,612 (3,558–3,633) | 30.771 |
+| Reinserts | 5,909 (5,533–5,918) | 23.232 |

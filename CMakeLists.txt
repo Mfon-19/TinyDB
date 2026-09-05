@@ -29,6 +29,10 @@ add_executable(tinydb_cli main.cpp)
 target_link_libraries(tinydb_cli PRIVATE tinydb)
 target_compile_options(tinydb_cli PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(tinydb_bench EXCLUDE_FROM_ALL benchmarks/benchmark.cpp)
+target_link_libraries(tinydb_bench PRIVATE tinydb)
+target_compile_options(tinydb_bench PRIVATE -Wall -Wextra -Wpedantic)
+
 option(TINYDB_BUILD_TESTS "Build the tests" ON)
 if(TINYDB_BUILD_TESTS)
   enable_testing()
