@@ -5,11 +5,15 @@
 
 namespace tinydb::detail {
 
-bool PageContext::Active() const noexcept {
+auto PageContext::Active() const noexcept -> bool {
   return !poisoned_ && (!write_ || write_->phase == WriteState::Phase::Active);
 }
 
-Status PageContext::CheckActive() const {
+auto PageContext::Version() const noexcept -> std::uint64_t {
+  return write_ ? write_->version : 0;
+}
+
+auto PageContext::CheckActive() const -> Status {
   if (poisoned_) {
     return Status::IoError(POISONED_DATABASE_MESSAGE);
   }
@@ -19,35 +23,39 @@ Status PageContext::CheckActive() const {
   return {};
 }
 
-Result<storage::Page> PageContext::ReadPage(storage::PageId page_id) {
+auto PageContext::Fail(Status error) -> Status {
+  assert(!error.Ok());
+  if (write_ && write_->phase == WriteState::Phase::Active) {
+    write_->phase = WriteState::Phase::Failed;
+  }
+  return error;
+}
+
+auto PageContext::ReadPage(storage::PageId page_id) -> Result<storage::Page> {
   if (auto status = CheckActive(); !status.Ok()) {
     return Err(std::move(status));
   }
   if (write_) {
     if (auto found = write_->pages.find(page_id);
         found != write_->pages.end()) {
-      return storage::DecodePage(page_id, found->second);
+      return found->second;
     }
   }
-  auto page = pool_.ReadPage(page_id);
-  if (!page) {
-    return Err(std::move(page.error()));
-  }
-  return page->Get();
+  return pool_.ReadPage(page_id);
 }
 
-Status PageContext::WritePage(storage::PageId page_id,
-                              const storage::PageBytes &page) {
+auto PageContext::WritePage(const storage::Page &page) -> Status {
   assert(write_);
   if (auto status = CheckActive(); !status.Ok()) {
     return status;
   }
-  assert(page_id > 0 && page_id < write_->page_count);
-  write_->pages.insert_or_assign(page_id, page);
+  assert(page.Id() < write_->page_count);
+  write_->pages.insert_or_assign(page.Id(), page);
+  ++write_->version;
   return {};
 }
 
-Result<storage::PageId> PageContext::AllocatePage() {
+auto PageContext::AllocatePage() -> Result<storage::PageId> {
   assert(write_);
   if (auto status = CheckActive(); !status.Ok()) {
     return Err(std::move(status));
@@ -68,6 +76,7 @@ void PageContext::FreePage(storage::PageId page_id) {
   assert(page_id > 1 && page_id < write_->page_count);
   write_->free_pages.push_back(page_id);
   write_->pages.erase(page_id);
+  ++write_->version;
 }
 
 } // namespace tinydb::detail

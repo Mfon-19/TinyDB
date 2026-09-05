@@ -24,8 +24,7 @@ inline constexpr std::size_t CHECKSUM_OFFSET = 16;
 } // namespace
 
 auto EncodeSuperblock(const Superblock &superblock) -> Result<PageBytes> {
-  if (superblock.root_page_id == 0 ||
-      superblock.root_page_id == INVALID_PAGE_ID) {
+  if (!ValidDataPageId(superblock.root_page_id)) {
     return Err(Status::InvalidArgument("invalid root page ID"));
   }
 
@@ -63,7 +62,7 @@ auto DecodeSuperblock(const PageBytes &page) -> Result<Superblock> {
   }
 
   const auto root_page_id = little_endian::GetU32(bytes, ROOT_PAGE_ID_OFFSET);
-  if (root_page_id == 0 || root_page_id == INVALID_PAGE_ID) {
+  if (!ValidDataPageId(root_page_id)) {
     return Err(Status::Corruption("invalid superblock root page ID"));
   }
 

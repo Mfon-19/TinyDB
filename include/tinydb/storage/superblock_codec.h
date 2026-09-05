@@ -16,7 +16,9 @@ struct Superblock {
   PageId root_page_id;
 };
 
-auto EncodeSuperblock(const Superblock &superblock) -> Result<PageBytes>;
-auto DecodeSuperblock(const PageBytes &page) -> Result<Superblock>;
+[[nodiscard]] auto EncodeSuperblock(const Superblock &superblock)
+    -> Result<PageBytes>;
+[[nodiscard]] auto DecodeSuperblock(const PageBytes &page)
+    -> Result<Superblock>;
 
 } // namespace tinydb::storage

@@ -11,15 +11,16 @@ class Database;
 class WriteTransaction {
 public:
   WriteTransaction(const WriteTransaction &) = delete;
-  WriteTransaction &operator=(const WriteTransaction &) = delete;
+  auto operator=(const WriteTransaction &) -> WriteTransaction & = delete;
   WriteTransaction(WriteTransaction &&) = delete;
-  WriteTransaction &operator=(WriteTransaction &&) = delete;
+  auto operator=(WriteTransaction &&) -> WriteTransaction & = delete;
 
-  auto Get(std::string_view key) -> Result<std::optional<std::string>>;
-  Status Put(std::string_view key, std::string_view value);
-  auto Delete(std::string_view key) -> Result<bool>;
-  auto Seek(std::string_view key) -> Result<btree::Cursor>;
-  Status Commit();
+  [[nodiscard]] auto Get(std::string_view key)
+      -> Result<std::optional<std::string>>;
+  auto Put(std::string_view key, std::string_view value) -> Status;
+  [[nodiscard]] auto Delete(std::string_view key) -> Result<bool>;
+  [[nodiscard]] auto Seek(std::string_view key) -> Result<Cursor>;
+  auto Commit() -> Status;
 
 private:
   friend class Database;

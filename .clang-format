@@ -1,0 +1,7 @@
+BasedOnStyle: LLVM
+IndentWidth: 2
+AccessModifierOffset: -2
+ColumnLimit: 80
+InsertBraces: true
+PenaltyReturnTypeOnItsOwnLine: 1000
+FixNamespaceComments: false

@@ -12,58 +12,46 @@ WriteTransaction::WriteTransaction(Database &database)
 
 auto WriteTransaction::Get(std::string_view key)
     -> Result<std::optional<std::string>> {
-  if (auto status = context_.CheckActive(); !status.Ok()) {
-    return Err(std::move(status));
-  }
   auto result = tree_.Get(key);
   if (!result) {
-    state_.phase = detail::WriteState::Phase::Failed;
+    return Err(context_.Fail(std::move(result.error())));
   }
   return result;
 }
 
-Status WriteTransaction::Put(std::string_view key, std::string_view value) {
-  if (auto status = context_.CheckActive(); !status.Ok()) {
-    return status;
-  }
+auto WriteTransaction::Put(std::string_view key,
+                           std::string_view value) -> Status {
   auto status = tree_.Put(key, value);
   if (!status.Ok()) {
-    state_.phase = detail::WriteState::Phase::Failed;
+    return context_.Fail(std::move(status));
   }
   return status;
 }
 
 auto WriteTransaction::Delete(std::string_view key) -> Result<bool> {
-  if (auto status = context_.CheckActive(); !status.Ok()) {
-    return Err(std::move(status));
-  }
   auto result = tree_.Delete(key);
   if (!result) {
-    state_.phase = detail::WriteState::Phase::Failed;
+    return Err(context_.Fail(std::move(result.error())));
   }
   return result;
 }
 
-auto WriteTransaction::Seek(std::string_view key) -> Result<btree::Cursor> {
-  if (auto status = context_.CheckActive(); !status.Ok()) {
-    return Err(std::move(status));
-  }
+auto WriteTransaction::Seek(std::string_view key) -> Result<Cursor> {
   auto result = tree_.Seek(key);
   if (!result) {
-    state_.phase = detail::WriteState::Phase::Failed;
+    return Err(context_.Fail(std::move(result.error())));
   }
   return result;
 }
 
-Status WriteTransaction::Commit() {
-  auto writer = std::move(writer_lock_);
-  auto status = context_.CheckActive();
-  auto pending = std::move(state_);
+auto WriteTransaction::Commit() -> Status {
+  const auto writer = std::move(writer_lock_);
+  const auto status = context_.CheckActive();
   state_.phase = detail::WriteState::Phase::Finished;
   if (!status.Ok()) {
     return status;
   }
-  return database_.Commit(pending);
+  return database_.Commit(state_);
 }
 
 } // namespace tinydb

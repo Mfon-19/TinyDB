@@ -1,17 +1,17 @@
 #pragma once
 
 #include "tinydb/status.h"
-#include "tinydb/storage/page.h"
-#include <map>
+#include "tinydb/storage/page_codec.h"
 #include <span>
 #include <vector>
 
 namespace tinydb::storage {
 
-using WalPages = std::map<PageId, PageBytes>;
+[[nodiscard]] auto WalRecordSize(std::size_t frame_count)
+    -> Result<std::size_t>;
+[[nodiscard]] auto EncodeWalRecord(const PageMap &pages)
+    -> Result<std::vector<char>>;
 
-auto WalRecordSize(std::size_t frame_count) -> Result<std::size_t>;
-auto EncodeWalRecord(const WalPages &pages) -> Result<std::vector<char>>;
-auto DecodeWal(std::span<const char> bytes) -> Result<WalPages>;
+[[nodiscard]] auto DecodeWal(std::span<const char> bytes) -> Result<PageMap>;
 
 } // namespace tinydb::storage

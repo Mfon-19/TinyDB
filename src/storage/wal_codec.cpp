@@ -5,7 +5,6 @@
 #include <array>
 #include <cstdint>
 #include <limits>
-#include <string>
 #include <utility>
 
 namespace tinydb::storage {
@@ -17,10 +16,6 @@ constexpr std::size_t HEADER_SIZE = 8;
 constexpr std::size_t FRAME_SIZE = sizeof(PageId) + PAGE_SIZE;
 constexpr std::size_t CRC_SIZE = sizeof(std::uint32_t);
 constexpr std::size_t RECORD_OVERHEAD = HEADER_SIZE + CRC_SIZE;
-
-bool ValidPageId(PageId page_id) {
-  return page_id != 0 && page_id != INVALID_PAGE_ID;
-}
 
 } // namespace
 
@@ -37,15 +32,10 @@ auto WalRecordSize(std::size_t frame_count) -> Result<std::size_t> {
   return RECORD_OVERHEAD + FRAME_SIZE * frame_count;
 }
 
-auto EncodeWalRecord(const WalPages &pages) -> Result<std::vector<char>> {
+auto EncodeWalRecord(const PageMap &pages) -> Result<std::vector<char>> {
   auto size = WalRecordSize(pages.size());
   if (!size) {
     return Err(std::move(size.error()));
-  }
-  for (const auto &[page_id, page] : pages) {
-    if (!ValidPageId(page_id)) {
-      return Err(Status::InvalidArgument("invalid WAL page ID"));
-    }
   }
   std::vector<char> bytes;
   if (*size > bytes.max_size()) {
@@ -56,8 +46,11 @@ auto EncodeWalRecord(const WalPages &pages) -> Result<std::vector<char>> {
   little_endian::PutU32(bytes, 4, static_cast<std::uint32_t>(pages.size()));
   std::size_t offset = HEADER_SIZE;
   for (const auto &[page_id, page] : pages) {
+    if (page_id != page.Id()) {
+      return Err(Status::InvalidArgument("invalid WAL page ID"));
+    }
     little_endian::PutU32(bytes, offset, page_id);
-    std::ranges::copy(page, bytes.begin() + offset + sizeof(PageId));
+    std::ranges::copy(page.Bytes(), bytes.begin() + offset + sizeof(PageId));
     offset += FRAME_SIZE;
   }
   little_endian::PutU32(bytes, offset,
@@ -65,8 +58,8 @@ auto EncodeWalRecord(const WalPages &pages) -> Result<std::vector<char>> {
   return bytes;
 }
 
-auto DecodeWal(std::span<const char> bytes) -> Result<WalPages> {
-  WalPages pages;
+auto DecodeWal(std::span<const char> bytes) -> Result<PageMap> {
+  PageMap pages;
   while (bytes.size() >= HEADER_SIZE) {
     if (!std::ranges::equal(MAGIC, bytes.first(MAGIC.size()))) {
       return Err(Status::Corruption("invalid WAL magic"));
@@ -74,7 +67,7 @@ auto DecodeWal(std::span<const char> bytes) -> Result<WalPages> {
     const auto frame_count = little_endian::GetU32(bytes, 4);
     auto size = WalRecordSize(frame_count);
     if (!size) {
-      return Err(Status::Corruption(std::string{size.error().Message()}));
+      return Err(Status::Corruption("invalid WAL frame count"));
     }
     if (*size > bytes.size()) {
       break;
@@ -84,7 +77,7 @@ auto DecodeWal(std::span<const char> bytes) -> Result<WalPages> {
     const std::size_t crc_offset = record.size() - CRC_SIZE;
     for (std::size_t offset = HEADER_SIZE; offset < crc_offset;
          offset += FRAME_SIZE) {
-      if (!ValidPageId(little_endian::GetU32(record, offset))) {
+      if (!ValidDataPageId(little_endian::GetU32(record, offset))) {
         return Err(Status::Corruption("invalid WAL page ID"));
       }
     }
@@ -102,7 +95,11 @@ auto DecodeWal(std::span<const char> bytes) -> Result<WalPages> {
       PageBytes page;
       std::ranges::copy(record.subspan(offset + sizeof(PageId), PAGE_SIZE),
                         page.begin());
-      pages.insert_or_assign(page_id, std::move(page));
+      auto decoded = DecodePage(page_id, page);
+      if (!decoded) {
+        return Err(std::move(decoded.error()));
+      }
+      pages.insert_or_assign(page_id, std::move(*decoded));
     }
     bytes = bytes.subspan(record.size());
   }

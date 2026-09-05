@@ -13,7 +13,7 @@ auto ReadTransaction::Get(std::string_view key)
   return tree_.Get(key);
 }
 
-auto ReadTransaction::Seek(std::string_view key) -> Result<btree::Cursor> {
+auto ReadTransaction::Seek(std::string_view key) -> Result<Cursor> {
   return tree_.Seek(key);
 }
 

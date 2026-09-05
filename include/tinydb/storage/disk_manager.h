@@ -7,38 +7,34 @@
  * process lock.
  */
 
+#include "tinydb/detail/file.h"
 #include "tinydb/status.h"
 #include "tinydb/storage/page.h"
 #include <string_view>
+#include <utility>
 
 namespace tinydb::storage {
 
 class DiskManager {
 public:
-  static Result<DiskManager> Open(std::string_view name);
-
-  ~DiskManager();
+  [[nodiscard]] static auto Open(std::string_view name) -> Result<DiskManager>;
 
   DiskManager(const DiskManager &) = delete;
-  DiskManager &operator=(const DiskManager &) = delete;
+  auto operator=(const DiskManager &) -> DiskManager & = delete;
 
-  DiskManager(DiskManager &&other) noexcept;
-  DiskManager &operator=(DiskManager &&other) noexcept;
+  DiskManager(DiskManager &&other) noexcept = default;
+  auto operator=(DiskManager &&other) noexcept -> DiskManager & = default;
 
-  [[nodiscard]] auto PageCount() const noexcept -> PageId {
-    return page_count_;
-  }
+  [[nodiscard]] auto PageCount() const -> Result<PageId>;
 
-  Status WritePage(PageId page_id, const PageBytes &page);
-  Status ReadPage(PageId page_id, PageBytes &page) const;
-  Status Sync() const;
+  auto WritePage(PageId page_id, const PageBytes &page) -> Status;
+  auto ReadPage(PageId page_id, PageBytes &page) const -> Status;
+  auto Sync() const -> Status;
 
 private:
-  DiskManager(int fd, PageId page_count) noexcept
-      : fd_(fd), page_count_(page_count) {}
-  int fd_;
-  PageId page_count_;
+  explicit DiskManager(detail::File file) noexcept : file_(std::move(file)) {}
+  detail::File file_;
 };
 
-Status SyncParentDirectory(std::string_view path);
+auto SyncParentDirectory(std::string_view path) -> Status;
 } // namespace tinydb::storage

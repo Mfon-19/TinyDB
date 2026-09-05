@@ -21,8 +21,6 @@ namespace tinydb::btree {
 
 namespace {
 
-constexpr std::size_t MAX_ENTRY_SIZE = storage::PAGE_SIZE / 4;
-
 auto TempFile() -> std::string {
   std::string path = testing::TempDir() + "b_plus_tree_test_XXXXXX";
   close(mkstemp(path.data()));
@@ -244,10 +242,8 @@ TEST(BPlusTree, MatchesAMapUnderRandomOperations) {
   EXPECT_EQ(LeafKeys(t.context, t.root), expected);
   EXPECT_TRUE(t.tree.FindFreePages(t.state.page_count));
   const auto depths = LeafDepths(t.context, t.root);
-  EXPECT_TRUE(std::ranges::all_of(depths,
-                                  [&](std::size_t depth) {
-                                    return depth == depths.front();
-                                  }));
+  EXPECT_TRUE(std::ranges::all_of(
+      depths, [&](std::size_t depth) { return depth == depths.front(); }));
 }
 
 TEST(BPlusTree, DeleteEverythingThenReinsert) {
@@ -282,7 +278,7 @@ TEST(BPlusTree, PersistsAcrossReopen) {
     ASSERT_TRUE(IsOk(tree.Initialize()));
     Fill(tree, 800, 400);
     EXPECT_TRUE(Remove(tree, Key(7)));
-    ASSERT_TRUE(IsOk(pool.Flush(state.pages)));
+    ASSERT_TRUE(IsOk(pool.Checkpoint(state.pages)));
   }
 
   cache::BufferPool pool{storage::DiskManager::Open(path).value(), 8};

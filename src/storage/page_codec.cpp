@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 /*
@@ -37,11 +38,6 @@ inline constexpr std::size_t HEADER_SIZE = 22;
 inline constexpr std::size_t SLOT_SIZE = sizeof(std::uint16_t);
 inline constexpr std::size_t KEY_SIZE_SIZE = sizeof(std::uint16_t);
 
-auto ValidDataPageId(PageId page_id) noexcept -> bool {
-  return page_id != 0 && page_id != INVALID_PAGE_ID;
-}
-
-// A link may only lead to a data page other than the one holding it.
 auto ValidLink(PageId page_id, PageId link) noexcept -> bool {
   return ValidDataPageId(link) && link != page_id;
 }
@@ -99,14 +95,39 @@ void EncodeHeader(PageBytes &page, PageType type, PageId page_id,
 }
 
 template <typename Entry>
+auto Fits(std::span<const Entry> entries) noexcept -> bool {
+  std::size_t remaining = PAGE_SIZE - HEADER_SIZE;
+  for (const auto &entry : entries) {
+    const auto size = EntrySize(entry);
+    if (size > remaining) {
+      return false;
+    }
+    remaining -= size;
+  }
+  return true;
+}
+
+template <typename Entry>
 auto EncodePage(PageType type, PageId page_id, PageId link,
                 std::span<const Entry> entries) -> Result<PageBytes> {
-  std::size_t size = HEADER_SIZE;
-  for (const auto &entry : entries) {
-    size += SLOT_SIZE + KEY_SIZE_SIZE + entry.key.size() + ValueSize(entry);
+  if (!ValidDataPageId(page_id) ||
+      (type == PageType::Leaf
+           ? link != INVALID_PAGE_ID && !ValidLink(page_id, link)
+           : entries.empty() || !ValidLink(page_id, link))) {
+    return Err(Status::InvalidArgument("invalid page ID or link"));
   }
-  if (size > PAGE_SIZE) {
+  if (!Fits(entries)) {
     return Err(Status::InvalidArgument("entries do not fit in a page"));
+  }
+  for (std::size_t index = 0; index < entries.size(); ++index) {
+    if (index != 0 && entries[index - 1].key >= entries[index].key) {
+      return Err(Status::InvalidArgument("keys are not strictly ordered"));
+    }
+    if constexpr (std::is_same_v<Entry, InternalEntry>) {
+      if (!ValidLink(page_id, entries[index].right_child)) {
+        return Err(Status::InvalidArgument("invalid internal child page ID"));
+      }
+    }
   }
 
   PageBytes page{};
@@ -128,6 +149,22 @@ auto EncodePage(PageType type, PageId page_id, PageId link,
 }
 
 } // namespace
+
+auto EntrySize(const LeafEntry &entry) noexcept -> std::size_t {
+  return SLOT_SIZE + KEY_SIZE_SIZE + entry.key.size() + entry.value.size();
+}
+
+auto EntrySize(const InternalEntry &entry) noexcept -> std::size_t {
+  return SLOT_SIZE + KEY_SIZE_SIZE + sizeof(PageId) + entry.key.size();
+}
+
+auto EntriesFit(std::span<const LeafEntry> entries) noexcept -> bool {
+  return Fits(entries);
+}
+
+auto EntriesFit(std::span<const InternalEntry> entries) noexcept -> bool {
+  return Fits(entries);
+}
 
 auto LeafPageView::Entry(std::size_t index) const noexcept -> LeafEntry {
   assert(index < entry_count_);
@@ -172,7 +209,8 @@ auto Page::Internal() const noexcept -> InternalPageView {
                           little_endian::GetU16(bytes_, ENTRY_COUNT_OFFSET)};
 }
 
-auto DecodePage(PageId expected_page_id, const PageBytes &page) -> Result<Page> {
+auto DecodePage(PageId expected_page_id,
+                const PageBytes &page) -> Result<Page> {
   if (!ValidDataPageId(expected_page_id)) {
     return Err(Status::InvalidArgument("invalid data page ID"));
   }
@@ -244,19 +282,22 @@ auto DecodePage(PageId expected_page_id, const PageBytes &page) -> Result<Page> 
 }
 
 auto EncodeLeafPage(PageId page_id, PageId next_leaf,
-                    std::span<const LeafEntry> entries) -> Result<PageBytes> {
-  assert(ValidDataPageId(page_id));
-  assert(next_leaf == INVALID_PAGE_ID || ValidLink(page_id, next_leaf));
-  return EncodePage(PageType::Leaf, page_id, next_leaf, entries);
+                    std::span<const LeafEntry> entries) -> Result<Page> {
+  auto bytes = EncodePage(PageType::Leaf, page_id, next_leaf, entries);
+  if (!bytes) {
+    return Err(std::move(bytes.error()));
+  }
+  return Page{*bytes};
 }
 
 auto EncodeInternalPage(PageId page_id, PageId leftmost_child,
                         std::span<const InternalEntry> entries)
-    -> Result<PageBytes> {
-  assert(ValidDataPageId(page_id));
-  assert(ValidLink(page_id, leftmost_child));
-  assert(!entries.empty());
-  return EncodePage(PageType::Internal, page_id, leftmost_child, entries);
+    -> Result<Page> {
+  auto bytes = EncodePage(PageType::Internal, page_id, leftmost_child, entries);
+  if (!bytes) {
+    return Err(std::move(bytes.error()));
+  }
+  return Page{*bytes};
 }
 
 } // namespace tinydb::storage

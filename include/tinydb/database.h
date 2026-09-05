@@ -6,6 +6,7 @@
  */
 
 #include "tinydb/cache/buffer_pool.h"
+#include "tinydb/limits.h"
 #include "tinydb/read_transaction.h"
 #include "tinydb/storage/wal.h"
 #include "tinydb/write_transaction.h"
@@ -23,21 +24,22 @@ namespace tinydb {
 
 class Database {
 public:
-  static Result<std::unique_ptr<Database>>
-  Open(std::string_view name, std::size_t buffer_pool_capacity);
+  [[nodiscard]] static auto Open(std::string_view name,
+                                 std::size_t buffer_pool_capacity)
+      -> Result<std::unique_ptr<Database>>;
 
   Database(const Database &) = delete;
-  Database &operator=(const Database &) = delete;
+  auto operator=(const Database &) -> Database & = delete;
   Database(Database &&) = delete;
-  Database &operator=(Database &&) = delete;
+  auto operator=(Database &&) -> Database & = delete;
 
-  auto BeginRead() -> Result<std::unique_ptr<ReadTransaction>>;
-  auto BeginWrite() -> Result<std::unique_ptr<WriteTransaction>>;
-
-  auto Get(std::string_view key) -> Result<std::optional<std::string>>;
-  Status Put(std::string_view key, std::string_view value);
-  auto Delete(std::string_view key) -> Result<bool>;
-  Status Checkpoint();
+  [[nodiscard]] auto BeginRead() -> Result<std::unique_ptr<ReadTransaction>>;
+  [[nodiscard]] auto BeginWrite() -> Result<std::unique_ptr<WriteTransaction>>;
+  [[nodiscard]] auto Get(std::string_view key)
+      -> Result<std::optional<std::string>>;
+  auto Put(std::string_view key, std::string_view value) -> Status;
+  [[nodiscard]] auto Delete(std::string_view key) -> Result<bool>;
+  auto Checkpoint() -> Status;
 
 private:
   friend class ReadTransaction;
@@ -45,14 +47,14 @@ private:
   Database(storage::DiskManager disk_manager, storage::Wal wal,
            std::size_t buffer_pool_capacity, storage::PageId root_page_id,
            storage::PageId page_count);
-  Status Commit(detail::WriteState &pending);
-  Status Publish(detail::WriteState &pending);
-  Status CheckpointLocked(const storage::WalPages &incoming);
-  Status Poison(std::string_view failure, const Status &status);
+  auto Commit(detail::WriteState &pending) -> Status;
+  auto Publish(detail::WriteState &pending) -> Status;
+  auto CheckpointLocked(const storage::PageMap &incoming) -> Status;
+  auto Poison(std::string_view failure, const Status &status) -> Status;
 
   cache::BufferPool buffer_pool_;
   storage::Wal wal_;
-  storage::PageId root_page_id_;
+  const storage::PageId root_page_id_;
   storage::PageId page_count_;
   std::vector<storage::PageId> free_pages_;
   std::size_t wal_frames_ = 0;

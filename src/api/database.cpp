@@ -11,14 +11,15 @@ namespace tinydb {
 
 namespace {
 
-Status Create(storage::DiskManager &disk_manager) {
+auto Create(storage::DiskManager &disk_manager) -> Status {
   constexpr storage::PageId root_page_id = 1;
   auto root =
       storage::EncodeLeafPage(root_page_id, storage::INVALID_PAGE_ID, {});
   if (!root) {
     return std::move(root.error());
   }
-  if (auto status = disk_manager.WritePage(root_page_id, *root); !status.Ok()) {
+  if (auto status = disk_manager.WritePage(root_page_id, root->Bytes());
+      !status.Ok()) {
     return status;
   }
   auto superblock = storage::EncodeSuperblock({root_page_id});
@@ -33,13 +34,14 @@ Status Create(storage::DiskManager &disk_manager) {
   return disk_manager.Sync();
 }
 
-Status Recover(storage::DiskManager &disk_manager, storage::Wal &wal) {
+auto Recover(storage::DiskManager &disk_manager, storage::Wal &wal) -> Status {
   auto pages = wal.Validate();
   if (!pages) {
     return std::move(pages.error());
   }
   for (const auto &[page_id, page] : *pages) {
-    if (auto status = disk_manager.WritePage(page_id, page); !status.Ok()) {
+    if (auto status = disk_manager.WritePage(page_id, page.Bytes());
+        !status.Ok()) {
       return status;
     }
   }
@@ -71,8 +73,8 @@ Database::Database(storage::DiskManager disk_manager, storage::Wal wal,
       wal_(std::move(wal)), root_page_id_(root_page_id),
       page_count_(page_count) {}
 
-Result<std::unique_ptr<Database>>
-Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
+auto Database::Open(std::string_view name, std::size_t buffer_pool_capacity)
+    -> Result<std::unique_ptr<Database>> {
   if (buffer_pool_capacity == 0) {
     return Err(
         Status::InvalidArgument("buffer pool capacity must be positive"));
@@ -80,6 +82,11 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
   auto disk_manager = storage::DiskManager::Open(name);
   if (!disk_manager) {
     return Err(std::move(disk_manager.error()));
+  }
+
+  auto initial_page_count = disk_manager->PageCount();
+  if (!initial_page_count) {
+    return Err(std::move(initial_page_count.error()));
   }
 
   std::error_code error;
@@ -92,7 +99,7 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
   if (!wal) {
     return Err(std::move(wal.error()));
   }
-  if (disk_manager->PageCount() == 0) {
+  if (*initial_page_count == 0) {
     if (!wal->Empty()) {
       return Err(Status::Corruption("nonempty WAL beside an empty database"));
     }
@@ -112,13 +119,16 @@ Database::Open(std::string_view name, std::size_t buffer_pool_capacity) {
   if (!root_page_id) {
     return Err(std::move(root_page_id.error()));
   }
-  const auto page_count = disk_manager->PageCount();
+  auto page_count = disk_manager->PageCount();
+  if (!page_count) {
+    return Err(std::move(page_count.error()));
+  }
   auto database = std::unique_ptr<Database>(
       new Database(std::move(*disk_manager), std::move(*wal),
-                   buffer_pool_capacity, *root_page_id, page_count));
+                   buffer_pool_capacity, *root_page_id, *page_count));
   detail::PageContext context(database->buffer_pool_, database->poisoned_);
   btree::BPlusTree tree(context, *root_page_id);
-  auto free_pages = tree.FindFreePages(page_count);
+  auto free_pages = tree.FindFreePages(*page_count);
   if (!free_pages) {
     return Err(std::move(free_pages.error()));
   }
@@ -149,7 +159,7 @@ auto Database::BeginWrite() -> Result<std::unique_ptr<WriteTransaction>> {
   return transaction;
 }
 
-Status Database::Put(std::string_view key, std::string_view value) {
+auto Database::Put(std::string_view key, std::string_view value) -> Status {
   WriteTransaction transaction(*this);
   if (auto status = transaction.Put(key, value); !status.Ok()) {
     return status;
@@ -169,13 +179,14 @@ auto Database::Delete(std::string_view key) -> Result<bool> {
   return *removed;
 }
 
-Status Database::Poison(std::string_view failure, const Status &status) {
+auto Database::Poison(std::string_view failure,
+                      const Status &status) -> Status {
   poisoned_ = true;
   return Status::IoError(
       std::format("{}: {}; close and reopen", failure, status.Message()));
 }
 
-Status Database::Commit(detail::WriteState &pending) {
+auto Database::Commit(detail::WriteState &pending) -> Status {
   if (pending.pages.empty()) {
     return {};
   }
@@ -197,7 +208,7 @@ Status Database::Commit(detail::WriteState &pending) {
   return {};
 }
 
-Status Database::Publish(detail::WriteState &pending) {
+auto Database::Publish(detail::WriteState &pending) -> Status {
   const auto threshold = buffer_pool_.Capacity() / 2;
   assert(wal_frames_ <= threshold);
   if (pending.pages.size() > threshold - wal_frames_) {
@@ -206,7 +217,7 @@ Status Database::Publish(detail::WriteState &pending) {
     }
   } else {
     for (const auto &[page_id, page] : pending.pages) {
-      if (auto status = buffer_pool_.InstallPage(page_id, page); !status.Ok()) {
+      if (auto status = buffer_pool_.InstallPage(page); !status.Ok()) {
         return status;
       }
     }
@@ -217,8 +228,8 @@ Status Database::Publish(detail::WriteState &pending) {
   return {};
 }
 
-Status Database::CheckpointLocked(const storage::WalPages &incoming) {
-  if (auto status = buffer_pool_.Flush(incoming); !status.Ok()) {
+auto Database::CheckpointLocked(const storage::PageMap &incoming) -> Status {
+  if (auto status = buffer_pool_.Checkpoint(incoming); !status.Ok()) {
     return status;
   }
   if (auto status = wal_.Reset(); !status.Ok()) {
@@ -228,7 +239,7 @@ Status Database::CheckpointLocked(const storage::WalPages &incoming) {
   return {};
 }
 
-Status Database::Checkpoint() {
+auto Database::Checkpoint() -> Status {
   std::unique_lock writer(writer_mutex_);
   if (poisoned_) {
     return Status::IoError(detail::POISONED_DATABASE_MESSAGE);

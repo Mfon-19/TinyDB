@@ -31,7 +31,7 @@ constexpr std::string_view HELP =
     "  --batch N       Writes per transaction (default 100)\n"
     "  --runs N        Independent repetitions (default 3)\n"
     "  --readers N     Concurrent reader threads (default 4)\n"
-    "  --value-size N  Value size in bytes, at most 1008 (default 100)\n"
+    "  --value-size N  Value size in bytes (default 100)\n"
     "Creates temporary databases under DIRECTORY; prints CSV to stdout.\n";
 
 [[noreturn]] void Fail(std::string_view message) {
@@ -83,23 +83,25 @@ Options Parse(int argc, char **argv) {
         value == 0) {
       Fail(std::format("{} requires a positive integer", name));
     }
-    if (name == "--keys")
+    if (name == "--keys") {
       options.keys = value;
-    else if (name == "--pool")
+    } else if (name == "--pool") {
       options.pool = value;
-    else if (name == "--batch")
+    } else if (name == "--batch") {
       options.batch = value;
-    else if (name == "--runs")
+    } else if (name == "--runs") {
       options.runs = value;
-    else if (name == "--readers")
+    } else if (name == "--readers") {
       options.readers = value;
-    else if (name == "--value-size")
+    } else if (name == "--value-size") {
       options.value_size = value;
-    else
+    } else {
       Fail(std::format("unknown option: {}", name));
+    }
   }
-  if (options.value_size > 1008) {
-    Fail("16-byte keys leave at most 1008 bytes for values");
+  if (options.value_size > tinydb::MAX_ENTRY_SIZE - 16) {
+    Fail(std::format("16-byte keys leave at most {} bytes for values",
+                     tinydb::MAX_ENTRY_SIZE - 16));
   }
   return options;
 }
@@ -146,7 +148,7 @@ struct Measurements {
   }
 };
 
-void Report(std::string_view name, std::uint32_t run, Measurements result,
+void Report(std::string_view name, std::uint64_t run, Measurements result,
             const std::string &path) {
   std::ranges::sort(result.latency_us);
   const auto percentile = [&](std::size_t percent) {
@@ -156,10 +158,13 @@ void Report(std::string_view name, std::uint32_t run, Measurements result,
                    "{},{},{},{},{:.6f},{:.1f},{:.1f},{:.2f},{:.2f},{:.2f},{:."
                    "2f},{:.3f},{}\n",
                    name, run, result.operations, result.latency_us.size(),
-                   result.seconds, result.operations / result.seconds,
-                   result.latency_us.size() / result.seconds, percentile(50),
-                   percentile(95), percentile(99), result.latency_us.back(),
-                   result.checkpoint_ms, std::filesystem::file_size(path))
+                   result.seconds,
+                   static_cast<double>(result.operations) / result.seconds,
+                   static_cast<double>(result.latency_us.size()) /
+                       result.seconds,
+                   percentile(50), percentile(95), percentile(99),
+                   result.latency_us.back(), result.checkpoint_ms,
+                   std::filesystem::file_size(path))
             << std::flush;
 }
 
@@ -265,7 +270,7 @@ Measurements Scan(tinydb::Database &database, const Data &data, bool full) {
 }
 
 void Concurrent(tinydb::Database &database, const Data &data,
-                const Options &options, std::uint32_t run,
+                const Options &options, std::uint64_t run,
                 const std::string &path) {
   std::vector<Measurements> results;
   for (std::size_t index = 0; index < options.readers; ++index) {
@@ -312,13 +317,15 @@ int main(int argc, char **argv) {
   const Data data(options);
   std::error_code error;
   std::filesystem::create_directories(options.directory, error);
-  if (error)
+  if (error) {
     Fail(error.message());
+  }
   auto directory =
       (std::filesystem::path(options.directory) / "tinydb-bench-XXXXXX")
           .string();
-  if (mkdtemp(directory.data()) == nullptr)
+  if (mkdtemp(directory.data()) == nullptr) {
     Fail("cannot create benchmark directory");
+  }
   const auto path = directory + "/database";
   std::cout << std::format(
       "# directory={}, compiler={}, seed={}, keys={}, key_bytes=16, "
@@ -375,8 +382,9 @@ int main(int argc, char **argv) {
           Write(*database, data, result, removed, options.batch, {}, true);
           result.checkpoint_ms = Checkpoint(*database);
           for (const auto index : removed) {
-            if (Take(database->Get(data.keys[index])))
+            if (Take(database->Get(data.keys[index]))) {
               Fail("deleted key is still present");
+            }
           }
           Report("delete", run, std::move(result), path);
           result = Measurements(removed.size());

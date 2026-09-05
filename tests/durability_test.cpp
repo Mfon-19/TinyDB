@@ -25,10 +25,8 @@ struct Fault {
 
 thread_local Fault fault;
 thread_local int mutations = 0;
-thread_local bool fail_after_sync = false;
-thread_local bool fail_allocation = false;
 
-bool Fail(int fd, Operation operation) {
+auto Fail(int fd, Operation operation) -> bool {
   ++mutations;
   if (fault.operation != operation) {
     return false;
@@ -72,8 +70,8 @@ auto Bytes(const std::string &path) -> std::string {
   return {std::istreambuf_iterator<char>{file}, {}};
 }
 
-auto Page(storage::PageId page_id,
-          std::string_view value) -> storage::PageBytes {
+auto MakePage(storage::PageId page_id,
+              std::string_view value) -> storage::Page {
   const storage::LeafEntry entry{"key", value};
   return storage::EncodeLeafPage(page_id, storage::INVALID_PAGE_ID,
                                  std::span{&entry, 1})
@@ -84,7 +82,6 @@ class DurabilityTest : public testing::Test {
 protected:
   void SetUp() override {
     fault = {};
-    fail_after_sync = fail_allocation = false;
     directory_ = testing::TempDir() + "tinydb_durable_XXXXXX";
     ASSERT_NE(mkdtemp(directory_.data()), nullptr);
     path_ = directory_ + "/database";
@@ -92,7 +89,6 @@ protected:
 
   void TearDown() override {
     fault = {};
-    fail_after_sync = fail_allocation = false;
     std::filesystem::remove_all(directory_);
   }
 
@@ -103,21 +99,17 @@ protected:
 TEST_F(DurabilityTest, DirtyPagesStayResident) {
   auto disk = storage::DiskManager::Open(path_).value();
   for (storage::PageId id = 1; id <= 3; ++id) {
-    ASSERT_TRUE(disk.WritePage(id, Page(id, "old")).Ok());
+    ASSERT_TRUE(disk.WritePage(id, MakePage(id, "old").Bytes()).Ok());
   }
   cache::BufferPool pool(std::move(disk), 2);
-  ASSERT_TRUE(pool.InstallPage(1, Page(1, "dirty")).Ok());
-  {
-    auto pinned = pool.ReadPage(2).value();
-    EXPECT_FALSE(pool.ReadPage(3));
-    EXPECT_EQ(pool.ReadPage(1).value().Bytes(), Page(1, "dirty"));
-  }
+  ASSERT_TRUE(pool.InstallPage(MakePage(1, "dirty")).Ok());
+  EXPECT_TRUE(pool.ReadPage(2));
   EXPECT_TRUE(pool.ReadPage(3));
-  EXPECT_EQ(pool.ReadPage(1).value().Bytes(), Page(1, "dirty"));
-  const storage::WalPages incoming{{1, Page(1, "checkpointed")}};
-  ASSERT_TRUE(pool.Flush(incoming).Ok());
-  EXPECT_EQ(pool.ReadPage(1).value().Bytes(), incoming.at(1));
-  auto pinned = pool.ReadPage(2).value();
+  EXPECT_EQ(pool.ReadPage(1).value(), MakePage(1, "dirty"));
+  const storage::PageMap incoming{{1, MakePage(1, "checkpointed")}};
+  ASSERT_TRUE(pool.Checkpoint(incoming).Ok());
+  EXPECT_EQ(pool.ReadPage(1).value(), incoming.at(1));
+  EXPECT_TRUE(pool.ReadPage(2));
   EXPECT_TRUE(pool.ReadPage(3));
 }
 
@@ -187,7 +179,7 @@ TEST_F(DurabilityTest, RejectsCorruptWal) {
     auto database = Database::Open(path_, 8).value();
     ASSERT_TRUE(database->Put("key", "committed").Ok());
   }
-  auto bad = storage::EncodeWalRecord({{1, Page(1, "bad")}}).value();
+  auto bad = storage::EncodeWalRecord({{1, MakePage(1, "bad")}}).value();
   bad[0] = 'X';
   {
     std::ofstream file(path_ + "-wal", std::ios::binary | std::ios::app);

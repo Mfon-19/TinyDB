@@ -3,16 +3,14 @@
 /*
  * A BufferPool keeps pages read from disk into in-memory
  * fixed-sized frames. When full, it replaces the least recently
- * used frame that is neither dirty nor pinned by a PageHandle.
+ * used clean frame.
  * All frames are allocated at construction and reused.
  */
 
-#include "tinydb/cache/page_handle.h"
 #include "tinydb/storage/disk_manager.h"
-#include <atomic>
+#include "tinydb/storage/page_codec.h"
 #include <cstddef>
 #include <list>
-#include <map>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -24,14 +22,17 @@ public:
   BufferPool(storage::DiskManager disk_manager, std::size_t capacity);
 
   BufferPool(const BufferPool &) = delete;
-  BufferPool &operator=(const BufferPool &) = delete;
+  auto operator=(const BufferPool &) -> BufferPool & = delete;
   BufferPool(BufferPool &&) = delete;
-  BufferPool &operator=(BufferPool &&) = delete;
+  auto operator=(BufferPool &&) -> BufferPool & = delete;
 
-  [[nodiscard]] std::size_t Capacity() const noexcept { return capacity_; }
-  Status InstallPage(storage::PageId page_id, const storage::PageBytes &page);
-  Result<PageHandle> ReadPage(storage::PageId page_id);
-  Status Flush(const std::map<storage::PageId, storage::PageBytes> &incoming);
+  [[nodiscard]] auto Capacity() const noexcept -> std::size_t {
+    return capacity_;
+  }
+  auto InstallPage(const storage::Page &page) -> Status;
+  [[nodiscard]] auto ReadPage(storage::PageId page_id) -> Result<storage::Page>;
+
+  auto Checkpoint(const storage::PageMap &incoming) -> Status;
 
 private:
   struct Frame;
@@ -39,7 +40,6 @@ private:
 
   struct Frame {
     std::optional<storage::Page> page;
-    std::atomic<std::size_t> pin_count{0};
     bool dirty = false;
     FrameIterator hash_next;
   };
@@ -50,7 +50,8 @@ private:
   void Touch(FrameIterator frame);
 
   storage::DiskManager disk_manager_;
-  std::size_t capacity_;
+  const std::size_t capacity_;
+
   std::mutex mutex_;
   std::list<Frame> frames_;
   std::vector<FrameIterator> buckets_;

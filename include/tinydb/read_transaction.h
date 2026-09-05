@@ -11,12 +11,13 @@ class Database;
 class ReadTransaction {
 public:
   ReadTransaction(const ReadTransaction &) = delete;
-  ReadTransaction &operator=(const ReadTransaction &) = delete;
+  auto operator=(const ReadTransaction &) -> ReadTransaction & = delete;
   ReadTransaction(ReadTransaction &&) = delete;
-  ReadTransaction &operator=(ReadTransaction &&) = delete;
+  auto operator=(ReadTransaction &&) -> ReadTransaction & = delete;
 
-  auto Get(std::string_view key) -> Result<std::optional<std::string>>;
-  auto Seek(std::string_view key) -> Result<btree::Cursor>;
+  [[nodiscard]] auto Get(std::string_view key)
+      -> Result<std::optional<std::string>>;
+  [[nodiscard]] auto Seek(std::string_view key) -> Result<Cursor>;
 
 private:
   friend class Database;

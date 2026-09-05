@@ -10,6 +10,8 @@
 #include "tinydb/storage/page.h"
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <ranges>
 #include <span>
 #include <string_view>
 
@@ -26,6 +28,14 @@ struct InternalEntry {
   std::string_view key;
   PageId right_child;
 };
+
+[[nodiscard]] auto EntrySize(const LeafEntry &entry) noexcept -> std::size_t;
+[[nodiscard]] auto EntrySize(const InternalEntry &entry) noexcept
+    -> std::size_t;
+[[nodiscard]] auto EntriesFit(std::span<const LeafEntry> entries) noexcept
+    -> bool;
+[[nodiscard]] auto EntriesFit(std::span<const InternalEntry> entries) noexcept
+    -> bool;
 
 class LeafPageView {
 public:
@@ -75,6 +85,12 @@ private:
   std::uint16_t entry_count_;
 };
 
+auto Keys(const auto &page) {
+  return std::views::iota(std::size_t{0}, page.EntryCount()) |
+         std::views::transform(
+             [&page](std::size_t index) { return page.Entry(index).key; });
+}
+
 // Owns validated bytes. Views borrow them until the page is replaced.
 class Page {
 public:
@@ -87,22 +103,33 @@ public:
   [[nodiscard]] auto PayloadSize() const noexcept -> std::size_t;
   [[nodiscard]] auto Leaf() const noexcept -> LeafPageView;
   [[nodiscard]] auto Internal() const noexcept -> InternalPageView;
+  auto operator==(const Page &) const noexcept -> bool = default;
 
 private:
-  friend auto DecodePage(PageId expected_page_id, const PageBytes &bytes)
+  friend auto DecodePage(PageId expected_page_id,
+                         const PageBytes &bytes) -> Result<Page>;
+  friend auto EncodeLeafPage(PageId page_id, PageId next_leaf,
+                             std::span<const LeafEntry> entries)
+      -> Result<Page>;
+  friend auto EncodeInternalPage(PageId page_id, PageId leftmost_child,
+                                 std::span<const InternalEntry> entries)
       -> Result<Page>;
   explicit Page(const PageBytes &bytes) noexcept : bytes_(bytes) {}
 
   PageBytes bytes_;
 };
 
-auto DecodePage(PageId expected_page_id, const PageBytes &bytes) -> Result<Page>;
+using PageMap = std::map<PageId, Page>;
 
-auto EncodeLeafPage(PageId page_id, PageId next_leaf,
-                    std::span<const LeafEntry> entries) -> Result<PageBytes>;
+[[nodiscard]] auto DecodePage(PageId expected_page_id,
+                              const PageBytes &bytes) -> Result<Page>;
 
-auto EncodeInternalPage(PageId page_id, PageId leftmost_child,
-                        std::span<const InternalEntry> entries)
-    -> Result<PageBytes>;
+[[nodiscard]] auto EncodeLeafPage(PageId page_id, PageId next_leaf,
+                                  std::span<const LeafEntry> entries)
+    -> Result<Page>;
+
+[[nodiscard]] auto EncodeInternalPage(PageId page_id, PageId leftmost_child,
+                                      std::span<const InternalEntry> entries)
+    -> Result<Page>;
 
 } // namespace tinydb::storage

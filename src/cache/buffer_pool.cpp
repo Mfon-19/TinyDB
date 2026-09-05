@@ -1,5 +1,6 @@
 #include "tinydb/cache/buffer_pool.h"
 #include <algorithm>
+#include <cassert>
 #include <utility>
 
 namespace tinydb::cache {
@@ -35,8 +36,7 @@ auto BufferPool::FindVictim() -> FrameIterator {
   auto frame = frames_.end();
   while (frame != frames_.begin()) {
     --frame;
-    if (!frame->dirty &&
-        frame->pin_count.load(std::memory_order_acquire) == 0) {
+    if (!frame->dirty) {
       return frame;
     }
   }
@@ -48,49 +48,35 @@ void BufferPool::Touch(FrameIterator frame) {
   frames_.splice(frames_.begin(), frames_, frame);
 }
 
-Status BufferPool::InstallPage(storage::PageId page_id,
-                               const storage::PageBytes &page) {
-  if (page_id == 0 || page_id == storage::INVALID_PAGE_ID) {
-    return Status::InvalidArgument("invalid page ID");
-  }
+auto BufferPool::InstallPage(const storage::Page &page) -> Status {
   std::lock_guard lock(mutex_);
-  auto frame = FindPage(page_id);
-  if (frame != frames_.end() &&
-      frame->pin_count.load(std::memory_order_acquire) != 0) {
-    return Status::ResourceExhausted("cannot write a pinned page");
-  }
+  auto frame = FindPage(page.Id());
   if (frame == frames_.end()) {
     frame = FindVictim();
     if (frame == frames_.end()) {
-      return Status::ResourceExhausted(
-          "all buffer pool frames are dirty or pinned");
+      return Status::ResourceExhausted("all buffer pool frames are dirty");
     }
   }
 
-  auto decoded = storage::DecodePage(page_id, page);
-  if (!decoded) {
-    return std::move(decoded.error());
-  }
-  SetPage(frame, *decoded);
+  SetPage(frame, page);
   frame->dirty = true;
   Touch(frame);
   return {};
 }
 
-Result<PageHandle> BufferPool::ReadPage(storage::PageId page_id) {
-  if (page_id == 0 || page_id == storage::INVALID_PAGE_ID) {
+auto BufferPool::ReadPage(storage::PageId page_id) -> Result<storage::Page> {
+  if (!storage::ValidDataPageId(page_id)) {
     return Err(Status::InvalidArgument("invalid page ID"));
   }
   std::lock_guard lock(mutex_);
   if (auto frame = FindPage(page_id); frame != frames_.end()) {
     Touch(frame);
-    return PageHandle{&*frame->page, &frame->pin_count};
+    return *frame->page;
   }
 
   auto frame = FindVictim();
   if (frame == frames_.end()) {
-    return Err(Status::ResourceExhausted(
-        "all buffer pool frames are dirty or pinned"));
+    return Err(Status::ResourceExhausted("all buffer pool frames are dirty"));
   }
 
   storage::PageBytes page{};
@@ -105,17 +91,11 @@ Result<PageHandle> BufferPool::ReadPage(storage::PageId page_id) {
   }
   SetPage(frame, *decoded);
   Touch(frame);
-  return PageHandle{&*frame->page, &frame->pin_count};
+  return *frame->page;
 }
 
-Status BufferPool::Flush(
-    const std::map<storage::PageId, storage::PageBytes> &incoming) {
+auto BufferPool::Checkpoint(const storage::PageMap &incoming) -> Status {
   std::lock_guard lock(mutex_);
-  for (const auto &frame : frames_) {
-    if (frame.pin_count.load(std::memory_order_acquire) != 0) {
-      return Status::ResourceExhausted("cannot checkpoint pinned pages");
-    }
-  }
   for (const auto &frame : frames_) {
     if (frame.dirty && !incoming.contains(frame.page->Id())) {
       if (auto status =
@@ -126,7 +106,9 @@ Status BufferPool::Flush(
     }
   }
   for (const auto &[page_id, page] : incoming) {
-    if (auto status = disk_manager_.WritePage(page_id, page); !status.Ok()) {
+    assert(page_id == page.Id());
+    if (auto status = disk_manager_.WritePage(page_id, page.Bytes());
+        !status.Ok()) {
       return status;
     }
   }
@@ -138,11 +120,7 @@ Status BufferPool::Flush(
       continue;
     }
     if (auto found = incoming.find(frame.page->Id()); found != incoming.end()) {
-      auto decoded = storage::DecodePage(found->first, found->second);
-      if (!decoded) {
-        return std::move(decoded.error());
-      }
-      frame.page = std::move(*decoded);
+      frame.page = found->second;
     }
     frame.dirty = false;
   }

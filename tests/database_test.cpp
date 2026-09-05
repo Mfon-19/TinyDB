@@ -283,5 +283,31 @@ TEST_F(DatabaseTest, ConcurrentTransactions) {
   workers.clear();
   EXPECT_EQ(database->Get(key(0)).value(), std::string(600, 'm'));
 }
+
+TEST_F(DatabaseTest, WritesInvalidateCursors) {
+  auto database = Database::Open(path_, 4).value();
+  ASSERT_TRUE(database->Put("a", "1").Ok());
+  ASSERT_TRUE(database->Put("b", "2").Ok());
+  auto transaction = database->BeginWrite().value();
+  auto cursor = transaction->Seek("").value();
+  ASSERT_TRUE(cursor.Valid());
+  EXPECT_EQ(cursor.Key(), "a");
+  ASSERT_TRUE(transaction->Put("c", "3").Ok());
+  EXPECT_FALSE(cursor.Valid());
+  EXPECT_FALSE(cursor.Next().Ok());
+  EXPECT_TRUE(transaction->Get("a"));
+  cursor = transaction->Seek("b").value();
+  ASSERT_TRUE(cursor.Valid());
+  EXPECT_EQ(cursor.Key(), "b");
+  auto moved = std::move(cursor);
+  EXPECT_FALSE(cursor.Valid());
+  ASSERT_TRUE(moved.Valid());
+  ASSERT_TRUE(moved.Next().Ok());
+  EXPECT_EQ(moved.Key(), "c");
+  ASSERT_TRUE(moved.Next().Ok());
+  EXPECT_FALSE(moved.Valid());
+  ASSERT_TRUE(transaction->Commit().Ok());
+  EXPECT_EQ(database->Get("c").value(), "3");
+}
 }
 }

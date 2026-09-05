@@ -12,4 +12,8 @@ using PageId = std::uint32_t;
 inline constexpr PageId INVALID_PAGE_ID = UINT32_MAX;
 using PageBytes = std::array<char, PAGE_SIZE>;
 
+[[nodiscard]] constexpr auto ValidDataPageId(PageId page_id) noexcept -> bool {
+  return page_id != 0 && page_id != INVALID_PAGE_ID;
+}
+
 } // namespace tinydb::storage

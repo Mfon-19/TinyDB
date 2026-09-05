@@ -14,7 +14,7 @@
 namespace tinydb::storage {
 namespace {
 
-auto Page(PageId page_id, std::string_view value) -> PageBytes {
+auto MakePage(PageId page_id, std::string_view value) -> storage::Page {
   const LeafEntry entry{"key", value};
   return EncodeLeafPage(page_id, INVALID_PAGE_ID, std::span{&entry, 1}).value();
 }
@@ -24,7 +24,7 @@ void Append(std::vector<char> &bytes, std::span<const char> record) {
 }
 
 TEST(WalCodec, RecordsRoundTrip) {
-  const WalPages first{{1, Page(1, "root")}, {7, Page(7, "old")}};
+  const PageMap first{{1, MakePage(1, "root")}, {7, MakePage(7, "old")}};
   auto bytes = EncodeWalRecord(first).value();
   EXPECT_EQ(bytes.size(), 8212U);
   EXPECT_EQ(std::string_view(bytes.data(), 4), "TDW1");
@@ -33,19 +33,20 @@ TEST(WalCodec, RecordsRoundTrip) {
   EXPECT_EQ(little_endian::GetU32(bytes, 4108), 7U);
   EXPECT_EQ(DecodeWal(bytes).value(), first);
 
-  const WalPages second{{7, Page(7, "new")}, {9, Page(9, "added")}};
+  const PageMap second{{7, MakePage(7, "new")}, {9, MakePage(9, "added")}};
   Append(bytes, EncodeWalRecord(second).value());
-  const WalPages expected{
+  const PageMap expected{
       {1, first.at(1)}, {7, second.at(7)}, {9, second.at(9)}};
   EXPECT_EQ(DecodeWal(bytes).value(), expected);
   EXPECT_TRUE(DecodeWal({}).value().empty());
 }
 
 TEST(WalCodec, IgnoresTornTail) {
-  const WalPages first{{1, Page(1, "old")}};
+  const PageMap first{{1, MakePage(1, "old")}};
   const auto prefix = EncodeWalRecord(first).value();
   auto final =
-      EncodeWalRecord({{1, Page(1, "new")}, {2, Page(2, "added")}}).value();
+      EncodeWalRecord({{1, MakePage(1, "new")}, {2, MakePage(2, "added")}})
+          .value();
   for (const std::size_t length : {0U, 1U, 7U, 8U, 12U, 4108U, 8208U, 8211U}) {
     SCOPED_TRACE(length);
     auto bytes = prefix;
@@ -62,7 +63,7 @@ TEST(WalCodec, IgnoresTornTail) {
 }
 
 TEST(WalCodec, RejectsCorruption) {
-  const auto good = EncodeWalRecord({{1, Page(1, "value")}}).value();
+  const auto good = EncodeWalRecord({{1, MakePage(1, "value")}}).value();
   std::vector<std::vector<char>> malformed;
   auto bad = good;
   bad[0] = 'X';
@@ -95,8 +96,8 @@ TEST(WalCodec, RejectsCorruption) {
     EXPECT_FALSE(DecodeWal(bytes));
   }
   EXPECT_FALSE(EncodeWalRecord({}));
-  EXPECT_FALSE(EncodeWalRecord({{0, {}}}));
-  EXPECT_FALSE(EncodeWalRecord({{INVALID_PAGE_ID, {}}}));
+  EXPECT_FALSE(EncodeWalRecord({{0, MakePage(1, "value")}}));
+  EXPECT_FALSE(EncodeWalRecord({{INVALID_PAGE_ID, MakePage(1, "value")}}));
 }
 
 class WalTest : public testing::Test {
@@ -124,8 +125,8 @@ protected:
 };
 
 TEST_F(WalTest, AppendsAndResets) {
-  const WalPages first{{1, Page(1, "old")}, {2, Page(2, "kept")}};
-  const WalPages second{{1, Page(1, "new")}};
+  const PageMap first{{1, MakePage(1, "old")}, {2, MakePage(2, "kept")}};
+  const PageMap second{{1, MakePage(1, "new")}};
   {
     auto wal = Wal::Open(path_).value();
     EXPECT_TRUE(wal.Empty());
@@ -137,7 +138,7 @@ TEST_F(WalTest, AppendsAndResets) {
   }
   auto wal = Wal::Open(path_).value();
   EXPECT_FALSE(wal.Empty());
-  const WalPages expected{{1, second.at(1)}, {2, first.at(2)}};
+  const PageMap expected{{1, second.at(1)}, {2, first.at(2)}};
   EXPECT_EQ(wal.Validate().value(), expected);
   ASSERT_TRUE(wal.Reset().Ok());
   EXPECT_TRUE(wal.Empty());

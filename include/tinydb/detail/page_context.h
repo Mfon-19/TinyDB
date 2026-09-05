@@ -3,7 +3,7 @@
 #include "tinydb/status.h"
 #include "tinydb/storage/page_codec.h"
 #include <atomic>
-#include <map>
+#include <cstdint>
 #include <vector>
 
 namespace tinydb::cache {
@@ -20,7 +20,8 @@ struct WriteState {
 
   storage::PageId page_count;
   std::vector<storage::PageId> free_pages;
-  std::map<storage::PageId, storage::PageBytes> pages{};
+  storage::PageMap pages{};
+  std::uint64_t version = 0;
   Phase phase = Phase::Active;
 };
 
@@ -30,12 +31,15 @@ public:
               WriteState *write = nullptr) noexcept
       : pool_(pool), poisoned_(poisoned), write_(write) {}
 
-  [[nodiscard]] bool Active() const noexcept;
-  [[nodiscard]] bool ReadOnly() const noexcept { return write_ == nullptr; }
-  Status CheckActive() const;
-  Result<storage::Page> ReadPage(storage::PageId page_id);
-  Status WritePage(storage::PageId page_id, const storage::PageBytes &page);
-  Result<storage::PageId> AllocatePage();
+  [[nodiscard]] auto Active() const noexcept -> bool;
+  [[nodiscard]] auto Version() const noexcept -> std::uint64_t;
+  auto CheckActive() const -> Status;
+
+  auto Fail(Status error) -> Status;
+  [[nodiscard]] auto ReadPage(storage::PageId page_id) -> Result<storage::Page>;
+
+  auto WritePage(const storage::Page &page) -> Status;
+  [[nodiscard]] auto AllocatePage() -> Result<storage::PageId>;
   void FreePage(storage::PageId page_id);
 
 private:

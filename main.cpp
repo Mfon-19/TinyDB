@@ -35,8 +35,8 @@ auto Parse(std::string_view line) -> tinydb::Result<std::vector<std::string>> {
   return args;
 }
 
-tinydb::Status Run(tinydb::Database &database,
-                   const std::vector<std::string> &args) {
+auto Run(tinydb::Database &database,
+         const std::vector<std::string> &args) -> tinydb::Status {
   const auto &command = args.front();
   if (command == "put" && args.size() == 3) {
     if (auto status = database.Put(args[1], args[2]); !status.Ok()) {
