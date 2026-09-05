@@ -283,9 +283,7 @@ TEST(BPlusTree, PersistsAcrossReopen) {
     ASSERT_TRUE(IsOk(tree.Initialize()));
     Fill(tree, 800, 400);
     EXPECT_TRUE(Remove(tree, Key(7)));
-    for (const auto &[page_id, page] : state.pages) {
-      ASSERT_TRUE(IsOk(pool.WritePage(page_id, page)));
-    }
+    ASSERT_TRUE(IsOk(pool.Flush(state.pages)));
   }
 
   cache::BufferPool pool{storage::DiskManager::Open(path).value(), 8};

@@ -11,8 +11,7 @@ bool PageContext::Active() const noexcept {
 
 Status PageContext::CheckActive() const {
   if (poisoned_) {
-    return Status::IoError(
-        "database must be closed and reopened after a failed commit");
+    return Status::IoError(POISONED_DATABASE_MESSAGE);
   }
   if (write_ && write_->phase != WriteState::Phase::Active) {
     return Status::InvalidArgument("write transaction is not active");

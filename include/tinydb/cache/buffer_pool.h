@@ -3,7 +3,7 @@
 /*
  * A BufferPool keeps pages read from disk into in-memory
  * fixed-sized frames. When full, it replaces the least recently
- * used frame that is not pinned by a PageHandle.
+ * used frame that is neither dirty nor pinned by a PageHandle.
  */
 
 #include "tinydb/cache/page_handle.h"
@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstddef>
 #include <list>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 
@@ -25,14 +26,17 @@ public:
   BufferPool(BufferPool &&) = delete;
   BufferPool &operator=(BufferPool &&) = delete;
 
-  Status WritePage(storage::PageId page_id, const storage::PageBytes &page);
+  [[nodiscard]] std::size_t Capacity() const noexcept { return capacity_; }
+  Status InstallPage(storage::PageId page_id, const storage::PageBytes &page);
   Result<PageHandle> ReadPage(storage::PageId page_id);
+  Status Flush(const std::map<storage::PageId, storage::PageBytes> &incoming);
 
 private:
   struct Frame {
     storage::PageId page_id;
     storage::PageBytes page;
     std::atomic<std::size_t> pin_count{0};
+    bool dirty = false;
   };
 
   using FrameIterator = std::list<Frame>::iterator;

@@ -55,42 +55,15 @@ auto WriteTransaction::Seek(std::string_view key) -> Result<btree::Cursor> {
   return result;
 }
 
-void WriteTransaction::Finish() {
-  state_.phase = detail::WriteState::Phase::Finished;
-  state_.pages.clear();
-  state_.free_pages.clear();
-  if (writer_lock_.owns_lock()) {
-    writer_lock_.unlock();
-  }
-}
-
 Status WriteTransaction::Commit() {
-  if (auto status = context_.CheckActive(); !status.Ok()) {
-    Finish();
+  auto writer = std::move(writer_lock_);
+  auto status = context_.CheckActive();
+  auto pending = std::move(state_);
+  state_.phase = detail::WriteState::Phase::Finished;
+  if (!status.Ok()) {
     return status;
   }
-
-  if (state_.pages.empty()) {
-    Finish();
-    return {};
-  }
-
-  std::unique_lock visibility(database_.visibility_mutex_);
-
-  for (const auto &[page_id, page] : state_.pages) {
-    if (auto status = database_.buffer_pool_.WritePage(page_id, page);
-        !status.Ok()) {
-      database_.poisoned_ = true;
-      visibility.unlock();
-      Finish();
-      return status;
-    }
-  }
-  database_.page_count_ = state_.page_count;
-  database_.free_pages_ = std::move(state_.free_pages);
-  visibility.unlock();
-  Finish();
-  return {};
+  return database_.Commit(pending);
 }
 
 } // namespace tinydb

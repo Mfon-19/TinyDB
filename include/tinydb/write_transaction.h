@@ -24,7 +24,6 @@ public:
 private:
   friend class Database;
   explicit WriteTransaction(Database &database);
-  void Finish();
 
   Database &database_;
   std::unique_lock<std::mutex> writer_lock_;

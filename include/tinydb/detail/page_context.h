@@ -12,6 +12,9 @@ class BufferPool;
 
 namespace tinydb::detail {
 
+inline constexpr auto POISONED_DATABASE_MESSAGE =
+    "database is poisoned; close and reopen";
+
 struct WriteState {
   enum class Phase { Active, Failed, Finished };
 
