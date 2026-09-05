@@ -149,6 +149,16 @@ auto Page::Type() const noexcept -> PageType {
   return static_cast<PageType>(little_endian::GetU16(bytes_, TYPE_OFFSET));
 }
 
+auto Page::FreeSpace() const noexcept -> std::size_t {
+  const auto count = little_endian::GetU16(bytes_, ENTRY_COUNT_OFFSET);
+  const auto cells_begin = count == 0 ? PAGE_SIZE : SlotOffset(bytes_, 0);
+  return cells_begin - HEADER_SIZE - count * SLOT_SIZE;
+}
+
+auto Page::PayloadSize() const noexcept -> std::size_t {
+  return PAGE_SIZE - HEADER_SIZE - FreeSpace();
+}
+
 auto Page::Leaf() const noexcept -> LeafPageView {
   assert(Type() == PageType::Leaf);
   return LeafPageView{&bytes_, Id(), little_endian::GetU32(bytes_, LINK_OFFSET),

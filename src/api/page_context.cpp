@@ -67,6 +67,7 @@ void PageContext::FreePage(storage::PageId page_id) {
   assert(write_ && Active());
   assert(page_id > 1 && page_id < write_->page_count);
   write_->free_pages.push_back(page_id);
+  write_->pages.erase(page_id);
 }
 
 } // namespace tinydb::detail

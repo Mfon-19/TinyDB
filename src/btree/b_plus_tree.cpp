@@ -28,19 +28,9 @@ auto EntryKeys(const auto &page) {
              [&page](std::size_t index) { return page.Entry(index).key; });
 }
 
-auto Entries(const storage::LeafPageView &leaf) -> std::vector<LeafEntry> {
-  std::vector<LeafEntry> entries;
-  entries.reserve(leaf.EntryCount() + 1);
-  for (std::size_t index = 0; index < leaf.EntryCount(); ++index) {
-    entries.push_back(leaf.Entry(index));
-  }
-  return entries;
-}
-
-auto Entries(const storage::InternalPageView &page)
-    -> std::vector<InternalEntry> {
-  std::vector<InternalEntry> entries;
-  entries.reserve(page.EntryCount() + 1);
+auto Entries(const auto &page, std::size_t extra = 1) {
+  std::vector<decltype(page.Entry(0))> entries;
+  entries.reserve(page.EntryCount() + extra);
   for (std::size_t index = 0; index < page.EntryCount(); ++index) {
     entries.push_back(page.Entry(index));
   }
@@ -257,13 +247,13 @@ auto BPlusTree::Remove(PageId page_id, std::string_view key) -> Result<bool> {
   }
 
   const auto leaf = page->Leaf();
-  auto entries = Entries(leaf);
-  const auto found =
-      std::ranges::lower_bound(entries, key, {}, &LeafEntry::key);
-  if (found == entries.end() || found->key != key) {
+  const auto keys = EntryKeys(leaf);
+  const auto found = std::ranges::lower_bound(keys, key);
+  if (found == keys.end() || *found != key) {
     return false;
   }
-  entries.erase(found);
+  auto entries = Entries(leaf);
+  entries.erase(entries.begin() + (found - keys.begin()));
 
   auto encoded = storage::EncodeLeafPage(page_id, leaf.NextLeaf(), entries);
   if (!encoded) {
@@ -288,25 +278,34 @@ auto BPlusTree::MergeChildren(PageId target, PageId left_id, PageId right_id,
   if (left->Type() != right->Type()) {
     return Err(Status::Corruption("cannot merge pages of different types"));
   }
+  auto added_size = right->PayloadSize();
+  if (left->Type() == storage::PageType::Internal) {
+    added_size += EntrySize(InternalEntry{separator, right_id});
+  }
+  if (added_size > left->FreeSpace()) {
+    return false;
+  }
 
   Result<storage::PageBytes> merged;
   if (left->Type() == storage::PageType::Internal) {
     const auto left_page = left->Internal();
     const auto right_page = right->Internal();
 
-    auto entries = Entries(left_page);
+    auto entries = Entries(left_page, right_page.EntryCount() + 1);
     entries.push_back({separator, right_page.LeftmostChild()});
-    const auto right_entries = Entries(right_page);
-    entries.insert(entries.end(), right_entries.begin(), right_entries.end());
+    for (std::size_t index = 0; index < right_page.EntryCount(); ++index) {
+      entries.push_back(right_page.Entry(index));
+    }
     merged = storage::EncodeInternalPage(target, left_page.LeftmostChild(),
                                          entries);
   } else {
     const auto left_page = left->Leaf();
     const auto right_page = right->Leaf();
 
-    auto entries = Entries(left_page);
-    const auto right_entries = Entries(right_page);
-    entries.insert(entries.end(), right_entries.begin(), right_entries.end());
+    auto entries = Entries(left_page, right_page.EntryCount());
+    for (std::size_t index = 0; index < right_page.EntryCount(); ++index) {
+      entries.push_back(right_page.Entry(index));
+    }
     merged = storage::EncodeLeafPage(target, right_page.NextLeaf(), entries);
   }
 

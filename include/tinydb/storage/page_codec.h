@@ -83,6 +83,8 @@ public:
   }
   [[nodiscard]] auto Id() const noexcept -> PageId;
   [[nodiscard]] auto Type() const noexcept -> PageType;
+  [[nodiscard]] auto FreeSpace() const noexcept -> std::size_t;
+  [[nodiscard]] auto PayloadSize() const noexcept -> std::size_t;
   [[nodiscard]] auto Leaf() const noexcept -> LeafPageView;
   [[nodiscard]] auto Internal() const noexcept -> InternalPageView;
 
