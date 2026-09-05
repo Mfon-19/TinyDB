@@ -38,6 +38,7 @@ private:
 
   detail::PageContext *context_;
   std::unique_ptr<storage::Page> page_;
+  storage::LeafPageView leaf_;
   std::uint64_t version_;
   std::size_t index_ = 0;
 };

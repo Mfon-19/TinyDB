@@ -8,7 +8,7 @@ namespace tinydb {
 
 Cursor::Cursor(detail::PageContext &context, const storage::Page &page)
     : context_(&context), page_(std::make_unique<storage::Page>(page)),
-      version_(context.Version()) {}
+      leaf_(page_->Leaf()), version_(context.Version()) {}
 
 auto Cursor::Valid() const noexcept -> bool {
   return page_ && context_->Active() && context_->Version() == version_;
@@ -16,38 +16,36 @@ auto Cursor::Valid() const noexcept -> bool {
 
 auto Cursor::Key() const noexcept -> std::string_view {
   assert(Valid());
-  return page_->Leaf().Key(index_);
+  return leaf_.Key(index_);
 }
 
 auto Cursor::Value() const noexcept -> std::string_view {
   assert(Valid());
-  return page_->Leaf().Entry(index_).value;
+  return leaf_.Entry(index_).value;
 }
 
 auto Cursor::Next() -> Status {
   if (auto status = context_->CheckActive(); !status.Ok()) {
     return status;
   }
-  if (!Valid()) {
+  if (!page_ || context_->Version() != version_) {
     return Status::InvalidArgument("cursor is not valid");
   }
-  const auto leaf = page_->Leaf();
-  if (++index_ < leaf.EntryCount()) {
+  if (++index_ < leaf_.EntryCount()) {
     return {};
   }
-  return LoadLeaf(leaf.NextLeaf());
+  return LoadLeaf(leaf_.NextLeaf());
 }
 
 auto Cursor::Position(std::string_view key) -> Status {
   while (page_) {
-    const auto leaf = page_->Leaf();
-    const auto keys = storage::Keys(leaf);
+    const auto keys = storage::Keys(leaf_);
     const auto found = std::ranges::lower_bound(keys, key);
     if (found != keys.end()) {
       index_ = static_cast<std::size_t>(found - keys.begin());
       return {};
     }
-    if (auto status = LoadLeaf(leaf.NextLeaf()); !status.Ok()) {
+    if (auto status = LoadLeaf(leaf_.NextLeaf()); !status.Ok()) {
       return status;
     }
   }
@@ -67,12 +65,12 @@ auto Cursor::LoadLeaf(storage::PageId page_id) -> Status {
           Status::Corruption("leaf link points to an internal page"));
     }
     *page_ = std::move(*page);
-    const auto leaf = page_->Leaf();
-    if (leaf.EntryCount() != 0) {
+    leaf_ = page_->Leaf();
+    if (leaf_.EntryCount() != 0) {
       index_ = 0;
       return {};
     }
-    page_id = leaf.NextLeaf();
+    page_id = leaf_.NextLeaf();
   }
   page_.reset();
   return {};

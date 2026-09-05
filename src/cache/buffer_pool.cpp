@@ -1,5 +1,5 @@
 #include "tinydb/cache/buffer_pool.h"
-#include <algorithm>
+#include <bit>
 #include <cassert>
 #include <utility>
 
@@ -8,10 +8,10 @@ namespace tinydb::cache {
 BufferPool::BufferPool(storage::DiskManager disk_manager, std::size_t capacity)
     : disk_manager_(std::move(disk_manager)), capacity_(capacity),
       frames_(capacity),
-      buckets_(std::max(capacity, std::size_t{1}), frames_.end()) {}
+      buckets_(std::bit_ceil(capacity), frames_.end()) {}
 
 auto BufferPool::FindPage(storage::PageId page_id) -> FrameIterator {
-  auto frame = buckets_[page_id % buckets_.size()];
+  auto frame = buckets_[page_id & (buckets_.size() - 1)];
   while (frame != frames_.end() && frame->page->Id() != page_id) {
     frame = frame->hash_next;
   }
@@ -20,13 +20,13 @@ auto BufferPool::FindPage(storage::PageId page_id) -> FrameIterator {
 
 void BufferPool::SetPage(FrameIterator frame, const storage::Page &page) {
   if (frame->page) {
-    auto *link = &buckets_[frame->page->Id() % buckets_.size()];
+    auto *link = &buckets_[frame->page->Id() & (buckets_.size() - 1)];
     while (*link != frame) {
       link = &(*link)->hash_next;
     }
     *link = frame->hash_next;
   }
-  auto &head = buckets_[page.Id() % buckets_.size()];
+  auto &head = buckets_[page.Id() & (buckets_.size() - 1)];
   frame->hash_next = head;
   head = frame;
   frame->page = page;
