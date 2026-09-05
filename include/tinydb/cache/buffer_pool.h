@@ -39,13 +39,13 @@ private:
   using FrameIterator = std::list<Frame>::iterator;
 
   struct Frame {
-    storage::PageRef page;
+    std::shared_ptr<storage::Page> page;
     bool dirty = false;
     FrameIterator hash_next;
   };
 
   auto FindPage(storage::PageId page_id) -> FrameIterator;
-  void SetPage(FrameIterator frame, storage::PageRef page);
+  void SetPage(FrameIterator frame, const storage::Page &page);
   auto FindVictim() -> FrameIterator;
   void Touch(FrameIterator frame);
 

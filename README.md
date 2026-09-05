@@ -105,14 +105,14 @@ a warm Linux file cache. The concurrent workload uses four readers and one write
 
 | Workload | Operations/s, median (min–max) | p99 transaction (ms) |
 | --- | ---: | ---: |
-| Sequential inserts | 40,915 (40,789–47,333) | 6.044 |
-| Random inserts | 24,057 (23,346–27,528) | 8.078 |
-| Existing-key reads | 507,258 (476,963–514,364) | 0.00405 |
-| Missing-key reads | 539,307 (539,192–545,057) | 0.00290 |
-| 100-entry scans | 6,940,362 (2,181,802–7,774,291) | 0.02455 |
-| Full scans | 6,506,613 (5,721,102–6,744,544) | — |
-| Overwrites | 20,224 (20,001–21,520) | 8.237 |
-| Deletes | 20,307 (19,731–20,375) | 7.383 |
-| Reinserts | 18,594 (18,093–18,963) | 8.908 |
-| Concurrent reads | 65,411 (64,002–71,658) | 0.106 |
-| Concurrent writes | 16,353 (16,000–17,915) | 18.516 |
+| Sequential inserts | 47,948 (46,784–49,103) | 5.481 |
+| Random inserts | 22,776 (22,369–24,399) | 8.059 |
+| Existing-key reads | 534,833 (525,564–595,708) | 0.00381 |
+| Missing-key reads | 667,487 (562,705–670,915) | 0.00249 |
+| 100-entry scans | 7,319,396 (5,158,606–7,342,090) | 0.0269 |
+| Full scans | 5,387,786 (4,904,642–6,910,153) | — |
+| Overwrites | 23,319 (21,622–23,384) | 7.877 |
+| Deletes | 21,598 (19,058–23,458) | 7.935 |
+| Reinserts | 19,439 (19,194–19,641) | 7.668 |
+| Concurrent reads | 68,698 (66,952–70,197) | 0.206 |
+| Concurrent writes | 17,174 (16,738–17,549) | 13.294 |

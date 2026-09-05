@@ -17,7 +17,7 @@ auto BufferPool::FindPage(storage::PageId page_id) -> FrameIterator {
   return frame;
 }
 
-void BufferPool::SetPage(FrameIterator frame, storage::PageRef page) {
+void BufferPool::SetPage(FrameIterator frame, const storage::Page &page) {
   if (frame->page) {
     auto *link = &buckets_[frame->page->Id() & (buckets_.size() - 1)];
     while (*link != frame) {
@@ -25,10 +25,14 @@ void BufferPool::SetPage(FrameIterator frame, storage::PageRef page) {
     }
     *link = frame->hash_next;
   }
-  auto &head = buckets_[page->Id() & (buckets_.size() - 1)];
+  auto &head = buckets_[page.Id() & (buckets_.size() - 1)];
   frame->hash_next = head;
   head = frame;
-  frame->page = std::move(page);
+  if (frame->page.use_count() == 1) {
+    *std::shared_ptr(frame->page) = page;
+  } else {
+    frame->page = std::make_shared<storage::Page>(page);
+  }
 }
 
 auto BufferPool::FindVictim() -> FrameIterator {
@@ -57,7 +61,7 @@ auto BufferPool::InstallPage(const storage::Page &page) -> Status {
     }
   }
 
-  SetPage(frame, std::make_shared<const storage::Page>(page));
+  SetPage(frame, page);
   frame->dirty = true;
   Touch(frame);
   return {};
@@ -88,7 +92,7 @@ auto BufferPool::ReadPage(storage::PageId page_id) -> Result<storage::PageRef> {
   if (!decoded) {
     return Err(std::move(decoded.error()));
   }
-  SetPage(frame, std::make_shared<const storage::Page>(std::move(*decoded)));
+  SetPage(frame, *decoded);
   Touch(frame);
   return frame->page;
 }
@@ -114,14 +118,15 @@ auto BufferPool::Checkpoint(const storage::PageMap &incoming) -> Status {
   if (auto status = disk_manager_.Sync(); !status.Ok()) {
     return status;
   }
-  for (auto &frame : frames_) {
-    if (!frame.page) {
+  for (auto frame = frames_.begin(); frame != frames_.end(); ++frame) {
+    if (!frame->page) {
       continue;
     }
-    if (auto found = incoming.find(frame.page->Id()); found != incoming.end()) {
-      frame.page = std::make_shared<const storage::Page>(found->second);
+    if (auto found = incoming.find(frame->page->Id());
+        found != incoming.end()) {
+      SetPage(frame, found->second);
     }
-    frame.dirty = false;
+    frame->dirty = false;
   }
   return {};
 }
