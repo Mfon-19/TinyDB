@@ -67,6 +67,17 @@ The example uses `.value()` for brevity; it throws if a `Result` contains an
 error. Callers can instead check the result and read `result.error().Message()`.
 A successful `Get` returns an empty optional when the key is absent.
 
+For a complete runnable example, see [examples/example.cpp](examples/example.cpp).
+It demonstrates batched writes, reading pending changes, rollback, cursor scans,
+deletion, checkpointing, and reopening, with error handling. It writes sample
+`user:` keys to the database path you supply:
+
+```sh
+cmake -S . -B build -DTINYDB_BUILD_TESTS=OFF
+cmake --build build --target tinydb_example
+./build/tinydb_example example.db
+```
+
 ## How it works
 
 TinyDB features a disk manager that talks to the operating system (Linux) to

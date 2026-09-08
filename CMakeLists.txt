@@ -48,6 +48,10 @@ add_executable(tinydb_cli main.cpp)
 target_link_libraries(tinydb_cli PRIVATE tinydb)
 tinydb_target_options(tinydb_cli)
 
+add_executable(tinydb_example EXCLUDE_FROM_ALL examples/example.cpp)
+target_link_libraries(tinydb_example PRIVATE tinydb)
+tinydb_target_options(tinydb_example)
+
 add_executable(tinydb_bench EXCLUDE_FROM_ALL benchmarks/benchmark.cpp)
 target_link_libraries(tinydb_bench PRIVATE tinydb)
 tinydb_target_options(tinydb_bench)
