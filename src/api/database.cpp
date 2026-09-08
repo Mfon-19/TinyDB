@@ -40,7 +40,7 @@ auto Recover(storage::DiskManager &disk_manager, storage::Wal &wal) -> Status {
     return std::move(pages.error());
   }
   for (const auto &[page_id, page] : *pages) {
-    if (auto status = disk_manager.WritePage(page_id, page.Bytes());
+    if (auto status = disk_manager.WritePage(page_id, page->Bytes());
         !status.Ok()) {
       return status;
     }
@@ -191,7 +191,7 @@ auto Database::Commit(detail::WriteState &pending) -> Status {
     return {};
   }
   for (auto &[page_id, page] : pending.pages) {
-    page.UpdateChecksum();
+    page->UpdateChecksum();
   }
   auto record = storage::EncodeWalRecord(pending.pages);
   if (!record) {
@@ -220,7 +220,7 @@ auto Database::Publish(detail::WriteState &pending) -> Status {
     }
   } else {
     for (const auto &[page_id, page] : pending.pages) {
-      if (auto status = buffer_pool_.InstallPage(page); !status.Ok()) {
+      if (auto status = buffer_pool_.InstallPage(*page); !status.Ok()) {
         return status;
       }
     }

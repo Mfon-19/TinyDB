@@ -40,7 +40,7 @@ auto PageContext::ReadPage(storage::PageId page_id)
   if (write_) {
     if (auto found = write_->pages.find(page_id);
         found != write_->pages.end()) {
-      return std::make_shared<const storage::Page>(found->second);
+      return found->second;
     }
   }
   return pool_.ReadPage(page_id);
@@ -52,7 +52,8 @@ auto PageContext::WritePage(const storage::Page &page) -> Status {
     return status;
   }
   assert(page.Id() < write_->page_count);
-  write_->pages.insert_or_assign(page.Id(), page);
+  write_->pages.insert_or_assign(page.Id(),
+                                std::make_shared<storage::Page>(page));
   ++write_->version;
   return {};
 }

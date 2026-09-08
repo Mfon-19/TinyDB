@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <utility>
 
 namespace tinydb::storage {
@@ -37,20 +38,23 @@ auto EncodeWalRecord(const PageMap &pages) -> Result<std::vector<char>> {
   if (!size) {
     return Err(std::move(size.error()));
   }
+
   std::vector<char> bytes;
   if (*size > bytes.max_size()) {
     return Err(Status::ResourceExhausted("WAL record is too large"));
   }
+
   bytes.resize(*size);
   std::ranges::copy(MAGIC, bytes.begin());
   little_endian::PutU32(bytes, 4, static_cast<std::uint32_t>(pages.size()));
+  
   std::size_t offset = HEADER_SIZE;
   for (const auto &[page_id, page] : pages) {
-    if (page_id != page.Id()) {
+    if (page_id != page->Id()) {
       return Err(Status::InvalidArgument("invalid WAL page ID"));
     }
     little_endian::PutU32(bytes, offset, page_id);
-    std::ranges::copy(page.Bytes(), bytes.begin() + offset + sizeof(PageId));
+    std::ranges::copy(page->Bytes(), bytes.begin() + offset + sizeof(PageId));
     offset += FRAME_SIZE;
   }
   little_endian::PutU32(bytes, offset,
@@ -99,7 +103,8 @@ auto DecodeWal(std::span<const char> bytes) -> Result<PageMap> {
       if (!decoded) {
         return Err(std::move(decoded.error()));
       }
-      pages.insert_or_assign(page_id, std::move(*decoded));
+      pages.insert_or_assign(page_id,
+                             std::make_shared<Page>(std::move(*decoded)));
     }
     bytes = bytes.subspan(record.size());
   }

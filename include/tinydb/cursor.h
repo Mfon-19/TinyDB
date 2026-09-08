@@ -2,7 +2,6 @@
 
 #include "tinydb/storage/page_codec.h"
 #include <cstdint>
-#include <memory>
 #include <string_view>
 
 namespace tinydb::detail {

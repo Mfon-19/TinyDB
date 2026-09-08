@@ -8,15 +8,26 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <iterator>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 
 namespace tinydb::storage {
 namespace {
 
-auto MakePage(PageId page_id, std::string_view value) -> storage::Page {
+auto MakePage(PageId page_id, std::string_view value) -> std::shared_ptr<Page> {
   const LeafEntry entry{"key", value};
-  return EncodeLeafPage(page_id, INVALID_PAGE_ID, std::span{&entry, 1}).value();
+  return std::make_shared<Page>(
+      EncodeLeafPage(page_id, INVALID_PAGE_ID, std::span{&entry, 1}).value());
+}
+
+auto ValuePages(const PageMap &pages) -> std::map<PageId, Page> {
+  std::map<PageId, Page> values;
+  for (const auto &[id, page] : pages) {
+    values.emplace(id, *page);
+  }
+  return values;
 }
 
 void Append(std::vector<char> &bytes, std::span<const char> record) {
@@ -31,13 +42,13 @@ TEST(WalCodec, RecordsRoundTrip) {
   EXPECT_EQ(little_endian::GetU32(bytes, 4), 2U);
   EXPECT_EQ(little_endian::GetU32(bytes, 8), 1U);
   EXPECT_EQ(little_endian::GetU32(bytes, 4108), 7U);
-  EXPECT_EQ(DecodeWal(bytes).value(), first);
+  EXPECT_EQ(ValuePages(DecodeWal(bytes).value()), ValuePages(first));
 
   const PageMap second{{7, MakePage(7, "new")}, {9, MakePage(9, "added")}};
   Append(bytes, EncodeWalRecord(second).value());
   const PageMap expected{
       {1, first.at(1)}, {7, second.at(7)}, {9, second.at(9)}};
-  EXPECT_EQ(DecodeWal(bytes).value(), expected);
+  EXPECT_EQ(ValuePages(DecodeWal(bytes).value()), ValuePages(expected));
   EXPECT_TRUE(DecodeWal({}).value().empty());
 }
 
@@ -53,12 +64,12 @@ TEST(WalCodec, IgnoresTornTail) {
     Append(bytes, std::span<const char>{final}.first(length));
     auto decoded = DecodeWal(bytes);
     ASSERT_TRUE(decoded) << decoded.error().Message();
-    EXPECT_EQ(*decoded, first);
+    EXPECT_EQ(ValuePages(*decoded), ValuePages(first));
   }
   final.back() ^= 1;
   auto bytes = prefix;
   Append(bytes, final);
-  EXPECT_EQ(DecodeWal(bytes).value(), first);
+  EXPECT_EQ(ValuePages(DecodeWal(bytes).value()), ValuePages(first));
   EXPECT_TRUE(DecodeWal(final).value().empty());
 }
 
@@ -139,14 +150,14 @@ TEST_F(WalTest, AppendsAndResets) {
   auto wal = Wal::Open(path_).value();
   EXPECT_FALSE(wal.Empty());
   const PageMap expected{{1, second.at(1)}, {2, first.at(2)}};
-  EXPECT_EQ(wal.Validate().value(), expected);
+  EXPECT_EQ(ValuePages(wal.Validate().value()), ValuePages(expected));
   ASSERT_TRUE(wal.Reset().Ok());
   EXPECT_TRUE(wal.Empty());
   EXPECT_EQ(std::filesystem::file_size(path_ + "-wal"), 0U);
   EXPECT_TRUE(wal.Validate().value().empty());
   ASSERT_TRUE(wal.Append(EncodeWalRecord(second).value()).Ok());
   ASSERT_TRUE(wal.Sync().Ok());
-  EXPECT_EQ(wal.Validate().value(), second);
+  EXPECT_EQ(ValuePages(wal.Validate().value()), ValuePages(second));
   EXPECT_EQ(ReadWal(), EncodeWalRecord(second).value());
 }
 }

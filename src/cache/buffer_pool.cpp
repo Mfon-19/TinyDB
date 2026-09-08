@@ -109,8 +109,8 @@ auto BufferPool::Checkpoint(const storage::PageMap &incoming) -> Status {
     }
   }
   for (const auto &[page_id, page] : incoming) {
-    assert(page_id == page.Id());
-    if (auto status = disk_manager_.WritePage(page_id, page.Bytes());
+    assert(page_id == page->Id());
+    if (auto status = disk_manager_.WritePage(page_id, page->Bytes());
         !status.Ok()) {
       return status;
     }
@@ -124,7 +124,7 @@ auto BufferPool::Checkpoint(const storage::PageMap &incoming) -> Status {
     }
     if (auto found = incoming.find(frame->page->Id());
         found != incoming.end()) {
-      SetPage(frame, found->second);
+      SetPage(frame, *found->second);
     }
     frame->dirty = false;
   }

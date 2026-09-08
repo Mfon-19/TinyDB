@@ -114,7 +114,7 @@ private:
   std::uint32_t checksum_ = 0;
 };
 
-using PageMap = std::map<PageId, Page>;
+using PageMap = std::map<PageId, std::shared_ptr<Page>>;
 using PageRef = std::shared_ptr<const Page>;
 
 [[nodiscard]] auto DecodePage(PageId expected_page_id,

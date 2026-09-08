@@ -8,6 +8,7 @@
 #include <future>
 #include <gtest/gtest.h>
 #include <iterator>
+#include <memory>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -106,9 +107,10 @@ TEST_F(DurabilityTest, DirtyPagesStayResident) {
   EXPECT_TRUE(pool.ReadPage(2));
   EXPECT_TRUE(pool.ReadPage(3));
   EXPECT_EQ(*pool.ReadPage(1).value(), MakePage(1, "dirty"));
-  const storage::PageMap incoming{{1, MakePage(1, "checkpointed")}};
+  const storage::PageMap incoming{
+      {1, std::make_shared<storage::Page>(MakePage(1, "checkpointed"))}};
   ASSERT_TRUE(pool.Checkpoint(incoming).Ok());
-  EXPECT_EQ(*pool.ReadPage(1).value(), incoming.at(1));
+  EXPECT_EQ(*pool.ReadPage(1).value(), *incoming.at(1));
   EXPECT_TRUE(pool.ReadPage(2));
   EXPECT_TRUE(pool.ReadPage(3));
 }
@@ -179,7 +181,9 @@ TEST_F(DurabilityTest, RejectsCorruptWal) {
     auto database = Database::Open(path_, 8).value();
     ASSERT_TRUE(database->Put("key", "committed").Ok());
   }
-  auto bad = storage::EncodeWalRecord({{1, MakePage(1, "bad")}}).value();
+  auto bad = storage::EncodeWalRecord(
+                 {{1, std::make_shared<storage::Page>(MakePage(1, "bad"))}})
+                 .value();
   bad[0] = 'X';
   {
     std::ofstream file(path_ + "-wal", std::ios::binary | std::ios::app);
