@@ -1,5 +1,9 @@
 # TinyDB
 
+<p align="center">
+  <img src="assets/tinydb-mascot-clean.png" alt="TinyDB pixel mascot" width="420">
+</p>
+
 TinyDB is a small, embeddable key-value storage engine. It is meant to run
 inside an application's process as a layer for durable storage.
 
