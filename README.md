@@ -103,9 +103,10 @@ changes.
 
 ## Benchmarks
 
-Benchmarked on my machine: Intel Core i5-1135G7 with four online CPUs,
+Benchmarked on my machine: Intel Core i5-1135G7 with four online CPUs
+(Hyper-Threading disabled),
 7.5 GiB RAM, and an Intel SSDPEKNW512G8 NVMe drive running ext4 over LVM.
-The build used GCC 13.3.0, `-O3 -DNDEBUG`, and Linux 6.17.0-29-generic.
+The build used GCC 13.3.0, `-O3 -DNDEBUG`, and Linux 7.0.0-31-generic.
 
 ```sh
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DTINYDB_BUILD_TESTS=OFF
@@ -120,14 +121,14 @@ a warm Linux file cache. The concurrent workload uses four readers and one write
 
 | Workload | Operations/s, median (min–max) | p99 transaction (ms) |
 | --- | ---: | ---: |
-| Sequential inserts | 47,948 (46,784–49,103) | 5.481 |
-| Random inserts | 22,776 (22,369–24,399) | 8.059 |
-| Existing-key reads | 534,833 (525,564–595,708) | 0.00381 |
-| Missing-key reads | 667,487 (562,705–670,915) | 0.00249 |
-| 100-entry scans | 7,319,396 (5,158,606–7,342,090) | 0.0269 |
-| Full scans | 5,387,786 (4,904,642–6,910,153) | — |
-| Overwrites | 23,319 (21,622–23,384) | 7.877 |
-| Deletes | 21,598 (19,058–23,458) | 7.935 |
-| Reinserts | 19,439 (19,194–19,641) | 7.668 |
-| Concurrent reads | 68,698 (66,952–70,197) | 0.206 |
-| Concurrent writes | 17,174 (16,738–17,549) | 13.294 |
+| Sequential inserts | 77,787 (75,078–80,364) | 3.55967 |
+| Random inserts | 34,126 (33,574–34,758) | 5.50768 |
+| Existing-key reads | 617,326 (578,796–624,488) | 0.00311 |
+| Missing-key reads | 657,626 (630,218–670,313) | 0.00251 |
+| 100-entry scans | 8,733,190 (4,206,948–8,942,648) | 0.02741 |
+| Full scans | 7,519,916 (4,447,128–7,617,939) | — |
+| Overwrites | 27,948 (27,482–28,586) | 6.03002 |
+| Deletes | 29,475 (29,266–29,626) | 5.40443 |
+| Reinserts | 28,647 (28,384–30,224) | 5.81111 |
+| Concurrent reads | 90,313 (87,943–91,967) | 0.17527 |
+| Concurrent writes | 22,578 (21,986–22,992) | 13.1168 |
