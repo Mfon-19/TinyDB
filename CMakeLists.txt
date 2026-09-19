@@ -56,6 +56,13 @@ add_executable(tinydb_bench EXCLUDE_FROM_ALL benchmarks/benchmark.cpp)
 target_link_libraries(tinydb_bench PRIVATE tinydb)
 tinydb_target_options(tinydb_bench)
 
+option(TINYDB_BENCH_SQLITE "Enable SQLite benchmark comparisons" OFF)
+if(TINYDB_BENCH_SQLITE)
+  find_package(SQLite3 3.24 REQUIRED)
+  target_link_libraries(tinydb_bench PRIVATE SQLite::SQLite3)
+  target_compile_definitions(tinydb_bench PRIVATE TINYDB_BENCH_SQLITE)
+endif()
+
 option(TINYDB_BUILD_TESTS "Build the tests" ON)
 if(TINYDB_BUILD_TESTS)
   enable_testing()
