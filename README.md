@@ -106,7 +106,8 @@ changes.
 Benchmarked on my machine: Intel Core i5-1135G7 with four online CPUs
 (Hyper-Threading disabled),
 7.5 GiB RAM, and an Intel SSDPEKNW512G8 NVMe drive running ext4 over LVM.
-The build used GCC 13.3.0, `-O3 -DNDEBUG`, and Linux 7.0.0-31-generic.
+The build used GCC 13.3.0, `-O3 -DNDEBUG`, Release link-time optimization,
+and Linux 7.0.0-31-generic.
 
 ```sh
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DTINYDB_BUILD_TESTS=OFF
@@ -117,21 +118,22 @@ cmake --build build-release --target tinydb_bench -j
 The benchmark uses 10,000 16-byte keys, 100-byte values, a 256-page pool (1 MiB),
 100 writes per transaction, and seed 42. Throughput and per-run p99 latencies
 are medians of three runs; parentheses show the throughput range. Reads use
-a warm Linux file cache. The concurrent workload uses four readers and one writer.
+a warm Linux file cache. Scan throughput counts entries per second.
+The concurrent workload uses four readers and one writer.
 
 | Workload | Operations/s, median (min–max) | p99 transaction (ms) |
 | --- | ---: | ---: |
-| Sequential inserts | 77,787 (75,078–80,364) | 3.55967 |
-| Random inserts | 34,126 (33,574–34,758) | 5.50768 |
-| Existing-key reads | 617,326 (578,796–624,488) | 0.00311 |
-| Missing-key reads | 657,626 (630,218–670,313) | 0.00251 |
-| 100-entry scans | 8,733,190 (4,206,948–8,942,648) | 0.02741 |
-| Full scans | 7,519,916 (4,447,128–7,617,939) | — |
-| Overwrites | 27,948 (27,482–28,586) | 6.03002 |
-| Deletes | 29,475 (29,266–29,626) | 5.40443 |
-| Reinserts | 28,647 (28,384–30,224) | 5.81111 |
-| Concurrent reads | 90,313 (87,943–91,967) | 0.17527 |
-| Concurrent writes | 22,578 (21,986–22,992) | 13.1168 |
+| Sequential inserts | 86,055 (81,826–86,228) | 3.62412 |
+| Random inserts | 34,062 (33,180–34,492) | 5.62166 |
+| Existing-key reads | 1,210,990 (1,130,433–1,314,462) | 0.00290 |
+| Missing-key reads | 1,308,786 (1,305,317–1,347,825) | 0.00258 |
+| 100-entry scans | 26,413,520 (26,133,201–27,329,872) | 0.01491 |
+| Full scans | 15,927,498 (15,611,730–15,934,757) | — |
+| Overwrites | 33,156 (32,992–33,756) | 4.92140 |
+| Deletes | 33,660 (32,884–33,681) | 4.55222 |
+| Reinserts | 34,254 (34,183–34,351) | 4.86948 |
+| Concurrent reads | 109,306 (108,679–115,745) | 0.04483 |
+| Concurrent writes | 27,327 (27,170–28,936) | 14.77927 |
 
 ### Comparing with SQLite
 
@@ -153,7 +155,7 @@ The table shows median throughput across three runs. Engine order alternated
 between runs, reads used a warm OS file cache, and all correctness checks
 passed. Each run measured one million lookups per read workload, 100,000
 100-entry scans, and 1,000 full scans. This comparison is single-threaded;
-the TinyDB-only table above comes from an earlier run.
+the TinyDB-only table above uses fewer read and scan passes in a separate run.
 
 | Workload | TinyDB | SQLite | Faster |
 | --- | ---: | ---: | --- |
