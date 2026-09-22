@@ -339,7 +339,15 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
   const auto found = std::ranges::lower_bound(keys, key);
   const auto index = static_cast<std::size_t>(found - keys.begin());
   const bool exists = found != keys.end() && *found == key;
-  if (exists && leaf.Entry(index).value == value) {
+  if (exists && leaf.Entry(index).value.size() == value.size()) {
+    if (leaf.Entry(index).value == value) {
+      return std::nullopt;
+    }
+    // Equal-sized values leave the slot directory and other cells unchanged.
+    if (auto status = context_.WritePage((*page)->WithValue(index, value));
+        !status.Ok()) {
+      return Err(std::move(status));
+    }
     return std::nullopt;
   }
   auto entries = Entries(leaf);
@@ -361,12 +369,16 @@ auto BPlusTree::Insert(PageId page_id, std::string_view key,
     }
     return std::nullopt;
   }
-  return SplitLeaf(page_id, leaf.NextLeaf(), entries);
+  return SplitLeaf(page_id, leaf.NextLeaf(), entries,
+                   !exists && index == leaf.EntryCount() &&
+                       leaf.NextLeaf() == storage::INVALID_PAGE_ID);
 }
 
 auto BPlusTree::SplitLeaf(PageId page_id, PageId next_leaf,
-                          std::span<const LeafEntry> entries) -> Result<Split> {
-  const std::size_t index = SplitIndex(entries);
+                          std::span<const LeafEntry> entries,
+                          bool append) -> Result<Split> {
+  // Pack completed leaves on append, keeping two entries in the new leaf.
+  const std::size_t index = append ? entries.size() - 2 : SplitIndex(entries);
   assert(index > 0 && index < entries.size());
   auto split = AllocateSplit(page_id, entries[index].key);
   if (!split) {

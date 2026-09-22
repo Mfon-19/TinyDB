@@ -85,8 +85,8 @@ auto File::Write(off_t offset, std::span<const char> bytes) const -> Status {
   return {};
 }
 
-auto File::Sync() const -> Status {
-  while (fsync(fd_) == -1) {
+auto File::Sync(bool data_only) const -> Status {
+  while ((data_only ? fdatasync(fd_) : fsync(fd_)) == -1) {
     if (errno != EINTR) {
       return SystemError("failed to sync file", errno);
     }

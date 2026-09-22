@@ -202,6 +202,17 @@ auto Page::Internal() const noexcept -> InternalPageView {
                           little_endian::GetU16(bytes_, ENTRY_COUNT_OFFSET)};
 }
 
+auto Page::WithValue(std::size_t index,
+                     std::string_view value) const noexcept -> Page {
+  const auto previous = Leaf().Entry(index).value;
+  assert(previous.size() == value.size());
+  auto page = *this;
+  std::ranges::copy(value,
+                    page.bytes_.begin() + (previous.data() - bytes_.data()));
+  page.checksum_ = 0;
+  return page;
+}
+
 auto DecodePage(PageId expected_page_id,
                 const PageBytes &page) -> Result<Page> {
   if (!ValidDataPageId(expected_page_id)) {

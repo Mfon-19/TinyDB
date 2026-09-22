@@ -51,7 +51,9 @@ auto DiskManager::PageCount() const -> Result<PageId> {
   return static_cast<PageId>(pages);
 }
 
-auto DiskManager::Sync() const -> Status { return file_.Sync(); }
+auto DiskManager::Sync() const -> Status {
+  return file_.Sync(/*data_only=*/true);
+}
 
 auto SyncParentDirectory(std::string_view path) -> Status {
   const auto slash = path.find_last_of('/');

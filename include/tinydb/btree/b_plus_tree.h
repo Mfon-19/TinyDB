@@ -47,7 +47,8 @@ private:
                      storage::PageId right,
                      std::string_view separator) -> Result<bool>;
   auto SplitLeaf(storage::PageId page_id, storage::PageId next_leaf,
-                 std::span<const storage::LeafEntry> entries) -> Result<Split>;
+                 std::span<const storage::LeafEntry> entries,
+                 bool append) -> Result<Split>;
   auto SplitInternal(storage::PageId page_id, storage::PageId leftmost_child,
                      std::span<const storage::InternalEntry> entries)
       -> Result<Split>;

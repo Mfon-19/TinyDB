@@ -95,6 +95,9 @@ public:
   [[nodiscard]] auto PayloadSize() const noexcept -> std::size_t;
   [[nodiscard]] auto Leaf() const noexcept -> LeafPageView;
   [[nodiscard]] auto Internal() const noexcept -> InternalPageView;
+  // Copy a leaf page, replacing a value with one of the same size.
+  [[nodiscard]] auto WithValue(std::size_t index,
+                               std::string_view value) const noexcept -> Page;
   auto operator==(const Page &other) const noexcept -> bool {
     return bytes_ == other.bytes_;
   }

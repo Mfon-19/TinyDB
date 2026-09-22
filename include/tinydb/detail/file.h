@@ -21,7 +21,8 @@ public:
   [[nodiscard]] auto Size() const -> Result<off_t>;
   auto Read(off_t offset, std::span<char> bytes) const -> Status;
   auto Write(off_t offset, std::span<const char> bytes) const -> Status;
-  auto Sync() const -> Status;
+  // Data-only sync still persists file size; directories need full sync.
+  auto Sync(bool data_only = false) const -> Status;
   auto Truncate() const -> Status;
 
 private:

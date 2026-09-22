@@ -30,13 +30,13 @@ auto Wal::Append(std::span<const char> record) -> Status {
   return {};
 }
 
-auto Wal::Sync() const -> Status { return file_.Sync(); }
+auto Wal::Sync() const -> Status { return file_.Sync(/*data_only=*/true); }
 
 auto Wal::Reset() -> Status {
   if (auto status = file_.Truncate(); !status.Ok()) {
     return status;
   }
-  if (auto status = file_.Sync(); !status.Ok()) {
+  if (auto status = file_.Sync(/*data_only=*/true); !status.Ok()) {
     return status;
   }
   end_ = 0;

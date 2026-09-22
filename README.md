@@ -135,11 +135,12 @@ a warm Linux file cache. The concurrent workload uses four readers and one write
 
 ### Comparing with SQLite
 
-TinyDB had higher throughput for point reads and 100-entry scans in a comparison with SQLite.
-SQLite was faster for writes and used less disk space; full-scan throughput
-was close.
+TinyDB had higher throughput for point reads and scans; SQLite was faster
+for writes. TinyDB used 8.4% less disk space after sequential inserts,
+while SQLite used less after random inserts.
 
-These results compare TinyDB with SQLite 3.45.1 on the machine described above.
+These results compare TinyDB with SQLite 3.45.1 on the machine described above,
+with Release link-time optimization enabled for TinyDB.
 Both engines used the same 10,000 16-byte keys, 100-byte values, seed 42,
 100 writes per transaction, and a 256-page (1 MiB) cache budget. SQLite used a
 `WITHOUT ROWID` table with BLOB keys and values, reused prepared statements,
@@ -156,21 +157,24 @@ the TinyDB-only table above comes from an earlier run.
 
 | Workload | TinyDB | SQLite | Faster |
 | --- | ---: | ---: | --- |
-| Sequential inserts | 78,455 ops/s | 121,327 ops/s | SQLite 1.55× |
-| Random inserts | 31,449 ops/s | 39,318 ops/s | SQLite 1.25× |
-| Existing-key reads | 633,521 ops/s | 518,759 ops/s | TinyDB 1.22× |
-| Missing-key reads | 652,233 ops/s | 546,613 ops/s | TinyDB 1.19× |
-| 100-entry scans | 93,045 scans/s | 70,926 scans/s | TinyDB 1.31× |
-| Full scans | 7,233,117 entries/s | 7,521,514 entries/s | SQLite 1.04× |
-| Overwrites | 28,521 ops/s | 41,822 ops/s | SQLite 1.47× |
-| Deletes | 25,711 ops/s | 43,339 ops/s | SQLite 1.69× |
-| Reinserts | 29,174 ops/s | 44,702 ops/s | SQLite 1.53× |
+| Sequential inserts | 85,489 ops/s | 124,036 ops/s | SQLite 1.45× |
+| Random inserts | 34,277 ops/s | 40,243 ops/s | SQLite 1.17× |
+| Existing-key reads | 1,280,667 ops/s | 498,047 ops/s | TinyDB 2.57× |
+| Missing-key reads | 1,343,919 ops/s | 519,868 ops/s | TinyDB 2.59× |
+| 100-entry scans | 483,600 scans/s | 65,807 scans/s | TinyDB 7.35× |
+| Full scans | 11,578,270 entries/s | 6,982,972 entries/s | TinyDB 1.66× |
+| Overwrites | 33,816 ops/s | 43,887 ops/s | SQLite 1.30× |
+| Deletes | 33,213 ops/s | 42,244 ops/s | SQLite 1.27× |
+| Reinserts | 31,390 ops/s | 42,973 ops/s | SQLite 1.37× |
 
 TinyDB's narrower API may explain its lead on point reads and short scans:
 operations call the B+ tree directly, and cursors read views into leaf pages.
 SQLite still executes [bytecode](https://www.sqlite.org/opcode.html) for
 prepared statements. Avoiding that execution layer can matter for small,
 cached operations, though this benchmark does not isolate its contribution.
+Short scans also benefit from dense leaves after sequential loading: the
+benchmark repeats the same 100 starting points, whose pages fit in TinyDB's
+cache. The scan advantage depends on this access pattern.
 
 To reproduce this comparison, install SQLite's development package
 (`libsqlite3-dev` on Ubuntu) and run:
