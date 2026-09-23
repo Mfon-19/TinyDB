@@ -22,7 +22,6 @@ public:
 
   auto Append(std::span<const char> record) -> Status;
   auto Sync() const -> Status;
-  // Starts a new log over the old one. The next Sync makes it durable.
   auto Reset() -> Status;
   [[nodiscard]] auto Validate() const -> Result<PageMap>;
 

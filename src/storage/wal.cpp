@@ -34,6 +34,12 @@ auto Wal::Reset() -> Status {
   if (auto status = file_.Write(0, EncodeWalHeader(salt)); !status.Ok()) {
     return status;
   }
+  // The header must be durable before new records overwrite old ones. If
+  // writeback reorders them, a crash could leave the old header with some old
+  // records clobbered, and replaying the rest would roll pages back.
+  if (auto status = Sync(); !status.Ok()) {
+    return status;
+  }
   end_ = WAL_HEADER_SIZE;
   salt_ = salt;
   return {};
