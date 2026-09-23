@@ -14,7 +14,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -59,7 +58,7 @@ private:
   std::size_t wal_frames_ = 0;
   // Lock order: writer -> visibility -> buffer pool.
   std::mutex writer_mutex_;
-  std::shared_mutex visibility_mutex_;
+  detail::SharedMutex visibility_mutex_;
   std::atomic<bool> poisoned_{false};
 };
 } // namespace tinydb

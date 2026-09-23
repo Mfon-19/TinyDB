@@ -3,6 +3,7 @@
 #include "sqlite_database.h"
 #endif
 #include <algorithm>
+#include <atomic>
 #include <barrier>
 #include <charconv>
 #include <chrono>
@@ -351,17 +352,21 @@ void Concurrent(tinydb::Database &database, const Data &data,
   std::barrier ready(static_cast<std::ptrdiff_t>(options.readers) + 1,
                      [&]() noexcept { start = Clock::now(); });
 
+  std::atomic<bool> writing = true;
   std::vector<std::jthread> workers;
   for (std::size_t index = 0; index < options.readers; ++index) {
     workers.emplace_back([&, index] {
       ready.arrive_and_wait();
-      Read(database, data, results[index], false, true,
-           index * (data.keys.size() / options.readers));
+      do {
+        Read(database, data, results[index], false, true,
+             index * (data.keys.size() / options.readers));
+      } while (writing);
     });
   }
 
   ready.arrive_and_wait();
   Write(database, data, writes, data.random, options.batch, data.updated);
+  writing = false;
   workers.clear();
 
   const auto seconds =

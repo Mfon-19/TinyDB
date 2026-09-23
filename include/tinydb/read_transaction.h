@@ -2,6 +2,7 @@
 
 #include "tinydb/btree/b_plus_tree.h"
 #include "tinydb/detail/page_context.h"
+#include "tinydb/detail/shared_mutex.h"
 #include <shared_mutex>
 
 namespace tinydb {
@@ -23,7 +24,7 @@ private:
   friend class Database;
   explicit ReadTransaction(Database &database);
 
-  std::shared_lock<std::shared_mutex> visibility_lock_;
+  std::shared_lock<detail::SharedMutex> visibility_lock_;
   detail::PageContext context_;
   btree::BPlusTree tree_;
 };

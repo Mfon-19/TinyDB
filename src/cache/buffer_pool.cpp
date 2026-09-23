@@ -71,17 +71,16 @@ auto BufferPool::ReadPage(storage::PageId page_id) -> Result<storage::PageRef> {
   if (!storage::ValidDataPageId(page_id)) {
     return Err(Status::InvalidArgument("invalid page ID"));
   }
-  std::lock_guard lock(mutex_);
-  if (auto frame = FindPage(page_id); frame != frames_.end()) {
-    Touch(frame);
-    return frame->page;
+  {
+    std::lock_guard lock(mutex_);
+    if (auto frame = FindPage(page_id); frame != frames_.end()) {
+      Touch(frame);
+      return frame->page;
+    }
   }
 
-  auto frame = FindVictim();
-  if (frame == frames_.end()) {
-    return Err(Status::ResourceExhausted("all buffer pool frames are dirty"));
-  }
-
+  // Pages on disk only change while no reader holds the pool, so misses can
+  // read and decode without blocking other lookups.
   storage::PageBytes page;
   auto status = disk_manager_.ReadPage(page_id, page);
   if (!status.Ok()) {
@@ -92,7 +91,16 @@ auto BufferPool::ReadPage(storage::PageId page_id) -> Result<storage::PageRef> {
   if (!decoded) {
     return Err(std::move(decoded.error()));
   }
-  SetPage(frame, *decoded);
+
+  std::lock_guard lock(mutex_);
+  auto frame = FindPage(page_id);
+  if (frame == frames_.end()) {
+    frame = FindVictim();
+    if (frame == frames_.end()) {
+      return Err(Status::ResourceExhausted("all buffer pool frames are dirty"));
+    }
+    SetPage(frame, *decoded);
+  }
   Touch(frame);
   return frame->page;
 }

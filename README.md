@@ -119,21 +119,22 @@ The benchmark uses 10,000 16-byte keys, 100-byte values, a 256-page pool (1 MiB)
 100 writes per transaction, and seed 42. Throughput and per-run p99 latencies
 are medians of three runs; parentheses show the throughput range. Reads use
 a warm Linux file cache. Scan throughput counts entries per second.
-The concurrent workload uses four readers and one writer.
+The concurrent workload uses four readers that keep reading until one writer
+finishes its transactions.
 
 | Workload | Operations/s, median (min–max) | p99 transaction (ms) |
 | --- | ---: | ---: |
-| Sequential inserts | 86,055 (81,826–86,228) | 3.62412 |
-| Random inserts | 34,062 (33,180–34,492) | 5.62166 |
-| Existing-key reads | 1,210,990 (1,130,433–1,314,462) | 0.00290 |
-| Missing-key reads | 1,308,786 (1,305,317–1,347,825) | 0.00258 |
-| 100-entry scans | 26,413,520 (26,133,201–27,329,872) | 0.01491 |
-| Full scans | 15,927,498 (15,611,730–15,934,757) | — |
-| Overwrites | 33,156 (32,992–33,756) | 4.92140 |
-| Deletes | 33,660 (32,884–33,681) | 4.55222 |
-| Reinserts | 34,254 (34,183–34,351) | 4.86948 |
-| Concurrent reads | 109,306 (108,679–115,745) | 0.04483 |
-| Concurrent writes | 27,327 (27,170–28,936) | 14.77927 |
+| Sequential inserts | 87,100 (83,764–87,108) | 3.41316 |
+| Random inserts | 33,923 (32,032–34,469) | 5.50889 |
+| Existing-key reads | 1,184,110 (972,008–1,217,928) | 0.00317 |
+| Missing-key reads | 1,300,970 (1,238,522–1,306,420) | 0.00267 |
+| 100-entry scans | 27,375,885 (25,617,444–28,957,222) | 0.01428 |
+| Full scans | 16,233,081 (15,580,328–16,599,301) | — |
+| Overwrites | 31,878 (30,766–34,355) | 5.15108 |
+| Deletes | 33,206 (30,897–33,411) | 4.88797 |
+| Reinserts | 32,746 (32,057–33,632) | 4.84886 |
+| Concurrent reads | 641,236 (613,713–642,290) | 0.02177 |
+| Concurrent writes | 26,718 (25,571–26,762) | 6.96735 |
 
 ### Comparing with SQLite
 
@@ -159,15 +160,15 @@ the TinyDB-only table above uses fewer read and scan passes in a separate run.
 
 | Workload | TinyDB | SQLite | Faster |
 | --- | ---: | ---: | --- |
-| Sequential inserts | 85,489 ops/s | 124,036 ops/s | SQLite 1.45× |
-| Random inserts | 34,277 ops/s | 40,243 ops/s | SQLite 1.17× |
-| Existing-key reads | 1,280,667 ops/s | 498,047 ops/s | TinyDB 2.57× |
-| Missing-key reads | 1,343,919 ops/s | 519,868 ops/s | TinyDB 2.59× |
-| 100-entry scans | 483,600 scans/s | 65,807 scans/s | TinyDB 7.35× |
-| Full scans | 11,578,270 entries/s | 6,982,972 entries/s | TinyDB 1.66× |
-| Overwrites | 33,816 ops/s | 43,887 ops/s | SQLite 1.30× |
-| Deletes | 33,213 ops/s | 42,244 ops/s | SQLite 1.27× |
-| Reinserts | 31,390 ops/s | 42,973 ops/s | SQLite 1.37× |
+| Sequential inserts | 84,750 ops/s | 120,412 ops/s | SQLite 1.42× |
+| Random inserts | 34,479 ops/s | 39,539 ops/s | SQLite 1.15× |
+| Existing-key reads | 1,334,741 ops/s | 547,012 ops/s | TinyDB 2.44× |
+| Missing-key reads | 1,416,696 ops/s | 567,525 ops/s | TinyDB 2.50× |
+| 100-entry scans | 517,927 scans/s | 71,467 scans/s | TinyDB 7.25× |
+| Full scans | 12,038,434 entries/s | 7,632,729 entries/s | TinyDB 1.58× |
+| Overwrites | 32,770 ops/s | 41,666 ops/s | SQLite 1.27× |
+| Deletes | 32,403 ops/s | 42,778 ops/s | SQLite 1.32× |
+| Reinserts | 32,572 ops/s | 42,688 ops/s | SQLite 1.31× |
 
 TinyDB's narrower API may explain its lead on point reads and short scans:
 operations call the B+ tree directly, and cursors read views into leaf pages.
