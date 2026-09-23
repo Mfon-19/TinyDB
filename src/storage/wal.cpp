@@ -1,6 +1,7 @@
 #include "tinydb/storage/wal.h"
 #include <cstdint>
 #include <fcntl.h>
+#include <random>
 #include <string>
 #include <utility>
 
@@ -12,11 +13,7 @@ auto Wal::Open(std::string_view database_path) -> Result<Wal> {
   if (!file) {
     return Err(std::move(file.error()));
   }
-  auto size = file->Size();
-  if (!size) {
-    return Err(std::move(size.error()));
-  }
-  return Wal(std::move(*file), *size);
+  return Wal(std::move(*file));
 }
 
 auto Wal::Append(std::span<const char> record) -> Status {
@@ -33,13 +30,12 @@ auto Wal::Append(std::span<const char> record) -> Status {
 auto Wal::Sync() const -> Status { return file_.Sync(/*data_only=*/true); }
 
 auto Wal::Reset() -> Status {
-  if (auto status = file_.Truncate(); !status.Ok()) {
+  const auto salt = static_cast<std::uint32_t>(std::random_device{}());
+  if (auto status = file_.Write(0, EncodeWalHeader(salt)); !status.Ok()) {
     return status;
   }
-  if (auto status = file_.Sync(/*data_only=*/true); !status.Ok()) {
-    return status;
-  }
-  end_ = 0;
+  end_ = WAL_HEADER_SIZE;
+  salt_ = salt;
   return {};
 }
 

@@ -23,7 +23,6 @@ public:
   auto Write(off_t offset, std::span<const char> bytes) const -> Status;
   // Data-only sync still persists file size; directories need full sync.
   auto Sync(bool data_only = false) const -> Status;
-  auto Truncate() const -> Status;
 
 private:
   explicit File(int fd) noexcept : fd_(fd) {}

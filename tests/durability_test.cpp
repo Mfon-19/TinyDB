@@ -1,5 +1,6 @@
 #include "tinydb/database.h"
 #include "tinydb/storage/page_codec.h"
+#include "tinydb/storage/wal_codec.h"
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
@@ -71,6 +72,11 @@ auto Bytes(const std::string &path) -> std::string {
   return {std::istreambuf_iterator<char>{file}, {}};
 }
 
+auto WalPages(const std::string &path) -> std::size_t {
+  const auto bytes = Bytes(path + "-wal");
+  return storage::DecodeWal(bytes).value().size();
+}
+
 auto MakePage(storage::PageId page_id,
               std::string_view value) -> storage::Page {
   const storage::LeafEntry entry{"key", value};
@@ -121,15 +127,16 @@ TEST_F(DurabilityTest, CheckpointPressure) {
   ASSERT_TRUE(database->Put("key", "one").Ok());
   ASSERT_TRUE(database->Put("key", "two").Ok());
   EXPECT_EQ(Bytes(path_), original);
-  EXPECT_EQ(std::filesystem::file_size(path_ + "-wal"), 2 * 4112U);
+  EXPECT_EQ(std::filesystem::file_size(path_ + "-wal"),
+            storage::WAL_HEADER_SIZE + 2 * 4112U);
   EXPECT_EQ(database->Get("key").value(), "two");
   ASSERT_TRUE(database->Put("key", "three").Ok());
-  EXPECT_TRUE(Bytes(path_ + "-wal").empty());
+  EXPECT_EQ(WalPages(path_), 0U);
   EXPECT_NE(Bytes(path_), original);
   EXPECT_EQ(database->Get("key").value(), "three");
   ASSERT_TRUE(database->Put("other", "pending").Ok());
   ASSERT_TRUE(database->Checkpoint().Ok());
-  EXPECT_TRUE(Bytes(path_ + "-wal").empty());
+  EXPECT_EQ(WalPages(path_), 0U);
   EXPECT_EQ(database->Get("other").value(), "pending");
 
   auto transaction = database->BeginWrite().value();
@@ -138,7 +145,7 @@ TEST_F(DurabilityTest, CheckpointPressure) {
     ASSERT_TRUE(transaction->Put(std::format("k{:03}", index), value).Ok());
   }
   ASSERT_TRUE(transaction->Commit().Ok());
-  EXPECT_TRUE(Bytes(path_ + "-wal").empty());
+  EXPECT_EQ(WalPages(path_), 0U);
   EXPECT_GT(std::filesystem::file_size(path_), 4 * storage::PAGE_SIZE);
   EXPECT_EQ(database->Get("k079").value(), value);
   const int calls = mutations;
@@ -165,7 +172,8 @@ TEST_F(DurabilityTest, CommitSurvivesExit) {
       },
       testing::ExitedWithCode(0), "");
   EXPECT_EQ(Bytes(path_), original);
-  EXPECT_EQ(std::filesystem::file_size(path_ + "-wal"), 3 * 4112U);
+  EXPECT_EQ(std::filesystem::file_size(path_ + "-wal"),
+            storage::WAL_HEADER_SIZE + 3 * 4112U);
   {
     std::ofstream file(path_ + "-wal", std::ios::binary | std::ios::app);
     file << "TDW";
@@ -173,7 +181,7 @@ TEST_F(DurabilityTest, CommitSurvivesExit) {
   auto database = Database::Open(path_, 64).value();
   EXPECT_EQ(database->Get("a").value(), std::nullopt);
   EXPECT_EQ(database->Get("b").value(), "kept");
-  EXPECT_TRUE(Bytes(path_ + "-wal").empty());
+  EXPECT_EQ(WalPages(path_), 0U);
 }
 
 TEST_F(DurabilityTest, RejectsCorruptWal) {
@@ -181,13 +189,10 @@ TEST_F(DurabilityTest, RejectsCorruptWal) {
     auto database = Database::Open(path_, 8).value();
     ASSERT_TRUE(database->Put("key", "committed").Ok());
   }
-  auto bad = storage::EncodeWalRecord(
-                 {{1, std::make_shared<storage::Page>(MakePage(1, "bad"))}})
-                 .value();
-  bad[0] = 'X';
   {
-    std::ofstream file(path_ + "-wal", std::ios::binary | std::ios::app);
-    file.write(bad.data(), static_cast<std::streamsize>(bad.size()));
+    std::fstream file(path_ + "-wal",
+                      std::ios::binary | std::ios::in | std::ios::out);
+    file.put('X');
   }
   const auto database_bytes = Bytes(path_);
   const auto wal_bytes = Bytes(path_ + "-wal");
@@ -222,7 +227,7 @@ TEST_F(DurabilityTest, RecoveryCanRetry) {
   for (int index = 0; index < 80; ++index) {
     EXPECT_EQ(database->Get(std::format("k{:03}", index)).value(), value);
   }
-  EXPECT_TRUE(Bytes(path_ + "-wal").empty());
+  EXPECT_EQ(WalPages(path_), 0U);
 }
 
 TEST_F(DurabilityTest, CheckpointWaitsForWriter) {
@@ -244,7 +249,7 @@ TEST_F(DurabilityTest, CheckpointWaitsForWriter) {
   ASSERT_TRUE(transaction->Commit().Ok());
   ASSERT_EQ(result.wait_for(5s), std::future_status::ready);
   EXPECT_TRUE(result.get().Ok());
-  EXPECT_TRUE(Bytes(path_ + "-wal").empty());
+  EXPECT_EQ(WalPages(path_), 0U);
   EXPECT_EQ(database->Get("key").value(), "value");
 }
 

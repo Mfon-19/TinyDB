@@ -11,8 +11,13 @@ public:
   SharedMutex() noexcept {
     pthread_rwlockattr_t attributes;
     pthread_rwlockattr_init(&attributes);
+#if defined(__GLIBC__)
+    // glibc rwlocks prefer readers by default. Darwin's already block new
+    // readers while a writer waits and have no setkind_np.
+    // Needed just so it compiles on my mac
     pthread_rwlockattr_setkind_np(&attributes,
                                   PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
     pthread_rwlock_init(&lock_, &attributes);
     pthread_rwlockattr_destroy(&attributes);
   }

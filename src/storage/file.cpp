@@ -86,18 +86,15 @@ auto File::Write(off_t offset, std::span<const char> bytes) const -> Status {
 }
 
 auto File::Sync(bool data_only) const -> Status {
+#if defined(__APPLE__)
+  // macOS does not declare fdatasync; fsync is the pre-existing behavior.
+  static_cast<void>(data_only);
+  while (fsync(fd_) == -1) {
+#else
   while ((data_only ? fdatasync(fd_) : fsync(fd_)) == -1) {
+#endif
     if (errno != EINTR) {
       return SystemError("failed to sync file", errno);
-    }
-  }
-  return {};
-}
-
-auto File::Truncate() const -> Status {
-  while (ftruncate(fd_, 0) == -1) {
-    if (errno != EINTR) {
-      return SystemError("failed to truncate file", errno);
     }
   }
   return {};

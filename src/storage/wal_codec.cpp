@@ -12,13 +12,25 @@ namespace tinydb::storage {
 
 namespace {
 
-constexpr std::array<char, 4> MAGIC{'T', 'D', 'W', '1'};
+constexpr std::array<char, 4> MAGIC{'T', 'D', 'W', '2'};
+constexpr std::size_t SALT_OFFSET = 4;
+constexpr std::size_t HEADER_CRC_OFFSET = 8;
 constexpr std::size_t HEADER_SIZE = 8;
 constexpr std::size_t FRAME_SIZE = sizeof(PageId) + PAGE_SIZE;
 constexpr std::size_t CRC_SIZE = sizeof(std::uint32_t);
 constexpr std::size_t RECORD_OVERHEAD = HEADER_SIZE + CRC_SIZE;
 
 } // namespace
+
+auto EncodeWalHeader(std::uint32_t salt) -> std::array<char, WAL_HEADER_SIZE> {
+  std::array<char, WAL_HEADER_SIZE> header{};
+  std::ranges::copy(MAGIC, header.begin());
+  little_endian::PutU32(header, SALT_OFFSET, salt);
+  little_endian::PutU32(
+      header, HEADER_CRC_OFFSET,
+      Crc32(std::span<const char>{header}.first(HEADER_CRC_OFFSET)));
+  return header;
+}
 
 auto WalRecordSize(std::size_t frame_count) -> Result<std::size_t> {
   if (frame_count == 0 ||
@@ -33,7 +45,8 @@ auto WalRecordSize(std::size_t frame_count) -> Result<std::size_t> {
   return RECORD_OVERHEAD + FRAME_SIZE * frame_count;
 }
 
-auto EncodeWalRecord(const PageMap &pages) -> Result<std::vector<char>> {
+auto EncodeWalRecord(const PageMap &pages,
+                     std::uint32_t salt) -> Result<std::vector<char>> {
   auto size = WalRecordSize(pages.size());
   if (!size) {
     return Err(std::move(size.error()));
@@ -45,9 +58,9 @@ auto EncodeWalRecord(const PageMap &pages) -> Result<std::vector<char>> {
   }
 
   bytes.resize(*size);
-  std::ranges::copy(MAGIC, bytes.begin());
+  little_endian::PutU32(bytes, 0, salt);
   little_endian::PutU32(bytes, 4, static_cast<std::uint32_t>(pages.size()));
-  
+
   std::size_t offset = HEADER_SIZE;
   for (const auto &[page_id, page] : pages) {
     if (page_id != page->Id()) {
@@ -64,38 +77,37 @@ auto EncodeWalRecord(const PageMap &pages) -> Result<std::vector<char>> {
 
 auto DecodeWal(std::span<const char> bytes) -> Result<PageMap> {
   PageMap pages;
-  while (bytes.size() >= HEADER_SIZE) {
-    if (!std::ranges::equal(MAGIC, bytes.first(MAGIC.size()))) {
-      return Err(Status::Corruption("invalid WAL magic"));
-    }
-    const auto frame_count = little_endian::GetU32(bytes, 4);
-    auto size = WalRecordSize(frame_count);
-    if (!size) {
-      return Err(Status::Corruption("invalid WAL frame count"));
-    }
-    if (*size > bytes.size()) {
+  if (bytes.empty()) {
+    return pages;
+  }
+  if (bytes.size() < WAL_HEADER_SIZE ||
+      !std::ranges::equal(MAGIC, bytes.first(MAGIC.size())) ||
+      little_endian::GetU32(bytes, HEADER_CRC_OFFSET) !=
+          Crc32(bytes.first(HEADER_CRC_OFFSET))) {
+    return Err(Status::Corruption("invalid WAL header"));
+  }
+  const auto salt = little_endian::GetU32(bytes, SALT_OFFSET);
+  bytes = bytes.subspan(WAL_HEADER_SIZE);
+
+  while (bytes.size() >= HEADER_SIZE &&
+         little_endian::GetU32(bytes, 0) == salt) {
+    auto size = WalRecordSize(little_endian::GetU32(bytes, 4));
+    if (!size || *size > bytes.size()) {
       break;
     }
-
     const auto record = bytes.first(*size);
     const std::size_t crc_offset = record.size() - CRC_SIZE;
-    for (std::size_t offset = HEADER_SIZE; offset < crc_offset;
-         offset += FRAME_SIZE) {
-      if (!ValidDataPageId(little_endian::GetU32(record, offset))) {
-        return Err(Status::Corruption("invalid WAL page ID"));
-      }
-    }
     if (little_endian::GetU32(record, crc_offset) !=
         Crc32(record.first(crc_offset))) {
-      if (record.size() == bytes.size()) {
-        break;
-      }
-      return Err(Status::Corruption("WAL checksum mismatch before end of log"));
+      break;
     }
 
     for (std::size_t offset = HEADER_SIZE; offset < crc_offset;
          offset += FRAME_SIZE) {
       const auto page_id = little_endian::GetU32(record, offset);
+      if (!ValidDataPageId(page_id)) {
+        return Err(Status::Corruption("invalid WAL page ID"));
+      }
       PageBytes page;
       std::ranges::copy(record.subspan(offset + sizeof(PageId), PAGE_SIZE),
                         page.begin());

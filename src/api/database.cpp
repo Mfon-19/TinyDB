@@ -100,13 +100,17 @@ auto Database::Open(std::string_view name, std::size_t buffer_pool_capacity)
     return Err(std::move(wal.error()));
   }
   if (*initial_page_count == 0) {
-    if (!wal->Empty()) {
+    auto pages = wal->Validate();
+    if (!pages) {
+      return Err(std::move(pages.error()));
+    }
+    if (!pages->empty()) {
       return Err(Status::Corruption("nonempty WAL beside an empty database"));
     }
     if (auto status = Create(*disk_manager); !status.Ok()) {
       return Err(std::move(status));
     }
-    if (auto status = wal->Sync(); !status.Ok()) {
+    if (auto status = wal->Reset(); !status.Ok()) {
       return Err(std::move(status));
     }
   } else if (auto status = Recover(*disk_manager, *wal); !status.Ok()) {
@@ -193,7 +197,7 @@ auto Database::Commit(detail::WriteState &pending) -> Status {
   for (auto &[page_id, page] : pending.pages) {
     page->UpdateChecksum();
   }
-  auto record = storage::EncodeWalRecord(pending.pages);
+  auto record = storage::EncodeWalRecord(pending.pages, wal_.Salt());
   if (!record) {
     return std::move(record.error());
   }

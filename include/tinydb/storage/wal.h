@@ -2,6 +2,7 @@
 
 #include "tinydb/detail/file.h"
 #include "tinydb/storage/wal_codec.h"
+#include <cstdint>
 #include <string_view>
 #include <sys/types.h>
 #include <utility>
@@ -17,19 +18,20 @@ public:
   Wal(Wal &&other) noexcept = default;
   auto operator=(Wal &&other) noexcept -> Wal & = default;
 
-  [[nodiscard]] auto Empty() const noexcept -> bool { return end_ == 0; }
+  [[nodiscard]] auto Salt() const noexcept -> std::uint32_t { return salt_; }
 
   auto Append(std::span<const char> record) -> Status;
   auto Sync() const -> Status;
+  // Starts a new log over the old one. The next Sync makes it durable.
   auto Reset() -> Status;
   [[nodiscard]] auto Validate() const -> Result<PageMap>;
 
 private:
-  Wal(detail::File file, off_t size) noexcept
-      : file_(std::move(file)), end_(size) {}
+  explicit Wal(detail::File file) noexcept : file_(std::move(file)) {}
 
   detail::File file_;
   off_t end_ = 0;
+  std::uint32_t salt_ = 0;
 };
 
 } // namespace tinydb::storage

@@ -3,11 +3,10 @@
 #include "tinydb/storage/encoding.h"
 #include "tinydb/storage/page_codec.h"
 #include "tinydb/storage/wal.h"
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <gtest/gtest.h>
-#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -34,30 +33,44 @@ void Append(std::vector<char> &bytes, std::span<const char> record) {
   bytes.insert(bytes.end(), record.begin(), record.end());
 }
 
+constexpr std::uint32_t SALT = 0x5a17;
+
+auto Header() -> std::vector<char> {
+  const auto header = EncodeWalHeader(SALT);
+  return {header.begin(), header.end()};
+}
+
+auto Record(const PageMap &pages) -> std::vector<char> {
+  return EncodeWalRecord(pages, SALT).value();
+}
+
 TEST(WalCodec, RecordsRoundTrip) {
   const PageMap first{{1, MakePage(1, "root")}, {7, MakePage(7, "old")}};
-  auto bytes = EncodeWalRecord(first).value();
-  EXPECT_EQ(bytes.size(), 8212U);
-  EXPECT_EQ(std::string_view(bytes.data(), 4), "TDW1");
-  EXPECT_EQ(little_endian::GetU32(bytes, 4), 2U);
-  EXPECT_EQ(little_endian::GetU32(bytes, 8), 1U);
-  EXPECT_EQ(little_endian::GetU32(bytes, 4108), 7U);
+  const auto record = Record(first);
+  EXPECT_EQ(record.size(), 8212U);
+  EXPECT_EQ(little_endian::GetU32(record, 0), SALT);
+  EXPECT_EQ(little_endian::GetU32(record, 4), 2U);
+  EXPECT_EQ(little_endian::GetU32(record, 8), 1U);
+  EXPECT_EQ(little_endian::GetU32(record, 4108), 7U);
+  auto bytes = Header();
+  EXPECT_EQ(std::string_view(bytes.data(), 4), "TDW2");
+  Append(bytes, record);
   EXPECT_EQ(ValuePages(DecodeWal(bytes).value()), ValuePages(first));
 
   const PageMap second{{7, MakePage(7, "new")}, {9, MakePage(9, "added")}};
-  Append(bytes, EncodeWalRecord(second).value());
+  Append(bytes, Record(second));
   const PageMap expected{
       {1, first.at(1)}, {7, second.at(7)}, {9, second.at(9)}};
   EXPECT_EQ(ValuePages(DecodeWal(bytes).value()), ValuePages(expected));
   EXPECT_TRUE(DecodeWal({}).value().empty());
+  EXPECT_TRUE(DecodeWal(Header()).value().empty());
 }
 
 TEST(WalCodec, IgnoresTornTail) {
   const PageMap first{{1, MakePage(1, "old")}};
-  const auto prefix = EncodeWalRecord(first).value();
-  auto final =
-      EncodeWalRecord({{1, MakePage(1, "new")}, {2, MakePage(2, "added")}})
-          .value();
+  auto prefix = Header();
+  Append(prefix, Record(first));
+  auto final = Record({{1, MakePage(1, "new")}, {2, MakePage(2, "added")}});
   for (const std::size_t length : {0U, 1U, 7U, 8U, 12U, 4108U, 8208U, 8211U}) {
     SCOPED_TRACE(length);
     auto bytes = prefix;
@@ -70,45 +83,45 @@ TEST(WalCodec, IgnoresTornTail) {
   auto bytes = prefix;
   Append(bytes, final);
   EXPECT_EQ(ValuePages(DecodeWal(bytes).value()), ValuePages(first));
-  EXPECT_TRUE(DecodeWal(final).value().empty());
+  bytes = prefix;
+  Append(bytes, EncodeWalRecord(first, SALT + 1).value());
+  EXPECT_EQ(ValuePages(DecodeWal(bytes).value()), ValuePages(first));
 }
 
 TEST(WalCodec, RejectsCorruption) {
-  const auto good = EncodeWalRecord({{1, MakePage(1, "value")}}).value();
+  auto good = Header();
+  Append(good, Record({{1, MakePage(1, "value")}}));
   std::vector<std::vector<char>> malformed;
-  auto bad = good;
-  bad[0] = 'X';
-  malformed.push_back(bad);
-  bad = good;
-  little_endian::PutU32(bad, 4, 0);
-  malformed.push_back(bad);
-  for (const PageId page_id : {0U, INVALID_PAGE_ID}) {
-    bad = good;
-    little_endian::PutU32(bad, 8, page_id);
-    little_endian::PutU32(
-        bad, bad.size() - 4,
-        Crc32(std::span<const char>{bad}.first(bad.size() - 4)));
-    malformed.push_back(bad);
-    bad.back() ^= 1;
+  for (const std::size_t index : {0U, 4U, 8U}) {
+    auto bad = good;
+    bad[index] ^= 1;
     malformed.push_back(bad);
   }
-  bad = good;
-  bad.back() ^= 1;
-  bad.push_back('x');
-  malformed.push_back(bad);
-  bad = good;
-  bad[12] ^= 1;
-  Append(bad, good);
-  malformed.push_back(bad);
+  malformed.emplace_back(good.begin(), good.begin() + WAL_HEADER_SIZE - 1);
+  const auto resealed = [&](std::size_t offset, auto change) {
+    auto bad = good;
+    const auto record = std::span<char>{bad}.subspan(WAL_HEADER_SIZE);
+    change(record.subspan(offset));
+    little_endian::PutU32(
+        record, record.size() - 4,
+        Crc32(std::span<const char>{record}.first(record.size() - 4)));
+    return bad;
+  };
+  for (const PageId page_id : {0U, INVALID_PAGE_ID}) {
+    malformed.push_back(resealed(8, [&](std::span<char> bytes) {
+      little_endian::PutU32(bytes, 0, page_id);
+    }));
+  }
+  malformed.push_back(
+      resealed(12, [](std::span<char> bytes) { bytes[0] ^= 1; }));
 
-  for (const auto &record : malformed) {
-    auto bytes = good;
-    Append(bytes, record);
+  for (const auto &bytes : malformed) {
     EXPECT_FALSE(DecodeWal(bytes));
   }
-  EXPECT_FALSE(EncodeWalRecord({}));
-  EXPECT_FALSE(EncodeWalRecord({{0, MakePage(1, "value")}}));
-  EXPECT_FALSE(EncodeWalRecord({{INVALID_PAGE_ID, MakePage(1, "value")}}));
+  EXPECT_FALSE(EncodeWalRecord({}, SALT));
+  EXPECT_FALSE(EncodeWalRecord({{0, MakePage(1, "value")}}, SALT));
+  EXPECT_FALSE(
+      EncodeWalRecord({{INVALID_PAGE_ID, MakePage(1, "value")}}, SALT));
 }
 
 class WalTest : public testing::Test {
@@ -125,11 +138,6 @@ protected:
     std::filesystem::remove_all(directory_);
   }
 
-  auto ReadWal() -> std::vector<char> {
-    std::ifstream file(path_ + "-wal", std::ios::binary);
-    return {std::istreambuf_iterator<char>{file}, {}};
-  }
-
   std::string directory_;
   std::string path_;
   std::optional<DiskManager> disk_;
@@ -140,25 +148,23 @@ TEST_F(WalTest, AppendsAndResets) {
   const PageMap second{{1, MakePage(1, "new")}};
   {
     auto wal = Wal::Open(path_).value();
-    EXPECT_TRUE(wal.Empty());
     EXPECT_TRUE(wal.Validate().value().empty());
-    ASSERT_TRUE(wal.Append(EncodeWalRecord(first).value()).Ok());
+    ASSERT_TRUE(wal.Reset().Ok());
+    ASSERT_TRUE(wal.Append(EncodeWalRecord(first, wal.Salt()).value()).Ok());
     ASSERT_TRUE(wal.Sync().Ok());
-    ASSERT_TRUE(wal.Append(EncodeWalRecord(second).value()).Ok());
+    ASSERT_TRUE(wal.Append(EncodeWalRecord(second, wal.Salt()).value()).Ok());
     ASSERT_TRUE(wal.Sync().Ok());
   }
   auto wal = Wal::Open(path_).value();
-  EXPECT_FALSE(wal.Empty());
   const PageMap expected{{1, second.at(1)}, {2, first.at(2)}};
   EXPECT_EQ(ValuePages(wal.Validate().value()), ValuePages(expected));
+  const auto size = std::filesystem::file_size(path_ + "-wal");
   ASSERT_TRUE(wal.Reset().Ok());
-  EXPECT_TRUE(wal.Empty());
-  EXPECT_EQ(std::filesystem::file_size(path_ + "-wal"), 0U);
   EXPECT_TRUE(wal.Validate().value().empty());
-  ASSERT_TRUE(wal.Append(EncodeWalRecord(second).value()).Ok());
+  ASSERT_TRUE(wal.Append(EncodeWalRecord(second, wal.Salt()).value()).Ok());
   ASSERT_TRUE(wal.Sync().Ok());
   EXPECT_EQ(ValuePages(wal.Validate().value()), ValuePages(second));
-  EXPECT_EQ(ReadWal(), EncodeWalRecord(second).value());
+  EXPECT_EQ(std::filesystem::file_size(path_ + "-wal"), size);
 }
 }
 }

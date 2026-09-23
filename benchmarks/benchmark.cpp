@@ -31,7 +31,7 @@ constexpr unsigned SEED = 42;
 
 constexpr std::string_view HELP =
     "Usage: tinydb_bench DIRECTORY WORKLOAD [OPTIONS]\n"
-    "Workloads: all, write, read, scan, churn, concurrent\n"
+    "Workloads: all, write, read, scan, churn, mixed\n"
     "  --engine NAME   tinydb (default), sqlite, or both\n"
     "Numeric options (positive integers):\n"
     "  --keys N        Keys in the database (default 10000)\n"
@@ -40,7 +40,7 @@ constexpr std::string_view HELP =
     "  --runs N        Independent repetitions (default 3)\n"
     "  --read-passes N Repeat each point-read workload (default 1)\n"
     "  --scan-passes N Repeat each scan workload (default 1)\n"
-    "  --readers N     Concurrent reader threads (default 4)\n"
+    "  --readers N     Reader threads in the mixed workload (default 4)\n"
     "  --value-size N  Value size in bytes (default 100)\n"
     "Creates temporary databases under DIRECTORY; prints CSV to stdout.\n";
 
@@ -84,7 +84,7 @@ Options Parse(int argc, char **argv) {
 
   Options options{argv[1], argv[2]};
   const std::vector<std::string_view> workloads{"all",  "write", "read",
-                                                "scan", "churn", "concurrent"};
+                                                "scan", "churn", "mixed"};
   if (std::ranges::find(workloads, options.workload) == workloads.end()) {
     Fail("unknown workload; use --help");
   }
@@ -139,8 +139,8 @@ Options Parse(int argc, char **argv) {
     Fail("reconfigure with -DTINYDB_BENCH_SQLITE=ON to compare SQLite");
   }
 #endif
-  if (options.engine != "tinydb" && options.workload == "concurrent") {
-    Fail("concurrent is currently supported only with --engine tinydb");
+  if (options.engine != "tinydb" && options.workload == "mixed") {
+    Fail("mixed is currently supported only with --engine tinydb");
   }
   return options;
 }
@@ -339,9 +339,8 @@ Measurements Scan(Database &database, const Data &data, bool full,
   return result;
 }
 
-void Concurrent(tinydb::Database &database, const Data &data,
-                const Options &options, std::uint64_t run,
-                const std::string &path) {
+void Mixed(tinydb::Database &database, const Data &data, const Options &options,
+           std::uint64_t run, const std::string &path) {
   std::vector<Measurements> results;
   for (std::size_t index = 0; index < options.readers; ++index) {
     results.emplace_back(data.keys.size());
@@ -383,21 +382,21 @@ void Concurrent(tinydb::Database &database, const Data &data,
   writes.checkpoint_ms = Checkpoint(database);
   Verify(database, data, data.updated);
 
-  Report<tinydb::Database>("concurrent_read", run, std::move(reads), path);
-  Report<tinydb::Database>("concurrent_write", run, std::move(writes), path);
+  Report<tinydb::Database>("mixed_read", run, std::move(reads), path);
+  Report<tinydb::Database>("mixed_write", run, std::move(writes), path);
 }
 
 template <typename Database>
 void Run(const Options &options, const Data &data, std::uint64_t run,
          const std::string &path) {
   for (const std::string_view name :
-       {"write_seq", "write_random", "read", "scan", "churn", "concurrent"}) {
+       {"write_seq", "write_random", "read", "scan", "churn", "mixed"}) {
     if (options.workload != "all" && options.workload != name &&
         !(options.workload == "write" && name.starts_with("write_"))) {
       continue;
     }
 
-    if (name == "concurrent" && options.engine != "tinydb") {
+    if (name == "mixed" && options.engine != "tinydb") {
       continue;
     }
 
@@ -461,7 +460,7 @@ void Run(const Options &options, const Data &data, std::uint64_t run,
         Report<Database>("reinsert", run, std::move(result), path);
       } else {
         if constexpr (std::is_same_v<Database, tinydb::Database>) {
-          Concurrent(*database, data, options, run, path);
+          Mixed(*database, data, options, run, path);
         }
       }
     }
@@ -515,7 +514,7 @@ int main(int argc, char **argv) {
       << std::max<std::uint32_t>(1, options.pool / 2) << '\n';
 #endif
   if (options.engine != "tinydb" && options.workload == "all") {
-    std::cout << "# concurrent omitted: comparison covers single-threaded "
+    std::cout << "# mixed omitted: comparison covers single-threaded "
                  "workloads.\n";
   }
 #ifndef NDEBUG
