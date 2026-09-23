@@ -165,10 +165,13 @@ auto InternalPageView::Entry(std::size_t index) const noexcept
 
 void Page::UpdateChecksum() noexcept { checksum_ = Crc32(bytes_); }
 
+auto Page::Checksum() const noexcept -> std::uint32_t {
+  return checksum_ == 0 ? Crc32(bytes_) : checksum_;
+}
+
 auto Page::Bytes() const noexcept -> PageBytes {
   auto bytes = bytes_;
-  little_endian::PutU32(bytes, CHECKSUM_OFFSET,
-                       checksum_ == 0 ? Crc32(bytes) : checksum_);
+  little_endian::PutU32(bytes, CHECKSUM_OFFSET, Checksum());
   return bytes;
 }
 

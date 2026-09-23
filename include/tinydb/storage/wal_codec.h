@@ -10,12 +10,6 @@
 
 namespace tinydb::storage {
 
-/*
- * The WAL starts with a header holding a random salt, followed by records
- * stamped with that salt. A reset writes a new salt instead of truncating, so
- * records left from earlier salts end the log.
- */
-
 inline constexpr std::size_t WAL_HEADER_SIZE = 12;
 
 [[nodiscard]] auto EncodeWalHeader(std::uint32_t salt)

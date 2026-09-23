@@ -1,4 +1,3 @@
-#include "tinydb/storage/crc32.h"
 #include "tinydb/storage/disk_manager.h"
 #include "tinydb/storage/encoding.h"
 #include "tinydb/storage/page_codec.h"
@@ -53,7 +52,7 @@ TEST(WalCodec, RecordsRoundTrip) {
   EXPECT_EQ(little_endian::GetU32(record, 8), 1U);
   EXPECT_EQ(little_endian::GetU32(record, 4108), 7U);
   auto bytes = Header();
-  EXPECT_EQ(std::string_view(bytes.data(), 4), "TDW2");
+  EXPECT_EQ(std::string_view(bytes.data(), 4), "TDW3");
   Append(bytes, record);
   EXPECT_EQ(ValuePages(DecodeWal(bytes).value()), ValuePages(first));
 
@@ -98,25 +97,33 @@ TEST(WalCodec, RejectsCorruption) {
     malformed.push_back(bad);
   }
   malformed.emplace_back(good.begin(), good.begin() + WAL_HEADER_SIZE - 1);
-  const auto resealed = [&](std::size_t offset, auto change) {
-    auto bad = good;
-    const auto record = std::span<char>{bad}.subspan(WAL_HEADER_SIZE);
-    change(record.subspan(offset));
-    little_endian::PutU32(
-        record, record.size() - 4,
-        Crc32(std::span<const char>{record}.first(record.size() - 4)));
-    return bad;
+  for (const auto &bytes : malformed) {
+    EXPECT_FALSE(DecodeWal(bytes));
+  }
+
+  const PageMap first{{1, MakePage(1, "value")}};
+  const auto record = Record({{2, MakePage(2, "next")}});
+  const auto damaged = [&](std::size_t offset, auto change) {
+    auto bytes = Header();
+    Append(bytes, Record(first));
+    const auto start = bytes.size();
+    Append(bytes, record);
+    change(std::span<char>{bytes}.subspan(start + offset));
+    return bytes;
   };
-  for (const PageId page_id : {0U, INVALID_PAGE_ID}) {
-    malformed.push_back(resealed(8, [&](std::span<char> bytes) {
+  std::vector<std::vector<char>> torn;
+  for (const PageId page_id : {0U, 3U, INVALID_PAGE_ID}) {
+    torn.push_back(damaged(8, [&](std::span<char> bytes) {
       little_endian::PutU32(bytes, 0, page_id);
     }));
   }
-  malformed.push_back(
-      resealed(12, [](std::span<char> bytes) { bytes[0] ^= 1; }));
-
-  for (const auto &bytes : malformed) {
-    EXPECT_FALSE(DecodeWal(bytes));
+  for (const std::size_t offset :
+       {std::size_t{12}, std::size_t{4100}, record.size() - 1}) {
+    torn.push_back(
+        damaged(offset, [](std::span<char> bytes) { bytes[0] ^= 1; }));
+  }
+  for (const auto &bytes : torn) {
+    EXPECT_EQ(ValuePages(DecodeWal(bytes).value()), ValuePages(first));
   }
   EXPECT_FALSE(EncodeWalRecord({}, SALT));
   EXPECT_FALSE(EncodeWalRecord({{0, MakePage(1, "value")}}, SALT));

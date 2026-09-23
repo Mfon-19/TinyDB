@@ -12,13 +12,21 @@ namespace tinydb::storage {
 
 namespace {
 
-constexpr std::array<char, 4> MAGIC{'T', 'D', 'W', '2'};
+constexpr std::array<char, 4> MAGIC{'T', 'D', 'W', '3'};
 constexpr std::size_t SALT_OFFSET = 4;
 constexpr std::size_t HEADER_CRC_OFFSET = 8;
 constexpr std::size_t HEADER_SIZE = 8;
 constexpr std::size_t FRAME_SIZE = sizeof(PageId) + PAGE_SIZE;
 constexpr std::size_t CRC_SIZE = sizeof(std::uint32_t);
 constexpr std::size_t RECORD_OVERHEAD = HEADER_SIZE + CRC_SIZE;
+
+void AddFrame(Crc32Accumulator &crc, PageId page_id,
+              std::uint32_t checksum) noexcept {
+  std::array<char, 2 * sizeof(std::uint32_t)> frame;
+  little_endian::PutU32(frame, 0, page_id);
+  little_endian::PutU32(frame, sizeof(std::uint32_t), checksum);
+  crc.Update(frame);
+}
 
 } // namespace
 
@@ -61,6 +69,8 @@ auto EncodeWalRecord(const PageMap &pages,
   little_endian::PutU32(bytes, 0, salt);
   little_endian::PutU32(bytes, 4, static_cast<std::uint32_t>(pages.size()));
 
+  Crc32Accumulator crc;
+  crc.Update(std::span<const char>{bytes}.first(HEADER_SIZE));
   std::size_t offset = HEADER_SIZE;
   for (const auto &[page_id, page] : pages) {
     if (page_id != page->Id()) {
@@ -68,10 +78,10 @@ auto EncodeWalRecord(const PageMap &pages,
     }
     little_endian::PutU32(bytes, offset, page_id);
     std::ranges::copy(page->Bytes(), bytes.begin() + offset + sizeof(PageId));
+    AddFrame(crc, page_id, page->Checksum());
     offset += FRAME_SIZE;
   }
-  little_endian::PutU32(bytes, offset,
-                        Crc32(std::span<const char>{bytes}.first(offset)));
+  little_endian::PutU32(bytes, offset, crc.Finish());
   return bytes;
 }
 
@@ -97,26 +107,33 @@ auto DecodeWal(std::span<const char> bytes) -> Result<PageMap> {
     }
     const auto record = bytes.first(*size);
     const std::size_t crc_offset = record.size() - CRC_SIZE;
-    if (little_endian::GetU32(record, crc_offset) !=
-        Crc32(record.first(crc_offset))) {
-      break;
-    }
-
+    Crc32Accumulator crc;
+    crc.Update(record.first(HEADER_SIZE));
+    std::vector<std::shared_ptr<Page>> frames;
     for (std::size_t offset = HEADER_SIZE; offset < crc_offset;
          offset += FRAME_SIZE) {
       const auto page_id = little_endian::GetU32(record, offset);
       if (!ValidDataPageId(page_id)) {
-        return Err(Status::Corruption("invalid WAL page ID"));
+        break;
       }
       PageBytes page;
       std::ranges::copy(record.subspan(offset + sizeof(PageId), PAGE_SIZE),
                         page.begin());
       auto decoded = DecodePage(page_id, page);
       if (!decoded) {
-        return Err(std::move(decoded.error()));
+        break;
       }
-      pages.insert_or_assign(page_id,
-                             std::make_shared<Page>(std::move(*decoded)));
+      AddFrame(crc, page_id, decoded->Checksum());
+      frames.push_back(std::make_shared<Page>(std::move(*decoded)));
+    }
+    if (frames.size() != (crc_offset - HEADER_SIZE) / FRAME_SIZE ||
+        little_endian::GetU32(record, crc_offset) != crc.Finish()) {
+      break;
+    }
+
+    for (auto &page : frames) {
+      const auto page_id = page->Id();
+      pages.insert_or_assign(page_id, std::move(page));
     }
     bytes = bytes.subspan(record.size());
   }

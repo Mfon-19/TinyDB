@@ -88,6 +88,7 @@ auto Keys(const auto &page) {
 class Page {
 public:
   void UpdateChecksum() noexcept;
+  [[nodiscard]] auto Checksum() const noexcept -> std::uint32_t;
   [[nodiscard]] auto Bytes() const noexcept -> PageBytes;
   [[nodiscard]] auto Id() const noexcept -> PageId;
   [[nodiscard]] auto Type() const noexcept -> PageType;
