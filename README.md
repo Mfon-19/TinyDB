@@ -109,7 +109,14 @@ sqlite> SELECT name FROM users WHERE id >= 2;
 SQLite keeps the table definitions in its own file (`schema.db`); the rows live
 in `data.tinydb`, keyed by table name and primary key. Programs can link the
 `tinydb_sqlite` library instead and call `tinydb_sqlite_register(db)` on a
-connection.
+connection. [examples/sqlite_example.cpp](examples/sqlite_example.cpp) shows
+this with bound parameters, joins, transactions, constraint errors, and
+reopening. It stores `schema.db` and `data.tinydb` in the directory you supply:
+
+```sh
+cmake --build build-release --target tinydb_sqlite_example
+./build-release/tinydb_sqlite_example sqlite-example
+```
 
 Queries, joins, transactions, and savepoints work as in SQLite. Lookups and
 range scans on the primary key use TinyDB's B+ tree, and a failed statement

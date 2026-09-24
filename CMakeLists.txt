@@ -97,6 +97,11 @@ if(TINYDB_SQLITE)
     ${SQLite3_INCLUDE_DIRS})
   target_link_libraries(tinydb_sqlite_extension PRIVATE tinydb)
   tinydb_target_options(tinydb_sqlite_extension)
+
+  add_executable(tinydb_sqlite_example EXCLUDE_FROM_ALL
+    examples/sqlite_example.cpp)
+  target_link_libraries(tinydb_sqlite_example PRIVATE tinydb_sqlite)
+  tinydb_target_options(tinydb_sqlite_example)
 endif()
 
 option(TINYDB_BUILD_TESTS "Build the tests" ON)

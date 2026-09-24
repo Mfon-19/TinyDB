@@ -6,7 +6,6 @@
 
 namespace {
 
-// Convert TinyDB errors to exceptions to keep the example's flow readable.
 void Check(tinydb::Status status) {
   if (!status.Ok()) {
     throw std::runtime_error(std::string{status.Message()});
