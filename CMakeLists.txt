@@ -51,6 +51,15 @@ target_compile_features(tinydb PUBLIC cxx_std_23)
 target_link_libraries(tinydb PUBLIC Threads::Threads)
 tinydb_target_options(tinydb)
 
+# CRC acceleration is required. Keep these flags local to the implementation
+# so unrelated code and consumers do not inherit AVX-512 code generation.
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$" OR
+   NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
+  message(FATAL_ERROR "TinyDB requires x86 with AVX-512 and a GCC/Clang compiler")
+endif()
+set_source_files_properties(src/storage/crc32.cpp PROPERTIES COMPILE_OPTIONS
+  "-mavx512f;-mavx512bw;-mavx512vl;-mvpclmulqdq;-mpclmul")
+
 add_executable(tinydb_cli main.cpp)
 target_link_libraries(tinydb_cli PRIVATE tinydb)
 tinydb_target_options(tinydb_cli)

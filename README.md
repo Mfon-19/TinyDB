@@ -9,8 +9,7 @@ inside an application's process as a layer for durable storage.
 
 ## Build and run
 
-Requires Linux, CMake 3.24 or newer, and a C++23 compiler and standard library
-with support for `std::expected` and `std::format`.
+Requires Linux, CMake 3.24 or newer, and a C++23 compiler and standard library with support for std::expected and std::format.
 
 ```sh
 cmake -S . -B build -DTINYDB_BUILD_TESTS=OFF
@@ -125,22 +124,22 @@ reading until the writer finishes.
 
 | Workload | Operations/s, median (min–max) | p99 transaction (ms) |
 | --- | ---: | ---: |
-| Sequential inserts | 129,220 (129,163–136,279) | 2.81148 |
-| Random inserts | 43,532 (41,246–44,446) | 4.79213 |
-| Existing-key reads | 1,261,375 (1,039,726–1,277,783) | 0.00282 |
-| Missing-key reads | 1,286,540 (1,176,257–1,300,473) | 0.00262 |
-| 100-entry scans | 24,505,540 (11,881,056–28,311,208) | 0.01566 |
-| Full scans | 14,939,800 (8,113,136–16,139,731) | — |
-| Overwrites | 46,140 (46,115–47,907) | 3.93407 |
-| Deletes | 46,972 (46,781–47,393) | 3.57150 |
-| Reinserts | 49,406 (49,153–49,431) | 3.43164 |
-| Reads with one active writer | 611,891 (581,378–626,686) | 0.02586 |
-| Writes with four active readers | 33,994 (32,984–36,336) | 4.48864 |
+| Sequential inserts | 135,065 (132,166–135,716) | 2.87069 |
+| Random inserts | 46,904 (43,125–48,007) | 4.73207 |
+| Existing-key reads | 1,789,500 (850,594–1,932,324) | 0.00145 |
+| Missing-key reads | 1,870,730 (1,840,384–1,943,654) | 0.00142 |
+| 100-entry scans | 23,163,859 (15,153,834–34,537,304) | 0.01101 |
+| Full scans | 17,599,530 (11,152,524–25,343,660) | — |
+| Overwrites | 51,191 (51,176–51,530) | 3.41459 |
+| Deletes | 49,980 (39,346–50,772) | 3.45452 |
+| Reinserts | 51,768 (51,516–52,289) | 3.36617 |
+| Reads with one active writer | 576,327 (545,171–599,438) | 0.02611 |
+| Writes with four active readers | 33,902 (29,972–34,073) | 5.90125 |
 
 ### Comparing with SQLite
 
 TinyDB had higher throughput in every workload. Its lead was largest for
-point reads and scans; for writes it was 1.06–1.18×. TinyDB used 8.4% less
+point reads and scans; for writes it was 1.14–1.22×. TinyDB used 8.4% less
 disk space after sequential inserts, while SQLite used less after random
 inserts.
 
@@ -162,15 +161,15 @@ the TinyDB-only table above uses fewer read and scan passes in a separate run.
 
 | Workload | TinyDB | SQLite | Faster |
 | --- | ---: | ---: | --- |
-| Sequential inserts | 130,573 ops/s | 119,654 ops/s | TinyDB 1.09× |
-| Random inserts | 45,750 ops/s | 38,701 ops/s | TinyDB 1.18× |
-| Existing-key reads | 1,271,067 ops/s | 529,973 ops/s | TinyDB 2.40× |
-| Missing-key reads | 1,361,622 ops/s | 559,091 ops/s | TinyDB 2.44× |
-| 100-entry scans | 480,066 scans/s | 68,674 scans/s | TinyDB 6.99× |
-| Full scans | 11,621,224 entries/s | 7,194,264 entries/s | TinyDB 1.62× |
-| Overwrites | 47,596 ops/s | 43,318 ops/s | TinyDB 1.10× |
-| Deletes | 45,356 ops/s | 42,902 ops/s | TinyDB 1.06× |
-| Reinserts | 48,193 ops/s | 41,364 ops/s | TinyDB 1.17× |
+| Sequential inserts | 133,694 ops/s | 117,014 ops/s | TinyDB 1.14× |
+| Random inserts | 46,721 ops/s | 40,485 ops/s | TinyDB 1.15× |
+| Existing-key reads | 1,869,234 ops/s | 525,500 ops/s | TinyDB 3.56× |
+| Missing-key reads | 1,976,036 ops/s | 561,423 ops/s | TinyDB 3.52× |
+| 100-entry scans | 501,334 scans/s | 68,659 scans/s | TinyDB 7.30× |
+| Full scans | 20,652,847 entries/s | 7,304,800 entries/s | TinyDB 2.83× |
+| Overwrites | 47,951 ops/s | 40,844 ops/s | TinyDB 1.17× |
+| Deletes | 51,539 ops/s | 42,629 ops/s | TinyDB 1.21× |
+| Reinserts | 52,346 ops/s | 43,028 ops/s | TinyDB 1.22× |
 
 TinyDB's narrower API may explain its lead on point reads and short scans:
 operations call the B+ tree directly, and cursors read views into leaf pages.
