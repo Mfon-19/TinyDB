@@ -51,8 +51,6 @@ target_compile_features(tinydb PUBLIC cxx_std_23)
 target_link_libraries(tinydb PUBLIC Threads::Threads)
 tinydb_target_options(tinydb)
 
-# CRC acceleration is required. Keep these flags local to the implementation
-# so unrelated code and consumers do not inherit AVX-512 code generation.
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$" OR
    NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
   message(FATAL_ERROR "TinyDB requires x86 with AVX-512 and a GCC/Clang compiler")
@@ -77,6 +75,28 @@ if(TINYDB_BENCH_SQLITE)
   find_package(SQLite3 3.24 REQUIRED)
   target_link_libraries(tinydb_bench PRIVATE SQLite::SQLite3)
   target_compile_definitions(tinydb_bench PRIVATE TINYDB_BENCH_SQLITE)
+endif()
+
+option(TINYDB_SQLITE "Build the SQLite virtual table module" OFF)
+if(TINYDB_SQLITE)
+  find_package(SQLite3 3.24 REQUIRED)
+  # The loadable extension links the library into a shared object.
+  set_target_properties(tinydb PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+  add_library(tinydb_sqlite STATIC sqlite/tinydb_vtab.cpp)
+  target_compile_definitions(tinydb_sqlite PRIVATE SQLITE_CORE)
+  target_include_directories(tinydb_sqlite PUBLIC sqlite)
+  target_link_libraries(tinydb_sqlite PUBLIC tinydb SQLite::SQLite3)
+  tinydb_target_options(tinydb_sqlite)
+
+  # Load in the sqlite3 shell with: .load ./tinydb
+  add_library(tinydb_sqlite_extension MODULE sqlite/tinydb_vtab.cpp)
+  set_target_properties(tinydb_sqlite_extension PROPERTIES
+    OUTPUT_NAME tinydb PREFIX "")
+  target_include_directories(tinydb_sqlite_extension PRIVATE
+    ${SQLite3_INCLUDE_DIRS})
+  target_link_libraries(tinydb_sqlite_extension PRIVATE tinydb)
+  tinydb_target_options(tinydb_sqlite_extension)
 endif()
 
 option(TINYDB_BUILD_TESTS "Build the tests" ON)

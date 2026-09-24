@@ -81,6 +81,54 @@ cmake --build build --target tinydb_example
 ./build/tinydb_example example.db
 ```
 
+## Using TinyDB from SQL
+
+TinyDB can serve as the storage layer beneath a SQL engine. The
+[sqlite/](sqlite/) directory contains a SQLite
+[virtual table](https://www.sqlite.org/vtab.html) module: SQLite parses,
+plans, and executes queries, and TinyDB stores the rows. Building it requires
+SQLite's development package (`libsqlite3-dev` on Ubuntu):
+
+```sh
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DTINYDB_SQLITE=ON
+cmake --build build-release --target tinydb_sqlite_extension -j
+```
+
+Load the extension in the `sqlite3` shell and create tables backed by a TinyDB
+file:
+
+```text
+sqlite3 schema.db
+sqlite> .load ./build-release/tinydb
+sqlite> CREATE VIRTUAL TABLE users USING tinydb('data.tinydb',
+   ...>   id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);
+sqlite> INSERT INTO users VALUES (1, 'alice', 31), (2, 'bob', 27);
+sqlite> SELECT name FROM users WHERE id >= 2;
+```
+
+SQLite keeps the table definitions in its own file (`schema.db`); the rows live
+in `data.tinydb`, keyed by table name and primary key. Programs can link the
+`tinydb_sqlite` library instead and call `tinydb_sqlite_register(db)` on a
+connection.
+
+Queries, joins, transactions, and savepoints work as in SQLite. Lookups and
+range scans on the primary key use TinyDB's B+ tree, and a failed statement
+rolls back only its own changes. The module has these limitations:
+
+- Each table needs a single `INTEGER` or `TEXT` primary key. `INTEGER` keys
+  accept only integers.
+- SQLite does not support `CREATE INDEX` on virtual tables, so filters on
+  other columns scan the table.
+- `NOT NULL` is enforced. `CHECK`, `DEFAULT`, `UNIQUE`, and foreign keys are
+  rejected when the table is created, because SQLite ignores them on virtual
+  tables.
+- A row, including its key, must fit in 1 KiB.
+- Only one SQLite connection may use a TinyDB file at a time.
+
+Queries pass through SQLite's virtual table interface, so they are slower than
+on a native SQLite table: in a quick test with 10,000 rows, 200,000 primary key
+lookups took 2.5 times as long.
+
 ## How it works
 
 TinyDB features a disk manager that talks to the operating system (Linux) to
